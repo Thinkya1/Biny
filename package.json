@@ -1,0 +1,25 @@
+{
+  "name": "biny",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "biny": "./dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "node --import tsx src/cli/index.ts",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/cli/index.js"
+  },
+  "dependencies": {
+    "commander": "^13.1.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.21",
+    "tsx": "^4.22.4",
+    "typescript": "^5.9.3"
+  },
+  "packageManager": "pnpm@10.6.5"
+}

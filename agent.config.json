@@ -1,0 +1,14 @@
+{
+  "model": {
+    "provider": "mock",
+    "baseUrl": "",
+    "model": "mock",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  },
+  "permission": {
+    "mode": "safe"
+  },
+  "workspace": {
+    "ignore": ["node_modules", ".git", "dist", "build", ".env"]
+  }
+}
