@@ -2,17 +2,19 @@ import type { CommandAnalysisInput, FileEditInput, FileEditProposal, LLMProvider
 
 export class MockProvider implements LLMProvider {
   async chat(messages: ChatMessage[]): Promise<string> {
-    const last = messages.at(-1)?.content ?? "";
+    // MockProvider 只用于验证 CLI、工具、权限和 session 流程；不要在这里模拟真实模型能力。
+    const userMessage = [...messages].reverse().find((message) => message.role === "user")?.content ?? "";
+    const question = extractQuestion(userMessage);
     return [
-      "MockProvider answer:",
-      "I can inspect local files, propose simple edits, and run approved commands.",
-      last ? `Input summary: ${last.slice(0, 500)}` : ""
+      "模型未接入，当前使用 MockProvider。",
+      question ? `收到输入：${question}` : "",
+      "可用能力：读取文件、搜索文件、生成计划、在确认后修改文件或执行命令。"
     ].filter(Boolean).join("\n");
   }
 
   async analyzeCommandResult(input: CommandAnalysisInput): Promise<string> {
-    if (input.exitCode === 0) return `Command succeeded: ${input.command}\n${input.stdout.slice(0, 1000)}`;
-    return `Command failed with exit code ${input.exitCode}: ${input.command}\nSTDERR:\n${input.stderr.slice(0, 1000)}`;
+    if (input.exitCode === 0) return `命令执行成功：${input.command}\n${input.stdout.slice(0, 1000)}`;
+    return `命令执行失败，退出码 ${input.exitCode}：${input.command}\nSTDERR:\n${input.stderr.slice(0, 1000)}`;
   }
 
   async proposeFileEdit(input: FileEditInput): Promise<FileEditProposal> {
@@ -29,6 +31,16 @@ export class MockProvider implements LLMProvider {
       explanation: `Replace "${replacement.oldText}" with "${replacement.newText}" in ${input.path}.`
     };
   }
+}
+
+function extractQuestion(content: string): string {
+  const marker = "\n\nQuestion:\n";
+  const index = content.lastIndexOf(marker);
+  if (index !== -1) return content.slice(index + marker.length).trim().slice(0, 300);
+  const taskMarker = "\n\nTask:\n";
+  const taskIndex = content.lastIndexOf(taskMarker);
+  if (taskIndex !== -1) return content.slice(taskIndex + taskMarker.length).trim().slice(0, 300);
+  return content.trim().slice(0, 300);
 }
 
 function parseReplacement(instruction: string): { oldText: string; newText: string } | undefined {

@@ -28,6 +28,18 @@ export const defaultConfig: AgentConfig = {
     mode: "safe"
   },
   workspace: {
-    ignore: ["node_modules", ".git", "dist", "build", ".env"]
+    // ignore 同时用于 ProjectContext、文件扫描和搜索工具，避免读取依赖目录、构建产物和本地私有文档。
+    ignore: [
+      "node_modules",
+      ".git",
+      "dist",
+      "build",
+      ".env",
+      ".agent",
+      ".DS_Store",
+      "PROJECT_DESCRIPTION.local.md",
+      "TODO.local.md",
+      "ARCHITECTURE.local.md"
+    ]
   }
 };

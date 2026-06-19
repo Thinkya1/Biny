@@ -14,17 +14,12 @@ export interface RunCommandResult {
   exitCode: number;
 }
 
-const DANGEROUS_PATTERNS = [/rm\s+-rf/, /\bsudo\b/, /chmod\s+-R/, /chown\s+-R/, /\bdd\b/, /\bmkfs\b/, /curl\b.*\|\s*sh/, /wget\b.*\|\s*sh/];
-
 export function createRunCommandTool(context: ToolContext): Tool<RunCommandArgs, RunCommandResult> {
   return {
     name: "run_command",
     description: "Run a local shell command in the workspace.",
     async execute(args) {
-      if (DANGEROUS_PATTERNS.some((pattern) => pattern.test(args.command))) {
-        throw new Error(`Refusing dangerous command: ${args.command}`);
-      }
-
+      // 这里只负责执行命令；是否允许执行由 agent/permission 层在调用前处理。
       try {
         const result = await execAsync(args.command, {
           cwd: context.workspaceRoot,

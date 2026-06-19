@@ -9,6 +9,17 @@
     "mode": "safe"
   },
   "workspace": {
-    "ignore": ["node_modules", ".git", "dist", "build", ".env"]
+    "ignore": [
+      "node_modules",
+      ".git",
+      "dist",
+      "build",
+      ".env",
+      ".agent",
+      ".DS_Store",
+      "PROJECT_DESCRIPTION.local.md",
+      "TODO.local.md",
+      "ARCHITECTURE.local.md"
+    ]
   }
 }

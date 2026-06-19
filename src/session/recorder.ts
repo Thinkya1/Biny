@@ -2,7 +2,13 @@ import { createWriteStream, type WriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { sessionFilePath } from "./store.js";
 
-export type SessionEvent = Record<string, unknown> & { type: string; time?: string };
+export type SessionEvent =
+  // session 事件类型要保持稳定；resume、未来上下文压缩和记忆功能都会依赖这几个基础类型。
+  | { type: "user_message"; content: string; time?: string }
+  | { type: "assistant_message"; content: string; time?: string }
+  | { type: "tool_call"; tool: string; args: unknown; time?: string }
+  | { type: "tool_result"; tool: string; result: unknown; time?: string }
+  | { type: "error"; message: string; detail?: unknown; time?: string };
 
 export class SessionRecorder {
   readonly sessionId: string;
@@ -16,6 +22,7 @@ export class SessionRecorder {
   }
 
   record(event: SessionEvent): void {
+    // 每个事件一行 JSON，便于追加写入，也方便后续按行读取和压缩。
     const line = JSON.stringify({ ...event, time: event.time ?? new Date().toISOString() });
     this.stream.write(`${line}\n`);
   }
