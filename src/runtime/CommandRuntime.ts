@@ -1,6 +1,6 @@
 import { loadConfig } from "../config/loader.js";
 import type { AgentConfig } from "../config/schema.js";
-import { MockProvider } from "../llm/mock.js";
+import { createLLMProvider } from "../llm/factory.js";
 import type { LLMProvider } from "../llm/provider.js";
 import { collectProjectContext, type ProjectContext } from "../project/ProjectContext.js";
 import { SessionRecorder } from "../session/recorder.js";
@@ -33,7 +33,7 @@ export async function createCommandRuntime(workspaceRoot: string): Promise<Comma
   await ensureAgentDirs(workspaceRoot);
   const config = await loadConfig(workspaceRoot);
   const recorder = new SessionRecorder(workspaceRoot);
-  const llm = new MockProvider();
+  const llm = createLLMProvider(config);
   const projectContext = await collectProjectContext(workspaceRoot, config.workspace.ignore);
   const toolRegistry = createToolRegistry({ workspaceRoot, ignore: config.workspace.ignore });
 

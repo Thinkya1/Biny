@@ -2,9 +2,11 @@
 **/.DS_Store
 node_modules/
 dist/
+docs/
 .agent/
 .agents/
 .env
 PROJECT_DESCRIPTION.local.md
 TODO.local.md
 ARCHITECTURE.local.md
+/.agents

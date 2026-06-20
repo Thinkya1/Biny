@@ -136,7 +136,7 @@ async function handleSlashCommand(runtime: CommandRuntime, text: string): Promis
       "- During execution, show a diff and wait for user confirmation before writing.",
       "",
       "Risks",
-      "- MockProvider can only produce conservative plans.",
+      "- Provider output should be reviewed before executing changes.",
       "- Plan mode does not execute writes, edits, or commands.",
       "",
       "ProjectContext Summary",

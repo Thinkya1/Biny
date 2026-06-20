@@ -53,13 +53,24 @@ export function extractCommand(input: string): string | undefined {
 }
 
 export function extractWriteFile(input: string): { path: string; content: string } | undefined {
-  const english = input.match(/(?:write|create)\s+([A-Za-z0-9._/-]+\.[A-Za-z0-9]+)\s+(?:with|content:)\s*([\s\S]+)$/i);
-  if (english?.[1] && english[2]) return { path: english[1], content: english[2].trim() };
+  const english = input.match(/(?:write|create|new)\s+(?:a\s+)?(?:file\s+)?([A-Za-z0-9._/-]+\.[A-Za-z0-9]+)\s*(?:(?:with|content:|content is)\s*([\s\S]+))?$/i);
+  if (english?.[1]) return { path: english[1], content: (english[2] ?? "").trim() };
 
-  const chinese = input.match(/(?:写入|创建)\s*([A-Za-z0-9._/-]+\.[A-Za-z0-9]+)\s*(?:内容为|内容:|：|:)\s*([\s\S]+)$/);
-  if (chinese?.[1] && chinese[2]) return { path: chinese[1], content: chinese[2].trim() };
+  const chinese = input.match(/(?:写入|创建|新建)\s*(?:一个|一份)?\s*(?:文件)?\s*([A-Za-z0-9._/-]+\.[A-Za-z0-9]+)\s*(?:(?:文件)?\s*(?:内容为|内容是|内容:|写入|：|:)\s*([\s\S]+))?$/);
+  if (chinese?.[1]) return { path: chinese[1], content: (chinese[2] ?? "").trim() };
+
+  const path = extractFilePath(input);
+  if (path && /创建|新建|写入|create|write|new file/i.test(input)) {
+    return { path, content: extractLooseWriteContent(input, path) };
+  }
 
   return undefined;
+}
+
+function extractLooseWriteContent(input: string, path: string): string {
+  const afterPath = input.slice(input.indexOf(path) + path.length);
+  const content = afterPath.match(/(?:内容为|内容是|内容:|写入|with|content:|content is|：|:)\s*([\s\S]+)$/i)?.[1];
+  return content?.trim() ?? "";
 }
 
 export function extractSearchQuery(input: string): string | undefined {

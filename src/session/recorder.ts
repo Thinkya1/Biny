@@ -14,9 +14,10 @@ export class SessionRecorder {
   readonly sessionId: string;
   readonly filePath: string;
   private readonly stream: WriteStream;
+  private closePromise?: Promise<void>;
 
-  constructor(workspaceRoot: string) {
-    this.sessionId = createSessionId();
+  constructor(workspaceRoot: string, sessionId = createSessionId()) {
+    this.sessionId = sessionId;
     this.filePath = sessionFilePath(workspaceRoot, this.sessionId);
     this.stream = createWriteStream(this.filePath, { flags: "a" });
   }
@@ -28,12 +29,13 @@ export class SessionRecorder {
   }
 
   close(): Promise<void> {
-    return new Promise((resolve, reject) => {
+    this.closePromise ??= new Promise((resolve, reject) => {
       this.stream.end((error?: Error | null) => {
         if (error) reject(error);
         else resolve();
       });
     });
+    return this.closePromise;
   }
 }
 

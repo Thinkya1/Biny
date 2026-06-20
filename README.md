@@ -1,6 +1,6 @@
 # Biny
 
-Biny 是一个 TypeScript CLI 本地编码代理。当前版本只使用 `MockProvider`，暂时不会接入 OpenAI、Claude 或其它真实模型。
+Biny 是一个 TypeScript CLI 本地编码代理。当前保留 `MockProvider`，并支持通过 OpenAI-compatible 接口接入 DeepSeek。
 
 它支持 ProjectContext、本地文件工具、命令执行确认、执行计划和 `.agent/sessions/*.jsonl` 会话记录。
 
@@ -12,6 +12,25 @@ pnpm install
 
 ## 开发模式运行
 
+当前项目的 `agent.config.json` 已配置为 DeepSeek：
+
+```json
+{
+  "model": {
+    "provider": "deepseek",
+    "baseUrl": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "apiKeyEnv": "DEEPSEEK_API_KEY"
+  }
+}
+```
+
+API key 不要写入仓库文件。运行前在当前 shell 设置环境变量：
+
+```bash
+export DEEPSEEK_API_KEY="你的 DeepSeek API key"
+```
+
 ```bash
 pnpm dev
 pnpm dev -- init
@@ -21,6 +40,7 @@ pnpm dev -- plan "给 README 增加用法说明"
 pnpm dev -- sessions
 pnpm dev -- resume
 pnpm dev -- chat
+pnpm dev -- tui
 ```
 
 不带子命令运行 `pnpm dev` 时会默认进入 `chat`。
@@ -42,6 +62,7 @@ biny run "运行 pnpm typecheck 并分析错误"
 biny plan "实现一个只读搜索工具"
 biny sessions
 biny resume
+biny tui
 ```
 
 ## 命令
@@ -77,6 +98,37 @@ biny chat
 - `/resume [session]`：查看指定 session，不传参数时查看 latest
 - `/plan <task>`：只生成计划，不执行写入、编辑或命令
 - `/exit`：退出 chat
+
+### `tui`
+
+启动 TUI 终端界面模式。当前 TUI 使用 React Ink 实现，用来替代或增强普通 `chat` 的交互体验。
+
+```bash
+biny tui
+pnpm dev -- tui
+```
+
+当前 TUI 已支持：
+
+- Header：显示 BinyAgent、TUI 模式、当前工作目录、当前 provider 和 session id。
+- 消息区域：显示用户输入、assistant 回复、系统状态和错误；支持 `PageUp` / `PageDown` 浏览历史，`End` 回到最新消息。
+- 输入区域：输入 prompt 后按 Enter 发送。
+- 状态栏：显示 `Idle`、`Thinking`、`Running`、`Waiting Permission`、`Completed`、`Error`。
+- 工具调用展示：显示工具名、参数摘要、执行状态和结果摘要。
+- 权限提示：工具需要确认时显示工具名、操作说明和风险提示。
+
+权限提示快捷键：
+
+- `y`：允许本次操作。
+- `n`：拒绝本次操作。
+- `a`：本轮自动允许。
+
+TUI 使用 `agent.config.json` 中配置的 provider。当前项目配置为 DeepSeek；如果改回 `mock`，则会使用本地 `MockProvider`。
+
+TUI 内的 `/resume` 行为：
+
+- `/resume`：列出当前项目历史 session。
+- `/resume <session id>`：恢复指定 session，并把后续对话继续追加到同一个 `.agent/sessions/*.jsonl` 文件。
 
 ### `plan`
 
@@ -155,4 +207,12 @@ biny resume .agent/sessions/20260619-153000-abcd1234.jsonl
 - `tool_result`
 - `error`
 
-当前版本不需要 API key。真实模型 provider 还没有接入。
+## 模型配置
+
+Biny 当前支持：
+
+- `mock`：本地 MockProvider，不需要 API key。
+- `deepseek`：DeepSeek API，读取 `DEEPSEEK_API_KEY`。
+- `openai-compatible`：通用 OpenAI-compatible 接口，可配置 `baseUrl`、`model` 和 `apiKeyEnv`。
+
+DeepSeek 使用官方 OpenAI-compatible Chat Completions 格式，默认 `baseUrl` 为 `https://api.deepseek.com`，默认模型为 `deepseek-chat`。

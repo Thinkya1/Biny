@@ -24,6 +24,7 @@ export interface FileEditProposal {
 
 export interface LLMProvider {
   chat(messages: ChatMessage[]): Promise<string>;
+  streamChat?(messages: ChatMessage[], onDelta: (delta: string) => void, options?: { signal?: AbortSignal }): Promise<string>;
   analyzeCommandResult(input: CommandAnalysisInput): Promise<string>;
   proposeFileEdit(input: FileEditInput): Promise<FileEditProposal>;
 }

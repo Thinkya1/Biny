@@ -1,9 +1,9 @@
 {
   "model": {
-    "provider": "mock",
-    "baseUrl": "",
-    "model": "mock",
-    "apiKeyEnv": "OPENAI_API_KEY"
+    "provider": "deepseek",
+    "baseUrl": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "apiKeyEnv": "DEEPSEEK_API_KEY"
   },
   "permission": {
     "mode": "safe"

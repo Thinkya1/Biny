@@ -1,12 +1,12 @@
+import { buildSystemPrompt } from "../../agent/prompts.js";
 import { formatProjectContext } from "../../project/ProjectContext.js";
 import { withCommandRuntime } from "../../runtime/CommandRuntime.js";
 
 export async function planCommand(workspaceRoot: string, task: string): Promise<void> {
   await withCommandRuntime(workspaceRoot, async (runtime) => {
     runtime.recorder.record({ type: "user_message", content: `plan: ${task}` });
-    // 当前 plan 仍通过 MockProvider 产出备注，但不会执行任何写入、编辑或命令工具。
     const plan = await runtime.llm.chat([
-      { role: "system", content: "Create a deterministic execution plan. Do not execute tools." },
+      { role: "system", content: buildSystemPrompt("plan") },
       { role: "user", content: `${formatProjectContext(runtime.projectContext)}\n\nTask:\n${task}` }
     ]);
     const output = formatPlan(task, runtime.projectContext.srcTree.slice(0, 20), plan);
@@ -16,7 +16,7 @@ export async function planCommand(workspaceRoot: string, task: string): Promise<
   });
 }
 
-function formatPlan(task: string, srcTree: string[], mockNotes: string): string {
+function formatPlan(task: string, srcTree: string[], providerNotes: string): string {
   return [
     "Goal",
     `- ${task}`,
@@ -39,12 +39,12 @@ function formatPlan(task: string, srcTree: string[], mockNotes: string): string 
     "- If validation is needed, ask for confirmation before running commands.",
     "",
     "Risks",
-    "- MockProvider can only produce conservative plans.",
+    "- Provider output should be reviewed before executing changes.",
     "- Plan mode does not execute writes, edits, or commands, so feasibility is not verified.",
     "- Larger changes may require inspecting more specific files.",
     "",
-    "MockProvider Notes",
-    mockNotes
+    "Provider Notes",
+    providerNotes
   ].join("\n");
 }
 

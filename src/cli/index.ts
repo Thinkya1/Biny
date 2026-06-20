@@ -7,6 +7,7 @@ import { chatCommand } from "./commands/chat.js";
 import { resumeCommand } from "./commands/resume.js";
 import { sessionsCommand } from "./commands/sessions.js";
 import { planCommand } from "./commands/plan.js";
+import { tuiCommand } from "./commands/tui.js";
 
 const program = new Command();
 const workspaceRoot = process.cwd();
@@ -16,6 +17,7 @@ program.name("biny").description("Biny TypeScript coding agent").version("0.1.0"
 program.command("init").description("Initialize config and .agent directories").action(wrap(() => initCommand(workspaceRoot)));
 program.command("doctor").description("Check local environment").action(wrap(() => doctorCommand(workspaceRoot)));
 program.command("chat").description("Start interactive chat").action(wrap(() => chatCommand(workspaceRoot)));
+program.command("tui").description("Start terminal UI mode").action(wrap(() => tuiCommand(workspaceRoot)));
 program.command("sessions").description("List recorded sessions").action(wrap(() => sessionsCommand(workspaceRoot)));
 program
   .command("plan")

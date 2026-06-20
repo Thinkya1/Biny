@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const configSchema = z.object({
   model: z.object({
-    provider: z.enum(["mock", "openai-compatible"]),
+    provider: z.enum(["mock", "openai-compatible", "deepseek"]),
     baseUrl: z.string(),
     model: z.string(),
     apiKeyEnv: z.string()
@@ -16,6 +16,32 @@ export const configSchema = z.object({
 });
 
 export type AgentConfig = z.infer<typeof configSchema>;
+
+export const deepSeekConfig: AgentConfig = {
+  model: {
+    provider: "deepseek",
+    baseUrl: "https://api.deepseek.com",
+    model: "deepseek-chat",
+    apiKeyEnv: "DEEPSEEK_API_KEY"
+  },
+  permission: {
+    mode: "safe"
+  },
+  workspace: {
+    ignore: [
+      "node_modules",
+      ".git",
+      "dist",
+      "build",
+      ".env",
+      ".agent",
+      ".DS_Store",
+      "PROJECT_DESCRIPTION.local.md",
+      "TODO.local.md",
+      "ARCHITECTURE.local.md"
+    ]
+  }
+};
 
 export const defaultConfig: AgentConfig = {
   model: {

@@ -6,8 +6,10 @@ import type { SessionEvent } from "./recorder.js";
 export interface SessionSummary {
   fileName: string;
   firstUserMessage: string;
+  lastAssistantMessage: string;
   eventCount: number;
   createdAt: string;
+  updatedAt: string;
 }
 
 export async function readSessionEvents(filePath: string): Promise<SessionEvent[]> {
@@ -27,12 +29,16 @@ export async function listSessionSummaries(workspaceRoot: string): Promise<Sessi
       const filePath = path.join(sessionsDir, fileName);
       const [events, stat] = await Promise.all([readSessionEvents(filePath), fs.stat(filePath)]);
       const firstUserMessage = events.find((event) => event.type === "user_message")?.content ?? "";
+      const lastAssistantMessage = [...events].reverse().find((event) => event.type === "assistant_message")?.content ?? "";
       const firstTime = events.find((event) => typeof event.time === "string")?.time;
+      const lastTime = [...events].reverse().find((event) => typeof event.time === "string")?.time;
       return {
         fileName,
         firstUserMessage,
+        lastAssistantMessage,
         eventCount: events.length,
-        createdAt: firstTime ?? stat.birthtime.toISOString()
+        createdAt: firstTime ?? stat.birthtime.toISOString(),
+        updatedAt: lastTime ?? stat.mtime.toISOString()
       };
     })
   );
