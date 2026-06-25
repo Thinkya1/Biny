@@ -1,4 +1,11 @@
 #!/usr/bin/env node
+/**
+ * Biny 的命令行入口模块。
+ *
+ * 这里集中声明 `init`、`run`、`chat`、`tui` 等子命令，并把执行逻辑转交给
+ * `commands/` 下的具体实现。入口层只处理参数拼接、默认命令和异常展示，
+ * 不直接承载 agent、工具或 TUI 的业务流程。
+ */
 import { Command } from "commander";
 import { initCommand } from "./commands/init.js";
 import { doctorCommand } from "./commands/doctor.js";
@@ -10,6 +17,7 @@ import { planCommand } from "./commands/plan.js";
 import { tuiCommand } from "./commands/tui.js";
 
 const program = new Command();
+// CLI 的工作区以用户执行 biny 时的当前目录为准。
 const workspaceRoot = process.cwd();
 
 program.name("biny").description("Biny TypeScript coding agent").version("0.1.0");
@@ -23,6 +31,7 @@ program
   .command("plan")
   .description("Create a plan without executing write, edit, or command tools")
   .argument("<task...>", "task text")
+  // Commander 对可变参数返回数组，这里统一拼回自然语言任务文本。
   .action((task: string[]) => wrap(() => planCommand(workspaceRoot, task.join(" ")))());
 program
   .command("run")
@@ -43,6 +52,7 @@ if (process.argv.length <= 2) {
 }
 
 function wrap(fn: () => Promise<void>): () => Promise<void> {
+  // 所有命令都经过 wrap，保证异步异常不会打印冗长堆栈到普通用户界面。
   return async () => {
     try {
       await fn();

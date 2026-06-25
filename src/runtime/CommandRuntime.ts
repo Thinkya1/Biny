@@ -1,11 +1,19 @@
+/**
+ * 命令运行时装配模块。
+ *
+ * 每个 CLI/TUI 入口最终都会通过这里创建一套共享运行时：配置、模型 provider、
+ * session recorder、项目摘要和工具注册表。这样上层命令不需要重复初始化逻辑，
+ * 未来接入 MCP、skill、memory 等能力也可以继续从这个运行时扩展。
+ */
 import { loadConfig } from "../config/loader.js";
 import type { AgentConfig } from "../config/schema.js";
 import { createLLMProvider } from "../llm/factory.js";
-import type { LLMProvider } from "../llm/provider.js";
+import type { ChatMessage, LLMProvider } from "../llm/provider.js";
 import { collectProjectContext, type ProjectContext } from "../project/ProjectContext.js";
 import { SessionRecorder } from "../session/recorder.js";
 import { ensureAgentDirs } from "../session/store.js";
 import { createToolRegistry, type ToolRegistry } from "../tools/registry.js";
+import { PermissionManager } from "../permission/PermissionManager.js";
 
 export interface FutureRuntimeExtensions {
   // 这些字段当前只是占位，目的是让后续 MCP、skill、subagent、memory 等能力通过 Runtime 注入，
@@ -24,6 +32,8 @@ export interface CommandRuntime extends FutureRuntimeExtensions {
   llm: LLMProvider;
   projectContext: ProjectContext;
   toolRegistry: ToolRegistry;
+  permissionManager: PermissionManager;
+  conversation: ChatMessage[];
   close(): Promise<void>;
 }
 
@@ -36,6 +46,8 @@ export async function createCommandRuntime(workspaceRoot: string): Promise<Comma
   const llm = createLLMProvider(config);
   const projectContext = await collectProjectContext(workspaceRoot, config.workspace.ignore);
   const toolRegistry = createToolRegistry({ workspaceRoot, ignore: config.workspace.ignore });
+  const permissionManager = new PermissionManager({ ...config.permission, source: "agent.config.json" });
+  const conversation: ChatMessage[] = [];
 
   return {
     workspaceRoot,
@@ -44,6 +56,8 @@ export async function createCommandRuntime(workspaceRoot: string): Promise<Comma
     llm,
     projectContext,
     toolRegistry,
+    permissionManager,
+    conversation,
     close: () => recorder.close()
   };
 }

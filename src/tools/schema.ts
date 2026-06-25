@@ -1,0 +1,127 @@
+/**
+ * 工具 JSON Schema 模块。
+ *
+ * 这里维护给模型看的 function parameters 结构，并提供 agent loop 执行前的最小校验。
+ * 当前只实现项目内工具需要的 JSON Schema 子集，避免额外引入校验依赖。
+ */
+export type JsonSchema =
+  | JsonObjectSchema
+  | JsonStringSchema
+  | JsonNumberSchema
+  | JsonBooleanSchema
+  | JsonArraySchema;
+
+export interface JsonObjectSchema {
+  type: "object";
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  additionalProperties?: boolean;
+  description?: string;
+}
+
+export interface JsonStringSchema {
+  type: "string";
+  description?: string;
+  minLength?: number;
+}
+
+export interface JsonNumberSchema {
+  type: "number" | "integer";
+  description?: string;
+  minimum?: number;
+  maximum?: number;
+}
+
+export interface JsonBooleanSchema {
+  type: "boolean";
+  description?: string;
+}
+
+export interface JsonArraySchema {
+  type: "array";
+  description?: string;
+  items?: JsonSchema;
+}
+
+export interface JsonSchemaValidationResult {
+  ok: boolean;
+  errors: string[];
+}
+
+export function validateJsonSchema(schema: JsonSchema, value: unknown, path = "arguments"): JsonSchemaValidationResult {
+  const errors: string[] = [];
+  validateValue(schema, value, path, errors);
+  return { ok: errors.length === 0, errors };
+}
+
+function validateValue(schema: JsonSchema, value: unknown, path: string, errors: string[]): void {
+  switch (schema.type) {
+    case "object":
+      validateObject(schema, value, path, errors);
+      return;
+    case "string":
+      validateString(schema, value, path, errors);
+      return;
+    case "number":
+    case "integer":
+      validateNumber(schema, value, path, errors);
+      return;
+    case "boolean":
+      if (typeof value !== "boolean") errors.push(`${path} must be a boolean`);
+      return;
+    case "array":
+      validateArray(schema, value, path, errors);
+      return;
+  }
+}
+
+function validateObject(schema: JsonObjectSchema, value: unknown, path: string, errors: string[]): void {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    errors.push(`${path} must be an object`);
+    return;
+  }
+
+  const record = value as Record<string, unknown>;
+  const properties = schema.properties ?? {};
+  for (const key of schema.required ?? []) {
+    if (!(key in record)) errors.push(`${path}.${key} is required`);
+  }
+
+  for (const [key, field] of Object.entries(record)) {
+    const propertySchema = properties[key];
+    if (!propertySchema) {
+      if (schema.additionalProperties === false) errors.push(`${path}.${key} is not allowed`);
+      continue;
+    }
+    validateValue(propertySchema, field, `${path}.${key}`, errors);
+  }
+}
+
+function validateString(schema: JsonStringSchema, value: unknown, path: string, errors: string[]): void {
+  if (typeof value !== "string") {
+    errors.push(`${path} must be a string`);
+    return;
+  }
+  if (schema.minLength !== undefined && value.length < schema.minLength) {
+    errors.push(`${path} must contain at least ${String(schema.minLength)} character(s)`);
+  }
+}
+
+function validateNumber(schema: JsonNumberSchema, value: unknown, path: string, errors: string[]): void {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    errors.push(`${path} must be a ${schema.type}`);
+    return;
+  }
+  if (schema.type === "integer" && !Number.isInteger(value)) errors.push(`${path} must be an integer`);
+  if (schema.minimum !== undefined && value < schema.minimum) errors.push(`${path} must be >= ${String(schema.minimum)}`);
+  if (schema.maximum !== undefined && value > schema.maximum) errors.push(`${path} must be <= ${String(schema.maximum)}`);
+}
+
+function validateArray(schema: JsonArraySchema, value: unknown, path: string, errors: string[]): void {
+  if (!Array.isArray(value)) {
+    errors.push(`${path} must be an array`);
+    return;
+  }
+  if (!schema.items) return;
+  value.forEach((item, index) => validateValue(schema.items as JsonSchema, item, `${path}[${String(index)}]`, errors));
+}

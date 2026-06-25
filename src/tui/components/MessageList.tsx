@@ -1,6 +1,13 @@
+/**
+ * 消息列表组件。
+ *
+ * TUI 会把 live messages 交给这里渲染。组件会把多行消息拆成连续行，并在新的用户消息前插入分隔线，
+ * 让终端里的多轮对话更容易扫描。
+ */
 import React from "react";
 import { Box, Text } from "ink";
 import type { TuiMessage } from "../types.js";
+import { tuiColors } from "../theme/index.js";
 import { MessageItem } from "./MessageItem.js";
 
 type MessageRow =
@@ -15,12 +22,13 @@ export interface MessageListProps {
 }
 
 export function MessageList({ messages }: MessageListProps): React.ReactElement {
+  // MessageList 只渲染传入的 live messages；静态历史由 App 的 <Static> 承载。
   const rows = flattenMessages(messages);
   return (
     <Box flexDirection="column">
       {rows.map((row) => (
         row.type === "separator"
-          ? <Text key={row.id} color="gray">────────────────────────────────────────────────────────────────</Text>
+          ? <Text key={row.id} color={tuiColors.border}>────────────────────────────────────────────────────────────────</Text>
           : <MessageItem key={row.id} message={row.message} continuation={row.continuation} />
       ))}
     </Box>
@@ -28,6 +36,7 @@ export function MessageList({ messages }: MessageListProps): React.ReactElement 
 }
 
 function flattenMessages(messages: TuiMessage[]): MessageRow[] {
+  // 在新的用户消息前插入分隔线，让多轮对话在终端里更容易扫描。
   const rows: MessageRow[] = [];
   let hasConversation = false;
   for (const message of messages) {
@@ -46,6 +55,7 @@ function flattenMessages(messages: TuiMessage[]): MessageRow[] {
 }
 
 function flattenOneMessage(message: TuiMessage): MessageRow[] {
+  // 多行消息拆成多行渲染，首行显示角色标签，后续行做缩进延续。
   const rows: MessageRow[] = [];
   const lines = message.content.split("\n");
   lines.forEach((line, index) => {

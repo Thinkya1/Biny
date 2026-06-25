@@ -1,16 +1,8 @@
-import type { RuntimeEvent, RuntimeEventSink } from "../../runtime/events.js";
+/**
+ * TUI 事件桥模块。
+ *
+ * TUI 当前直接复用通用 AgentEventBus，保留这个类名是为了不扩散改动范围。
+ */
+import { AgentEventBus } from "../../runtime/AgentEventBus.js";
 
-export class TuiEventBridge {
-  private readonly listeners = new Set<RuntimeEventSink>();
-
-  emit(event: RuntimeEvent): void {
-    for (const listener of this.listeners) listener(event);
-  }
-
-  subscribe(listener: RuntimeEventSink): () => void {
-    this.listeners.add(listener);
-    return () => {
-      this.listeners.delete(listener);
-    };
-  }
-}
+export class TuiEventBridge extends AgentEventBus {}

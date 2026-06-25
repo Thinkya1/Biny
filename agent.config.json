@@ -6,7 +6,23 @@
     "apiKeyEnv": "DEEPSEEK_API_KEY"
   },
   "permission": {
-    "mode": "safe"
+    "mode": "full-access",
+    "allowTools": [
+      "read_file",
+      "list_files",
+      "search_files",
+      "grep_search",
+      "git_status",
+      "git_diff"
+    ],
+    "allowPaths": [],
+    "denyPaths": [
+      ".env",
+      ".env.local",
+      ".ssh/",
+      "node_modules/"
+    ],
+    "criticalAlwaysAsk": true
   },
   "workspace": {
     "ignore": [

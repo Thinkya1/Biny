@@ -1,3 +1,9 @@
+/**
+ * Agent 提示词模块。
+ *
+ * 不同执行模式共用全局行为约束，再叠加问答、解释文件、分析命令、编辑建议和 plan 模式的
+ * 专用提示。集中维护这些 prompt 可以让 CLI、TUI 和 provider 层保持一致的输出约束。
+ */
 export const GLOBAL_SYSTEM_PROMPT = `
 You are Biny, a local coding agent running on the user's machine.
 You help the user understand, inspect, modify, and debug local projects.
@@ -76,5 +82,6 @@ If the task asks to create or modify files, describe the intended file and conte
 export type PromptMode = keyof typeof MODE_PROMPTS;
 
 export function buildSystemPrompt(mode: PromptMode): string {
+  // 全局规则始终在前，mode 只补充当前任务的输出约束。
   return `${GLOBAL_SYSTEM_PROMPT.trim()}\n\n${MODE_PROMPTS[mode].trim()}`;
 }

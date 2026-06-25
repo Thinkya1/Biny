@@ -1,3 +1,9 @@
+/**
+ * Session 事件读取模块。
+ *
+ * Session 文件是一行一个 JSON 事件。这里负责把 JSONL 解析成事件数组，并从中提取首条用户消息、
+ * 最后一条 assistant 消息、事件数量和时间信息，供 `sessions` 列表与历史恢复界面使用。
+ */
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { agentDir, listSessionFiles } from "./store.js";
@@ -13,6 +19,7 @@ export interface SessionSummary {
 }
 
 export async function readSessionEvents(filePath: string): Promise<SessionEvent[]> {
+  // session 文件采用 JSONL，一行一个事件；空行忽略，坏行带行号报错。
   const raw = await fs.readFile(filePath, "utf8");
   return raw
     .split("\n")
@@ -46,6 +53,7 @@ export async function listSessionSummaries(workspaceRoot: string): Promise<Sessi
 }
 
 function parseSessionEvent(line: string, lineNumber: number): SessionEvent {
+  // 单独封装解析错误，resume/sessions 命令可以直接显示具体损坏位置。
   try {
     return JSON.parse(line) as SessionEvent;
   } catch (error) {

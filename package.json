@@ -9,6 +9,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "node --import tsx src/cli/index.ts",
+    "test": "tsx tests/agent-loop.test.ts",
     "typecheck": "tsc --noEmit",
     "start": "node dist/cli/index.js"
   },

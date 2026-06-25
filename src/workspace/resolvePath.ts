@@ -1,3 +1,9 @@
+/**
+ * 工作区路径解析模块。
+ *
+ * 文件工具统一通过这里把用户传入路径转换成工作区内绝对路径。`../`、绝对路径逃逸以及命中
+ * ignore 规则的路径都会被拒绝，避免工具访问项目边界之外的内容。
+ */
 import path from "node:path";
 import { isIgnoredPath } from "./ignore.js";
 

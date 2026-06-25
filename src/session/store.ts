@@ -1,21 +1,31 @@
+/**
+ * Session 存储定位模块。
+ *
+ * `.agent/sessions` 和 `.agent/logs` 的目录创建、session 文件名生成、latest 解析以及 session id
+ * 前缀匹配都在这里处理。命令层只需要给出 workspace 和可选 session 参数，不必关心文件布局。
+ */
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { ensureDir, pathExists } from "../utils/fs.js";
 
 export function agentDir(workspaceRoot: string): string {
+  // 所有 agent 运行产物集中放在工作区 .agent 下，方便清理和忽略。
   return path.join(workspaceRoot, ".agent");
 }
 
 export async function ensureAgentDirs(workspaceRoot: string): Promise<void> {
+  // 启动 runtime 前确保 sessions/logs 存在，后续 recorder 可以直接打开文件。
   await ensureDir(path.join(agentDir(workspaceRoot), "sessions"));
   await ensureDir(path.join(agentDir(workspaceRoot), "logs"));
 }
 
 export function sessionFilePath(workspaceRoot: string, sessionId: string): string {
+  // sessionId 不带扩展名，落盘时统一追加 .jsonl。
   return path.join(agentDir(workspaceRoot), "sessions", `${sessionId}.jsonl`);
 }
 
 export async function listSessionFiles(workspaceRoot: string): Promise<string[]> {
+  // 只列出 JSONL session，避免 logs 或临时文件混进恢复列表。
   const sessionsDir = path.join(agentDir(workspaceRoot), "sessions");
   const entries = await fs.readdir(sessionsDir);
   return entries.filter((entry) => entry.endsWith(".jsonl")).sort();
@@ -53,6 +63,7 @@ export async function resolveSessionFile(workspaceRoot: string, session: string 
 }
 
 async function latestSessionFile(workspaceRoot: string): Promise<string> {
+  // latest 基于修改时间而不是文件名，能覆盖恢复后继续追加的旧 session。
   const sessions = await listSessionFiles(workspaceRoot);
   if (!sessions.length) throw new Error("No sessions found in .agent/sessions.");
   const sessionsDir = path.join(agentDir(workspaceRoot), "sessions");
@@ -70,5 +81,6 @@ async function latestSessionFile(workspaceRoot: string): Promise<string> {
 }
 
 function isLatestAlias(session: string): boolean {
+  // 允许 lat/lates/latest 这类前缀，兼顾命令行输入效率和可读性。
   return "latest".startsWith(session) && session.length >= 3;
 }

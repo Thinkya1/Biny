@@ -1,0 +1,261 @@
+/**
+ * 统一权限管理模块。
+ *
+ * PermissionManager 是所有工具调用前的 gate：它根据项目策略、当前会话 allowlist、
+ * 工具动作类型和风险等级决定放行、询问或拒绝。工具本身不做 UI 确认。
+ */
+import path from "node:path";
+
+export type ActionType = "read" | "write" | "delete" | "shell" | "network" | "git" | "install" | "unknown";
+export type RiskLevel = "low" | "medium" | "high" | "critical";
+export type PermissionMode = "ask" | "read-only" | "auto" | "full-access";
+export type PermissionGrantScope = "once" | "command" | "session" | "tool" | "path";
+export type PermissionDecision = "allow" | "ask" | "deny";
+
+export interface ProjectPermissionPolicy {
+  mode: PermissionMode | "safe";
+  allowTools: string[];
+  allowPaths: string[];
+  denyPaths: string[];
+  criticalAlwaysAsk: boolean;
+  source?: string;
+}
+
+export interface PermissionRequestContext {
+  toolName: string;
+  actionType: ActionType;
+  riskLevel: RiskLevel;
+  targetPath?: string;
+  command?: string;
+  reason?: string;
+  diffPreview?: string;
+  changeSummary?: string;
+  sessionId: string;
+  projectRoot: string;
+}
+
+export interface PermissionEvaluation {
+  decision: PermissionDecision;
+  reason: string;
+}
+
+export interface PermissionApplyResult {
+  approved: boolean;
+  scope?: PermissionGrantScope;
+  nextMode?: PermissionMode;
+  message?: string;
+}
+
+export interface DeniedOperation {
+  toolName: string;
+  actionType: ActionType;
+  riskLevel: RiskLevel;
+  target?: string;
+  reason: string;
+  at: string;
+}
+
+export interface PermissionStatus {
+  mode: PermissionMode;
+  allowTools: string[];
+  allowPaths: string[];
+  projectAllowTools: string[];
+  projectAllowPaths: string[];
+  sessionAllowTools: string[];
+  sessionAllowPaths: string[];
+  allowedCommands: string[];
+  allowedActions: string[];
+  deniedOperations: DeniedOperation[];
+  projectPolicySource?: string;
+}
+
+const defaultPolicy: ProjectPermissionPolicy = {
+  mode: "ask",
+  allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff"],
+  allowPaths: [],
+  denyPaths: [".env", ".ssh/", "node_modules/"],
+  criticalAlwaysAsk: true
+};
+
+export class PermissionManager {
+  private mode: PermissionMode;
+  private readonly policy: ProjectPermissionPolicy;
+  private readonly sessionAllowedTools = new Set<string>();
+  private readonly sessionAllowedPaths = new Set<string>();
+  private readonly sessionAllowedCommands = new Set<string>();
+  private readonly sessionAllowedActions = new Set<string>();
+  private readonly deniedOperations: DeniedOperation[] = [];
+
+  constructor(policy: Partial<ProjectPermissionPolicy> = {}) {
+    this.policy = {
+      ...defaultPolicy,
+      ...policy,
+      allowTools: policy.allowTools ?? defaultPolicy.allowTools,
+      allowPaths: policy.allowPaths ?? defaultPolicy.allowPaths,
+      denyPaths: policy.denyPaths ?? defaultPolicy.denyPaths,
+      criticalAlwaysAsk: policy.criticalAlwaysAsk ?? defaultPolicy.criticalAlwaysAsk
+    };
+    this.mode = normalizePermissionMode(this.policy.mode);
+  }
+
+  evaluate(request: PermissionRequestContext): PermissionEvaluation {
+    const deniedPath = request.targetPath ? matchingPathRule(request.targetPath, this.policy.denyPaths) : undefined;
+    if (deniedPath) {
+      return { decision: "deny", reason: `Target path is denied by project policy: ${deniedPath}` };
+    }
+
+    if (this.mode === "read-only" && request.actionType !== "read") {
+      return { decision: "deny", reason: "Permission mode is read only." };
+    }
+
+    if (request.riskLevel === "critical" && this.policy.criticalAlwaysAsk) {
+      return { decision: "ask", reason: request.reason ? `Critical operation: ${request.reason}` : "Critical operation requires confirmation." };
+    }
+
+    if (isAllowedBySession(request, this.sessionAllowedTools, this.sessionAllowedPaths, this.sessionAllowedCommands, this.sessionAllowedActions)) {
+      return { decision: "allow", reason: "Allowed by current session permission." };
+    }
+
+    if (this.policy.allowTools.includes(request.toolName)) {
+      return { decision: "allow", reason: `Allowed by project tool policy: ${request.toolName}` };
+    }
+
+    if (request.targetPath && matchingPathRule(request.targetPath, this.policy.allowPaths)) {
+      return { decision: "allow", reason: `Allowed by project path policy: ${request.targetPath}` };
+    }
+
+    if (this.mode === "full-access") {
+      return { decision: "allow", reason: "Allowed by full access mode." };
+    }
+
+    if (request.actionType === "read" && request.riskLevel === "low") {
+      return { decision: "allow", reason: "Low risk read operation." };
+    }
+
+    if (request.actionType === "git" && request.riskLevel === "low") {
+      return { decision: "allow", reason: "Low risk git inspection." };
+    }
+
+    if (this.mode === "auto" && request.riskLevel === "low") {
+      return { decision: "allow", reason: "Allowed by auto mode for low risk operation." };
+    }
+
+    return { decision: "ask", reason: request.reason ?? "Operation requires permission." };
+  }
+
+  applyResult(request: PermissionRequestContext, result: PermissionApplyResult): void {
+    if (result.nextMode) this.mode = result.nextMode;
+
+    if (!result.approved) {
+      this.deniedOperations.push({
+        toolName: request.toolName,
+        actionType: request.actionType,
+        riskLevel: request.riskLevel,
+        target: request.targetPath ?? request.command,
+        reason: result.message ?? "Denied by user.",
+        at: new Date().toISOString()
+      });
+      return;
+    }
+
+    if (result.scope === "tool") {
+      this.sessionAllowedTools.add(request.toolName);
+      return;
+    }
+
+    if (result.scope === "path" && request.targetPath) {
+      this.sessionAllowedPaths.add(normalizeRulePath(request.targetPath));
+      return;
+    }
+
+    if (result.scope === "command") {
+      this.sessionAllowedCommands.add(requestKey(request));
+      return;
+    }
+
+    if (result.scope === "session") {
+      this.sessionAllowedActions.add(actionKey(request));
+    }
+  }
+
+  setMode(mode: PermissionMode): void {
+    this.mode = mode;
+  }
+
+  resetSession(): void {
+    this.sessionAllowedTools.clear();
+    this.sessionAllowedPaths.clear();
+    this.sessionAllowedCommands.clear();
+    this.sessionAllowedActions.clear();
+    this.deniedOperations.length = 0;
+  }
+
+  getStatus(): PermissionStatus {
+    return {
+      mode: this.mode,
+      allowTools: [...new Set([...this.policy.allowTools, ...this.sessionAllowedTools])].sort(),
+      allowPaths: [...new Set([...this.policy.allowPaths.map(normalizeRulePath), ...this.sessionAllowedPaths])].sort(),
+      projectAllowTools: [...this.policy.allowTools].sort(),
+      projectAllowPaths: this.policy.allowPaths.map(normalizeRulePath).sort(),
+      sessionAllowTools: [...this.sessionAllowedTools].sort(),
+      sessionAllowPaths: [...this.sessionAllowedPaths].sort(),
+      allowedCommands: [...this.sessionAllowedCommands].sort(),
+      allowedActions: [...this.sessionAllowedActions].sort(),
+      deniedOperations: [...this.deniedOperations],
+      projectPolicySource: this.policy.source
+    };
+  }
+}
+
+export function normalizePermissionMode(mode: PermissionMode | "safe" | undefined): PermissionMode {
+  if (mode === "read-only" || mode === "auto" || mode === "full-access" || mode === "ask") return mode;
+  return "ask";
+}
+
+function isAllowedBySession(
+  request: PermissionRequestContext,
+  tools: Set<string>,
+  paths: Set<string>,
+  commands: Set<string>,
+  actions: Set<string>
+): boolean {
+  if (tools.has(request.toolName)) return true;
+  if (commands.has(requestKey(request))) return true;
+  if (actions.has(actionKey(request))) return true;
+  return request.targetPath ? matchingPathRule(request.targetPath, [...paths]) !== undefined : false;
+}
+
+function requestKey(request: PermissionRequestContext): string {
+  return JSON.stringify([
+    request.toolName,
+    request.actionType,
+    request.command ?? "",
+    request.targetPath ? normalizeRulePath(request.targetPath) : "",
+    request.changeSummary ?? "",
+    request.diffPreview ?? ""
+  ]);
+}
+
+function actionKey(request: PermissionRequestContext): string {
+  return `${request.toolName}:${request.actionType}`;
+}
+
+function matchingPathRule(targetPath: string, rules: string[]): string | undefined {
+  const target = normalizeRulePath(targetPath);
+  return rules.find((rule) => pathRuleMatches(target, normalizeRulePath(rule)));
+}
+
+function pathRuleMatches(target: string, rule: string): boolean {
+  if (!rule) return false;
+  if (rule.endsWith("/")) return target === rule.slice(0, -1) || target.startsWith(rule);
+  if (target === rule) return true;
+  if (rule === ".env" && target.startsWith(".env.")) return true;
+  return false;
+}
+
+function normalizeRulePath(value: string): string {
+  const normalized = value.replaceAll("\\", "/").replace(/^\.\//, "");
+  if (!normalized) return normalized;
+  if (path.isAbsolute(normalized)) return normalized;
+  return normalized.replace(/\/+/g, "/");
+}

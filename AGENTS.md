@@ -7,7 +7,7 @@
 - 只有一个参数的内部方法，不要为了风格统一硬改成 options object。
 - 除了包自身的 `index.ts` 外，其他 `index.ts` 文件应优先使用 `export * from "./module"`。
 - 不要过度封装，尤其是一两行的小函数，不要为了形式引入两层包装，直接内联即可。
-
+- 完成一个任务及时更新PROJECT_DESCRIPTION.local.md
 ## 当前项目约束
 
 - 当前保留 `MockProvider`，并支持通过 OpenAI-compatible 接口接入 DeepSeek。

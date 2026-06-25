@@ -96,6 +96,8 @@ biny chat
 - `/context`：打印当前 ProjectContext 摘要
 - `/sessions`：列出历史 session
 - `/resume [session]`：查看指定 session，不传参数时查看 latest
+- `/permissions [status|readonly|ask|auto|full|reset]`：查看或切换当前会话权限模式
+- `/approvals`：`/permissions` 的别名
 - `/plan <task>`：只生成计划，不执行写入、编辑或命令
 - `/exit`：退出 chat
 
@@ -115,13 +117,18 @@ pnpm dev -- tui
 - 输入区域：输入 prompt 后按 Enter 发送。
 - 状态栏：显示 `Idle`、`Thinking`、`Running`、`Waiting Permission`、`Completed`、`Error`。
 - 工具调用展示：显示工具名、参数摘要、执行状态和结果摘要。
-- 权限提示：工具需要确认时显示工具名、操作说明和风险提示。
+- 权限提示：工具需要确认时显示工具名、动作类型、风险等级、目标路径或命令、reason、修改摘要和 diff。
+- 权限设置：`/permissions` 或 `/approvals` 可查看当前模式、session allowlist、项目策略来源和拒绝历史。
 
 权限提示快捷键：
 
-- `y`：允许本次操作。
+- `Enter` / `y`：允许本次操作。
 - `n`：拒绝本次操作。
-- `a`：本轮自动允许。
+- `t`：本会话允许当前工具。
+- `p`：本会话允许当前路径。
+- `s`：本会话允许当前工具和动作类型。
+- `r`：切换到 Read Only 并拒绝当前操作。
+- `f`：切换到 Full Access 并允许当前操作。Critical 操作后续仍会继续询问。
 
 TUI 使用 `agent.config.json` 中配置的 provider。当前项目配置为 DeepSeek；如果改回 `mock`，则会使用本地 `MockProvider`。
 
@@ -174,26 +181,62 @@ biny resume .agent/sessions/20260619-153000-abcd1234.jsonl
 - `read_file`：读取工作区内文件，可直接执行。
 - `list_files`：列出工作区文件，可直接执行。
 - `search_files`：在工作区内搜索文本，返回 `path`、`line`、`text`，支持 `maxResults`，可直接执行。
+- `grep_search`：按普通子串搜索工作区文件，可直接执行。
+- `git_status`：查看 `git status --short`，可直接执行。
 - `write_file`：写入工作区内文件，执行前需要用户确认。
 - `edit_file`：替换工作区内文件文本，执行前需要用户确认。
 - `run_command`：在工作区运行 shell 命令，执行前需要用户确认。
 
 所有工具都会遵守 workspace ignore 规则，跳过 `node_modules`、`.git`、`dist`、`build`、`.env` 等路径，并限制在当前工作区内执行。
 
-### diff 确认流程
+每个工具都有 zod 运行时参数 schema。Agent loop 会在执行工具前统一校验参数；校验失败时不会调用工具实现，并会写入 `tool_result` 和 `error` session 事件，保持会话事件类型稳定。
 
-`write_file` 和 `edit_file` 在真正写入前会先展示 diff。只有用户确认后才会写入文件。
+### 权限模式和确认流程
+
+权限由统一的 `PermissionManager` 判断。项目级策略来自 `agent.config.json` 的 `permission` 字段，示例：
+
+```json
+{
+  "permission": {
+    "mode": "ask",
+    "allowTools": ["read_file", "grep_search", "list_files", "search_files", "git_status"],
+    "allowPaths": ["src/", "tests/"],
+    "denyPaths": [".env", ".ssh/", "node_modules/"],
+    "criticalAlwaysAsk": true
+  }
+}
+```
+
+支持的当前会话模式：
+
+- `ask`：读文件、搜索、列目录等低风险只读工具直接执行；写入、命令、网络、依赖安装和 Git 状态变更会询问。
+- `read-only`：只允许低风险读取、搜索、列表和查看 Git 状态。
+- `auto`：自动允许低风险工具，其他操作询问。
+- `full-access`：允许读写和命令执行，但 Critical 操作仍会询问。
+
+TUI 和 chat 中可用：
+
+```text
+/permissions status
+/permissions readonly
+/permissions ask
+/permissions auto
+/permissions full
+/permissions reset
+```
+
+`write_file` 在真正写入前会通过 `ToolDisplay` 展示 diff。`edit_file` 和 `run_command` 也有独立的权限提示展示规则。只有用户确认后才会执行写入、编辑或命令。
 
 流程如下：
 
-- 生成 diff
-- 记录包含 diff 的 `tool_call`
-- 询问用户确认
-- 记录确认结果，拒绝时状态为 `cancelled`
+- PermissionManager 识别 `actionType`、`riskLevel`、目标路径、命令和项目策略
+- ToolDisplay 生成权限提示摘要和可选 diff
+- 需要用户确认时发出权限请求
+- 记录确认结果，拒绝时状态为 `denied`
 - 用户确认后执行实际写入
 - 记录最终 `tool_result`
 
-对于 `run_command`，如果命令包含 `rm`、`sudo`、`chmod`、`git push`、`npm install` 或 `pnpm install`，会被视为敏感命令，必须明确输入 `yes` 才会执行。
+对于 `run_command`，`rm`、`chmod`、依赖安装、Git reset/checkout/push、网络访问等会提高风险等级。`sudo`、`curl | sh`、`rm -rf`、`git push --force` 等 Critical 操作即使在 Full Access 下也会继续询问。
 
 ## 会话记录
 

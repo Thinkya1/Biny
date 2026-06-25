@@ -1,9 +1,16 @@
+/**
+ * 会话恢复打印模块。
+ *
+ * `resume` 可以接受 latest、session id 前缀或 JSONL 路径，然后按事件顺序打印历史用户消息、
+ * assistant 消息、工具调用、工具结果和错误，帮助用户在普通终端里回看 session。
+ */
 import path from "node:path";
 import { ensureAgentDirs, resolveSessionFile } from "../../session/store.js";
 import { readSessionEvents } from "../../session/events.js";
 import type { SessionEvent } from "../../session/recorder.js";
 
 export async function resumeCommand(workspaceRoot: string, session: string | undefined): Promise<void> {
+  // resume 支持 latest、session id 前缀或 jsonl 文件路径，解析逻辑集中在 store。
   await ensureAgentDirs(workspaceRoot);
   const filePath = await resolveSessionFile(workspaceRoot, session);
   const events = await readSessionEvents(filePath);
@@ -15,6 +22,7 @@ export async function resumeCommand(workspaceRoot: string, session: string | und
 }
 
 function printEvent(event: SessionEvent): void {
+  // 恢复输出保留事件类型，方便定位一次对话中的工具调用和错误。
   const time = "time" in event && typeof event.time === "string" ? event.time : "";
   const prefix = time ? `[${time}] ${event.type}` : event.type;
 

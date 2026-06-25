@@ -1,5 +1,13 @@
+/**
+ * Git diff 工具模块。
+ *
+ * `git_diff` 读取当前工作区的 `git diff` 文本，供用户查看未提交修改或交给模型分析。
+ * 它保持原始 diff 输出，不尝试解析 hunk，也会把失败原因作为文本返回。
+ */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { z } from "zod";
+import { ToolAccesses } from "../access.js";
 import type { Tool, ToolContext } from "../types.js";
 
 const execFileAsync = promisify(execFile);
@@ -9,15 +17,28 @@ export interface GitDiffResult {
 }
 
 export function createGitDiffTool(context: ToolContext): Tool<Record<string, never>, GitDiffResult> {
+  // git 工具在非 Git 仓库中也返回文本结果，避免一个辅助命令中断整个 agent 流程。
   return {
     name: "git_diff",
     description: "Run git diff.",
-    async execute() {
-      try {
-        const result = await execFileAsync("git", ["diff"], { cwd: context.workspaceRoot, maxBuffer: 1024 * 1024 });
-        return { output: result.stdout };
-      } catch (error) {
-        return { output: error instanceof Error ? error.message : String(error) };
+    parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+    schema: z.object({}).default({}),
+    capability: "git.diff",
+    risk: "read",
+    resolveExecution() {
+      return {
+        accesses: ToolAccesses.readTree(context.workspaceRoot),
+        display: { kind: "file_io", operation: "git", path: ".", detail: "git diff" },
+        description: "Run git diff",
+        approvalRule: "git_diff",
+        async execute() {
+          try {
+            const result = await execFileAsync("git", ["diff"], { cwd: context.workspaceRoot, maxBuffer: 1024 * 1024 });
+            return { output: result.stdout };
+          } catch (error) {
+            return { output: error instanceof Error ? error.message : String(error) };
+          }
+        }
       }
     }
   };

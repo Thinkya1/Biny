@@ -1,3 +1,9 @@
+/**
+ * TUI 计划数据模块。
+ *
+ * 这里可以根据当前 runtime 的项目上下文生成结构化计划，并把计划转换成文本格式。
+ * 当前 plan 模式不执行工具，计划内容只是供用户审阅后再决定是否进入执行。
+ */
 import type { TuiRuntime } from "./runtime/createTuiRuntime.js";
 
 export interface TuiPlan {
@@ -10,6 +16,7 @@ export interface TuiPlan {
 }
 
 export function createStructuredPlan(runtime: TuiRuntime, task: string): TuiPlan {
+  // 结构化计划直接来自当前 ProjectContext，不执行工具也不读取额外文件。
   const context = runtime.commandRuntime.projectContext;
   const files = candidateFiles(context.srcTree);
   return {
@@ -39,6 +46,7 @@ export function createStructuredPlan(runtime: TuiRuntime, task: string): TuiPlan
 }
 
 export function formatStructuredPlan(plan: TuiPlan): string {
+  // 文本格式用于 session 记录或降级展示，保留和 CLI plan 相近的章节。
   return [
     "Plan",
     "",
@@ -60,6 +68,7 @@ export function formatStructuredPlan(plan: TuiPlan): string {
 }
 
 function candidateFiles(srcTree: string[]): string[] {
+  // 先从 src tree 中挑候选源码文件；没有 src 时回退到项目入口文档。
   const files = srcTree
     .map((entry) => entry.replace(/^\s*\[f\]\s+/, "").trim())
     .filter((entry) => entry.startsWith("src/"))

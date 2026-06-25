@@ -1,3 +1,9 @@
+/**
+ * Session 记录模块。
+ *
+ * 每一轮交互中的用户消息、assistant 回复、工具调用、工具结果和错误都会通过这个 recorder
+ * 追加成 JSONL。追加写入让长会话可以持续落盘，也方便后续 resume、压缩和记忆功能按行读取。
+ */
 import { createWriteStream, type WriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { sessionFilePath } from "./store.js";
@@ -17,6 +23,7 @@ export class SessionRecorder {
   private closePromise?: Promise<void>;
 
   constructor(workspaceRoot: string, sessionId = createSessionId()) {
+    // sessionId 默认按时间和随机后缀生成，便于人工排序也避免同秒冲突。
     this.sessionId = sessionId;
     this.filePath = sessionFilePath(workspaceRoot, this.sessionId);
     this.stream = createWriteStream(this.filePath, { flags: "a" });
@@ -29,6 +36,7 @@ export class SessionRecorder {
   }
 
   close(): Promise<void> {
+    // close 可能被 finally 和外部清理重复调用，用同一个 promise 保证只 end 一次。
     this.closePromise ??= new Promise((resolve, reject) => {
       this.stream.end((error?: Error | null) => {
         if (error) reject(error);
@@ -40,6 +48,7 @@ export class SessionRecorder {
 }
 
 function createSessionId(): string {
+  // 文件名中避免使用冒号，兼容不同平台的路径规则。
   const now = new Date();
   const stamp = [
     now.getFullYear(),

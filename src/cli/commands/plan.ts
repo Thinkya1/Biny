@@ -1,8 +1,15 @@
+/**
+ * 计划命令模块。
+ *
+ * `plan` 模式把项目摘要和任务交给模型，让它生成执行计划，但不会调用写入、编辑或命令工具。
+ * 输出保持固定章节结构，方便用户在真正执行前先审阅范围、步骤和风险。
+ */
 import { buildSystemPrompt } from "../../agent/prompts.js";
 import { formatProjectContext } from "../../project/ProjectContext.js";
 import { withCommandRuntime } from "../../runtime/CommandRuntime.js";
 
 export async function planCommand(workspaceRoot: string, task: string): Promise<void> {
+  // plan 命令只生成计划并记录 session，不执行写入、编辑或命令工具。
   await withCommandRuntime(workspaceRoot, async (runtime) => {
     runtime.recorder.record({ type: "user_message", content: `plan: ${task}` });
     const plan = await runtime.llm.chat([
@@ -17,6 +24,7 @@ export async function planCommand(workspaceRoot: string, task: string): Promise<
 }
 
 function formatPlan(task: string, srcTree: string[], providerNotes: string): string {
+  // 固定结构方便用户快速扫读，也方便未来把 plan 输出解析成 TUI 计划视图。
   return [
     "Goal",
     `- ${task}`,
