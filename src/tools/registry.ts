@@ -5,6 +5,7 @@
  * 工具来源信息，后续 MCP、skill 或 plugin 工具接入时可以复用同一调用路径。
  */
 import type { JsonObjectSchema } from "./schema.js";
+import type { ToolDefinition } from "./definition.js";
 import type { Tool, ToolContext, ToolExecution, ToolSource } from "./types.js";
 import { createReadFileTool } from "./file/readFile.js";
 import { createWriteFileTool } from "./file/writeFile.js";
@@ -55,6 +56,14 @@ export class ToolManager {
 
   list(): Tool[] {
     return [...this.tools.values()].map((entry) => entry.tool);
+  }
+
+  listDefinitions(): ToolDefinition[] {
+    return this.list().map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters
+    }));
   }
 
   listEntries(): RegisteredTool[] {

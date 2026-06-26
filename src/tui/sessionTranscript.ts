@@ -6,12 +6,14 @@
  */
 import path from "node:path";
 import type { SessionEvent } from "../session/recorder.js";
-import { formatToolResultSummary } from "./toolDiffSummary.js";
+import { summarizeToolOutput } from "./toolOutputSummary.js";
 
 export interface TranscriptMessage {
   // TranscriptMessage 是 session 事件转换后的 UI 消息形态。
   role: "user" | "assistant" | "system" | "error";
   content: string;
+  fullTitle?: string;
+  fullContent?: string;
 }
 
 export function sessionIdFromFile(filePath: string): string {
@@ -29,7 +31,7 @@ export function sessionEventsToMessages(workspaceRoot: string, filePath: string,
   ];
 
   for (const event of events) {
-    // 用户和 assistant 消息按原角色恢复；工具事件作为 system 摘要展示。
+    // 用户和 assistant 消息按原角色恢复；工具调用只保留结果摘要，避免回放时展示原始 JSON 参数。
     if (event.type === "user_message") {
       messages.push({ role: "user", content: event.content });
       continue;
@@ -41,12 +43,11 @@ export function sessionEventsToMessages(workspaceRoot: string, filePath: string,
     }
 
     if (event.type === "tool_call") {
-      messages.push({ role: "system", content: `tool call: ${event.tool}\n${summarize(event.args)}` });
       continue;
     }
 
     if (event.type === "tool_result") {
-      messages.push({ role: "system", content: `tool result: ${event.tool}\n${summarizeToolResult(event.tool, event.result)}` });
+      messages.push({ role: "system", ...summarizeToolResult(event.tool, event.result) });
       continue;
     }
 
@@ -56,8 +57,16 @@ export function sessionEventsToMessages(workspaceRoot: string, filePath: string,
   return messages;
 }
 
-function summarizeToolResult(tool: string, value: unknown): string {
-  return formatToolResultSummary(tool, value) ?? summarize(value);
+function summarizeToolResult(tool: string, value: unknown): Pick<TranscriptMessage, "content" | "fullTitle" | "fullContent"> {
+  const output = summarizeToolOutput(tool, value, "", undefined);
+  const content = output.fullTitle && !output.summary.startsWith(output.fullTitle)
+    ? `${output.fullTitle}\n${output.summary}`
+    : output.summary || summarize(value);
+  return {
+    content,
+    fullTitle: output.fullTitle,
+    fullContent: output.fullContent
+  };
 }
 
 function summarize(value: unknown): string {

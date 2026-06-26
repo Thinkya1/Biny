@@ -5,6 +5,10 @@
  * 这个文件让未来迁移工具目录结构时，不必修改 agent loop 的导入路径。
  */
 export type {
+  ToolDefinition
+} from "./definition.js";
+
+export type {
   RunnableToolExecution,
   Tool,
   ToolContext,

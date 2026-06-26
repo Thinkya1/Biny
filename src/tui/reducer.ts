@@ -271,6 +271,7 @@ function summarizeToolProgress(update: { kind: string; text?: string; percent?: 
 
 function resultStatus(result: unknown): TuiToolCall["status"] {
   if (typeof result === "object" && result !== null && "status" in result && result.status === "denied") return "denied";
+  if (typeof result === "object" && result !== null && "exitCode" in result && typeof result.exitCode === "number" && result.exitCode !== 0) return "failed";
   if (typeof result === "object" && result !== null && "error" in result) return "failed";
   return "success";
 }
@@ -300,12 +301,18 @@ function formatToolCallMessage(call: TuiToolCall): string {
     call.truncated ? "truncated" : undefined
   ].filter(Boolean).join(" · ");
   const progress = call.progressSummary && call.status === "running" ? `\n  progress: ${call.progressSummary}` : "";
-  const preview = call.display?.kind === "command" && call.status !== "running" ? "" : formatDisplayPreview(call.display);
+  const preview = shouldShowDisplayPreview(call) ? formatDisplayPreview(call.display) : "";
   const result = call.resultSummary && !shouldHideResultSummaryAfterPreview(call, preview)
     ? formatResultSummary(call.resultSummary)
     : "";
   const suffix = meta ? ` (${meta})` : "";
-  return `${statusSymbol(call.status)} ${toolIcon(call.tool)} ${call.tool}: ${call.argsSummary}${suffix}${progress}${preview}${result}`;
+  return `${statusSymbol(call.status)} ${toolIcon(call.tool)} ${toolActionSummary(call)}${suffix}${progress}${preview}${result}`;
+}
+
+function shouldShowDisplayPreview(call: TuiToolCall): boolean {
+  if (!call.display) return false;
+  if (call.display.kind === "command") return false;
+  return call.status === "running";
 }
 
 function shouldHideResultSummaryAfterPreview(call: TuiToolCall, preview: string): boolean {
@@ -321,7 +328,7 @@ function formatDisplayPreview(display: ToolInputDisplay | undefined): string {
     return `\n${formatDiffPreviewLines(renderDiffLinesClustered(display.before, display.after, display.path, { contextLines: 3, maxLines: 12 }))}`;
   }
   if (display.kind === "command") {
-    return `\n  $ ${display.command}`;
+    return "";
   }
   return "";
 }
@@ -332,7 +339,10 @@ function formatResultSummary(summary: string): string {
 }
 
 function isBlockSummary(summary: string): boolean {
-  return /^(Created|Edited|Deleted|Read|Write) /.test(summary) || /^(?:\+\d+\s+)?-\d+\s+\S/.test(summary) || /^\+\d+\s+\S/.test(summary);
+  return /^(Created|Edited|Deleted|Read|Write|Ran|Checked|Searched|Listed) /.test(summary)
+    || /^\s+exit\s+/.test(summary)
+    || /^(?:\+\d+\s+)?-\d+\s+\S/.test(summary)
+    || /^\+\d+\s+\S/.test(summary);
 }
 
 function statusSymbol(status: TuiToolCall["status"]): string {
@@ -349,4 +359,20 @@ function toolIcon(tool: string): string {
   if (tool === "write_file" || tool === "edit_file") return "✏️";
   if (tool === "run_command") return "💻";
   return "•";
+}
+
+function toolActionSummary(call: TuiToolCall): string {
+  const display = call.display;
+  if (call.tool === "run_command") {
+    const command = display?.kind === "command" ? display.command : call.argsSummary || "command";
+    return `Ran ${command}`;
+  }
+  if (call.tool === "read_file") return call.argsSummary ? `Read ${call.argsSummary}` : "Read file";
+  if (call.tool === "write_file") return call.argsSummary ? `Wrote ${call.argsSummary}` : "Wrote file";
+  if (call.tool === "edit_file") return call.argsSummary ? `Edited ${call.argsSummary}` : "Edited file";
+  if (call.tool === "list_files") return "Listed workspace files";
+  if (call.tool === "search_files" || call.tool === "grep_search") return call.argsSummary ? `Searched ${call.argsSummary}` : "Searched workspace";
+  if (call.tool === "git_status") return "Checked git status";
+  if (call.tool === "git_diff") return "Viewed git diff";
+  return call.argsSummary ? `${call.tool} ${call.argsSummary}` : call.tool;
 }

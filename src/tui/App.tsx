@@ -5,7 +5,7 @@
  * 它负责处理全局快捷键、slash command、plan 模式、session 恢复和退出摘要，但不直接执行工具。
  */
 import React, { useCallback, useEffect, useReducer, useRef, useState } from "react";
-import { Box, Static, Text, useApp, useInput, useWindowSize } from "ink";
+import { Box, Text, useApp, useInput, useWindowSize } from "ink";
 import { saveConfig } from "../config/loader.js";
 import type { PermissionMode } from "../permission/PermissionManager.js";
 import { listSessionSummaries, readSessionEvents, type SessionSummary } from "../session/events.js";
@@ -16,7 +16,6 @@ import { formatPermissionModeChanged, runPermissionCommand } from "../permission
 import { createInitialTuiState, tuiReducer } from "./state.js";
 import { Header } from "./components/Header.js";
 import { MessageList } from "./components/MessageList.js";
-import { MessageItem } from "./components/MessageItem.js";
 import { InputBox } from "./components/InputBox.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { TurnStatus } from "./components/TurnStatus.js";
@@ -29,7 +28,7 @@ import type { PermissionChoice } from "./types.js";
 import { TUI_SLASH_COMMANDS } from "./slashCommands.js";
 import { sessionEventsToMessages, sessionIdFromFile } from "./sessionTranscript.js";
 import { appendInputHistory, loadInputHistory } from "./inputHistory.js";
-import { splitTranscriptMessages } from "./transcriptSplit.js";
+import { resizableTranscriptMessages } from "./transcriptSplit.js";
 import { latestExpandableTranscript, type ExpandableTranscript } from "./transcriptViewer.js";
 import { tuiColors } from "./theme/index.js";
 
@@ -179,7 +178,7 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
       sessions: filterSessions(sessionPicker.sessions, sessionPicker.query)
     }
     : undefined;
-  const transcript = splitTranscriptMessages(state.messages, state.status);
+  const transcriptMessages = resizableTranscriptMessages(state.messages);
 
   const togglePlanMode = (): void => {
     // 手动切换 plan mode 会追加一条 system message，方便 transcript 留痕。
@@ -205,19 +204,8 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
   }
 
   return (
-    <Box flexDirection="column">
-      {filteredSessionPicker || transcriptViewer ? null : (
-        <Static items={transcript.staticMessages}>
-          {(message, index) => (
-            <StaticTranscriptItem
-              key={message.id}
-              message={message}
-              showSeparator={shouldShowSeparator(transcript.staticMessages, index)}
-            />
-          )}
-        </Static>
-      )}
-      <Box flexDirection="column" flexShrink={0}>
+    <Box flexDirection="column" width="100%">
+      <Box flexDirection="column" flexShrink={0} width="100%">
         <Box flexShrink={0} width="100%">
           <Header sessionId={state.sessionId} viewingSessionId={state.viewingSessionId} />
         </Box>
@@ -252,7 +240,7 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
           />
         ) : (
           <MessageList
-            messages={transcript.liveMessages}
+            messages={transcriptMessages}
             visibleCount={Math.max(1, rows - 12)}
             scrollOffset={state.messageScrollOffset}
             followLatest={state.followLatest}
@@ -463,29 +451,6 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
     });
     setMode("chat");
   }
-}
-
-function shouldShowSeparator(messages: Array<{ role: "user" | "assistant" | "system" | "error" }>, index: number): boolean {
-  // 从第二轮用户消息开始显示分隔线，第一条用户消息前不加线。
-  const message = messages[index];
-  if (message?.role !== "user") return false;
-  return messages.slice(0, index).some((item) => item.role === "user" || item.role === "assistant");
-}
-
-function StaticTranscriptItem({
-  message,
-  showSeparator
-}: {
-  message: { id: string; role: "user" | "assistant" | "system" | "error"; content: string };
-  showSeparator: boolean;
-}): React.ReactElement {
-  // StaticTranscriptItem 用于 Ink Static，已渲染内容不会随每次输入重绘。
-  return (
-    <Box flexDirection="column">
-      {showSeparator ? <Text color={tuiColors.border}>────────────────────────────────────────────────────────────────</Text> : null}
-      <MessageItem message={message} />
-    </Box>
-  );
 }
 
 function isKnownSlashCommand(value: string): boolean {

@@ -25,8 +25,10 @@ export function ToolCallView({ toolCalls, expanded }: ToolCallViewProps): React.
       <Text bold>Tool Calls <Text color={tuiColors.textDim}>{expanded ? "Ctrl-O/Ctrl-D collapse" : "Ctrl-O/Ctrl-D details"}</Text></Text>
       {visible.map((call) => (
         <Box key={call.id} flexDirection="column">
-          <Text color={statusColor(call.status)}>
-            {statusSymbol(call.status)} {toolIcon(call.tool)} {call.tool}: {call.argsSummary}
+          <Text>
+            <Text color={statusColor(call.status)}>{statusSymbol(call.status)} {toolIcon(call.tool)} </Text>
+            <Text color={tuiColors.accent} bold>{toolAction(call.tool)}</Text>
+            {call.argsSummary ? <Text> {call.argsSummary}</Text> : null}
           </Text>
           {expanded ? <Text color={tuiColors.textDim}>  {formatMeta(call)}</Text> : null}
           {expanded && call.resultSummary ? <ToolResultSummary summary={call.resultSummary} /> : null}
@@ -79,6 +81,18 @@ function toolIcon(tool: string): string {
   if (tool === "write_file" || tool === "edit_file") return "✏️";
   if (tool === "run_command") return "💻";
   return "•";
+}
+
+function toolAction(tool: string): string {
+  if (tool === "run_command") return "Ran";
+  if (tool === "read_file") return "Read";
+  if (tool === "write_file") return "Wrote";
+  if (tool === "edit_file") return "Edited";
+  if (tool === "list_files") return "Listed";
+  if (tool === "search_files" || tool === "grep_search") return "Searched";
+  if (tool === "git_status") return "Checked";
+  if (tool === "git_diff") return "Viewed";
+  return tool;
 }
 
 function formatMeta(call: TuiToolCall): string {

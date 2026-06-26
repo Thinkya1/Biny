@@ -12,28 +12,39 @@ import { MarkdownText } from "./MarkdownText.js";
 
 export interface MessageItemProps {
   message: TuiMessage;
-  continuation?: boolean;
+  prefix?: string;
 }
 
-export function MessageItem({ message, continuation = false }: MessageItemProps): React.ReactElement {
-  // 角色决定标签和颜色；system/error 也走同一个展示路径。
-  const color = message.role === "user" ? tuiColors.roleUser : message.role === "assistant" ? tuiColors.primary : message.role === "error" ? tuiColors.error : tuiColors.textDim;
-  const label = message.role === "user" ? "›" : message.role === "assistant" ? "Biny" : message.role === "error" ? "Error" : "•";
+export function MessageItem({ message, prefix }: MessageItemProps): React.ReactElement {
+  // 角色决定提示符和正文颜色；assistant 不显示名称，减少横向占位。
+  const resolvedPrefix = prefix ?? defaultPrefix(message.role);
+  const prefixColor = message.role === "user" ? tuiColors.roleUser : message.role === "error" ? tuiColors.error : tuiColors.textDim;
   const isPlainSystemMessage = message.role === "system" && message.content.startsWith("Permission mode switched to ");
-  const bodyColor = message.role === "error" ? tuiColors.error : isPlainSystemMessage ? tuiColors.text : undefined;
+  const bodyColor = message.role === "user" ? tuiColors.textStrong : message.role === "error" ? tuiColors.error : isPlainSystemMessage ? tuiColors.text : undefined;
   const lines = message.content.split("\n");
   if (!message.content) {
     // 空行保留一行高度，用于消息之间的视觉间隔。
     return <Text> </Text>;
   }
   return (
-    <Box flexDirection="column" marginBottom={message.role === "system" ? 0 : 1}>
+    <Box flexDirection="column" width="100%">
       {lines.map((line, index) => (
         <Text key={`${message.id}-${String(index)}`}>
-          {index === 0 && !continuation ? <Text color={color} bold>{label.padEnd(5)}</Text> : <Text color={tuiColors.textDim}>{"     "}</Text>}
+          <Text color={prefixColor} bold={message.role === "user"}>{index === 0 ? resolvedPrefix : continuationPrefix(resolvedPrefix)}</Text>
           <MarkdownText line={line} muted={message.role === "system" && !isPlainSystemMessage} color={bodyColor} />
         </Text>
       ))}
     </Box>
   );
+}
+
+function defaultPrefix(role: TuiMessage["role"]): string {
+  if (role === "assistant") return "";
+  if (role === "user") return "› ";
+  if (role === "error") return "Error ";
+  return "• ";
+}
+
+function continuationPrefix(prefix: string): string {
+  return " ".repeat(prefix.length);
 }

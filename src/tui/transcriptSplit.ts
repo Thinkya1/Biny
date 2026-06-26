@@ -1,8 +1,8 @@
 /**
- * TUI transcript 分区辅助。
+ * TUI transcript 投影辅助。
  *
- * Ink Static 渲染过的内容不会再更新；运行中的工具消息必须留在 live 区域，等结果更新后再进入
- * Static，否则界面会一直停在 `… tool`。
+ * 早期 TUI 用 Ink Static 分区渲染历史消息和 live 消息；Static 输出不会响应终端 resize，
+ * 因此聊天主界面现在应使用 resizableTranscriptMessages 返回的同一份动态消息流。
  */
 import type { RuntimeStatus } from "../runtime/events.js";
 import type { TuiMessage } from "./types.js";
@@ -25,6 +25,11 @@ export function splitTranscriptMessages(messages: TuiMessage[], status: RuntimeS
   const hasLiveAssistant = last?.role === "assistant" && (status === "thinking" || status === "running" || status === "waiting_permission");
   if (!hasLiveAssistant) return { staticMessages: messages, liveMessages: [] };
   return { staticMessages: messages.slice(0, -1), liveMessages: [last] };
+}
+
+export function resizableTranscriptMessages(messages: TuiMessage[]): TuiMessage[] {
+  // 返回原始数组，让 MessageList 随窗口宽度重新渲染所有消息，避免 Static 固定旧换行。
+  return messages;
 }
 
 function isRunningToolMessage(message: TuiMessage): boolean {

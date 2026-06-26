@@ -14,16 +14,17 @@ export interface HeaderProps {
 }
 
 export function Header({ sessionId, viewingSessionId }: HeaderProps): React.ReactElement {
-  // viewingSessionId 不同于当前 recorder 时，说明用户正在查看历史 session。
-  const viewing = viewingSessionId && viewingSessionId !== sessionId ? `Viewing: ${viewingSessionId}` : undefined;
+  const displayText = headerDisplayText(sessionId, viewingSessionId);
+  if (!displayText) return <></>;
   return (
-    <Box width="100%" marginBottom={1}>
-      <Text>
-        <Text bold>Biny</Text>
-        <Text color={tuiColors.textDim}>  </Text>
-        <Text color={tuiColors.textDim}>{sessionId || "(starting)"}</Text>
-        {viewing ? <Text color={tuiColors.warning}>  {viewing}</Text> : null}
-      </Text>
+    <Box width="100%">
+      <Text color={tuiColors.warning}>{displayText}</Text>
     </Box>
   );
+}
+
+export function headerDisplayText(sessionId: string, viewingSessionId: string | undefined): string | undefined {
+  // 当前会话 id 不再常驻展示；只有查看历史 session 时保留上下文提示。
+  if (!viewingSessionId || viewingSessionId === sessionId) return undefined;
+  return `Viewing ${viewingSessionId}`;
 }

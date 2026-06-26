@@ -28,6 +28,7 @@ export interface MarkdownTextProps {
 
 type Segment =
   | { type: "text"; value: string }
+  | { type: "action"; value: string }
   | { type: "bold"; value: string }
   | { type: "code"; value: string };
 
@@ -36,6 +37,7 @@ export function MarkdownText({ line, muted = false, color: textColor }: Markdown
   const { columns } = useWindowSize();
   const normalized = normalizeMarkdownLine(line);
   const style = diffLineStyle(normalized);
+  const semanticStyle = semanticLineStyle(normalized);
   const displayLine = style?.fillBackground ? padDiffLine(normalized, Math.max(normalized.length, columns - 6)) : normalized;
   const kimiHeader = parseKimiDiffHeader(displayLine);
   if (kimiHeader) return <KimiDiffHeaderText header={kimiHeader} />;
@@ -48,17 +50,33 @@ export function MarkdownText({ line, muted = false, color: textColor }: Markdown
   const codeLine = parseDiffCodeLine(displayLine);
   if (codeLine) return <DiffCodeLineText line={codeLine} color={style?.color} backgroundColor={style?.backgroundColor} />;
 
-  const color = style?.color ?? textColor ?? (muted ? tuiColors.textDim : tuiColors.text);
+  const color = style?.color ?? (semanticStyle ? colorToken(semanticStyle.color) : textColor ?? (muted ? tuiColors.textDim : tuiColors.text));
   return (
-    <Text color={color} backgroundColor={style?.backgroundColor} bold={style?.bold} dimColor={style?.dimColor}>
+    <Text color={color} backgroundColor={style?.backgroundColor} bold={style?.bold ?? semanticStyle?.bold} dimColor={style?.dimColor}>
       {parseInlineMarkdown(displayLine).map((segment, index) => {
         const key = `${segment.type}-${String(index)}`;
+        if (segment.type === "action") return <Text key={key} color={tuiColors.accent} bold>{segment.value}</Text>;
         if (segment.type === "bold") return <Text key={key} bold>{segment.value}</Text>;
         if (segment.type === "code") return <Text key={key} color={tuiColors.primary}>{segment.value}</Text>;
         return <Text key={key}>{segment.value}</Text>;
       })}
     </Text>
   );
+}
+
+export function semanticLineStyle(line: string): { color: ColorToken; bold?: true } | undefined {
+  const trimmed = line.trim();
+  if (trimmed === "stdout:") return { color: "textStrong", bold: true };
+  if (trimmed === "stderr:") return { color: "warning", bold: true };
+  if (/^exit\s+0$/.test(trimmed)) return { color: "success", bold: true };
+  if (/^exit\s+\d+$/.test(trimmed)) return { color: "error", bold: true };
+  if (/^… \d+ lines \(ctrl \+ t to view transcript\)$/.test(trimmed)) return { color: "textMuted" };
+  return undefined;
+}
+
+export function commandActionPrefix(line: string): string | undefined {
+  const match = line.match(/^\s*(Ran|Read|Searched|Edited|Wrote|Checked|Viewed|Listed|Created|Deleted)\b/);
+  return match?.[1];
 }
 
 function KimiDiffHeaderText({ header }: { header: { path: string; additions: number | undefined; deletions: number | undefined } }): React.ReactElement {
@@ -135,8 +153,16 @@ function normalizeMarkdownLine(line: string): string {
 function parseInlineMarkdown(line: string): Segment[] {
   // 行内解析只识别 `code` 和 **bold**，无法闭合的标记按普通文本处理。
   const segments: Segment[] = [];
+  const action = commandActionPrefix(line);
+  let initialIndex = 0;
+  if (action) {
+    const actionStart = line.indexOf(action);
+    pushText(segments, line.slice(0, actionStart));
+    segments.push({ type: "action", value: action });
+    initialIndex = actionStart + action.length;
+  }
 
-  for (let index = 0; index < line.length;) {
+  for (let index = initialIndex; index < line.length;) {
     const codeStart = line.indexOf("`", index);
     const boldStart = line.indexOf("**", index);
     const next = nextToken(codeStart, boldStart);

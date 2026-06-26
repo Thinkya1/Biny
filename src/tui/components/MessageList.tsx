@@ -5,14 +5,15 @@
  * 让终端里的多轮对话更容易扫描。
  */
 import React from "react";
-import { Box, Text } from "ink";
+import { Box, Text, useWindowSize } from "ink";
 import type { TuiMessage } from "../types.js";
 import { tuiColors } from "../theme/index.js";
 import { MessageItem } from "./MessageItem.js";
 
-type MessageRow =
-  | { type: "message"; id: string; message: TuiMessage; continuation: boolean }
-  | { type: "separator"; id: string };
+export type MessageDisplayRow =
+  | { type: "message"; id: string; message: TuiMessage; prefix: string }
+  | { type: "separator"; id: string }
+  | { type: "spacer"; id: string };
 
 export interface MessageListProps {
   messages: TuiMessage[];
@@ -22,22 +23,25 @@ export interface MessageListProps {
 }
 
 export function MessageList({ messages }: MessageListProps): React.ReactElement {
-  // MessageList 只渲染传入的 live messages；静态历史由 App 的 <Static> 承载。
-  const rows = flattenMessages(messages);
+  // MessageList 动态渲染完整 transcript；终端 resize 时所有消息重新按当前宽度换行。
+  const { columns } = useWindowSize();
+  const rows = messageRowsForDisplay(messages);
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" width="100%">
       {rows.map((row) => (
         row.type === "separator"
-          ? <Text key={row.id} color={tuiColors.border}>────────────────────────────────────────────────────────────────</Text>
-          : <MessageItem key={row.id} message={row.message} continuation={row.continuation} />
+          ? <Text key={row.id} color={tuiColors.border}>{separatorLine(columns)}</Text>
+          : row.type === "spacer"
+            ? <Text key={row.id}> </Text>
+            : <MessageItem key={row.id} message={row.message} prefix={row.prefix} />
       ))}
     </Box>
   );
 }
 
-function flattenMessages(messages: TuiMessage[]): MessageRow[] {
+export function messageRowsForDisplay(messages: TuiMessage[]): MessageDisplayRow[] {
   // 在新的用户消息前插入分隔线，让多轮对话在终端里更容易扫描。
-  const rows: MessageRow[] = [];
+  const rows: MessageDisplayRow[] = [];
   let hasConversation = false;
   for (const message of messages) {
     if (message.role === "user" && hasConversation) {
@@ -54,9 +58,9 @@ function flattenMessages(messages: TuiMessage[]): MessageRow[] {
   return rows;
 }
 
-function flattenOneMessage(message: TuiMessage): MessageRow[] {
-  // 多行消息拆成多行渲染，首行显示角色标签，后续行做缩进延续。
-  const rows: MessageRow[] = [];
+function flattenOneMessage(message: TuiMessage): MessageDisplayRow[] {
+  // 多行消息拆成多行渲染；assistant 不保留名称占位，用户消息只在首行显示简短提示符。
+  const rows: MessageDisplayRow[] = [];
   const lines = message.content.split("\n");
   lines.forEach((line, index) => {
     rows.push({
@@ -67,16 +71,25 @@ function flattenOneMessage(message: TuiMessage): MessageRow[] {
         id: `${message.id}-${String(index)}`,
         content: line
       },
-      continuation: index > 0
+      prefix: messagePrefix(message.role, index)
     });
   });
   if (message.role !== "system") {
     rows.push({
-      type: "message",
-      id: `${message.id}-spacer`,
-      message: { id: `${message.id}-spacer`, role: "system", content: "" },
-      continuation: true
+      type: "spacer",
+      id: `${message.id}-spacer`
     });
   }
   return rows;
+}
+
+function messagePrefix(role: TuiMessage["role"], lineIndex: number): string {
+  if (role === "assistant") return "";
+  if (role === "user") return lineIndex === 0 ? "› " : "  ";
+  if (role === "error") return lineIndex === 0 ? "Error " : "      ";
+  return lineIndex === 0 ? "• " : "  ";
+}
+
+export function separatorLine(columns: number): string {
+  return "─".repeat(Math.max(1, columns));
 }

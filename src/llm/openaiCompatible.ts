@@ -116,8 +116,8 @@ export class OpenAICompatibleProvider implements LLMProvider {
     const message = json.choices?.[0]?.message;
     return {
       content: message?.content ?? "",
-      toolCalls: message?.tool_calls?.map((call, index) => ({
-        id: call.id ?? `tool-${String(index + 1)}`,
+      toolCalls: message?.tool_calls?.map((call) => ({
+        id: call.id ?? "",
         name: call.function?.name ?? "",
         args: parseToolArguments(call.function?.arguments ?? "{}")
       })).filter((call) => call.name)

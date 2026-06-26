@@ -15,7 +15,7 @@ export type RuntimeEvent =
   | { type: "session.error"; sessionId?: string; message: string }
   | { type: "system.message"; content: string }
   | { type: "messages.cleared" }
-  | { type: "messages.replaced"; messages: Array<{ role: "user" | "assistant" | "system" | "error"; content: string }>; viewingSessionId?: string }
+  | { type: "messages.replaced"; messages: Array<{ role: "user" | "assistant" | "system" | "error"; content: string; fullTitle?: string; fullContent?: string }>; viewingSessionId?: string }
   | { type: "messages.scrolled"; direction: -1 | 1; amount?: number }
   | { type: "messages.follow_latest" }
   | { type: "tool.details.toggled" }
