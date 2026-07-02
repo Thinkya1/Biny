@@ -6,7 +6,8 @@ import { z } from "zod";
 import { detectIntent } from "../src/agent/intent.js";
 import { runAgentLoop } from "../src/agent/loop.js";
 import { loadConfig, saveConfig } from "../src/config/loader.js";
-import { defaultConfig, type AgentConfig } from "../src/config/schema.js";
+import { configSchema, defaultConfig, type AgentConfig } from "../src/config/schema.js";
+import { createLLMProvider } from "../src/llm/factory.js";
 import type { ChatMessage, CommandAnalysisInput, FileEditInput, FileEditProposal, LLMProvider, LLMRequest, LLMResponse } from "../src/llm/provider.js";
 import type { ProjectContext } from "../src/project/ProjectContext.js";
 import { OpenAICompatibleProvider } from "../src/llm/openaiCompatible.js";
@@ -84,6 +85,8 @@ async function main(): Promise<void> {
   await testPermissionPromptSelectionUsesArrowAndEnter();
   await testPermissionModeOptionsExposeThreeSelectableModes();
   await testPermissionModePersistsToConfig();
+  await testConfigSchemaRejectsMockProvider();
+  await testCreateLLMProviderRequiresConfiguredApiKey();
   await testGitDiffToolIsRegistered();
   await testGitDiffIntentUsesDedicatedTool();
   await testGitDiffResultKeepsLineBreaksForTui();
@@ -571,6 +574,37 @@ async function testPermissionModePersistsToConfig(): Promise<void> {
     assert.equal(reloaded.permission.mode, "full-access");
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testConfigSchemaRejectsMockProvider(): Promise<void> {
+  const result = configSchema.safeParse({
+    ...defaultConfig,
+    model: {
+      ...defaultConfig.model,
+      provider: "mock"
+    }
+  });
+
+  assert.equal(result.success, false);
+}
+
+async function testCreateLLMProviderRequiresConfiguredApiKey(): Promise<void> {
+  const originalApiKey = process.env.DEEPSEEK_API_KEY;
+  delete process.env.DEEPSEEK_API_KEY;
+
+  try {
+    assert.throws(
+      () => createLLMProvider(defaultConfig),
+      (error: unknown) => {
+        assert.equal(error instanceof Error, true);
+        assert.match((error as Error).message, /No model available/);
+        assert.match((error as Error).message, /DEEPSEEK_API_KEY/);
+        return true;
+      }
+    );
+  } finally {
+    process.env.DEEPSEEK_API_KEY = originalApiKey;
   }
 }
 

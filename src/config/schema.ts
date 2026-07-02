@@ -1,7 +1,7 @@
 /**
  * 配置结构模块。
  *
- * `agent.config.json` 的合法形状、默认 mock 配置和 DeepSeek 示例配置都定义在这里。
+ * `agent.config.json` 的合法形状、默认 DeepSeek 配置和示例配置都定义在这里。
  * 运行时只接受通过 schema 校验的配置，确保模型 provider、权限模式和 workspace ignore
  * 规则在各入口中保持一致。
  */
@@ -24,7 +24,7 @@ const permissionSchema = z.object({
 // 运行时配置的唯一校验入口；loader 读到 JSON 后必须先经过这个 schema。
 export const configSchema = z.object({
   model: z.object({
-    provider: z.enum(["mock", "openai-compatible", "deepseek"]),
+    provider: z.enum(["openai-compatible", "deepseek"]),
     baseUrl: z.string(),
     model: z.string(),
     apiKeyEnv: z.string()
@@ -69,12 +69,12 @@ export const deepSeekConfig: AgentConfig = {
 };
 
 export const defaultConfig: AgentConfig = {
-  // 默认使用 mock，保证首次安装后没有 API key 也能跑通 CLI 和工具链。
+  // 默认配置直接指向 DeepSeek，运行时仍要求从环境变量读取密钥。
   model: {
-    provider: "mock",
-    baseUrl: "",
-    model: "mock",
-    apiKeyEnv: "OPENAI_API_KEY"
+    provider: "deepseek",
+    baseUrl: "https://api.deepseek.com",
+    model: "deepseek-chat",
+    apiKeyEnv: "DEEPSEEK_API_KEY"
   },
   permission: {
     mode: "ask",
