@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { renderToStaticMarkup } from "react-dom/server";
 import { z } from "zod";
 import { detectIntent } from "../src/agent/intent.js";
 import { runAgentLoop } from "../src/agent/loop.js";
 import { loadConfig, saveConfig } from "../src/config/loader.js";
 import { configSchema, defaultConfig, type AgentConfig } from "../src/config/schema.js";
 import { createLLMProvider } from "../src/llm/factory.js";
+import { createCommandRuntime } from "../src/runtime/CommandRuntime.js";
 import type { ChatMessage, CommandAnalysisInput, FileEditInput, FileEditProposal, LLMProvider, LLMRequest, LLMResponse } from "../src/llm/provider.js";
 import type { ProjectContext } from "../src/project/ProjectContext.js";
 import { OpenAICompatibleProvider } from "../src/llm/openaiCompatible.js";
@@ -21,6 +23,7 @@ import { PermissionManager, type PermissionRequestContext } from "../src/permiss
 import { runPermissionCommand } from "../src/permission/commands.js";
 import { permissionChoiceAt, movePermissionSelection, permissionOptions } from "../src/tui/permissionOptions.js";
 import { permissionModeOptions, permissionModeOptionIndex } from "../src/tui/permissionModeOptions.js";
+import { StatusBar } from "../src/tui/components/StatusBar.js";
 import { createInitialTuiState, tuiReducer } from "../src/tui/state.js";
 import { diffLineColor, diffLineStyle, padDiffLine, parseDiffHeader } from "../src/tui/diffLines.js";
 import { computeDiffLines, renderDiffLinesClustered, renderFileContentPreview } from "../src/tui/diffPreview.js";
@@ -82,11 +85,13 @@ async function main(): Promise<void> {
   await testMessageRowsUseCompactCodexStyleConversationLayout();
   await testMessageSeparatorUsesCurrentViewportWidth();
   await testHeaderHidesCurrentSessionId();
+  await testTuiInitialStateUsesNeutralModelLabels();
   await testPermissionPromptSelectionUsesArrowAndEnter();
   await testPermissionModeOptionsExposeThreeSelectableModes();
   await testPermissionModePersistsToConfig();
   await testConfigSchemaRejectsMockProvider();
   await testCreateLLMProviderRequiresConfiguredApiKey();
+  await testCreateCommandRuntimeDoesNotCreateSessionArtifactWithoutApiKey();
   await testGitDiffToolIsRegistered();
   await testGitDiffIntentUsesDedicatedTool();
   await testGitDiffResultKeepsLineBreaksForTui();
@@ -544,6 +549,19 @@ async function testHeaderHidesCurrentSessionId(): Promise<void> {
   assert.equal(headerDisplayText("current-session", "older-session"), "Viewing older-session");
 }
 
+async function testTuiInitialStateUsesNeutralModelLabels(): Promise<void> {
+  const state = createInitialTuiState("/workspace");
+
+  assert.equal(state.provider.includes("mock"), false);
+  assert.equal(state.modelLabel.includes("mock"), false);
+  assert.equal(state.provider, "No model");
+  assert.equal(state.modelLabel, "No model");
+
+  const markup = renderToStaticMarkup(StatusBar({ mode: "chat", cwd: "/workspace", modelLabel: "" }));
+  assert.match(markup, /No model/);
+  assert.equal(markup.includes("mock"), false);
+}
+
 async function testPermissionPromptSelectionUsesArrowAndEnter(): Promise<void> {
   assert.equal(permissionOptions.length, 3);
   assert.equal(permissionChoiceAt(0), "approve_once");
@@ -590,6 +608,7 @@ async function testConfigSchemaRejectsMockProvider(): Promise<void> {
 }
 
 async function testCreateLLMProviderRequiresConfiguredApiKey(): Promise<void> {
+  const hadOriginalApiKey = Object.prototype.hasOwnProperty.call(process.env, "DEEPSEEK_API_KEY");
   const originalApiKey = process.env.DEEPSEEK_API_KEY;
   delete process.env.DEEPSEEK_API_KEY;
 
@@ -604,7 +623,46 @@ async function testCreateLLMProviderRequiresConfiguredApiKey(): Promise<void> {
       }
     );
   } finally {
-    process.env.DEEPSEEK_API_KEY = originalApiKey;
+    if (hadOriginalApiKey) {
+      process.env.DEEPSEEK_API_KEY = originalApiKey;
+    } else {
+      delete process.env.DEEPSEEK_API_KEY;
+    }
+  }
+}
+
+async function testCreateCommandRuntimeDoesNotCreateSessionArtifactWithoutApiKey(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-runtime-missing-key-"));
+  const hadOriginalApiKey = Object.prototype.hasOwnProperty.call(process.env, "DEEPSEEK_API_KEY");
+  const originalApiKey = process.env.DEEPSEEK_API_KEY;
+  delete process.env.DEEPSEEK_API_KEY;
+
+  try {
+    await saveConfig(workspaceRoot, defaultConfig);
+    await assert.rejects(
+      () => createCommandRuntime(workspaceRoot),
+      (error: unknown) => {
+        assert.equal(error instanceof Error, true);
+        assert.match((error as Error).message, /No model available/);
+        assert.match((error as Error).message, /DEEPSEEK_API_KEY/);
+        return true;
+      }
+    );
+
+    await assert.rejects(
+      () => readdir(path.join(workspaceRoot, ".agent")),
+      (error: unknown) => {
+        assert.equal((error as NodeJS.ErrnoException).code, "ENOENT");
+        return true;
+      }
+    );
+  } finally {
+    if (hadOriginalApiKey) {
+      process.env.DEEPSEEK_API_KEY = originalApiKey;
+    } else {
+      delete process.env.DEEPSEEK_API_KEY;
+    }
+    await rm(workspaceRoot, { recursive: true, force: true });
   }
 }
 

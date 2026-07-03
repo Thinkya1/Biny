@@ -19,7 +19,7 @@ export function StatusBar({ mode, cwd, modelLabel }: StatusBarProps): React.Reac
   return (
     <Box justifyContent="space-between" width="100%">
       <Text>
-        <Text color={tuiColors.textStrong}>{modelLabel || "mock"}</Text>
+        <Text color={tuiColors.textStrong}>{modelLabel || "No model"}</Text>
         <Text color={tuiColors.textDim}> · </Text>
         <Text color={tuiColors.textDim}>{cwd}</Text>
       </Text>

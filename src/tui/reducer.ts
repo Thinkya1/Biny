@@ -14,8 +14,8 @@ export function createInitialTuiState(workspaceRoot: string): TuiState {
   // 初始状态先显示欢迎消息；真正 session 信息会在 runtime 创建完成后覆盖。
   return {
     cwd: workspaceRoot,
-    provider: "MockProvider",
-    modelLabel: "mock",
+    provider: "No model",
+    modelLabel: "No model",
     sessionId: "",
     sessionFile: "",
     viewingSessionId: undefined,

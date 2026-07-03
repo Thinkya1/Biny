@@ -1,6 +1,6 @@
 # Biny
 
-Biny 是一个 TypeScript CLI 本地编码代理。当前保留 `MockProvider`，并支持通过 OpenAI-compatible 接口接入 DeepSeek。
+Biny 是一个 TypeScript CLI 本地编码代理，当前支持 DeepSeek 和通用 OpenAI-compatible API。
 
 它支持 ProjectContext、本地文件工具、命令执行确认、执行计划和 `.agent/sessions/*.jsonl` 会话记录。
 
@@ -12,7 +12,7 @@ pnpm install
 
 ## 开发模式运行
 
-当前项目的 `agent.config.json` 已配置为 DeepSeek：
+默认配置使用 DeepSeek；运行时会读取 `config.model.apiKeyEnv` 指向的环境变量，因此默认需要 `DEEPSEEK_API_KEY`：
 
 ```json
 {
@@ -74,7 +74,7 @@ biny tui
 ```bash
 biny run "读取 README.md 并解释"
 biny run "运行 pnpm typecheck"
-biny run "搜索 \"MockProvider\""
+biny run "搜索 \"provider\" 相关配置和用法"
 ```
 
 `run` 启动时会收集 ProjectContext，包含当前工作目录、包管理器、`package.json` 摘要、`tsconfig.json` 摘要、README 摘要、`src` 目录树和 `git status`。ProjectContext 只读取摘要和有限目录树，不会读取整个项目。
@@ -130,7 +130,7 @@ pnpm dev -- tui
 - `r`：切换到 Read Only 并拒绝当前操作。
 - `f`：切换到 Full Access 并允许当前操作。Critical 操作后续仍会继续询问。
 
-TUI 使用 `agent.config.json` 中配置的 provider。当前项目配置为 DeepSeek；如果改回 `mock`，则会使用本地 `MockProvider`。
+TUI 使用 `agent.config.json` 中配置的 provider。当前默认配置为 DeepSeek，也可以切换到其它 OpenAI-compatible 接口；对应 API key 仍然必须从环境变量读取。
 
 TUI 内的 `/resume` 行为：
 
@@ -254,8 +254,9 @@ TUI 和 chat 中可用：
 
 Biny 当前支持：
 
-- `mock`：本地 MockProvider，不需要 API key。
-- `deepseek`：DeepSeek API，读取 `DEEPSEEK_API_KEY`。
+- `deepseek`：DeepSeek API，默认读取 `DEEPSEEK_API_KEY`。
 - `openai-compatible`：通用 OpenAI-compatible 接口，可配置 `baseUrl`、`model` 和 `apiKeyEnv`。
+
+所有 provider 的密钥都只从环境变量读取，不写入代码、配置示例或会话数据。
 
 DeepSeek 使用官方 OpenAI-compatible Chat Completions 格式，默认 `baseUrl` 为 `https://api.deepseek.com`，默认模型为 `deepseek-chat`。

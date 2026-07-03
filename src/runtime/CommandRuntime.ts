@@ -40,10 +40,10 @@ export interface CommandRuntime extends FutureRuntimeExtensions {
 export async function createCommandRuntime(workspaceRoot: string): Promise<CommandRuntime> {
   // 每次命令执行都创建一套运行时上下文：配置、session、provider、项目摘要和工具注册表。
   // 这样 run/chat/plan 的启动流程保持一致，后续扩展也只需要改这里。
-  await ensureAgentDirs(workspaceRoot);
   const config = await loadConfig(workspaceRoot);
-  const recorder = new SessionRecorder(workspaceRoot);
   const llm = createLLMProvider(config);
+  await ensureAgentDirs(workspaceRoot);
+  const recorder = new SessionRecorder(workspaceRoot);
   const projectContext = await collectProjectContext(workspaceRoot, config.workspace.ignore);
   const toolRegistry = createToolRegistry({ workspaceRoot, ignore: config.workspace.ignore });
   const permissionManager = new PermissionManager({ ...config.permission, source: "agent.config.json" });
