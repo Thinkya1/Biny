@@ -15,10 +15,10 @@ export interface TuiPlan {
   risks: string[];
 }
 
-export function createStructuredPlan(runtime: TuiRuntime, task: string): TuiPlan {
-  // 结构化计划直接来自当前 ProjectContext，不执行工具也不读取额外文件。
-  const context = runtime.commandRuntime.projectContext;
-  const files = candidateFiles(context.srcTree);
+export async function createStructuredPlan(runtime: TuiRuntime, task: string): Promise<TuiPlan> {
+  // 结构化计划只读取 AgentSession 已知活动路径，不读取完整源码或绕过 runtime。
+  const context = await runtime.contextStatus();
+  const files = candidateFiles(context.activePaths);
   return {
     task,
     goal: task,
@@ -67,11 +67,7 @@ export function formatStructuredPlan(plan: TuiPlan): string {
   ].join("\n");
 }
 
-function candidateFiles(srcTree: string[]): string[] {
-  // 先从 src tree 中挑候选源码文件；没有 src 时回退到项目入口文档。
-  const files = srcTree
-    .map((entry) => entry.replace(/^\s*\[f\]\s+/, "").trim())
-    .filter((entry) => entry.startsWith("src/"))
-    .slice(0, 8);
+function candidateFiles(activePaths: string[]): string[] {
+  const files = activePaths.filter((entry) => entry.startsWith("src/")).slice(0, 8);
   return files.length ? files : ["package.json", "README.md", "tsconfig.json"];
 }

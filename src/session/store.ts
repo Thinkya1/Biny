@@ -24,6 +24,10 @@ export function sessionFilePath(workspaceRoot: string, sessionId: string): strin
   return path.join(agentDir(workspaceRoot), "sessions", `${sessionId}.jsonl`);
 }
 
+export function sessionIdFromFile(filePath: string): string {
+  return path.basename(filePath, ".jsonl");
+}
+
 export async function listSessionFiles(workspaceRoot: string): Promise<string[]> {
   // 只列出 JSONL session，避免 logs 或临时文件混进恢复列表。
   const sessionsDir = path.join(agentDir(workspaceRoot), "sessions");

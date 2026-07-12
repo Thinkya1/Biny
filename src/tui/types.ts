@@ -7,31 +7,65 @@
 import type { RuntimeStatus } from "../runtime/events.js";
 import type { ToolInputDisplay } from "../tools/types.js";
 
-export interface TuiMessage {
-  // id 用于 Ink 渲染 key，role 决定颜色和标签。
+interface TranscriptItemBase {
   id: string;
-  role: "user" | "assistant" | "system" | "error";
-  content: string;
-  fullTitle?: string;
-  fullContent?: string;
 }
 
-export interface TuiToolCall {
-  // TUI 只保存工具调用摘要，避免把完整结果长期保留在界面状态中。
-  id: string;
-  messageId?: string;
+export interface UserTranscriptItem extends TranscriptItemBase {
+  kind: "user";
+  content: string;
+}
+
+export interface AssistantTranscriptItem extends TranscriptItemBase {
+  kind: "assistant";
+  content: string;
+}
+
+export interface NotificationTranscriptItem extends TranscriptItemBase {
+  kind: "notification";
+  content: string;
+  tone?: "muted" | "success" | "warning";
+}
+
+export interface ErrorTranscriptItem extends TranscriptItemBase {
+  kind: "error";
+  content: string;
+}
+
+export type ToolTranscriptStatus = "pending" | "running" | "success" | "failed" | "denied" | "skipped";
+
+export interface ToolTranscriptItem extends TranscriptItemBase {
+  kind: "tool";
+  toolCallId?: string;
   tool: string;
+  description?: string;
+  title: string;
   argsSummary: string;
   display?: ToolInputDisplay;
-  status: "pending" | "running" | "success" | "failed" | "denied" | "skipped";
-  progressSummary?: string;
-  resultSummary?: string;
-  fullTitle?: string;
-  fullContent?: string;
+  status: ToolTranscriptStatus;
+  startedAtMs?: number;
+  progress?: string;
+  output?: string;
+  details?: string;
   durationMs?: number;
   outputLines?: number;
   exitCode?: number;
   truncated?: boolean;
+}
+
+export type TranscriptItem =
+  | UserTranscriptItem
+  | AssistantTranscriptItem
+  | ToolTranscriptItem
+  | NotificationTranscriptItem
+  | ErrorTranscriptItem;
+
+export type ActiveTranscriptItem = AssistantTranscriptItem | ToolTranscriptItem;
+
+export interface TranscriptState {
+  // committed 只保存已完成单元；active 中的 assistant/tool 允许按 id 原地更新。
+  committed: TranscriptItem[];
+  active: ActiveTranscriptItem[];
 }
 
 export interface TuiPermissionRequest {
@@ -55,17 +89,17 @@ export interface TuiState {
   cwd: string;
   provider: string;
   modelLabel: string;
+  reasoningLabel: string;
   sessionId: string;
   sessionFile: string;
   viewingSessionId?: string;
   status: RuntimeStatus;
   turnStartedAt?: number;
   lastWorkedMs?: number;
-  messages: TuiMessage[];
-  messageScrollOffset: number;
+  transcript: TranscriptState;
+  transcriptScrollOffset: number;
   followLatest: boolean;
-  toolCalls: TuiToolCall[];
-  toolDetailsExpanded: boolean;
+  expandedToolId?: string;
   permissionDetailsExpanded: boolean;
   permission?: TuiPermissionRequest;
 }

@@ -10,7 +10,9 @@ import type { SlashCommand } from "../cli/prompt/slashMenu.js";
 export const TUI_SLASH_COMMANDS: SlashCommand[] = [
   { name: "/help", description: "Show available commands", category: "system" },
   { name: "/clear", description: "Clear visible messages", category: "system" },
-  { name: "/context", description: "Show current ProjectContext", category: "system" },
+  { name: "/context", description: "Show loaded context and budget", category: "system" },
+  { name: "/compact", description: "Compact older conversation history", category: "system" },
+  { name: "/model", description: "Switch model and thinking effort", category: "system" },
   { name: "/sessions", description: "List recorded sessions", category: "session" },
   { name: "/resume", description: "Show a session, defaults to latest", category: "session" },
   { name: "/permissions", description: "View or change permission mode", category: "system" },

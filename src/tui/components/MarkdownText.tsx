@@ -5,10 +5,9 @@
  * `Text` 片段，遇到无法闭合的标记时按普通文本处理。
  */
 import React from "react";
-import { Text, useWindowSize } from "ink";
+import { Text } from "ink";
 import {
   diffLineStyle,
-  padDiffLine,
   parseDiffCodeLine,
   parseDiffHeader,
   parseKimiDiffCodeLine,
@@ -34,11 +33,10 @@ type Segment =
 
 export function MarkdownText({ line, muted = false, color: textColor }: MarkdownTextProps): React.ReactElement {
   // 这里只支持终端友好的轻量 Markdown，不尝试完整解析 Markdown 语法。
-  const { columns } = useWindowSize();
   const normalized = normalizeMarkdownLine(line);
   const style = diffLineStyle(normalized);
   const semanticStyle = semanticLineStyle(normalized);
-  const displayLine = style?.fillBackground ? padDiffLine(normalized, Math.max(normalized.length, columns - 6)) : normalized;
+  const displayLine = normalized;
   const kimiHeader = parseKimiDiffHeader(displayLine);
   if (kimiHeader) return <KimiDiffHeaderText header={kimiHeader} />;
   const header = parseDiffHeader(displayLine);
@@ -48,11 +46,11 @@ export function MarkdownText({ line, muted = false, color: textColor }: Markdown
   if (kimiCodeLine) return <KimiDiffCodeLineText line={kimiCodeLine} />;
 
   const codeLine = parseDiffCodeLine(displayLine);
-  if (codeLine) return <DiffCodeLineText line={codeLine} color={style?.color} backgroundColor={style?.backgroundColor} />;
+  if (codeLine) return <DiffCodeLineText line={codeLine} color={style?.color} />;
 
   const color = style?.color ?? (semanticStyle ? colorToken(semanticStyle.color) : textColor ?? (muted ? tuiColors.textDim : tuiColors.text));
   return (
-    <Text color={color} backgroundColor={style?.backgroundColor} bold={style?.bold ?? semanticStyle?.bold} dimColor={style?.dimColor}>
+    <Text color={color} bold={style?.bold ?? semanticStyle?.bold} dimColor={style?.dimColor}>
       {parseInlineMarkdown(displayLine).map((segment, index) => {
         const key = `${segment.type}-${String(index)}`;
         if (segment.type === "action") return <Text key={key} color={tuiColors.accent} bold>{segment.value}</Text>;
@@ -120,18 +118,18 @@ function KimiDiffCodeLineText({ line }: { line: KimiDiffCodeLine }): React.React
   );
 }
 
-function DiffCodeLineText({ line, color, backgroundColor }: { line: DiffCodeLine; color?: string; backgroundColor?: string }): React.ReactElement {
+function DiffCodeLineText({ line, color }: { line: DiffCodeLine; color?: string }): React.ReactElement {
   const isAdd = line.prefix === "+";
   const isDelete = line.prefix === "-";
   const contentColor = color ?? (isAdd || isDelete ? tuiColors.textStrong : tuiColors.diffMeta);
   return (
-    <Text backgroundColor={backgroundColor}>
-      <Text color={tuiColors.diffGutter} dimColor backgroundColor={backgroundColor}>{line.oldColumn}</Text>
-      <Text color={tuiColors.diffGutter} dimColor backgroundColor={backgroundColor}> </Text>
-      <Text color={tuiColors.diffGutter} dimColor backgroundColor={backgroundColor}>{line.newColumn}</Text>
-      <Text color={tuiColors.diffGutter} dimColor backgroundColor={backgroundColor}> </Text>
-      <Text color={contentColor} backgroundColor={backgroundColor} dimColor={!isAdd && !isDelete}>{line.prefix}</Text>
-      <Text color={contentColor} backgroundColor={backgroundColor} dimColor={!isAdd && !isDelete}> {line.content}</Text>
+    <Text>
+      <Text color={tuiColors.diffGutter} dimColor>{line.oldColumn}</Text>
+      <Text color={tuiColors.diffGutter} dimColor> </Text>
+      <Text color={tuiColors.diffGutter} dimColor>{line.newColumn}</Text>
+      <Text color={tuiColors.diffGutter} dimColor> </Text>
+      <Text color={contentColor} dimColor={!isAdd && !isDelete}>{line.prefix}</Text>
+      <Text color={contentColor} dimColor={!isAdd && !isDelete}> {line.content}</Text>
     </Text>
   );
 }

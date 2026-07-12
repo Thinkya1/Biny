@@ -18,7 +18,7 @@ export async function loadConfig(workspaceRoot: string): Promise<AgentConfig> {
     return configSchema.parse(JSON.parse(raw));
   } catch (error) {
     // 没有配置文件时使用默认配置；其他读取或解析错误都需要暴露给用户。
-    if (isNotFound(error)) return defaultConfig;
+    if (isNotFound(error)) return configSchema.parse(defaultConfig);
     throw new Error(`Failed to load ${CONFIG_FILE}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }

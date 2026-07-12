@@ -1,9 +1,41 @@
 {
-  "model": {
-    "provider": "deepseek",
-    "baseUrl": "https://api.deepseek.com",
-    "model": "deepseek-chat",
-    "apiKeyEnv": "DEEPSEEK_API_KEY"
+  "defaultModel": "deepseek-v4-pro",
+  "providers": {
+    "deepseek": {
+      "type": "deepseek",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKeyEnv": "DEEPSEEK_API_KEY"
+    }
+  },
+  "models": {
+    "deepseek-v4-flash": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "displayName": "DeepSeek V4 Flash",
+      "thinking": {
+        "efforts": [
+          "high",
+          "max"
+        ],
+        "defaultEffort": "high"
+      }
+    },
+    "deepseek-v4-pro": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-pro",
+      "displayName": "DeepSeek V4 Pro",
+      "thinking": {
+        "efforts": [
+          "high",
+          "max"
+        ],
+        "defaultEffort": "high"
+      }
+    }
+  },
+  "thinking": {
+    "enabled": true,
+    "effort": "high"
   },
   "permission": {
     "mode": "full-access",
@@ -37,5 +69,12 @@
       "TODO.local.md",
       "ARCHITECTURE.local.md"
     ]
+  },
+  "context": {
+    "maxInputTokens": 24000,
+    "instructionsMaxBytes": 32768,
+    "memory": {
+      "enabled": true
+    }
   }
 }

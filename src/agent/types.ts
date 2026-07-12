@@ -1,17 +1,11 @@
-/**
- * Agent 类型定义模块。
- *
- * 这里描述 agent loop 与外部运行时之间的契约：识别出的用户意图、权限请求结构，以及执行
- * 一轮任务所需的配置、LLM、工具注册表、session recorder 和事件出口。
- */
+/** Agent runtime types shared by the SDK-backed session and Ink host. */
 import type { AgentConfig } from "../config/schema.js";
-import type { ChatMessage, LLMProvider, LLMToolCall } from "../llm/provider.js";
-import type { ProjectContext } from "../project/ProjectContext.js";
-import type { RuntimeEventSink } from "../runtime/events.js";
+import type { LanguageModel, TextStreamPart, ToolSet } from "ai";
 import type { SessionRecorder } from "../session/recorder.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { ToolInputDisplay, ToolUpdate } from "../tools/types.js";
-import type { PermissionGrantScope, PermissionManager, PermissionMode, PermissionRequestContext } from "../permission/PermissionManager.js";
+import type { PermissionManager, PermissionPrompt, PermissionResult } from "../permission/PermissionManager.js";
+import type { ContextMemory } from "./context/ContextMemory.js";
 
 export type IntentType = "qa" | "read_file" | "write_file" | "edit_file" | "search_files" | "git_diff" | "run_command";
 
@@ -25,48 +19,33 @@ export interface Intent {
   command?: string;
 }
 
-export interface AgentPermissionRequest extends PermissionRequestContext {
-  // 权限请求包含 UI 展示所需的标题、详情和可选 diff。
-  tool: string;
-  title: string;
-  details: string;
-  requireFullYes: boolean;
-  diff?: string;
-  preview?: string;
-}
+// Preserve Agent-facing event names while the shared permission contract lives in permission/.
+export type AgentPermissionRequest = PermissionPrompt;
+export type AgentPermissionResult = PermissionResult;
 
-export interface AgentPermissionResult {
-  approved: boolean;
-  scope?: PermissionGrantScope;
-  nextMode?: PermissionMode;
-  message?: string;
-}
+/** SDK-native stream plus the small set of Biny lifecycle events that the SDK does not own. */
+export type AgentSessionEvent =
+  | { type: "status"; status: AgentStatus }
+  | { type: "sdk"; part: TextStreamPart<ToolSet> }
+  | { type: "tool-started"; toolCallId: string; tool: string; args: unknown; description?: string; display?: ToolInputDisplay }
+  | { type: "tool-progress"; toolCallId: string; tool: string; update: ToolUpdate }
+  | { type: "permission-requested"; request: AgentPermissionRequest }
+  | { type: "permission-result"; request: AgentPermissionRequest; result: AgentPermissionResult }
+  | { type: "error"; message: string; recorded?: boolean }
+  | { type: "done"; content: string };
 
 export interface AgentRuntimeContext {
   // Agent loop 的所有外部依赖都由 runtime 注入，方便 CLI 和 TUI 复用同一套执行逻辑。
   workspaceRoot: string;
   config: AgentConfig;
-  llm: LLMProvider;
+  /** Canonical Vercel AI SDK model used by ToolLoopAgent and SDK helpers. */
+  model: LanguageModel;
   recorder: SessionRecorder;
-  projectContext: ProjectContext;
+  contextMemory?: ContextMemory;
   toolRegistry: ToolRegistry;
   permissionManager?: PermissionManager;
-  conversation?: ChatMessage[];
-  eventSink?: RuntimeEventSink;
   confirmPermission?: (request: AgentPermissionRequest) => Promise<AgentPermissionResult>;
   abortSignal?: AbortSignal;
 }
 
-export type AgentLoopStatus = "thinking" | "running" | "waiting_permission" | "completed" | "error";
-
-export type AgentLoopEvent =
-  | { type: "status"; status: AgentLoopStatus }
-  | { type: "assistant_delta"; content: string }
-  | { type: "assistant_message"; content: string }
-  | { type: "tool_call"; call: LLMToolCall; description?: string; display?: ToolInputDisplay }
-  | { type: "tool_progress"; toolCallId: string; tool: string; update: ToolUpdate }
-  | { type: "tool_result"; toolCallId: string; tool: string; result: unknown }
-  | { type: "permission_request"; request: AgentPermissionRequest }
-  | { type: "permission_result"; request: AgentPermissionRequest; result: AgentPermissionResult }
-  | { type: "error"; message: string }
-  | { type: "done"; content: string };
+export type AgentStatus = "thinking" | "running" | "waiting_permission" | "completed" | "error";

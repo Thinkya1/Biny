@@ -6,12 +6,14 @@
  */
 import { promises as fs } from "node:fs";
 import { analyzePermissionRequest, commandSafetyWarnings } from "../../permission/policy.js";
-import type { PermissionRequestContext } from "../../permission/PermissionManager.js";
-import { formatDiffPreviewLines, renderDiffLinesClustered, renderFileContentPreview } from "../../tui/diffPreview.js";
+import type { PermissionPrompt, PermissionRequestContext } from "../../permission/PermissionManager.js";
 import { createUnifiedDiff } from "../../utils/diff.js";
 import { resolveWorkspacePath } from "../../workspace/resolvePath.js";
-import type { AgentPermissionRequest } from "../../agent/types.js";
-import type { LLMToolCall } from "../../llm/provider.js";
+export interface ToolCallInput {
+  id: string;
+  name: string;
+  args: unknown;
+}
 
 export interface ToolDisplayContext {
   workspaceRoot: string;
@@ -33,10 +35,10 @@ export interface ToolDisplaySummary {
 }
 
 export async function createToolPermissionRequest(
-  call: LLMToolCall,
+  call: ToolCallInput,
   context: ToolDisplayContext,
   permissionContext?: PermissionRequestContext
-): Promise<AgentPermissionRequest> {
+): Promise<PermissionPrompt> {
   const requestContext = permissionContext ?? analyzePermissionRequest({
     toolName: call.name,
     args: call.args,
@@ -79,8 +81,8 @@ export const toolDisplayRules: Record<string, ToolDisplayRule> = {
       const oldContent = await readExistingFileForDiff(filePath, context);
       const diff = oldContent ? createUnifiedDiff(filePath, oldContent, content) : undefined;
       const preview = oldContent
-        ? formatDiffPreviewLines(renderDiffLinesClustered(oldContent, content, filePath, { contextLines: 3, maxLines: 16 }))
-        : formatDiffPreviewLines(renderFileContentPreview(filePath, content, { maxLines: 16 }));
+        ? formatUnifiedDiffPreview(filePath, diff ?? "", 16)
+        : formatFileContentPreview(filePath, content, 16);
       return {
         details: `File: ${filePath}\nBytes: ${Buffer.byteLength(content, "utf8")}\n\n${preview}`,
         diff,
@@ -98,7 +100,7 @@ export const toolDisplayRules: Record<string, ToolDisplayRule> = {
       const oldContent = await readExistingFileForDiff(filePath, context);
       const nextContent = oldContent.includes(oldText) ? oldContent.replace(oldText, newText) : oldContent;
       const diff = createUnifiedDiff(filePath, oldContent, nextContent);
-      const preview = formatDiffPreviewLines(renderDiffLinesClustered(oldContent, nextContent, filePath, { contextLines: 3, maxLines: 16 }));
+      const preview = formatUnifiedDiffPreview(filePath, diff, 16);
       return {
         details: `File: ${filePath}\nReplace bytes: ${Buffer.byteLength(oldText, "utf8")} -> ${Buffer.byteLength(newText, "utf8")}\n\n${preview}`,
         diff,
@@ -130,4 +132,54 @@ function getStringField(value: unknown, key: string): string {
   if (typeof value !== "object" || value === null) return "";
   const field = (value as Record<string, unknown>)[key];
   return typeof field === "string" ? field : "";
+}
+
+// Permission previews are plain text shared by CLI and TUI. They deliberately
+// stay in the tool domain so a core tool never imports a TUI rendering module.
+function formatFileContentPreview(filePath: string, content: string, maxLines: number): string {
+  const normalized = content.endsWith("\n") ? content.slice(0, -1) : content;
+  const lines = normalized ? normalized.split("\n") : [];
+  const shown = lines.slice(0, maxLines);
+  return [
+    `Write ${filePath}`,
+    ...shown.map((line, index) => `${String(index + 1).padStart(4, " ")}   ${line}`),
+    ...(lines.length > shown.length ? [`     … ${String(lines.length - shown.length)} more line${lines.length - shown.length > 1 ? "s" : ""} hidden`] : [])
+  ].join("\n");
+}
+
+function formatUnifiedDiffPreview(filePath: string, diff: string, maxLines: number): string {
+  const body: string[] = [];
+  let oldLine = 1;
+  let newLine = 1;
+
+  for (const line of diff.split("\n")) {
+    const range = line.match(/^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/);
+    if (range) {
+      oldLine = Number.parseInt(range[1] ?? "1", 10);
+      newLine = Number.parseInt(range[2] ?? "1", 10);
+      continue;
+    }
+    if (line.startsWith("---") || line.startsWith("+++")) continue;
+    if (line.startsWith("-")) {
+      body.push(`${String(oldLine).padStart(4, " ")} - ${line.slice(1)}`);
+      oldLine += 1;
+      continue;
+    }
+    if (line.startsWith("+")) {
+      body.push(`${String(newLine).padStart(4, " ")} + ${line.slice(1)}`);
+      newLine += 1;
+      continue;
+    }
+    if (line.startsWith(" ")) {
+      body.push(`${String(newLine).padStart(4, " ")}   ${line.slice(1)}`);
+      oldLine += 1;
+      newLine += 1;
+    }
+  }
+
+  return [
+    `Edit ${filePath}`,
+    ...body.slice(0, maxLines),
+    ...(body.length > maxLines ? [`     … ${String(body.length - maxLines)} more line${body.length - maxLines > 1 ? "s" : ""} hidden`] : [])
+  ].join("\n");
 }

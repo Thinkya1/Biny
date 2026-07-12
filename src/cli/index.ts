@@ -10,7 +10,7 @@ import { Command } from "commander";
 import { initCommand } from "./commands/init.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { runCommand } from "./commands/run.js";
-import { chatCommand } from "./commands/chat.js";
+import { chatCommand, type ChatCommandOptions } from "./commands/chat.js";
 import { resumeCommand } from "./commands/resume.js";
 import { sessionsCommand } from "./commands/sessions.js";
 import { planCommand } from "./commands/plan.js";
@@ -24,7 +24,12 @@ program.name("biny").description("Biny TypeScript coding agent").version("0.1.0"
 
 program.command("init").description("Initialize config and .agent directories").action(wrap(() => initCommand(workspaceRoot)));
 program.command("doctor").description("Check local environment").action(wrap(() => doctorCommand(workspaceRoot)));
-program.command("chat").description("Start interactive chat").action(wrap(() => chatCommand(workspaceRoot)));
+program
+  .command("chat")
+  .description("Start interactive chat")
+  .option("-c, --continue", "continue the latest recorded session")
+  .option("-s, --session <id>", "continue a specific session id or .jsonl path")
+  .action((options: ChatCommandOptions) => wrap(() => chatCommand(workspaceRoot, options))());
 program.command("tui").description("Start terminal UI mode").action(wrap(() => tuiCommand(workspaceRoot)));
 program.command("sessions").description("List recorded sessions").action(wrap(() => sessionsCommand(workspaceRoot)));
 program

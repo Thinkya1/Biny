@@ -10,16 +10,13 @@ export type RuntimeStatus = "idle" | "thinking" | "running" | "waiting_permissio
 
 // RuntimeEvent 是 agent/runtime 到 TUI 的唯一事件协议；UI reducer 只消费这些事件更新状态。
 export type RuntimeEvent =
-  | { type: "session.started"; sessionId: string; sessionFile: string; cwd: string; provider: string; modelLabel?: string }
+  | { type: "session.started"; sessionId: string; sessionFile: string; cwd: string; provider: string; modelLabel: string; reasoningLabel: string }
+  | { type: "model.changed"; provider: string; modelLabel: string; reasoningLabel: string }
+  | { type: "runtime.status"; status: RuntimeStatus }
   | { type: "session.completed"; sessionId: string }
   | { type: "session.error"; sessionId?: string; message: string }
+  | { type: "error.message"; message: string }
   | { type: "system.message"; content: string }
-  | { type: "messages.cleared" }
-  | { type: "messages.replaced"; messages: Array<{ role: "user" | "assistant" | "system" | "error"; content: string; fullTitle?: string; fullContent?: string }>; viewingSessionId?: string }
-  | { type: "messages.scrolled"; direction: -1 | 1; amount?: number }
-  | { type: "messages.follow_latest" }
-  | { type: "tool.details.toggled" }
-  | { type: "permission.details.toggled" }
   | { type: "user.message"; content: string }
   | { type: "assistant.delta"; content: string }
   | { type: "assistant.completed"; content: string }

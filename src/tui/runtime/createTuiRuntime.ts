@@ -1,24 +1,32 @@
 /**
- * TUI 运行时桥接模块。
- *
- * TUI 不直接调用底层 agent loop，而是通过这个 runtime 发送 prompt、取消当前轮次、回答权限请求和恢复 session。
- * 它把 agent 事件广播给 React reducer，并把权限弹窗的用户选择转换回 agent loop 等待的结果。
+ * TUI host bridge. Ink consumes agent events through this narrow interface and
+ * never reaches into the provider, tool registry, recorder or context state.
  */
-import { runAgentLoop } from "../../agent/loop.js";
-import type { AgentLoopEvent } from "../../agent/types.js";
-import type { AgentPermissionRequest, AgentPermissionResult } from "../../agent/types.js";
-import { createCommandRuntime, type CommandRuntime } from "../../runtime/CommandRuntime.js";
+import type { AgentSessionInfo, ResumedAgentSession } from "../../agent/AgentSession.js";
+import type { AgentPermissionRequest, AgentPermissionResult, AgentSessionEvent } from "../../agent/types.js";
+import type { PermissionMode } from "../../permission/PermissionManager.js";
+import type { ModelChoice, ModelRuntimeInfo, ThinkingSelection } from "../../llm/ModelManager.js";
+import { createCommandRuntime } from "../../runtime/CommandRuntime.js";
 import type { RuntimeEventSink } from "../../runtime/events.js";
-import { SessionRecorder } from "../../session/recorder.js";
-import { sessionIdFromFile } from "../sessionTranscript.js";
+import type { SessionSummary } from "../../session/events.js";
+import type { ContextStatus } from "../../agent/context/types.js";
 import type { PermissionChoice } from "../types.js";
 import { TuiEventBridge } from "./eventBridge.js";
 
 export interface TuiRuntime {
-  // TUI 只通过这些方法操作 runtime，不直接调用 agent loop 或 recorder。
-  readonly commandRuntime: CommandRuntime;
+  getInfo(): AgentSessionInfo;
+  getPermissionMode(): PermissionMode;
+  setPermissionMode(mode: PermissionMode): Promise<void>;
+  runPermissionCommand(args: string[]): Promise<string>;
+  listModels(): ModelChoice[];
+  switchModel(alias: string, thinking?: ThinkingSelection): Promise<ModelRuntimeInfo>;
   sendPrompt(prompt: string): Promise<void>;
-  resumeSession(filePath: string): Promise<void>;
+  createPlan(task: string): Promise<void>;
+  resumeSession(session: string): Promise<ResumedAgentSession>;
+  listSessions(): Promise<SessionSummary[]>;
+  contextReport(): Promise<string>;
+  contextStatus(): Promise<ContextStatus>;
+  compactConversation(hint?: string): Promise<string>;
   cancelCurrentTurn(): void;
   answerPermission(choice: PermissionChoice): void;
   subscribe(listener: RuntimeEventSink): () => void;
@@ -28,52 +36,62 @@ export interface TuiRuntime {
 export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntime> {
   const bridge = new TuiEventBridge();
   const commandRuntime = await createCommandRuntime(workspaceRoot);
-  // pendingPermission 保存当前权限弹窗的 resolver；用户按键后再恢复 agent loop。
+  const agent = commandRuntime.agent;
   let pendingPermission: ((result: AgentPermissionResult) => void) | undefined;
   let queuedPermissionChoice: PermissionChoice | undefined;
   let busy = false;
   let abortController: AbortController | undefined;
   let closePromise: Promise<void> | undefined;
 
-  bridge.emit({
-    // runtime 创建完成后立即通知 UI 当前 session 元信息。
-    type: "session.started",
-    sessionId: commandRuntime.recorder.sessionId,
-    sessionFile: commandRuntime.recorder.filePath,
-    cwd: commandRuntime.workspaceRoot,
-    provider: commandRuntime.config.model.provider,
-    modelLabel: formatModelLabel(commandRuntime.config.model.provider, commandRuntime.config.model.model)
-  });
-
   return {
-    commandRuntime,
+    getInfo(): AgentSessionInfo {
+      return agent.getInfo();
+    },
+    getPermissionMode(): PermissionMode {
+      return agent.getPermissionMode();
+    },
+    async setPermissionMode(mode: PermissionMode): Promise<void> {
+      await agent.setPermissionMode(mode);
+    },
+    async runPermissionCommand(args: string[]): Promise<string> {
+      return await agent.runPermissionCommand(args);
+    },
+    listModels(): ModelChoice[] {
+      return agent.listModels();
+    },
+    async switchModel(alias: string, thinking?: ThinkingSelection): Promise<ModelRuntimeInfo> {
+      if (busy) throw new Error("Cannot switch models while a turn is running.");
+      const info = await agent.switchModel(alias, thinking);
+      bridge.emit({
+        type: "model.changed",
+        provider: info.provider,
+        modelLabel: info.modelLabel,
+        reasoningLabel: info.reasoningLabel
+      });
+      return info;
+    },
     async sendPrompt(prompt: string): Promise<void> {
-      // 同一时间只允许一个 turn，避免 session 记录和权限状态交叉。
       if (busy) return;
       busy = true;
       abortController = new AbortController();
       try {
         bridge.emit({ type: "user.message", content: prompt });
-        for await (const event of runAgentLoop(prompt, {
-          ...commandRuntime,
+        for await (const event of agent.runSdk(prompt, {
           abortSignal: abortController.signal,
-          confirmPermission: async (request) => {
-            return await waitForPermission(request);
-          }
+          confirmPermission: async (request) => await waitForPermission(request)
         })) {
-          bridgeAgentLoopEvent(event);
+          bridgeAgentSessionEvent(event);
         }
       } catch (error) {
         if (abortController.signal.aborted) {
-          // 用户中断不视为失败，用 system message 告知并结束本轮。
-          commandRuntime.recorder.record({ type: "error", message: "Current turn interrupted." });
+          agent.recordError(new Error("Current turn interrupted."));
           bridge.emit({ type: "system.message", content: "当前轮次已中断。" });
-          bridge.emit({ type: "session.completed", sessionId: commandRuntime.recorder.sessionId });
+          bridge.emit({ type: "session.completed", sessionId: agent.getInfo().sessionId });
           return;
         }
         bridge.emit({
           type: "session.error",
-          sessionId: commandRuntime.recorder.sessionId,
+          sessionId: agent.getInfo().sessionId,
           message: error instanceof Error ? error.message : String(error)
         });
       } finally {
@@ -82,22 +100,52 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
         pendingPermission = undefined;
       }
     },
-    async resumeSession(filePath: string): Promise<void> {
-      // resume 会切换 recorder 到目标 session，后续新消息继续追加到该文件。
+    async createPlan(task: string): Promise<void> {
+      if (busy) return;
+      busy = true;
+      bridge.emit({ type: "user.message", content: `/plan ${task}` });
+      try {
+        const output = await agent.createPlan(task, (delta) => bridge.emit({ type: "assistant.delta", content: delta }));
+        bridge.emit({ type: "assistant.completed", content: output });
+        bridge.emit({ type: "session.completed", sessionId: agent.getInfo().sessionId });
+      } catch (error) {
+        bridge.emit({
+          type: "session.error",
+          sessionId: agent.getInfo().sessionId,
+          message: error instanceof Error ? error.message : String(error)
+        });
+      } finally {
+        busy = false;
+      }
+    },
+    async resumeSession(session: string): Promise<ResumedAgentSession> {
       if (busy) throw new Error("Cannot resume another session while a turn is running.");
-      await commandRuntime.recorder.close();
-      commandRuntime.recorder = new SessionRecorder(commandRuntime.workspaceRoot, sessionIdFromFile(filePath));
+      const resumed = await agent.resume(session);
+      const info = agent.getInfo();
       bridge.emit({
         type: "session.started",
-        sessionId: commandRuntime.recorder.sessionId,
-        sessionFile: commandRuntime.recorder.filePath,
-        cwd: commandRuntime.workspaceRoot,
-        provider: commandRuntime.config.model.provider,
-        modelLabel: formatModelLabel(commandRuntime.config.model.provider, commandRuntime.config.model.model)
+        sessionId: info.sessionId,
+        sessionFile: info.sessionFile,
+        cwd: info.workspaceRoot,
+        provider: info.provider,
+        modelLabel: info.modelLabel,
+        reasoningLabel: info.reasoningLabel
       });
+      return resumed;
+    },
+    async listSessions(): Promise<SessionSummary[]> {
+      return await agent.listSessions();
+    },
+    async contextReport(): Promise<string> {
+      return await agent.contextReport();
+    },
+    async contextStatus(): Promise<ContextStatus> {
+      return await agent.contextStatus();
+    },
+    async compactConversation(hint?: string): Promise<string> {
+      return await agent.compactConversation(hint);
     },
     cancelCurrentTurn(): void {
-      // 取消 turn 时同时拒绝悬挂的权限请求，避免 agent loop 永远等待。
       if (!busy || !abortController) return;
       abortController.abort();
       if (pendingPermission) {
@@ -106,7 +154,6 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
       }
     },
     answerPermission(choice: PermissionChoice): void {
-      // 如果按键早于 resolver 建立，先缓存一次选择，waitForPermission 会消费它。
       if (!pendingPermission) {
         queuedPermissionChoice = choice;
         return;
@@ -118,14 +165,12 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
       return bridge.subscribe(listener);
     },
     close(): Promise<void> {
-      // close 保持幂等，避免 React unmount 和显式退出同时关闭 recorder。
       closePromise ??= commandRuntime.close();
       return closePromise;
     }
   };
 
   async function waitForPermission(_request: AgentPermissionRequest): Promise<AgentPermissionResult> {
-    // 权限请求事件已经由 agent loop 发到 UI，这里只负责等待用户选择。
     if (queuedPermissionChoice !== undefined) {
       const choice = queuedPermissionChoice;
       queuedPermissionChoice = undefined;
@@ -136,29 +181,31 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
     });
   }
 
-  function bridgeAgentLoopEvent(event: AgentLoopEvent): void {
-    if (event.type === "status") return;
-    if (event.type === "assistant_delta") {
-      bridge.emit({ type: "assistant.delta", content: event.content });
+  function bridgeAgentSessionEvent(event: AgentSessionEvent): void {
+    if (event.type === "status") {
+      bridge.emit({ type: "runtime.status", status: event.status });
       return;
     }
-    if (event.type === "assistant_message") {
-      bridge.emit({ type: "assistant.completed", content: event.content });
+    if (event.type === "sdk") {
+      const part = event.part;
+      if (part.type === "text-delta") {
+        bridge.emit({ type: "assistant.delta", content: part.text });
+      } else if (part.type === "tool-result") {
+        bridge.emit({ type: "tool.call.completed", toolCallId: part.toolCallId, tool: part.toolName, result: part.output });
+      } else if (part.type === "tool-error") {
+        bridge.emit({ type: "tool.call.failed", toolCallId: part.toolCallId, tool: part.toolName, error: String(part.error) });
+      }
       return;
     }
-    if (event.type === "tool_call") {
-      bridge.emit({ type: "tool.call.started", toolCallId: event.call.id, tool: event.call.name, args: event.call.args, description: event.description, display: event.display });
+    if (event.type === "tool-started") {
+      bridge.emit({ type: "tool.call.started", toolCallId: event.toolCallId, tool: event.tool, args: event.args, description: event.description, display: event.display });
       return;
     }
-    if (event.type === "tool_progress") {
+    if (event.type === "tool-progress") {
       bridge.emit({ type: "tool.call.progress", toolCallId: event.toolCallId, tool: event.tool, update: event.update });
       return;
     }
-    if (event.type === "tool_result") {
-      bridge.emit({ type: "tool.call.completed", toolCallId: event.toolCallId, tool: event.tool, result: event.result });
-      return;
-    }
-    if (event.type === "permission_request") {
+    if (event.type === "permission-requested") {
       bridge.emit({
         type: "permission.requested",
         tool: event.request.tool,
@@ -176,27 +223,21 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
       });
       return;
     }
-    if (event.type === "permission_result") {
+    if (event.type === "permission-result") {
       bridge.emit(event.result.approved
         ? { type: "permission.approved", tool: event.request.tool, scope: event.result.scope ?? "once" }
         : { type: "permission.rejected", tool: event.request.tool, reason: event.result.message });
-      if (event.result.nextMode) {
-        bridge.emit({ type: "permission.status.changed", message: `Permission mode switched to ${event.result.nextMode}.` });
-      }
       return;
     }
     if (event.type === "error") {
-      bridge.emit({ type: "session.error", sessionId: commandRuntime.recorder.sessionId, message: event.message });
+      bridge.emit({ type: "error.message", message: event.message });
       return;
     }
-    bridge.emit({ type: "session.completed", sessionId: commandRuntime.recorder.sessionId });
+    if (event.type === "done") {
+      if (event.content) bridge.emit({ type: "assistant.completed", content: event.content });
+      bridge.emit({ type: "session.completed", sessionId: agent.getInfo().sessionId });
+    }
   }
-}
-
-function formatModelLabel(provider: string, model: string): string {
-  // model 与 provider 相同或为空时只显示 provider，减少状态栏噪音。
-  if (!model || model === provider) return provider;
-  return `${provider}/${model}`;
 }
 
 function permissionChoiceToResult(choice: PermissionChoice): AgentPermissionResult {

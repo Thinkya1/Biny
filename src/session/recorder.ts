@@ -11,9 +11,9 @@ import { sessionFilePath } from "./store.js";
 export type SessionEvent =
   // session 事件类型要保持稳定；resume、未来上下文压缩和记忆功能都会依赖这几个基础类型。
   | { type: "user_message"; content: string; time?: string }
-  | { type: "assistant_message"; content: string; time?: string }
-  | { type: "tool_call"; tool: string; args: unknown; time?: string }
-  | { type: "tool_result"; tool: string; result: unknown; time?: string }
+  | { type: "assistant_message"; content: string; reasoningContent?: string; time?: string }
+  | { type: "tool_call"; tool: string; args: unknown; toolCallId?: string; sequence?: number; assistantContent?: string; reasoningContent?: string; time?: string }
+  | { type: "tool_result"; tool: string; result: unknown; toolCallId?: string; sequence?: number; time?: string }
   | { type: "error"; message: string; detail?: unknown; time?: string };
 
 export class SessionRecorder {
@@ -21,6 +21,8 @@ export class SessionRecorder {
   readonly filePath: string;
   private readonly stream: WriteStream;
   private closePromise?: Promise<void>;
+  private toolCallSequence = 0;
+  private recordedEvents = 0;
 
   constructor(workspaceRoot: string, sessionId = createSessionId()) {
     // sessionId 默认按时间和随机后缀生成，便于人工排序也避免同秒冲突。
@@ -33,6 +35,20 @@ export class SessionRecorder {
     // 每个事件一行 JSON，便于追加写入，也方便后续按行读取和压缩。
     const line = JSON.stringify({ ...event, time: event.time ?? new Date().toISOString() });
     this.stream.write(`${line}\n`);
+    this.recordedEvents += 1;
+  }
+
+  nextToolCallSequence(): number {
+    this.toolCallSequence += 1;
+    return this.toolCallSequence;
+  }
+
+  restoreToolCallSequence(sequence: number): void {
+    this.toolCallSequence = Math.max(this.toolCallSequence, sequence);
+  }
+
+  hasRecordedEvents(): boolean {
+    return this.recordedEvents > 0;
   }
 
   close(): Promise<void> {

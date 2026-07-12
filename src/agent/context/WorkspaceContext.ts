@@ -1,0 +1,348 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import type { ModelMessage } from "ai";
+import { messageText } from "../modelMessages.js";
+import { collectProjectContext } from "../../project/ProjectContext.js";
+import { scanWorkspaceFiles } from "../../workspace/scanner.js";
+import type { LoadedInstruction, ProjectSnapshot, RecentWorkspaceActivity, RepoMapEntry, RepoMapRole, WorkspaceTurnData } from "./types.js";
+
+const instructionFileNames = ["AGENTS.override.md", "AGENTS.md"];
+const codeExtensions = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md"]);
+const maxRepoFiles = 600;
+const maxSourceChars = 120_000;
+
+export interface WorkspaceContextStatus {
+  loadedInstructions: string[];
+  instructionBytes: number;
+  snapshotRefreshedAt?: string;
+  snapshotDirty: boolean;
+  repoMapRefreshedAt?: string;
+  repoMapDirty: boolean;
+  repoMapEntries: number;
+  activePaths: string[];
+  recentActivity: RecentWorkspaceActivity;
+}
+
+export class WorkspaceContext {
+  private readonly loadedInstructions: LoadedInstruction[] = [];
+  private readonly visitedInstructionDirectories = new Set<string>();
+  private readonly activePaths: string[] = [];
+  private readonly recentSummaries: string[] = [];
+  private instructionBytes = 0;
+  private snapshot: ProjectSnapshot | undefined;
+  private snapshotDirty = true;
+  private repoEntries: RepoMapEntry[] = [];
+  private repoMapRefreshedAt: string | undefined;
+  private repoMapDirty = true;
+  private initialized = false;
+
+  constructor(
+    private readonly workspaceRoot: string,
+    private readonly ignore: string[],
+    private readonly instructionMaxBytes: number
+  ) {}
+
+  async initialize(): Promise<void> {
+    if (this.initialized) return;
+    await Promise.all([
+      this.loadInstructionDirectory(this.workspaceRoot),
+      this.refreshSnapshot(),
+      this.refreshRepoMap()
+    ]);
+    this.initialized = true;
+  }
+
+  async prepareTurn(input: string): Promise<WorkspaceTurnData> {
+    await this.initialize();
+    const explicitPaths = extractPathReferences(input);
+    await this.loadInstructionsForPaths(this.activePaths);
+    const [snapshot, repoMapCandidates] = await Promise.all([
+      this.refreshSnapshot(),
+      this.findRepoMapCandidates(input)
+    ]);
+    return {
+      instructions: this.loadedInstructions.map((instruction) => ({ ...instruction })),
+      snapshot,
+      explicitPaths,
+      recentActivity: this.recentActivity(),
+      repoMapCandidates
+    };
+  }
+
+  observeToolResult(tool: string, args: unknown, result: unknown): void {
+    const paths = collectPaths(args, result);
+    for (const filePath of paths) addUnique(this.activePaths, filePath, 24);
+    addUnique(this.recentSummaries, summarizeToolResult(tool, paths, result), 12);
+    if (tool === "run_command" || ((tool === "write_file" || tool === "edit_file") && !isFailure(result))) {
+      this.snapshotDirty = true;
+      this.repoMapDirty = true;
+    }
+  }
+
+  restoreFromHistory(messages: ModelMessage[]): void {
+    this.activePaths.splice(0, this.activePaths.length);
+    this.recentSummaries.splice(0, this.recentSummaries.length);
+    for (const message of messages) {
+      for (const filePath of extractPathReferences(messageText(message))) addUnique(this.activePaths, filePath, 24);
+    }
+  }
+
+  status(): WorkspaceContextStatus {
+    return {
+      loadedInstructions: this.loadedInstructions.map((instruction) => instruction.path),
+      instructionBytes: this.instructionBytes,
+      snapshotRefreshedAt: this.snapshot?.refreshedAt,
+      snapshotDirty: this.snapshotDirty,
+      repoMapRefreshedAt: this.repoMapRefreshedAt,
+      repoMapDirty: this.repoMapDirty,
+      repoMapEntries: this.repoEntries.length,
+      activePaths: [...this.activePaths],
+      recentActivity: this.recentActivity()
+    };
+  }
+
+  private async refreshSnapshot(): Promise<ProjectSnapshot> {
+    if (!this.snapshot || this.snapshotDirty) {
+      const context = await collectProjectContext(this.workspaceRoot, this.ignore);
+      this.snapshot = {
+        context,
+        refreshedAt: new Date().toISOString(),
+        revision: (this.snapshot?.revision ?? 0) + 1
+      };
+      this.snapshotDirty = false;
+    }
+    return this.snapshot;
+  }
+
+  private async refreshRepoMap(): Promise<void> {
+    if (!this.repoMapDirty) return;
+    const files = (await scanWorkspaceFiles(this.workspaceRoot, this.ignore, maxRepoFiles)).sort((left, right) => left.localeCompare(right));
+    this.repoEntries = await Promise.all(files.map(async (filePath) => await buildRepoMapEntry(this.workspaceRoot, filePath)));
+    this.repoMapRefreshedAt = new Date().toISOString();
+    this.repoMapDirty = false;
+  }
+
+  private async findRepoMapCandidates(query: string): Promise<RepoMapEntry[]> {
+    await this.refreshRepoMap();
+    const active = new Set(this.activePaths);
+    const terms = tokenize(query);
+    return this.repoEntries
+      .map((entry) => ({ entry, score: scoreRepoEntry(entry, active, terms) }))
+      .filter((item) => item.score > 0)
+      .sort((left, right) => right.score - left.score || left.entry.path.localeCompare(right.entry.path))
+      .slice(0, 12)
+      .map((item) => item.entry);
+  }
+
+  private async loadInstructionsForPaths(filePaths: string[]): Promise<void> {
+    const directories = new Set<string>();
+    for (const filePath of filePaths) {
+      const absolutePath = this.toWorkspacePath(filePath);
+      if (!absolutePath) continue;
+      let currentDirectory = path.dirname(absolutePath);
+      const chain: string[] = [];
+      while (isInsideWorkspace(this.workspaceRoot, currentDirectory)) {
+        chain.unshift(currentDirectory);
+        if (currentDirectory === this.workspaceRoot) break;
+        currentDirectory = path.dirname(currentDirectory);
+      }
+      for (const directory of chain) directories.add(directory);
+    }
+    for (const directory of [...directories].sort((left, right) => left.localeCompare(right))) {
+      await this.loadInstructionDirectory(directory);
+    }
+  }
+
+  private async loadInstructionDirectory(directory: string): Promise<void> {
+    if (this.visitedInstructionDirectories.has(directory) || this.instructionBytes >= this.instructionMaxBytes) return;
+    this.visitedInstructionDirectories.add(directory);
+    const filePath = await findInstructionFile(directory);
+    if (!filePath) return;
+
+    const content = await fs.readFile(filePath, "utf8");
+    const selectedContent = truncateUtf8(content, this.instructionMaxBytes - this.instructionBytes);
+    const bytes = Buffer.byteLength(selectedContent, "utf8");
+    if (!selectedContent || !bytes) return;
+    this.loadedInstructions.push({
+      path: path.relative(this.workspaceRoot, filePath) || path.basename(filePath),
+      content: selectedContent,
+      bytes
+    });
+    this.instructionBytes += bytes;
+  }
+
+  private toWorkspacePath(filePath: string): string | undefined {
+    const absolutePath = path.resolve(this.workspaceRoot, filePath);
+    return isInsideWorkspace(this.workspaceRoot, absolutePath) ? absolutePath : undefined;
+  }
+
+  private recentActivity(): RecentWorkspaceActivity {
+    return { paths: [...this.activePaths], summaries: [...this.recentSummaries] };
+  }
+}
+
+export function formatRepoMapCandidates(entries: RepoMapEntry[]): string {
+  if (!entries.length) return "(no deterministic RepoMap candidates)";
+  return entries.map((entry) => {
+    const details = [
+      entry.role,
+      entry.symbols.length ? `symbols: ${entry.symbols.join(", ")}` : "",
+      entry.imports.length ? `imports: ${entry.imports.join(", ")}` : "",
+      entry.exports.length ? `exports: ${entry.exports.join(", ")}` : ""
+    ].filter(Boolean).join("; ");
+    return `- ${entry.path}${details ? ` (${details})` : ""}`;
+  }).join("\n");
+}
+
+export function extractPathReferences(value: string): string[] {
+  return [...new Set(value.match(/[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json|md|yml|yaml|css|html)/g) ?? [])].slice(0, 24);
+}
+
+async function buildRepoMapEntry(workspaceRoot: string, filePath: string): Promise<RepoMapEntry> {
+  const role = classifyRepoRole(filePath);
+  if (!codeExtensions.has(path.extname(filePath).toLowerCase())) {
+    return { path: filePath, role, symbols: [], imports: [], exports: [] };
+  }
+  try {
+    const content = (await fs.readFile(path.join(workspaceRoot, filePath), "utf8")).slice(0, maxSourceChars);
+    return {
+      path: filePath,
+      role,
+      symbols: extractSymbols(content),
+      imports: extractImports(content),
+      exports: extractExports(content)
+    };
+  } catch {
+    return { path: filePath, role, symbols: [], imports: [], exports: [] };
+  }
+}
+
+function classifyRepoRole(filePath: string): RepoMapRole {
+  const normalized = filePath.replace(/\\/g, "/");
+  const baseName = path.basename(normalized).toLowerCase();
+  if (/\.(test|spec)\.[cm]?[jt]sx?$/.test(baseName) || normalized.includes("/tests/")) return "test";
+  if (["index.ts", "index.tsx", "main.ts", "main.tsx", "cli.ts", "server.ts"].includes(baseName)) return "entry";
+  if (["package.json", "tsconfig.json", "vite.config.ts", "next.config.js"].includes(baseName)) return "config";
+  if (normalized.startsWith("src/")) return "source";
+  return "other";
+}
+
+function extractSymbols(content: string): string[] {
+  const matches = content.matchAll(/\b(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)/g);
+  return unique([...matches].map((match) => match[1]).filter((value): value is string => Boolean(value))).slice(0, 24);
+}
+
+function extractImports(content: string): string[] {
+  const fromImports = [...content.matchAll(/\b(?:import|export)\s+(?:[\s\S]*?\s+from\s+)?["']([^"']+)["']/g)].map((match) => match[1]);
+  const requires = [...content.matchAll(/\brequire\(["']([^"']+)["']\)/g)].map((match) => match[1]);
+  return unique([...fromImports, ...requires].filter((value): value is string => Boolean(value))).slice(0, 16);
+}
+
+function extractExports(content: string): string[] {
+  const declarations = [...content.matchAll(/\bexport\s+(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|enum|const|let|var)\s+([A-Za-z_$][\w$]*)/g)]
+    .map((match) => match[1]);
+  const lists = [...content.matchAll(/\bexport\s*{([^}]+)}/g)]
+    .flatMap((match) => match[1]?.split(",").map((name) => name.trim().split(/\s+as\s+/)[0]?.trim()) ?? []);
+  return unique([...declarations, ...lists].filter((value): value is string => Boolean(value))).slice(0, 24);
+}
+
+function scoreRepoEntry(entry: RepoMapEntry, activePaths: Set<string>, terms: string[]): number {
+  let score = activePaths.has(entry.path) ? 80 : 0;
+  if (entry.role === "entry") score += 8;
+  if (!terms.length) return score + (entry.role === "source" ? 2 : 1);
+  const pathText = entry.path.toLowerCase();
+  const symbolText = entry.symbols.join(" ").toLowerCase();
+  const importText = entry.imports.join(" ").toLowerCase();
+  for (const term of terms) {
+    if (pathText.includes(term)) score += 12;
+    if (symbolText.includes(term)) score += 10;
+    if (importText.includes(term)) score += 4;
+  }
+  return score;
+}
+
+function collectPaths(args: unknown, result: unknown): string[] {
+  const paths: string[] = [];
+  collectRecordPaths(args, paths);
+  collectRecordPaths(result, paths);
+  return [...new Set(paths)].slice(0, 24);
+}
+
+function collectRecordPaths(value: unknown, paths: string[]): void {
+  if (!isRecord(value)) return;
+  if (typeof value.path === "string") addUnique(paths, value.path, 24);
+  if (Array.isArray(value.files)) {
+    for (const file of value.files) if (typeof file === "string") addUnique(paths, file, 24);
+  }
+  if (Array.isArray(value.matches)) {
+    for (const match of value.matches) {
+      if (isRecord(match) && typeof match.path === "string") addUnique(paths, match.path, 24);
+    }
+  }
+}
+
+function summarizeToolResult(tool: string, paths: string[], result: unknown): string {
+  const target = paths.length ? ` ${paths.slice(0, 4).join(", ")}` : "";
+  return isFailure(result) ? `${tool} failed${target}` : `${tool} completed${target}`;
+}
+
+function isFailure(value: unknown): boolean {
+  return isRecord(value) && (typeof value.error === "string" || value.status === "denied");
+}
+
+async function findInstructionFile(directory: string): Promise<string | undefined> {
+  for (const fileName of instructionFileNames) {
+    const filePath = path.join(directory, fileName);
+    try {
+      if ((await fs.stat(filePath)).isFile()) return filePath;
+    } catch (error) {
+      if (isNotFound(error)) continue;
+      throw error;
+    }
+  }
+  return undefined;
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const suffix = "\n[truncated]";
+  const suffixBytes = Buffer.byteLength(suffix, "utf8");
+  if (maxBytes <= suffixBytes) return Buffer.from(value, "utf8").subarray(0, maxBytes).toString("utf8");
+  const targetBytes = maxBytes - suffixBytes;
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(value.slice(0, middle), "utf8") <= targetBytes) low = middle;
+    else high = middle - 1;
+  }
+  return `${value.slice(0, low)}${suffix}`;
+}
+
+function isInsideWorkspace(workspaceRoot: string, candidate: string): boolean {
+  const relative = path.relative(workspaceRoot, candidate);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function tokenize(value: string): string[] {
+  return unique(value.toLowerCase().split(/[^a-z0-9_$./-]+/).filter((term) => term.length >= 2)).slice(0, 12);
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function addUnique(values: string[], value: string, limit: number): void {
+  if (!value || values.includes(value)) return;
+  values.push(value);
+  if (values.length > limit) values.splice(0, values.length - limit);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNotFound(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}

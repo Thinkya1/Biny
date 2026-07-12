@@ -6,7 +6,7 @@
  */
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import type { AgentPermissionRequest, AgentPermissionResult } from "../agent/types.js";
+import type { PermissionPrompt, PermissionResult } from "./PermissionManager.js";
 
 export interface ConfirmOptions {
   // 高风险操作可以要求完整输入 yes，避免用户误按 y。
@@ -26,7 +26,7 @@ export async function confirmAction(title: string, details: string, options: Con
   }
 }
 
-export async function confirmPermissionRequest(request: AgentPermissionRequest): Promise<AgentPermissionResult> {
+export async function confirmPermissionRequest(request: PermissionPrompt): Promise<PermissionResult> {
   output.write(`\n${request.title}\n`);
   output.write(`Tool: ${request.tool}\n`);
   output.write(`Action: ${request.actionType}\n`);

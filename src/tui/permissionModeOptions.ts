@@ -24,6 +24,11 @@ export const permissionModeOptions: PermissionModeOption[] = [
   }
 ];
 
+export function permissionModeLabel(mode: PermissionMode): string {
+  if (mode === "read-only") return "Read Only";
+  return permissionModeOptions.find((option) => option.mode === mode)?.label ?? mode;
+}
+
 export function permissionModeOptionIndex(mode: PermissionMode): number {
   const index = permissionModeOptions.findIndex((option) => option.mode === mode);
   return index === -1 ? 0 : index;

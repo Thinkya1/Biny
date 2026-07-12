@@ -7,13 +7,15 @@
 - 只有一个参数的内部方法，不要为了风格统一硬改成 options object。
 - 除了包自身的 `index.ts` 外，其他 `index.ts` 文件应优先使用 `export * from "./module"`。
 - 不要过度封装，尤其是一两行的小函数，不要为了形式引入两层包装，直接内联即可。
+- 减少冗余；每个函数、文件和模块只承担一个清晰职责。不要把无关逻辑堆进同一文件，优先通过明确边界解耦。
 - 完成一个任务及时更新PROJECT_DESCRIPTION.local.md
 ## 当前项目约束
 
-- 当前保留 `MockProvider`，并支持通过 OpenAI-compatible 接口接入 DeepSeek。
-- 真实模型 API key 只能通过环境变量读取，不能写入代码、配置文件、README、测试快照或 session 示例。
+- 当前不保留 `MockProvider`；模型通过命名 provider profile 或通用 OpenAI-compatible 接口接入。
+- 真实模型 API key 可从 `providers.<alias>.apiKey` 或 `providers.<alias>.apiKeyEnv` 读取。不得把真实 key 写入代码、README、测试快照或 session 示例；配置文件中的 key 应视作敏感本地数据。
 - 新功能优先保持 CLI、Runtime、AgentLoop、Tool、Permission、Session、Context 的边界清晰。
 - 不要把新能力继续堆进 `agent/loop.ts` 或 `cli/commands/chat.ts`；能抽到 runtime、prompt、tools、session、permission 的，应放到对应模块。
+- 同样不要把业务逻辑堆进 TUI 组件；入口只负责装配和路由，具体上下文、会话、记忆和提示词逻辑应落在各自模块。
 - 保持 `pnpm typecheck` 通过。
 - 修改工具行为时，确保 session 仍记录 `user_message`、`assistant_message`、`tool_call`、`tool_result`、`error` 这些稳定事件类型。
 

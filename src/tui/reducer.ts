@@ -1,113 +1,191 @@
 /**
- * TUI 状态归约模块。
+ * Pure TUI state reducer.
  *
- * Runtime 事件会在这里转换成可渲染的界面状态：消息列表、工具调用摘要、权限请求、滚动状态和轮次耗时。
- * reducer 保持纯函数，不读写文件，也不持有 runtime 对象。
+ * Completed transcript items are immutable history. Streaming assistant text
+ * and running tools live in active cells and are updated in place until one
+ * completion event commits each cell exactly once.
  */
 import type { RuntimeEvent } from "../runtime/events.js";
-import type { ToolInputDisplay } from "../tools/types.js";
-import { formatDiffPreviewLines, renderDiffLinesClustered, renderFileContentPreview } from "./diffPreview.js";
-import type { TuiState, TuiToolCall } from "./types.js";
-import { summarizeToolOutput } from "./toolOutputSummary.js";
+import {
+  completeToolItem,
+  createRunningToolItem,
+  updateRunningToolItem
+} from "./toolPresentation.js";
+import type {
+  ActiveTranscriptItem,
+  AssistantTranscriptItem,
+  NotificationTranscriptItem,
+  ToolTranscriptItem,
+  TranscriptItem,
+  TranscriptState,
+  TuiState
+} from "./types.js";
+
+export type TuiAction = RuntimeEvent
+  | { type: "transcript.cleared" }
+  | { type: "transcript.replaced"; items: TranscriptItem[]; viewingSessionId?: string }
+  | { type: "transcript.scrolled"; direction: -1 | 1; amount?: number }
+  | { type: "transcript.follow_latest" }
+  | { type: "tool.details.toggled" }
+  | { type: "permission.details.toggled" };
 
 export function createInitialTuiState(workspaceRoot: string): TuiState {
-  // 初始状态先显示欢迎消息；真正 session 信息会在 runtime 创建完成后覆盖。
   return {
     cwd: workspaceRoot,
     provider: "No model",
     modelLabel: "No model",
+    reasoningLabel: "Not configured",
     sessionId: "",
     sessionFile: "",
     viewingSessionId: undefined,
     status: "idle",
     turnStartedAt: undefined,
     lastWorkedMs: undefined,
-    messages: [{ id: "welcome", role: "system", content: "BinyAgent TUI 已启动。输入 / 查看命令，Enter 发送，/exit 退出。" }],
-    messageScrollOffset: 0,
+    transcript: { committed: [], active: [] },
+    transcriptScrollOffset: 0,
     followLatest: true,
-    toolCalls: [],
-    toolDetailsExpanded: false,
+    expandedToolId: undefined,
     permissionDetailsExpanded: false
   };
 }
 
-export function tuiReducer(state: TuiState, event: RuntimeEvent): TuiState {
-  // reducer 保持纯函数，只根据事件更新 UI 状态，不直接访问 runtime 或文件系统。
+export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
   switch (event.type) {
     case "session.started":
-      // 新 session 或 resume 后都会重置运行中状态，但保留消息由调用方决定。
-      return { ...state, cwd: event.cwd, provider: event.provider, modelLabel: event.modelLabel ?? event.provider, sessionId: event.sessionId, sessionFile: event.sessionFile, viewingSessionId: event.sessionId, status: "idle", turnStartedAt: undefined, lastWorkedMs: undefined };
-    case "session.completed":
-      // 完成事件负责计算本轮耗时，并清掉可能残留的权限请求。
       return {
         ...state,
-        status: "completed",
+        cwd: event.cwd,
+        provider: event.provider,
+        modelLabel: event.modelLabel,
+        reasoningLabel: event.reasoningLabel,
+        sessionId: event.sessionId,
+        sessionFile: event.sessionFile,
+        viewingSessionId: event.sessionId,
+        status: "idle",
+        turnStartedAt: undefined,
+        lastWorkedMs: undefined
+      };
+    case "model.changed":
+      return { ...state, provider: event.provider, modelLabel: event.modelLabel, reasoningLabel: event.reasoningLabel };
+    case "runtime.status":
+      return { ...state, status: event.status };
+    case "session.completed": {
+      const transcript = finalizeActiveCells(state.transcript, "skipped", "Interrupted before completion.");
+      return {
+        ...state,
+        status: state.status === "error" ? "error" : "completed",
         permission: undefined,
         lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
-        turnStartedAt: undefined
+        turnStartedAt: undefined,
+        transcript
       };
-    case "session.error":
-      // 运行时错误既更新状态，也追加一条 error 消息到 transcript。
+    }
+    case "session.error": {
+      const finalized = finalizeActiveCells(state.transcript, "failed", event.message);
       return {
         ...state,
         status: "error",
         permission: undefined,
         lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
         turnStartedAt: undefined,
-        messages: appendMessage(state, "error", event.message)
+        transcript: commitItem(finalized, {
+          id: nextTranscriptId(finalized, "error"),
+          kind: "error",
+          content: event.message
+        })
       };
-    case "system.message":
-      return { ...state, messages: appendMessage(state, "system", event.content) };
-    case "messages.cleared":
-      return { ...state, messages: [], toolCalls: [], messageScrollOffset: 0, followLatest: true };
-    case "messages.replaced":
+    }
+    case "error.message":
       return {
         ...state,
-        viewingSessionId: event.viewingSessionId,
-        messages: event.messages.map((message, index) => ({ ...message, id: `loaded-${String(index + 1)}` })),
-        messageScrollOffset: 0,
-        followLatest: true,
-        turnStartedAt: undefined,
-        lastWorkedMs: undefined
+        status: "error",
+        transcript: commitItem(state.transcript, {
+          id: nextTranscriptId(state.transcript, "error"),
+          kind: "error",
+          content: event.message
+        })
       };
-    case "messages.scrolled":
-      // 用户手动滚动后停止自动跟随最新消息，直到显式按 End。
+    case "system.message":
+      return {
+        ...state,
+        transcript: commitItem(state.transcript, notificationItem(state.transcript, event.content))
+      };
+    case "transcript.cleared":
+      return {
+        ...state,
+        transcript: { committed: [], active: [] },
+        expandedToolId: undefined,
+        transcriptScrollOffset: 0,
+        followLatest: true
+      };
+    case "transcript.replaced":
+      return replaceTranscript(state, event.items, event.viewingSessionId);
+    case "transcript.scrolled":
       return {
         ...state,
         followLatest: false,
-        messageScrollOffset: Math.max(0, state.messageScrollOffset + event.direction * (event.amount ?? 1))
+        transcriptScrollOffset: Math.max(0, state.transcriptScrollOffset + event.direction * (event.amount ?? 1))
       };
-    case "messages.follow_latest":
-      return { ...state, followLatest: true, messageScrollOffset: 0 };
-    case "tool.details.toggled":
-      return { ...state, toolDetailsExpanded: !state.toolDetailsExpanded };
+    case "transcript.follow_latest":
+      return { ...state, followLatest: true, transcriptScrollOffset: 0 };
+    case "tool.details.toggled": {
+      const latest = latestToolItem(state.transcript);
+      if (!latest) return state;
+      return { ...state, expandedToolId: state.expandedToolId === latest.id ? undefined : latest.id };
+    }
     case "permission.details.toggled":
       return { ...state, permissionDetailsExpanded: !state.permissionDetailsExpanded };
     case "user.message":
-      // 用户消息标志新一轮开始，后续 assistant delta 会接在 transcript 末尾。
-      return { ...state, viewingSessionId: state.sessionId, status: "thinking", turnStartedAt: Date.now(), lastWorkedMs: undefined, messages: appendMessage(state, "user", event.content) };
+      return {
+        ...state,
+        viewingSessionId: state.sessionId,
+        status: "thinking",
+        turnStartedAt: Date.now(),
+        lastWorkedMs: undefined,
+        transcript: commitItem(state.transcript, {
+          id: nextTranscriptId(state.transcript, "user"),
+          kind: "user",
+          content: event.content
+        })
+      };
     case "assistant.delta":
-      return { ...state, status: "thinking", messages: appendAssistantDelta(state, event.content) };
+      return {
+        ...state,
+        status: "thinking",
+        transcript: updateAssistantDelta(state.transcript, event.content)
+      };
     case "assistant.completed":
-      return { ...state, status: "completed", messages: completeAssistantMessage(state, event.content) };
-    case "tool.call.started": {
-      const next = appendToolCall(state, event.toolCallId, event.tool, summarizeToolArgs(event.tool, event.args), event.display);
-      return { ...state, status: "running", toolCalls: next.toolCalls, messages: next.messages };
-    }
-    case "tool.call.progress": {
-      const next = updateToolProgress(state, event.toolCallId, event.tool, summarizeToolProgress(event.update));
-      return { ...state, status: "running", toolCalls: next.toolCalls, messages: next.messages };
-    }
-    case "tool.call.completed": {
-      const next = finishLatestToolCall(state, event.toolCallId, event.tool, resultStatus(event.result), event.result);
-      return { ...state, status: "running", toolCalls: next.toolCalls, messages: next.messages };
-    }
-    case "tool.call.failed": {
-      const next = finishLatestToolCall(state, event.toolCallId, event.tool, "failed", event.error);
-      return { ...state, status: "error", toolCalls: next.toolCalls, messages: next.messages };
-    }
+      return {
+        ...state,
+        status: "completed",
+        transcript: commitAssistant(state.transcript, event.content)
+      };
+    case "tool.call.started":
+      return {
+        ...state,
+        status: "running",
+        expandedToolId: undefined,
+        transcript: startTool(state.transcript, event)
+      };
+    case "tool.call.progress":
+      return {
+        ...state,
+        status: "running",
+        transcript: updateTool(state.transcript, event.toolCallId, event.tool, (item) => updateRunningToolItem(item, event.update))
+      };
+    case "tool.call.completed":
+      return {
+        ...state,
+        status: "running",
+        transcript: finishTool(state.transcript, event.toolCallId, event.tool, event.result)
+      };
+    case "tool.call.failed":
+      return {
+        ...state,
+        status: "error",
+        transcript: finishTool(state.transcript, event.toolCallId, event.tool, { error: event.error }, "failed")
+      };
     case "permission.requested":
-      // 权限请求会冻结输入框，并由 PermissionPrompt 接管 y/n/a 快捷键。
       return {
         ...state,
         status: "waiting_permission",
@@ -129,250 +207,175 @@ export function tuiReducer(state: TuiState, event: RuntimeEvent): TuiState {
     case "permission.approved":
       return { ...state, status: "running", permission: undefined };
     case "permission.rejected":
+      return { ...state, status: "running", permission: undefined };
+    case "permission.status.changed":
       return {
         ...state,
-        status: "completed",
-        permission: undefined,
-        lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
-        turnStartedAt: undefined
+        transcript: commitItem(state.transcript, {
+          ...notificationItem(state.transcript, event.message),
+          tone: "success"
+        })
       };
-    case "permission.status.changed":
-      return { ...state, messages: appendMessage(state, "system", event.message) };
   }
 }
 
-function appendMessage(state: TuiState, role: "user" | "assistant" | "system" | "error", content: string) {
-  // 简单用消息数量生成稳定 id；session reload 会重新生成 loaded-* id。
-  return [...state.messages, { id: `${role}-${String(state.messages.length + 1)}`, role, content }];
-}
-
-function appendAssistantDelta(state: TuiState, content: string) {
-  // 流式输出时持续修改最后一条 assistant 消息；没有 assistant 时新建一条。
-  const last = state.messages[state.messages.length - 1];
-  if (last?.role === "assistant") {
-    return [...state.messages.slice(0, -1), { ...last, content: `${last.content}${content}` }];
+function updateAssistantDelta(transcript: TranscriptState, content: string): TranscriptState {
+  const index = transcript.active.findIndex((item) => item.kind === "assistant");
+  if (index === -1) {
+    return {
+      ...transcript,
+      active: [
+        ...transcript.active,
+        { id: nextTranscriptId(transcript, "assistant"), kind: "assistant", content }
+      ]
+    };
   }
-  return appendMessage(state, "assistant", content);
+  const active = [...transcript.active];
+  const item = active[index] as AssistantTranscriptItem;
+  active[index] = { ...item, content: `${item.content}${content}` };
+  return { ...transcript, active };
 }
 
-function completeAssistantMessage(state: TuiState, content: string) {
-  // complete 事件用最终文本覆盖流式累积内容，确保 session 和 UI 一致。
-  const last = state.messages[state.messages.length - 1];
-  if (last?.role === "assistant") {
-    return [...state.messages.slice(0, -1), { ...last, content }];
-  }
-  return appendMessage(state, "assistant", content);
-}
-
-function appendToolCall(state: TuiState, toolCallId: string | undefined, tool: string, argsSummary: string, display: ToolInputDisplay | undefined): { toolCalls: TuiToolCall[]; messages: TuiState["messages"] } {
-  // 只保留最近 80 条工具调用，防止长会话造成界面状态无限增长。
-  const id = toolCallId ?? `${tool}-${String(state.toolCalls.length + 1)}`;
-  const call: TuiToolCall = { id, messageId: `tool-message-${id}`, tool, argsSummary, display, status: "running" };
-  return {
-    toolCalls: [...state.toolCalls, call].slice(-80),
-    messages: [...state.messages, { id: call.messageId ?? id, role: "system", content: formatToolCallMessage(call) }]
+function commitAssistant(transcript: TranscriptState, content: string): TranscriptState {
+  const index = transcript.active.findIndex((item) => item.kind === "assistant");
+  const activeItem = index === -1 ? undefined : transcript.active[index] as AssistantTranscriptItem;
+  const finalContent = content || activeItem?.content || "";
+  const active = index === -1 ? transcript.active : transcript.active.filter((_, itemIndex) => itemIndex !== index);
+  if (!finalContent) return { ...transcript, active };
+  const item: AssistantTranscriptItem = {
+    id: activeItem?.id ?? nextTranscriptId(transcript, "assistant"),
+    kind: "assistant",
+    content: finalContent
   };
+  return { committed: [...transcript.committed, item], active };
 }
 
-function updateToolProgress(
-  state: TuiState,
+function startTool(
+  transcript: TranscriptState,
+  event: Extract<RuntimeEvent, { type: "tool.call.started" }>
+): TranscriptState {
+  const existing = event.toolCallId === undefined
+    ? -1
+    : transcript.active.findIndex((item) => item.kind === "tool" && item.toolCallId === event.toolCallId);
+  const item = createRunningToolItem({
+    id: existing === -1
+      ? nextTranscriptId(transcript, `tool-${event.tool}`)
+      : transcript.active[existing]?.id ?? nextTranscriptId(transcript, `tool-${event.tool}`),
+    toolCallId: event.toolCallId,
+    tool: event.tool,
+    args: event.args,
+    description: event.description,
+    display: event.display,
+    startedAtMs: Date.now()
+  });
+  if (existing === -1) return { ...transcript, active: [...transcript.active, item] };
+  const active = [...transcript.active];
+  active[existing] = item;
+  return { ...transcript, active };
+}
+
+function updateTool(
+  transcript: TranscriptState,
   toolCallId: string | undefined,
   tool: string,
-  progressSummary: string
-): { toolCalls: TuiToolCall[]; messages: TuiState["messages"] } {
-  const next = [...state.toolCalls];
-  const index = findToolCallIndex(next, toolCallId, tool);
-  if (index === -1) return { toolCalls: next, messages: state.messages };
-  const item = next[index];
-  if (!item) return { toolCalls: next, messages: state.messages };
-  const updated = { ...item, progressSummary };
-  next[index] = updated;
-  return { toolCalls: next, messages: updateToolMessage(state.messages, updated) };
+  update: (item: ToolTranscriptItem) => ToolTranscriptItem
+): TranscriptState {
+  const index = findActiveToolIndex(transcript.active, toolCallId, tool);
+  if (index === -1) return transcript;
+  const item = transcript.active[index];
+  if (item?.kind !== "tool") return transcript;
+  const active = [...transcript.active];
+  active[index] = update(item);
+  return { ...transcript, active };
 }
 
-function finishLatestToolCall(
-  state: TuiState,
+function finishTool(
+  transcript: TranscriptState,
   toolCallId: string | undefined,
   tool: string,
-  status: TuiToolCall["status"],
-  result: unknown
-): { toolCalls: TuiToolCall[]; messages: TuiState["messages"] } {
-  // 从后往前找同名 running 调用，处理并发或重复工具名时最贴近最近事件。
-  const next = [...state.toolCalls];
-  const meta = toolResultMeta(result);
-  const index = findToolCallIndex(next, toolCallId, tool);
-  if (index !== -1) {
-    const item = next[index];
-    if (item) {
-      const output = summarizeToolOutput(tool, result, item.argsSummary, item.display);
-      const updated = { ...item, status, resultSummary: output.summary, fullTitle: output.fullTitle, fullContent: output.fullContent, ...meta };
-      next[index] = updated;
-      return { toolCalls: next, messages: updateToolMessage(state.messages, updated) };
-    }
+  result: unknown,
+  forcedStatus?: ToolTranscriptItem["status"]
+): TranscriptState {
+  const index = findActiveToolIndex(transcript.active, toolCallId, tool);
+  if (index === -1 && toolCallId && transcript.committed.some((item) => item.kind === "tool" && item.toolCallId === toolCallId)) {
+    return transcript;
   }
-  const id = toolCallId ?? `${tool}-${String(next.length + 1)}`;
-  const output = summarizeToolOutput(tool, result, "", undefined);
-  const call: TuiToolCall = { id, messageId: `tool-message-${id}`, tool, argsSummary: "", status, resultSummary: output.summary, fullTitle: output.fullTitle, fullContent: output.fullContent, ...meta };
-  return {
-    toolCalls: [...next, call].slice(-80),
-    messages: [...state.messages, { id: call.messageId ?? id, role: "system", content: formatToolCallMessage(call) }]
-  };
+  const running = index === -1
+    ? createRunningToolItem({
+      id: nextTranscriptId(transcript, `tool-${tool}`),
+      toolCallId,
+      tool,
+      args: {},
+      startedAtMs: Date.now()
+    })
+    : transcript.active[index];
+  if (!running || running.kind !== "tool") return transcript;
+  const completed = completeToolItem(running, result, forcedStatus);
+  const active = index === -1 ? transcript.active : transcript.active.filter((_, itemIndex) => itemIndex !== index);
+  return { committed: [...transcript.committed, completed], active };
 }
 
-function findToolCallIndex(toolCalls: TuiToolCall[], toolCallId: string | undefined, tool: string): number {
+function findActiveToolIndex(active: ActiveTranscriptItem[], toolCallId: string | undefined, tool: string): number {
   if (toolCallId) {
-    const index = toolCalls.findIndex((item) => item.id === toolCallId);
-    if (index !== -1) return index;
+    return active.findIndex((item) => item.kind === "tool" && item.toolCallId === toolCallId);
   }
-  for (let index = toolCalls.length - 1; index >= 0; index--) {
-    const item = toolCalls[index];
-    if (item && item.tool === tool && item.status === "running") return index;
+  for (let index = active.length - 1; index >= 0; index -= 1) {
+    const item = active[index];
+    if (item?.kind === "tool" && item.tool === tool && item.status === "running") return index;
   }
   return -1;
 }
 
-function summarizeValue(value: unknown): string {
-  // 工具参数和结果在 UI 中只显示短摘要，完整内容仍保存在 session JSONL。
-  if (typeof value === "string") return value.slice(0, 240);
-  if (typeof value === "object" && value !== null) {
-    const record = value as Record<string, unknown>;
-    const output = record.output;
-    if (typeof output === "string") return output.slice(0, 4000);
+function commitItem(transcript: TranscriptState, item: TranscriptItem): TranscriptState {
+  return { ...transcript, committed: [...transcript.committed, item] };
+}
+
+function notificationItem(transcript: TranscriptState, content: string): NotificationTranscriptItem {
+  return { id: nextTranscriptId(transcript, "notification"), kind: "notification", content, tone: "muted" };
+}
+
+function nextTranscriptId(transcript: TranscriptState, prefix: string): string {
+  return `${prefix}-${String(transcript.committed.length + transcript.active.length + 1)}`;
+}
+
+function latestToolItem(transcript: TranscriptState): ToolTranscriptItem | undefined {
+  for (let index = transcript.active.length - 1; index >= 0; index -= 1) {
+    const item = transcript.active[index];
+    if (item?.kind === "tool") return item;
   }
-  try {
-    return JSON.stringify(value).slice(0, 240);
-  } catch {
-    return String(value).slice(0, 240);
+  for (let index = transcript.committed.length - 1; index >= 0; index -= 1) {
+    const item = transcript.committed[index];
+    if (item?.kind === "tool") return item;
   }
+  return undefined;
 }
 
-function summarizeToolArgs(tool: string, args: unknown): string {
-  const record = typeof args === "object" && args !== null ? args as Record<string, unknown> : {};
-  const path = typeof record.path === "string" ? record.path : undefined;
-  const query = typeof record.query === "string" ? record.query : undefined;
-  const command = typeof record.command === "string" ? record.command : undefined;
-
-  if (tool === "read_file" && path) return path;
-  if (tool === "write_file" && path) return path;
-  if (tool === "edit_file" && path) return path;
-  if ((tool === "search_files" || tool === "grep_search") && query) return `searching "${query}"`;
-  if (tool === "list_files") return "listing workspace files";
-  if (tool === "git_status") return "git status --short";
-  if (tool === "git_diff") return "git diff";
-  if (tool === "run_command" && command) return command;
-  return summarizeValue(args);
-}
-
-function summarizeToolProgress(update: { kind: string; text?: string; percent?: number }): string {
-  const percent = update.percent === undefined ? "" : `${String(update.percent)}% `;
-  const text = update.text ?? update.kind;
-  return `${percent}${text}`.slice(0, 240);
-}
-
-function resultStatus(result: unknown): TuiToolCall["status"] {
-  if (typeof result === "object" && result !== null && "status" in result && result.status === "denied") return "denied";
-  if (typeof result === "object" && result !== null && "exitCode" in result && typeof result.exitCode === "number" && result.exitCode !== 0) return "failed";
-  if (typeof result === "object" && result !== null && "error" in result) return "failed";
-  return "success";
-}
-
-function toolResultMeta(result: unknown): Pick<TuiToolCall, "durationMs" | "outputLines" | "exitCode" | "truncated"> {
-  if (typeof result !== "object" || result === null) return {};
-  const record = result as Record<string, unknown>;
+function replaceTranscript(state: TuiState, items: TranscriptItem[], viewingSessionId: string | undefined): TuiState {
   return {
-    durationMs: typeof record.durationMs === "number" ? record.durationMs : undefined,
-    outputLines: typeof record.outputLines === "number" ? record.outputLines : undefined,
-    exitCode: typeof record.exitCode === "number" ? record.exitCode : undefined,
-    truncated: typeof record.truncated === "boolean" ? record.truncated : undefined
+    ...state,
+    viewingSessionId,
+    transcript: { committed: items, active: [] },
+    expandedToolId: undefined,
+    transcriptScrollOffset: 0,
+    followLatest: true,
+    turnStartedAt: undefined,
+    lastWorkedMs: undefined
   };
 }
 
-function updateToolMessage(messages: TuiState["messages"], call: TuiToolCall): TuiState["messages"] {
-  const messageId = call.messageId;
-  if (!messageId) return messages;
-  return messages.map((message) => message.id === messageId ? { ...message, content: formatToolCallMessage(call), fullTitle: call.fullTitle, fullContent: call.fullContent } : message);
-}
-
-function formatToolCallMessage(call: TuiToolCall): string {
-  const meta = [
-    call.durationMs === undefined ? undefined : `${String(call.durationMs)}ms`,
-    call.outputLines === undefined ? undefined : `${String(call.outputLines)} output lines`,
-    call.exitCode === undefined ? undefined : `exit ${String(call.exitCode)}`,
-    call.truncated ? "truncated" : undefined
-  ].filter(Boolean).join(" · ");
-  const progress = call.progressSummary && call.status === "running" ? `\n  progress: ${call.progressSummary}` : "";
-  const preview = shouldShowDisplayPreview(call) ? formatDisplayPreview(call.display) : "";
-  const result = call.resultSummary && !shouldHideResultSummaryAfterPreview(call, preview)
-    ? formatResultSummary(call.resultSummary)
-    : "";
-  const suffix = meta ? ` (${meta})` : "";
-  return `${statusSymbol(call.status)} ${toolIcon(call.tool)} ${toolActionSummary(call)}${suffix}${progress}${preview}${result}`;
-}
-
-function shouldShowDisplayPreview(call: TuiToolCall): boolean {
-  if (!call.display) return false;
-  if (call.display.kind === "command") return false;
-  return call.status === "running";
-}
-
-function shouldHideResultSummaryAfterPreview(call: TuiToolCall, preview: string): boolean {
-  return preview.length > 0 && call.display?.kind === "file_io" && isBlockSummary(call.resultSummary ?? "");
-}
-
-function formatDisplayPreview(display: ToolInputDisplay | undefined): string {
-  if (!display) return "";
-  if (display.kind === "file_io" && display.operation === "write" && display.path && typeof display.content === "string") {
-    return `\n${formatDiffPreviewLines(renderFileContentPreview(display.path, display.content, { maxLines: 12 }))}`;
+function finalizeActiveCells(
+  transcript: TranscriptState,
+  toolStatus: "failed" | "skipped",
+  message: string
+): TranscriptState {
+  if (transcript.active.length === 0) return transcript;
+  const committed = [...transcript.committed];
+  for (const item of transcript.active) {
+    if (item.kind === "assistant") {
+      if (item.content) committed.push(item);
+      continue;
+    }
+    committed.push(completeToolItem(item, { error: message }, toolStatus));
   }
-  if (display.kind === "file_io" && display.operation === "edit" && display.path && typeof display.before === "string" && typeof display.after === "string") {
-    return `\n${formatDiffPreviewLines(renderDiffLinesClustered(display.before, display.after, display.path, { contextLines: 3, maxLines: 12 }))}`;
-  }
-  if (display.kind === "command") {
-    return "";
-  }
-  return "";
-}
-
-function formatResultSummary(summary: string): string {
-  if (isBlockSummary(summary)) return `\n${summary}`;
-  return `\n  result: ${summary}`;
-}
-
-function isBlockSummary(summary: string): boolean {
-  return /^(Created|Edited|Deleted|Read|Write|Ran|Checked|Searched|Listed) /.test(summary)
-    || /^\s+exit\s+/.test(summary)
-    || /^(?:\+\d+\s+)?-\d+\s+\S/.test(summary)
-    || /^\+\d+\s+\S/.test(summary);
-}
-
-function statusSymbol(status: TuiToolCall["status"]): string {
-  if (status === "success") return "✓";
-  if (status === "failed") return "✗";
-  if (status === "denied") return "⊘";
-  if (status === "skipped") return "↷";
-  return "…";
-}
-
-function toolIcon(tool: string): string {
-  if (tool === "search_files" || tool === "grep_search") return "🔍";
-  if (tool === "read_file" || tool === "list_files" || tool === "git_status" || tool === "git_diff") return "📖";
-  if (tool === "write_file" || tool === "edit_file") return "✏️";
-  if (tool === "run_command") return "💻";
-  return "•";
-}
-
-function toolActionSummary(call: TuiToolCall): string {
-  const display = call.display;
-  if (call.tool === "run_command") {
-    const command = display?.kind === "command" ? display.command : call.argsSummary || "command";
-    return `Ran ${command}`;
-  }
-  if (call.tool === "read_file") return call.argsSummary ? `Read ${call.argsSummary}` : "Read file";
-  if (call.tool === "write_file") return call.argsSummary ? `Wrote ${call.argsSummary}` : "Wrote file";
-  if (call.tool === "edit_file") return call.argsSummary ? `Edited ${call.argsSummary}` : "Edited file";
-  if (call.tool === "list_files") return "Listed workspace files";
-  if (call.tool === "search_files" || call.tool === "grep_search") return call.argsSummary ? `Searched ${call.argsSummary}` : "Searched workspace";
-  if (call.tool === "git_status") return "Checked git status";
-  if (call.tool === "git_diff") return "Viewed git diff";
-  return call.argsSummary ? `${call.tool} ${call.argsSummary}` : call.tool;
+  return { committed, active: [] };
 }

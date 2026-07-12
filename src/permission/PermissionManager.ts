@@ -34,6 +34,15 @@ export interface PermissionRequestContext {
   projectRoot: string;
 }
 
+export interface PermissionPrompt extends PermissionRequestContext {
+  tool: string;
+  title: string;
+  details: string;
+  requireFullYes: boolean;
+  diff?: string;
+  preview?: string;
+}
+
 export interface PermissionEvaluation {
   decision: PermissionDecision;
   reason: string;
@@ -45,6 +54,8 @@ export interface PermissionApplyResult {
   nextMode?: PermissionMode;
   message?: string;
 }
+
+export type PermissionResult = PermissionApplyResult;
 
 export interface DeniedOperation {
   toolName: string;

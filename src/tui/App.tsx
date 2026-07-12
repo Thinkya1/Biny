@@ -5,30 +5,26 @@
  * 它负责处理全局快捷键、slash command、plan 模式、session 恢复和退出摘要，但不直接执行工具。
  */
 import React, { useCallback, useEffect, useReducer, useRef, useState } from "react";
-import { Box, Text, useApp, useInput, useWindowSize } from "ink";
-import { saveConfig } from "../config/loader.js";
+import { Box, Text, useApp, useBoxMetrics, useInput, useWindowSize, type DOMElement } from "ink";
 import type { PermissionMode } from "../permission/PermissionManager.js";
-import { listSessionSummaries, readSessionEvents, type SessionSummary } from "../session/events.js";
-import { resolveSessionFile } from "../session/store.js";
-import { buildSystemPrompt } from "../agent/prompts.js";
-import { formatProjectContext } from "../project/ProjectContext.js";
-import { formatPermissionModeChanged, runPermissionCommand } from "../permission/commands.js";
+import { parseThinkingSelection, type ModelChoice, type ThinkingSelection } from "../llm/ModelManager.js";
+import type { SessionSummary } from "../session/events.js";
+import { formatPermissionModeChanged } from "../permission/commands.js";
 import { createInitialTuiState, tuiReducer } from "./state.js";
 import { Header } from "./components/Header.js";
-import { MessageList } from "./components/MessageList.js";
+import { Transcript } from "./components/Transcript.js";
 import { InputBox } from "./components/InputBox.js";
 import { StatusBar } from "./components/StatusBar.js";
-import { TurnStatus } from "./components/TurnStatus.js";
 import { PermissionPrompt } from "./components/PermissionPrompt.js";
 import { PermissionModePicker } from "./components/PermissionModePicker.js";
 import { SessionPicker } from "./components/SessionPicker.js";
 import { TranscriptViewer } from "./components/TranscriptViewer.js";
+import { ModelPicker } from "./components/ModelPicker.js";
 import { createTuiRuntime, type TuiRuntime } from "./runtime/createTuiRuntime.js";
 import type { PermissionChoice } from "./types.js";
 import { TUI_SLASH_COMMANDS } from "./slashCommands.js";
-import { sessionEventsToMessages, sessionIdFromFile } from "./sessionTranscript.js";
+import { sessionEventsToTranscript } from "./sessionTranscript.js";
 import { appendInputHistory, loadInputHistory } from "./inputHistory.js";
-import { resizableTranscriptMessages } from "./transcriptSplit.js";
 import { latestExpandableTranscript, type ExpandableTranscript } from "./transcriptViewer.js";
 import { tuiColors } from "./theme/index.js";
 
@@ -51,16 +47,35 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
   const [previewMode, setPreviewMode] = useState<"chat" | "plan" | undefined>(undefined);
   const [sessionPicker, setSessionPicker] = useState<{ sessions: SessionSummary[]; selectedIndex: number; query: string } | undefined>(undefined);
   const [permissionModePicker, setPermissionModePicker] = useState(false);
+  const [modelPicker, setModelPicker] = useState<{
+    models: ModelChoice[];
+    currentAlias: string;
+    currentThinking: ThinkingSelection;
+  } | undefined>(undefined);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("ask");
   const [transcriptViewer, setTranscriptViewer] = useState<ExpandableTranscript | undefined>(undefined);
+  const [contextUsage, setContextUsage] = useState<{ usedTokens?: number; maxTokens?: number }>({});
   const runtimeRef = useRef<TuiRuntime | undefined>(undefined);
   const exitingRef = useRef(false);
+  const mainAreaRef = useRef<DOMElement | null>(null);
+  const mainArea = useBoxMetrics(mainAreaRef);
   const app = useApp();
-  const { rows } = useWindowSize();
+  const { columns, rows } = useWindowSize();
+
+  const refreshContextUsage = useCallback(async (runtime = runtimeRef.current): Promise<void> => {
+    if (!runtime) return;
+    try {
+      const context = await runtime.contextStatus();
+      setContextUsage({ usedTokens: context.budget.usedTokens, maxTokens: context.budget.maxTokens });
+    } catch {
+      // Footer telemetry is best effort and must never interrupt the TUI.
+    }
+  }, []);
 
   useEffect(() => {
     // TUI runtime 异步创建；组件卸载时关闭 recorder，避免 session 文件未 flush。
     let disposed = false;
+    let unsubscribe: (() => void) | undefined;
     void createTuiRuntime(workspaceRoot)
       .then((runtime) => {
         if (disposed) {
@@ -68,22 +83,30 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
           return;
         }
         runtimeRef.current = runtime;
-        setPermissionMode(runtime.commandRuntime.permissionManager.getStatus().mode);
+        const info = runtime.getInfo();
+        setPermissionMode(runtime.getPermissionMode());
         // 输入历史失败不阻断 TUI，只作为 system message 显示。
-        void loadInputHistory(runtime.commandRuntime.workspaceRoot)
+        void loadInputHistory(info.workspaceRoot)
           .then(setInputHistory)
           .catch((error) => {
             dispatch({ type: "system.message", content: `读取输入历史失败：${error instanceof Error ? error.message : String(error)}` });
           });
-        runtime.subscribe(dispatch);
+        unsubscribe = runtime.subscribe((event) => {
+          dispatch(event);
+          if (event.type === "session.completed" || event.type === "session.error") {
+            void refreshContextUsage(runtime);
+          }
+        });
         dispatch({
           type: "session.started",
-          sessionId: runtime.commandRuntime.recorder.sessionId,
-          sessionFile: runtime.commandRuntime.recorder.filePath,
-          cwd: runtime.commandRuntime.workspaceRoot,
-          provider: runtime.commandRuntime.config.model.provider,
-          modelLabel: formatModelLabel(runtime.commandRuntime.config.model.provider, runtime.commandRuntime.config.model.model)
+          sessionId: info.sessionId,
+          sessionFile: info.sessionFile,
+          cwd: info.workspaceRoot,
+          provider: info.provider,
+          modelLabel: info.modelLabel,
+          reasoningLabel: info.reasoningLabel
         });
+        void refreshContextUsage(runtime);
       })
       .catch((error) => {
         setStartupError(error instanceof Error ? error.message : String(error));
@@ -91,32 +114,34 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
 
     return () => {
       disposed = true;
+      unsubscribe?.();
       void runtimeRef.current?.close();
     };
-  }, [workspaceRoot]);
+  }, [refreshContextUsage, workspaceRoot]);
 
   useInput((input, key) => {
     // App 级快捷键只处理全局动作：滚动、详情、取消和退出。
     const isBusy = state.status === "thinking" || state.status === "running" || state.status === "waiting_permission";
+    if (modelPicker && !(key.ctrl && input === "c")) return;
     if (key.ctrl && input.toLowerCase() === "o") {
       dispatch({ type: "tool.details.toggled" });
       return;
     }
     if (key.ctrl && input.toLowerCase() === "t") {
-      const expandable = latestExpandableTranscript(state.messages);
+      const expandable = latestExpandableTranscript(state.transcript);
       if (expandable) setTranscriptViewer(expandable);
       return;
     }
     if (key.pageUp) {
-      dispatch({ type: "messages.scrolled", direction: 1, amount: Math.max(1, rows - 12) });
+      dispatch({ type: "transcript.scrolled", direction: 1, amount: Math.max(1, rows - 12) });
       return;
     }
     if (key.pageDown) {
-      dispatch({ type: "messages.scrolled", direction: -1, amount: Math.max(1, rows - 12) });
+      dispatch({ type: "transcript.scrolled", direction: -1, amount: Math.max(1, rows - 12) });
       return;
     }
     if (key.end) {
-      dispatch({ type: "messages.follow_latest" });
+      dispatch({ type: "transcript.follow_latest" });
       return;
     }
     if (key.escape && transcriptViewer) {
@@ -148,14 +173,18 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
       return;
     }
     if (isKnownSlashCommand(value)) {
-      void handleSlashCommand(value);
+      void handleSlashCommand(value).catch((error) => {
+        dispatch({ type: "system.message", content: error instanceof Error ? error.message : String(error) });
+      });
       return;
     }
     if (mode === "plan") {
-      void createTuiPlan(value);
+      const runtime = runtimeRef.current;
+      if (runtime) void runtime.createPlan(value).finally(() => refreshContextUsage(runtime));
       return;
     }
-    void runtimeRef.current?.sendPrompt(value);
+    const runtime = runtimeRef.current;
+    if (runtime) void runtime.sendPrompt(value).finally(() => refreshContextUsage(runtime));
   };
 
   const appendHistory = (value: string): void => {
@@ -178,7 +207,10 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
       sessions: filterSessions(sessionPicker.sessions, sessionPicker.query)
     }
     : undefined;
-  const transcriptMessages = resizableTranscriptMessages(state.messages);
+  const hasToolCalls = [...state.transcript.committed, ...state.transcript.active].some((item) => item.kind === "tool");
+  const overlayOpen = Boolean(filteredSessionPicker || transcriptViewer || modelPicker);
+  const mainWidth = mainArea.hasMeasured ? Math.max(1, mainArea.width) : Math.max(1, columns);
+  const mainHeight = mainArea.hasMeasured ? Math.max(1, mainArea.height) : Math.max(1, rows - 5);
 
   const togglePlanMode = (): void => {
     // 手动切换 plan mode 会追加一条 system message，方便 transcript 留痕。
@@ -204,15 +236,14 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
   }
 
   return (
-    <Box flexDirection="column" width="100%">
-      <Box flexDirection="column" flexShrink={0} width="100%">
-        <Box flexShrink={0} width="100%">
-          <Header sessionId={state.sessionId} viewingSessionId={state.viewingSessionId} />
-        </Box>
-        <Box flexDirection="column">
-          {transcriptViewer ? (
+    <Box flexDirection="column" width="100%" height={Math.max(1, rows)}>
+      <Header sessionId={state.sessionId} viewingSessionId={state.viewingSessionId} cwd={state.cwd} />
+      <Box ref={mainAreaRef} flexDirection="column" flexGrow={1} overflow="hidden" width="100%">
+        {transcriptViewer ? (
           <TranscriptViewer
             transcript={transcriptViewer}
+            width={mainWidth}
+            height={mainHeight}
             onExit={() => setTranscriptViewer(undefined)}
           />
         ) : filteredSessionPicker ? (
@@ -238,23 +269,17 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
             }}
             onExit={() => setSessionPicker(undefined)}
           />
-        ) : (
-          <MessageList
-            messages={transcriptMessages}
-            visibleCount={Math.max(1, rows - 12)}
-            scrollOffset={state.messageScrollOffset}
-            followLatest={state.followLatest}
+        ) : modelPicker ? (
+          <ModelPicker
+            models={modelPicker.models}
+            currentAlias={modelPicker.currentAlias}
+            currentThinking={modelPicker.currentThinking}
+            onSelect={(selection) => {
+              void applyModelSelection(selection);
+            }}
+            onCancel={() => setModelPicker(undefined)}
           />
-        )}
-        {transcriptViewer ? null : (
-        <PermissionPrompt
-          request={state.permission}
-          detailsExpanded={state.permissionDetailsExpanded}
-          onAnswer={answerPermission}
-          onToggleDetails={() => dispatch({ type: "permission.details.toggled" })}
-        />
-        )}
-        {permissionModePicker ? (
+        ) : permissionModePicker ? (
           <PermissionModePicker
             currentMode={permissionMode}
             onSelect={(nextMode) => {
@@ -262,40 +287,50 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
             }}
             onCancel={() => setPermissionModePicker(false)}
           />
-        ) : null}
-        {filteredSessionPicker || transcriptViewer ? null : (
-          <TurnStatus status={state.status} turnStartedAt={state.turnStartedAt} lastWorkedMs={state.lastWorkedMs} />
-        )}
-        </Box>
-        {filteredSessionPicker || transcriptViewer ? null : (
-          <Box flexShrink={0} width="100%">
-            <InputBox
-              disabled={state.status === "waiting_permission" || permissionModePicker || transcriptViewer !== undefined}
-              busy={state.status === "thinking" || state.status === "running"}
-              hasToolCalls={state.toolCalls.length > 0}
-              slashCommands={TUI_SLASH_COMMANDS}
-              initialHistory={inputHistory}
-              onSubmit={sendPrompt}
-              onHistoryAppend={appendHistory}
-              onToggleToolDetails={() => dispatch({ type: "tool.details.toggled" })}
-              onTogglePlanMode={togglePlanMode}
-              onPreviewCommand={previewSlashCommand}
-              onExit={() => {
-                void closeAndExit();
-              }}
-            />
-          </Box>
-        )}
-        {filteredSessionPicker || transcriptViewer ? null : (
-          <Box flexShrink={0} width="100%">
-            <StatusBar
-              mode={previewMode ?? mode}
-              cwd={state.cwd}
-              modelLabel={state.modelLabel}
-            />
-          </Box>
+        ) : state.permission ? (
+          <PermissionPrompt
+            request={state.permission}
+            detailsExpanded={state.permissionDetailsExpanded}
+            onAnswer={answerPermission}
+            onToggleDetails={() => dispatch({ type: "permission.details.toggled" })}
+          />
+        ) : (
+          <Transcript
+            transcript={state.transcript}
+            width={mainWidth}
+            height={mainHeight}
+            scrollOffset={state.transcriptScrollOffset}
+            followLatest={state.followLatest}
+            expandedToolId={state.expandedToolId}
+          />
         )}
       </Box>
+      <Box flexShrink={0} width="100%">
+        <InputBox
+          disabled={state.status === "waiting_permission" || permissionModePicker || overlayOpen}
+          disabledPlaceholder={overlayOpen ? "close overlay to continue" : permissionModePicker ? "choose a permission mode" : undefined}
+          busy={state.status === "thinking" || state.status === "running"}
+          hasToolCalls={hasToolCalls}
+          slashCommands={TUI_SLASH_COMMANDS}
+          initialHistory={inputHistory}
+          onSubmit={sendPrompt}
+          onHistoryAppend={appendHistory}
+          onToggleToolDetails={() => dispatch({ type: "tool.details.toggled" })}
+          onTogglePlanMode={togglePlanMode}
+          onPreviewCommand={previewSlashCommand}
+          onExit={() => {
+            void closeAndExit();
+          }}
+        />
+      </Box>
+      <StatusBar
+        modelLabel={state.modelLabel}
+        contextUsedTokens={contextUsage.usedTokens}
+        contextMaxTokens={contextUsage.maxTokens}
+        status={state.status}
+        mode={previewMode ?? mode}
+        width={columns}
+      />
     </Box>
   );
 
@@ -316,29 +351,51 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
     }
 
     if (command === "/clear") {
-      dispatch({ type: "messages.cleared" });
+      dispatch({ type: "transcript.cleared" });
       return;
     }
 
     if (command === "/context") {
-      dispatch({ type: "system.message", content: formatProjectContext(runtime.commandRuntime.projectContext) });
+      const report = await runtime.contextReport();
+      setTranscriptViewer({ title: "Context", content: report.startsWith("Context\n") ? report.slice("Context\n".length) : report });
+      await refreshContextUsage(runtime);
+      return;
+    }
+
+    if (command === "/compact") {
+      dispatch({ type: "system.message", content: await runtime.compactConversation(args.join(" ").trim() || undefined) });
+      await refreshContextUsage(runtime);
+      return;
+    }
+
+    if (command === "/model") {
+      if (!args[0]) {
+        const info = runtime.getInfo();
+        setModelPicker({
+          models: runtime.listModels(),
+          currentAlias: info.modelAlias,
+          currentThinking: info.thinking
+        });
+        return;
+      }
+      await applyModelSelection({ alias: args[0], thinking: parseThinkingSelection(args[1]) });
       return;
     }
 
     if (command === "/sessions") {
-      const summaries = await listSessionSummaries(runtime.commandRuntime.workspaceRoot);
+      const summaries = await runtime.listSessions();
       dispatch({ type: "system.message", content: formatSessionSummaries(summaries) });
       return;
     }
 
     if (command === "/permissions" || command === "/approvals") {
       if (args.length === 0) {
-        setPermissionMode(runtime.commandRuntime.permissionManager.getStatus().mode);
+        setPermissionMode(runtime.getPermissionMode());
         setPermissionModePicker(true);
         return;
       }
-      dispatch({ type: "system.message", content: runPermissionCommand(runtime.commandRuntime.permissionManager, args) });
-      await persistCurrentPermissionMode(runtime);
+      dispatch({ type: "system.message", content: await runtime.runPermissionCommand(args) });
+      setPermissionMode(runtime.getPermissionMode());
       return;
     }
 
@@ -346,7 +403,7 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
       const session = args[0];
       if (!session) {
         // 无参数 /resume 打开选择器；有参数时直接恢复指定 session。
-        const summaries = await listSessionSummaries(runtime.commandRuntime.workspaceRoot);
+        const summaries = await runtime.listSessions();
         setSessionPicker({ sessions: summaries.filter((summary) => summary.firstUserMessage.trim()).slice().reverse(), selectedIndex: 0, query: "" });
         return;
       }
@@ -361,7 +418,8 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
         return;
       }
       setMode("plan");
-      await createTuiPlan(task);
+      await runtime.createPlan(task);
+      await refreshContextUsage(runtime);
       return;
     }
 
@@ -374,81 +432,49 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
     exitingRef.current = true;
     const runtime = runtimeRef.current;
     if (runtime) {
+      const info = runtime.getInfo();
       onExitSummary?.({
-        sessionId: runtime.commandRuntime.recorder.sessionId,
-        sessionFile: runtime.commandRuntime.recorder.filePath
+        sessionId: info.sessionId,
+        sessionFile: info.sessionFile
       });
       await runtime.close();
     }
     app.exit();
   }
 
-  async function createTuiPlan(task: string): Promise<void> {
-    const runtime = runtimeRef.current;
-    if (!runtime) return;
-
-    // TUI plan 只调用模型生成计划，不执行工具；仍然记录到当前 session。
-    runtime.commandRuntime.recorder.record({ type: "user_message", content: `plan: ${task}` });
-    dispatch({ type: "user.message", content: `/plan ${task}` });
-
-    try {
-      const messages = [
-        {
-          role: "system" as const,
-          content: buildSystemPrompt("plan")
-        },
-        {
-          role: "user" as const,
-          content: `${formatProjectContext(runtime.commandRuntime.projectContext)}\n\nTask:\n${task}`
-        }
-      ];
-      const answer = runtime.commandRuntime.llm.streamChat
-        ? await runtime.commandRuntime.llm.streamChat(messages, (delta) => {
-          // plan 模式也复用 assistant.delta，以便 TUI 能流式显示计划内容。
-          dispatch({ type: "assistant.delta", content: delta });
-        })
-        : await runtime.commandRuntime.llm.chat(messages);
-
-      runtime.commandRuntime.recorder.record({ type: "assistant_message", content: answer });
-      dispatch({ type: "assistant.completed", content: answer });
-      dispatch({ type: "session.completed", sessionId: runtime.commandRuntime.recorder.sessionId });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      runtime.commandRuntime.recorder.record({ type: "error", message });
-      dispatch({ type: "session.error", sessionId: runtime.commandRuntime.recorder.sessionId, message });
-    }
-  }
-
   async function applyPermissionMode(nextMode: PermissionMode): Promise<void> {
     const runtime = runtimeRef.current;
     if (!runtime) return;
-    runtime.commandRuntime.permissionManager.setMode(nextMode);
-    runtime.commandRuntime.config.permission.mode = nextMode;
-    await saveConfig(runtime.commandRuntime.workspaceRoot, runtime.commandRuntime.config);
+    await runtime.setPermissionMode(nextMode);
     setPermissionMode(nextMode);
     setPermissionModePicker(false);
     dispatch({ type: "system.message", content: formatPermissionModeChanged(nextMode) });
   }
 
-  async function persistCurrentPermissionMode(runtime: TuiRuntime): Promise<void> {
-    const nextMode = runtime.commandRuntime.permissionManager.getStatus().mode;
-    runtime.commandRuntime.config.permission.mode = nextMode;
-    await saveConfig(runtime.commandRuntime.workspaceRoot, runtime.commandRuntime.config);
-    setPermissionMode(nextMode);
+  async function applyModelSelection(selection: { alias: string; thinking?: ThinkingSelection }): Promise<void> {
+    const runtime = runtimeRef.current;
+    if (!runtime) return;
+    try {
+      const info = await runtime.switchModel(selection.alias, selection.thinking);
+      setModelPicker(undefined);
+      dispatch({ type: "system.message", content: `Model switched to ${info.modelLabel} (thinking: ${info.reasoningLabel}).` });
+    } catch (error) {
+      setModelPicker(undefined);
+      dispatch({ type: "system.message", content: `Model switch failed: ${error instanceof Error ? error.message : String(error)}` });
+    }
   }
 
   async function resumeSessionById(session: string): Promise<void> {
     const runtime = runtimeRef.current;
     if (!runtime) return;
-    // 恢复后先切换 recorder，再把历史事件转换为可展示消息。
-    const filePath = await resolveSessionFile(runtime.commandRuntime.workspaceRoot, session);
-    await runtime.resumeSession(filePath);
-    const events = await readSessionEvents(filePath);
+    // runtime 同时恢复 session recorder 和模型可用的 conversation，再把同一份事件转成展示消息。
+    const resumed = await runtime.resumeSession(session);
     dispatch({
-      type: "messages.replaced",
-      viewingSessionId: sessionIdFromFile(filePath),
-      messages: sessionEventsToMessages(runtime.commandRuntime.workspaceRoot, filePath, events)
+      type: "transcript.replaced",
+      viewingSessionId: resumed.sessionId,
+      items: sessionEventsToTranscript(resumed.events)
     });
+    await refreshContextUsage(runtime);
     setMode("chat");
   }
 }
@@ -459,17 +485,12 @@ function isKnownSlashCommand(value: string): boolean {
   return command === "/" || TUI_SLASH_COMMANDS.some((item) => item.name === command);
 }
 
-function formatModelLabel(provider: string, model: string): string {
-  // 状态栏模型名避免重复显示 mock/mock 这类冗余形式。
-  if (!model || model === provider) return provider;
-  return `${provider}/${model}`;
-}
-
 function formatSlashHelp(): string {
   // 帮助文本保持短小，详细交互提示由输入框和状态栏承担。
   return [
     "Commands:",
-    "/help /clear /context /sessions /resume [session]",
+    "/help /clear /context /compact [hint] /model [alias] [off|high|max]",
+    "/sessions /resume [session]",
     "/permissions [status|readonly|ask|auto|full|reset]",
     "/plan <task> /exit /quit"
   ].join("\n");

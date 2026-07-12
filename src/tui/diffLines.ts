@@ -9,10 +9,8 @@ export type DiffLineColor = string | undefined;
 
 export interface DiffLineStyle {
   color?: string;
-  backgroundColor?: string;
   bold?: boolean;
   dimColor?: boolean;
-  fillBackground?: boolean;
 }
 
 export type DiffHeaderOperation = "Created" | "Edited" | "Deleted";
@@ -39,8 +37,8 @@ export interface KimiDiffCodeLine {
 
 export function diffLineColor(line: string): DiffLineColor {
   if (line.startsWith("+++") || line.startsWith("---")) return undefined;
-  if (line.startsWith("+")) return tuiColors.diffAdded;
-  if (line.startsWith("-")) return tuiColors.diffRemoved;
+  if (line.startsWith("+")) return tuiColors.success;
+  if (line.startsWith("-")) return tuiColors.error;
   return undefined;
 }
 
@@ -55,15 +53,15 @@ export function diffLineStyle(line: string): DiffLineStyle | undefined {
   }
   if (trimmed.startsWith("+++") || trimmed.startsWith("---") || trimmed.startsWith("@@")) return { color: tuiColors.diffMeta, dimColor: true };
   const kimiLine = parseKimiDiffCodeLine(line);
-  if (kimiLine?.prefix === "+") return { color: tuiColors.diffAdded };
-  if (kimiLine?.prefix === "-") return { color: tuiColors.diffRemoved };
+  if (kimiLine?.prefix === "+") return { color: tuiColors.success };
+  if (kimiLine?.prefix === "-") return { color: tuiColors.error };
   if (kimiLine?.prefix === " ") return { color: tuiColors.diffMeta, dimColor: true };
   const codeLine = parseDiffCodeLine(line);
-  if (codeLine?.prefix === "+") return { color: tuiColors.textStrong, backgroundColor: tuiColors.diffAdded, fillBackground: true };
-  if (codeLine?.prefix === "-") return { color: tuiColors.textStrong, backgroundColor: tuiColors.diffRemoved, fillBackground: true };
+  if (codeLine?.prefix === "+") return { color: tuiColors.success };
+  if (codeLine?.prefix === "-") return { color: tuiColors.error };
   if (codeLine?.prefix === " ") return { color: tuiColors.diffMeta, dimColor: true };
-  if (rawSemantic.startsWith("+")) return { color: tuiColors.textStrong, backgroundColor: tuiColors.diffAdded, fillBackground: true };
-  if (rawSemantic.startsWith("-")) return { color: tuiColors.textStrong, backgroundColor: tuiColors.diffRemoved, fillBackground: true };
+  if (rawSemantic.startsWith("+")) return { color: tuiColors.success };
+  if (rawSemantic.startsWith("-")) return { color: tuiColors.error };
   if (rawSemantic.startsWith(" ")) return { color: tuiColors.diffMeta, dimColor: true };
   return undefined;
 }
@@ -106,10 +104,9 @@ export function parseKimiDiffCodeLine(line: string): KimiDiffCodeLine | undefine
   return parseKimiDiffCodeLineExact(line) ?? (line.startsWith("  ") ? parseKimiDiffCodeLineExact(line.slice(2)) : undefined);
 }
 
-export function padDiffLine(line: string, width: number): string {
-  const style = diffLineStyle(line);
-  if (!style?.fillBackground) return line;
-  return line.padEnd(Math.max(width, line.length), " ");
+export function padDiffLine(line: string, _width: number): string {
+  // Kept as a compatibility helper; foreground-only diff rows need no padding.
+  return line;
 }
 
 function parseDiffCodeLineExact(line: string): DiffCodeLine | undefined {

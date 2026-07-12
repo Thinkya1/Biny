@@ -27,6 +27,7 @@ const slashMenuVisibleRows = 6;
 export interface InputBoxProps {
   // disabled 表示权限等待中；busy 表示 agent 正在思考或执行工具。
   disabled: boolean;
+  disabledPlaceholder?: string;
   busy: boolean;
   hasToolCalls: boolean;
   slashCommands: SlashCommand[];
@@ -39,7 +40,7 @@ export interface InputBoxProps {
   onExit: () => void;
 }
 
-export function InputBox({ disabled, busy, hasToolCalls, slashCommands, initialHistory, onSubmit, onHistoryAppend, onToggleToolDetails, onTogglePlanMode, onPreviewCommand, onExit }: InputBoxProps): React.ReactElement {
+export function InputBox({ disabled, disabledPlaceholder, busy, hasToolCalls, slashCommands, initialHistory, onSubmit, onHistoryAppend, onToggleToolDetails, onTogglePlanMode, onPreviewCommand, onExit }: InputBoxProps): React.ReactElement {
   // InputBox 自己维护正在编辑的文本、slash 菜单状态和本地历史游标。
   const [text, setText] = useState("");
   const [cursor, setCursor] = useState(0);
@@ -196,7 +197,7 @@ export function InputBox({ disabled, busy, hasToolCalls, slashCommands, initialH
           {disabled ? (
             <Text>
               <Text color={tuiColors.textDim}>{"> "}</Text>
-              <Text color={tuiColors.textDim}>waiting for permission...</Text>
+              <Text color={tuiColors.textDim}>{disabledPlaceholder ?? "waiting for permission..."}</Text>
             </Text>
           ) : inputLineSegments(text, cursor).map((line, index) => (
             <Text key={String(index)}>
