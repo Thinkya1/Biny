@@ -5,20 +5,22 @@
  * 它负责处理全局快捷键、slash command、plan 模式、session 恢复和退出摘要，但不直接执行工具。
  */
 import React, { useCallback, useEffect, useReducer, useRef, useState } from "react";
-import { Box, Text, useApp, useBoxMetrics, useInput, useWindowSize, type DOMElement } from "ink";
+import { Box, Text, useApp, useInput, useWindowSize } from "ink";
 import type { PermissionMode } from "../permission/PermissionManager.js";
 import { parseThinkingSelection, type ModelChoice, type ThinkingSelection } from "../llm/ModelManager.js";
 import type { SessionSummary } from "../session/events.js";
 import { formatPermissionModeChanged } from "../permission/commands.js";
 import { createInitialTuiState, tuiReducer } from "./state.js";
 import { Header } from "./components/Header.js";
+import { Welcome } from "./components/Welcome.js";
 import { Transcript } from "./components/Transcript.js";
 import { InputBox } from "./components/InputBox.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { PermissionPrompt } from "./components/PermissionPrompt.js";
 import { PermissionModePicker } from "./components/PermissionModePicker.js";
-import { SessionPicker } from "./components/SessionPicker.js";
+import { SessionPicker, sessionPickerPageSize } from "./components/SessionPicker.js";
 import { TranscriptViewer } from "./components/TranscriptViewer.js";
+import { HelpDialog } from "./components/HelpDialog.js";
 import { ModelPicker } from "./components/ModelPicker.js";
 import { createTuiRuntime, type TuiRuntime } from "./runtime/createTuiRuntime.js";
 import type { PermissionChoice } from "./types.js";
@@ -54,11 +56,10 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
   } | undefined>(undefined);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("ask");
   const [transcriptViewer, setTranscriptViewer] = useState<ExpandableTranscript | undefined>(undefined);
-  const [contextUsage, setContextUsage] = useState<{ usedTokens?: number; maxTokens?: number }>({});
+  const [helpDialog, setHelpDialog] = useState<{ message?: string } | undefined>(undefined);
+  const [contextUsage, setContextUsage] = useState<{ usedTokens?: number; maxTokens?: number; source?: "estimated" | "provider" }>({});
   const runtimeRef = useRef<TuiRuntime | undefined>(undefined);
   const exitingRef = useRef(false);
-  const mainAreaRef = useRef<DOMElement | null>(null);
-  const mainArea = useBoxMetrics(mainAreaRef);
   const app = useApp();
   const { columns, rows } = useWindowSize();
 
@@ -66,7 +67,7 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
     if (!runtime) return;
     try {
       const context = await runtime.contextStatus();
-      setContextUsage({ usedTokens: context.budget.usedTokens, maxTokens: context.budget.maxTokens });
+      setContextUsage({ usedTokens: context.budget.usedTokens, maxTokens: context.budget.maxTokens, source: context.budget.source });
     } catch {
       // Footer telemetry is best effort and must never interrupt the TUI.
     }
@@ -120,28 +121,17 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
   }, [refreshContextUsage, workspaceRoot]);
 
   useInput((input, key) => {
-    // App 级快捷键只处理全局动作：滚动、详情、取消和退出。
+    // App 级快捷键只处理全局动作：详情、取消和退出。
     const isBusy = state.status === "thinking" || state.status === "running" || state.status === "waiting_permission";
     if (modelPicker && !(key.ctrl && input === "c")) return;
     if (key.ctrl && input.toLowerCase() === "o") {
-      dispatch({ type: "tool.details.toggled" });
+      const expandable = latestExpandableTranscript(state.transcript);
+      if (expandable) setTranscriptViewer(expandable);
       return;
     }
     if (key.ctrl && input.toLowerCase() === "t") {
       const expandable = latestExpandableTranscript(state.transcript);
       if (expandable) setTranscriptViewer(expandable);
-      return;
-    }
-    if (key.pageUp) {
-      dispatch({ type: "transcript.scrolled", direction: 1, amount: Math.max(1, rows - 12) });
-      return;
-    }
-    if (key.pageDown) {
-      dispatch({ type: "transcript.scrolled", direction: -1, amount: Math.max(1, rows - 12) });
-      return;
-    }
-    if (key.end) {
-      dispatch({ type: "transcript.follow_latest" });
       return;
     }
     if (key.escape && transcriptViewer) {
@@ -172,19 +162,19 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
       dispatch({ type: "system.message", content: "当前暂不支持 Ctrl-S 注入；请等待当前轮次结束，或按 Esc / Ctrl+C 中断。" });
       return;
     }
-    if (isKnownSlashCommand(value)) {
+    if (value.trim().startsWith("/")) {
       void handleSlashCommand(value).catch((error) => {
-        dispatch({ type: "system.message", content: error instanceof Error ? error.message : String(error) });
+        setTranscriptViewer({ title: "Command Error", content: error instanceof Error ? error.message : String(error) });
       });
       return;
     }
     if (mode === "plan") {
       const runtime = runtimeRef.current;
-      if (runtime) void runtime.createPlan(value).finally(() => refreshContextUsage(runtime));
+      if (runtime) void runtime.sendPrompt(value, "plan").finally(() => refreshContextUsage(runtime));
       return;
     }
     const runtime = runtimeRef.current;
-    if (runtime) void runtime.sendPrompt(value).finally(() => refreshContextUsage(runtime));
+    if (runtime) void runtime.sendPrompt(value, mode).finally(() => refreshContextUsage(runtime));
   };
 
   const appendHistory = (value: string): void => {
@@ -208,18 +198,15 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
     }
     : undefined;
   const hasToolCalls = [...state.transcript.committed, ...state.transcript.active].some((item) => item.kind === "tool");
-  const overlayOpen = Boolean(filteredSessionPicker || transcriptViewer || modelPicker);
-  const mainWidth = mainArea.hasMeasured ? Math.max(1, mainArea.width) : Math.max(1, columns);
-  const mainHeight = mainArea.hasMeasured ? Math.max(1, mainArea.height) : Math.max(1, rows - 5);
+  const overlayOpen = Boolean(filteredSessionPicker || transcriptViewer || helpDialog || modelPicker || permissionModePicker);
+  const isWelcomeVisible = !overlayOpen && !state.permission && state.transcript.committed.length === 0 && state.transcript.active.length === 0;
+  const mainWidth = Math.max(1, columns);
+  const mainHeight = Math.max(1, rows - 5);
 
   const togglePlanMode = (): void => {
-    // 手动切换 plan mode 会追加一条 system message，方便 transcript 留痕。
+    // Plan mode 是会话级 UI 模式；当前提示词和只读工具集由 runtime 按 mode 装配。
     setPreviewMode(undefined);
-    setMode((current) => {
-      const next = current === "plan" ? "chat" : "plan";
-      dispatch({ type: "system.message", content: next === "plan" ? "已进入 Plan 模式：后续输入只生成计划，不执行工具或修改文件。" : "已回到 Chat 模式。" });
-      return next;
-    });
+    setMode((current) => current === "plan" ? "chat" : "plan");
   };
 
   const previewSlashCommand = useCallback((commandName: string | undefined): void => {
@@ -236,15 +223,21 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
   }
 
   return (
-    <Box flexDirection="column" width="100%" height={Math.max(1, rows)}>
+    <Box flexDirection="column" width="100%">
       <Header sessionId={state.sessionId} viewingSessionId={state.viewingSessionId} cwd={state.cwd} />
-      <Box ref={mainAreaRef} flexDirection="column" flexGrow={1} overflow="hidden" width="100%">
+      <Box flexDirection="column" width="100%">
         {transcriptViewer ? (
           <TranscriptViewer
             transcript={transcriptViewer}
             width={mainWidth}
             height={mainHeight}
             onExit={() => setTranscriptViewer(undefined)}
+          />
+        ) : helpDialog ? (
+          <HelpDialog
+            commands={TUI_SLASH_COMMANDS}
+            message={helpDialog.message}
+            onExit={() => setHelpDialog(undefined)}
           />
         ) : filteredSessionPicker ? (
           <SessionPicker
@@ -259,6 +252,18 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
                 ? (current.selectedIndex + direction + sessions.length) % sessions.length
                 : 0;
               return { ...current, selectedIndex };
+            })}
+            onPageMove={(direction) => setSessionPicker((current) => {
+              if (!current) return current;
+              const sessions = filterSessions(current.sessions, current.query);
+              if (!sessions.length) return { ...current, selectedIndex: 0 };
+              return {
+                ...current,
+                selectedIndex: Math.min(
+                  Math.max(current.selectedIndex + direction * sessionPickerPageSize, 0),
+                  sessions.length - 1
+                )
+              };
             })}
             onSelect={() => {
               const selected = filteredSessionPicker.sessions[Math.min(filteredSessionPicker.selectedIndex, filteredSessionPicker.sessions.length - 1)];
@@ -294,28 +299,29 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
             onAnswer={answerPermission}
             onToggleDetails={() => dispatch({ type: "permission.details.toggled" })}
           />
+        ) : isWelcomeVisible ? (
+          <Welcome cwd={state.cwd} />
         ) : (
           <Transcript
             transcript={state.transcript}
             width={mainWidth}
-            height={mainHeight}
-            scrollOffset={state.transcriptScrollOffset}
-            followLatest={state.followLatest}
-            expandedToolId={state.expandedToolId}
           />
         )}
       </Box>
       <Box flexShrink={0} width="100%">
         <InputBox
           disabled={state.status === "waiting_permission" || permissionModePicker || overlayOpen}
-          disabledPlaceholder={overlayOpen ? "close overlay to continue" : permissionModePicker ? "choose a permission mode" : undefined}
+          disabledPlaceholder={permissionModePicker ? "choose a permission mode" : overlayOpen ? "close overlay to continue" : undefined}
           busy={state.status === "thinking" || state.status === "running"}
           hasToolCalls={hasToolCalls}
           slashCommands={TUI_SLASH_COMMANDS}
           initialHistory={inputHistory}
           onSubmit={sendPrompt}
           onHistoryAppend={appendHistory}
-          onToggleToolDetails={() => dispatch({ type: "tool.details.toggled" })}
+          onToggleToolDetails={() => {
+            const expandable = latestExpandableTranscript(state.transcript);
+            if (expandable) setTranscriptViewer(expandable);
+          }}
           onTogglePlanMode={togglePlanMode}
           onPreviewCommand={previewSlashCommand}
           onExit={() => {
@@ -327,6 +333,7 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
         modelLabel={state.modelLabel}
         contextUsedTokens={contextUsage.usedTokens}
         contextMaxTokens={contextUsage.maxTokens}
+        contextSource={contextUsage.source}
         status={state.status}
         mode={previewMode ?? mode}
         width={columns}
@@ -341,7 +348,7 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
     const [command = "", ...args] = value.trim().split(/\s+/);
 
     if (command === "/" || command === "/help") {
-      dispatch({ type: "system.message", content: formatSlashHelp() });
+      setHelpDialog({});
       return;
     }
 
@@ -362,8 +369,54 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
       return;
     }
 
+    if (command === "/usage") {
+      setTranscriptViewer({ title: "Usage", content: runtime.usageReport().replace(/^Usage\n\n?/, "") });
+      return;
+    }
+
+    if (command === "/status") {
+      const info = runtime.getInfo();
+      setTranscriptViewer({
+        title: "Status",
+        content: [
+          `Model: ${info.modelLabel}`,
+          `Reasoning: ${info.reasoningLabel}`,
+          `Permissions: ${runtime.getPermissionMode()}`,
+          "",
+          runtime.extensionReport()
+        ].join("\n")
+      });
+      return;
+    }
+
+    if (command === "/mcp" || command === "/skills" || command === "/plugins") {
+      const section = command.slice(1) as "mcp" | "skills" | "plugins";
+      const title = section === "mcp" ? "MCP" : section.charAt(0).toUpperCase() + section.slice(1);
+      setTranscriptViewer({ title, content: runtime.extensionReport(section).replace(new RegExp(`^${title}\\n`), "") });
+      return;
+    }
+
+    if (command === "/subagent") {
+      const task = args.join(" ").trim();
+      if (!task) {
+        setTranscriptViewer({ title: "Subagent", content: "Usage: /subagent <read-only task>" });
+        return;
+      }
+      const output = await runtime.runSubagentTask(task);
+      setTranscriptViewer({ title: "Subagent", content: output || "Subagent returned no text." });
+      return;
+    }
+
+    if (command === "/review") {
+      const instructions = args.join(" ").trim();
+      const task = instructions || "Review the current git changes for correctness, regressions, missing tests, and concrete risks. Return concise findings with exact file paths and line numbers.";
+      const output = await runtime.runSubagentTask(task);
+      setTranscriptViewer({ title: "Code Review", content: output || "No review findings." });
+      return;
+    }
+
     if (command === "/compact") {
-      dispatch({ type: "system.message", content: await runtime.compactConversation(args.join(" ").trim() || undefined) });
+      setTranscriptViewer({ title: "Compact", content: await runtime.compactConversation(args.join(" ").trim() || undefined) });
       await refreshContextUsage(runtime);
       return;
     }
@@ -384,7 +437,7 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
 
     if (command === "/sessions") {
       const summaries = await runtime.listSessions();
-      dispatch({ type: "system.message", content: formatSessionSummaries(summaries) });
+      setSessionPicker({ sessions: summaries.filter((summary) => summary.firstUserMessage.trim()).slice().reverse(), selectedIndex: 0, query: "" });
       return;
     }
 
@@ -394,7 +447,7 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
         setPermissionModePicker(true);
         return;
       }
-      dispatch({ type: "system.message", content: await runtime.runPermissionCommand(args) });
+      setTranscriptViewer({ title: "Permissions", content: await runtime.runPermissionCommand(args) });
       setPermissionMode(runtime.getPermissionMode());
       return;
     }
@@ -414,16 +467,16 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
     if (command === "/plan") {
       const task = args.join(" ").trim();
       if (!task) {
-        dispatch({ type: "system.message", content: "Usage: /plan <task>" });
+        togglePlanMode();
         return;
       }
       setMode("plan");
-      await runtime.createPlan(task);
+      await runtime.sendPrompt(task, "plan");
       await refreshContextUsage(runtime);
       return;
     }
 
-    dispatch({ type: "system.message", content: `Unknown command: ${command}\n\n${formatSlashHelp()}` });
+    setHelpDialog({ message: `Unknown command: ${command}` });
   }
 
   async function closeAndExit(): Promise<void> {
@@ -457,10 +510,10 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
     try {
       const info = await runtime.switchModel(selection.alias, selection.thinking);
       setModelPicker(undefined);
-      dispatch({ type: "system.message", content: `Model switched to ${info.modelLabel} (thinking: ${info.reasoningLabel}).` });
+      dispatch({ type: "system.message", content: `Model changed to ${info.modelLabel} ${info.reasoningLabel.toLowerCase()}` });
     } catch (error) {
       setModelPicker(undefined);
-      dispatch({ type: "system.message", content: `Model switch failed: ${error instanceof Error ? error.message : String(error)}` });
+      setTranscriptViewer({ title: "Model", content: `Model switch failed: ${error instanceof Error ? error.message : String(error)}` });
     }
   }
 
@@ -479,42 +532,6 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
   }
 }
 
-function isKnownSlashCommand(value: string): boolean {
-  // 只拦截已知 slash 命令；未知 /xxx 继续显示帮助，不交给 agent。
-  const [command = ""] = value.trim().split(/\s+/);
-  return command === "/" || TUI_SLASH_COMMANDS.some((item) => item.name === command);
-}
-
-function formatSlashHelp(): string {
-  // 帮助文本保持短小，详细交互提示由输入框和状态栏承担。
-  return [
-    "Commands:",
-    "/help /clear /context /compact [hint] /model [alias] [off|high|max]",
-    "/sessions /resume [session]",
-    "/permissions [status|readonly|ask|auto|full|reset]",
-    "/plan <task> /exit /quit"
-  ].join("\n");
-}
-
-function formatSessionSummaries(summaries: SessionSummary[]): string {
-  // 只展示最近 12 个 session，完整列表可通过选择器继续过滤。
-  if (!summaries.length) return "No sessions found.";
-  const latest = summaries.slice(-12).reverse();
-  return [
-    "Recent sessions:",
-    ...latest.map((summary) => {
-      const id = summary.fileName.replace(/\.jsonl$/, "");
-      const first = summary.firstUserMessage.replace(/\s+/g, " ").slice(0, 64) || "(no user message)";
-      const last = summary.lastAssistantMessage.replace(/\s+/g, " ").slice(0, 64) || "(no assistant message)";
-      return [
-        `${id} | ${formatAbsoluteTime(summary.createdAt)} | ${relativeTime(summary.updatedAt)} | ${String(summary.eventCount)} events`,
-        `  user: ${first}`,
-        `  biny: ${last}`
-      ].join("\n");
-    })
-  ].join("\n");
-}
-
 function filterSessions(sessions: SessionSummary[], query: string): SessionSummary[] {
   // 过滤同时匹配文件名、首条用户消息和最后 assistant 消息。
   const normalized = query.trim().toLowerCase();
@@ -524,26 +541,4 @@ function filterSessions(sessions: SessionSummary[], query: string): SessionSumma
     session.firstUserMessage,
     session.lastAssistantMessage
   ].some((value) => value.toLowerCase().includes(normalized)));
-}
-
-function formatAbsoluteTime(value: string): string {
-  // TUI 列表里只需要月日时分，年份可从 session 文件名或完整记录中查看。
-  const date = new Date(value);
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  const hour = String(date.getHours()).padStart(2, "0");
-  const minute = String(date.getMinutes()).padStart(2, "0");
-  return `${month}-${day} ${hour}:${minute}`;
-}
-
-function relativeTime(value: string): string {
-  // 相对时间用于快速判断最近更新，不参与 session 排序。
-  const diff = Date.now() - new Date(value).getTime();
-  const minute = 60_000;
-  const hour = 60 * minute;
-  const day = 24 * hour;
-  if (diff < minute) return "just now";
-  if (diff < hour) return `${String(Math.floor(diff / minute))}m ago`;
-  if (diff < day) return `${String(Math.floor(diff / hour))}h ago`;
-  return `${String(Math.floor(diff / day))}d ago`;
 }

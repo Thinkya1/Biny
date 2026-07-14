@@ -5,11 +5,12 @@
  * 并把用户选择回传给 TUI runtime。
  */
 import React, { useEffect, useState } from "react";
-import { Box, Text, useInput } from "ink";
+import { Text, useInput } from "ink";
 import { TUI_KEYS } from "../keymap.js";
 import { movePermissionSelection, permissionChoiceAt, permissionOptions } from "../permissionOptions.js";
 import { tuiColors } from "../theme/index.js";
 import type { PermissionChoice, TuiPermissionRequest } from "../types.js";
+import { DialogFrame } from "./DialogFrame.js";
 import { MarkdownText } from "./MarkdownText.js";
 
 export interface PermissionPromptProps {
@@ -58,10 +59,13 @@ export function PermissionPrompt({ request, detailsExpanded, onAnswer, onToggleD
   const detailLines = detailSource.split("\n");
   const lines = detailsExpanded ? detailLines.slice(0, 80) : detailLines.slice(0, 16);
   return (
-    <Box flexDirection="column" borderStyle="double" borderColor={tuiColors.borderFocus} paddingX={1} marginBottom={1}>
-      <Text color={tuiColors.warning} bold>{request.title}</Text>
-      <Text>Tool: {request.tool}</Text>
-      <Text>Action: {request.actionType}  Risk: {request.riskLevel}</Text>
+    <DialogFrame
+      title={<Text color={tuiColors.warning}>{request.title}</Text>}
+      subtitle={`Tool: ${request.tool} · Action: ${request.actionType} · Risk: ${request.riskLevel}`}
+      hint="↑↓ navigate · Enter select · y execute · n deny · Ctrl+E/Ctrl+O details"
+      footer={request.requireFullYes ? "Critical action: review details before accepting." : "Press enter to select"}
+    >
+      <Text> </Text>
       {request.targetPath ? <Text>Target: {request.targetPath}</Text> : null}
       {request.command ? <Text>Command: {request.command}</Text> : null}
       {request.reason ? <Text>Reason: {request.reason}</Text> : null}
@@ -70,20 +74,18 @@ export function PermissionPrompt({ request, detailsExpanded, onAnswer, onToggleD
       {lines.map((line, index) => (
         <MarkdownText key={`${request.tool}-${String(index)}`} line={line} />
       ))}
-      <Box flexDirection="column" marginTop={1}>
-        {permissionOptions.map((option, index) => {
-          const selected = index === selectedIndex;
-          const color = option.dangerous ? tuiColors.error : selected ? tuiColors.warning : undefined;
-          return (
-            <Text key={option.choice} color={color} bold={selected}>
-              {selected ? "❯ " : "  "}
-              {option.label}
-              <Text color={tuiColors.textDim}>  {option.description}</Text>
-            </Text>
-          );
-        })}
-      </Box>
-      <Text color={tuiColors.textDim}>↑↓ navigate · Enter select · y execute · n deny · Ctrl-E details</Text>
-    </Box>
+      <Text> </Text>
+      {permissionOptions.map((option, index) => {
+        const selected = index === selectedIndex;
+        const color = option.dangerous ? tuiColors.error : selected ? tuiColors.warning : undefined;
+        return (
+          <Text key={option.choice} color={color} bold={selected} wrap="truncate-end">
+            {selected ? "❯ " : "  "}
+            {option.label}
+            <Text color={tuiColors.textDim}>  {option.description}</Text>
+          </Text>
+        );
+      })}
+    </DialogFrame>
   );
 }

@@ -2,7 +2,7 @@
  * TUI host bridge. Ink consumes agent events through this narrow interface and
  * never reaches into the provider, tool registry, recorder or context state.
  */
-import type { AgentSessionInfo, ResumedAgentSession } from "../../agent/AgentSession.js";
+import type { AgentRunMode, AgentSessionInfo, ResumedAgentSession } from "../../agent/AgentSession.js";
 import type { AgentPermissionRequest, AgentPermissionResult, AgentSessionEvent } from "../../agent/types.js";
 import type { PermissionMode } from "../../permission/PermissionManager.js";
 import type { ModelChoice, ModelRuntimeInfo, ThinkingSelection } from "../../llm/ModelManager.js";
@@ -12,6 +12,7 @@ import type { SessionSummary } from "../../session/events.js";
 import type { ContextStatus } from "../../agent/context/types.js";
 import type { PermissionChoice } from "../types.js";
 import { TuiEventBridge } from "./eventBridge.js";
+import type { ExtensionSection } from "../../extensions/report.js";
 
 export interface TuiRuntime {
   getInfo(): AgentSessionInfo;
@@ -20,11 +21,13 @@ export interface TuiRuntime {
   runPermissionCommand(args: string[]): Promise<string>;
   listModels(): ModelChoice[];
   switchModel(alias: string, thinking?: ThinkingSelection): Promise<ModelRuntimeInfo>;
-  sendPrompt(prompt: string): Promise<void>;
-  createPlan(task: string): Promise<void>;
+  sendPrompt(prompt: string, mode?: AgentRunMode): Promise<void>;
   resumeSession(session: string): Promise<ResumedAgentSession>;
   listSessions(): Promise<SessionSummary[]>;
+  extensionReport(section?: ExtensionSection): string;
+  runSubagentTask(task: string): Promise<string>;
   contextReport(): Promise<string>;
+  usageReport(): string;
   contextStatus(): Promise<ContextStatus>;
   compactConversation(hint?: string): Promise<string>;
   cancelCurrentTurn(): void;
@@ -70,7 +73,7 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
       });
       return info;
     },
-    async sendPrompt(prompt: string): Promise<void> {
+    async sendPrompt(prompt: string, mode: AgentRunMode = "chat"): Promise<void> {
       if (busy) return;
       busy = true;
       abortController = new AbortController();
@@ -78,7 +81,8 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
         bridge.emit({ type: "user.message", content: prompt });
         for await (const event of agent.runSdk(prompt, {
           abortSignal: abortController.signal,
-          confirmPermission: async (request) => await waitForPermission(request)
+          confirmPermission: async (request) => await waitForPermission(request),
+          mode
         })) {
           bridgeAgentSessionEvent(event);
         }
@@ -100,24 +104,6 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
         pendingPermission = undefined;
       }
     },
-    async createPlan(task: string): Promise<void> {
-      if (busy) return;
-      busy = true;
-      bridge.emit({ type: "user.message", content: `/plan ${task}` });
-      try {
-        const output = await agent.createPlan(task, (delta) => bridge.emit({ type: "assistant.delta", content: delta }));
-        bridge.emit({ type: "assistant.completed", content: output });
-        bridge.emit({ type: "session.completed", sessionId: agent.getInfo().sessionId });
-      } catch (error) {
-        bridge.emit({
-          type: "session.error",
-          sessionId: agent.getInfo().sessionId,
-          message: error instanceof Error ? error.message : String(error)
-        });
-      } finally {
-        busy = false;
-      }
-    },
     async resumeSession(session: string): Promise<ResumedAgentSession> {
       if (busy) throw new Error("Cannot resume another session while a turn is running.");
       const resumed = await agent.resume(session);
@@ -136,8 +122,23 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
     async listSessions(): Promise<SessionSummary[]> {
       return await agent.listSessions();
     },
+    extensionReport(section?: ExtensionSection): string {
+      return commandRuntime.extensionReport(section);
+    },
+    async runSubagentTask(task: string): Promise<string> {
+      if (busy) throw new Error("Cannot run a subagent while a turn is running.");
+      busy = true;
+      try {
+        return await commandRuntime.runSubagentTask(task);
+      } finally {
+        busy = false;
+      }
+    },
     async contextReport(): Promise<string> {
       return await agent.contextReport();
+    },
+    usageReport(): string {
+      return agent.usageReport();
     },
     async contextStatus(): Promise<ContextStatus> {
       return await agent.contextStatus();

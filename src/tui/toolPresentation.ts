@@ -107,6 +107,7 @@ export function summarizeToolArgs(tool: string, args: unknown): string {
 
   if ((tool === "read_file" || tool === "write_file" || tool === "edit_file") && path) return path;
   if ((tool === "search_files" || tool === "grep_search") && query) return query;
+  if (tool === "web_search" && query) return query;
   if (tool === "list_files") return "workspace files";
   if (tool === "git_status") return "git status";
   if (tool === "git_diff") return "git diff";
@@ -131,6 +132,9 @@ export function semanticToolTitle(
   if (tool === "list_files") return running ? "Listing workspace files" : "Listed workspace files";
   if (tool === "search_files" || tool === "grep_search") {
     return `${running ? "Searching" : "Searched"}${argsSummary ? ` for “${argsSummary}”` : " workspace"}`;
+  }
+  if (tool === "web_search") {
+    return `${running ? "Searching the web" : "Searched the web"}${argsSummary ? ` for “${argsSummary}”` : ""}`;
   }
   if (tool === "git_status") return running ? "Checking git status" : "Checked git status";
   if (tool === "git_diff") return running ? "Reading git diff" : "Viewed git diff";
@@ -158,6 +162,8 @@ function projectToolResult(item: ToolTranscriptItem, result: unknown, status: To
   const outputLines = typeof record?.outputLines === "number" ? record.outputLines : undefined;
   const exitCode = typeof record?.exitCode === "number" ? record.exitCode : undefined;
   const truncated = typeof record?.truncated === "boolean" ? record.truncated : undefined;
+
+  if (item.tool === "web_search") return projectWebSearchResult(result, status, durationMs, outputLines, truncated);
 
   if (item.tool === "run_command" || item.display?.kind === "command") {
     const command = item.display?.kind === "command" ? item.display.command : item.argsSummary;
@@ -198,6 +204,55 @@ function projectToolResult(item: ToolTranscriptItem, result: unknown, status: To
     durationMs,
     outputLines: outputLines ?? logicalLineCount(output),
     exitCode,
+    truncated
+  };
+}
+
+function projectWebSearchResult(
+  result: unknown,
+  status: ToolTranscriptStatus,
+  durationMs: number | undefined,
+  outputLines: number | undefined,
+  truncated: boolean | undefined
+): ToolResultProjection {
+  const record = typeof result === "object" && result !== null ? result as Record<string, unknown> : undefined;
+  const error = typeof record?.error === "string"
+    ? record.error
+    : typeof record?.message === "string"
+      ? record.message
+      : undefined;
+  if (status !== "success" || error) {
+    const output = error ?? (status === "denied" ? "Denied" : "Web search failed");
+    return { output, details: output, durationMs, outputLines: 1, truncated };
+  }
+
+  const query = typeof record?.query === "string" ? record.query : "(unknown)";
+  const provider = typeof record?.provider === "string" ? record.provider : "web";
+  const rawResults = Array.isArray(record?.results) ? record.results : [];
+  const resultLines: string[] = [];
+  for (const [index, rawResult] of rawResults.entries()) {
+    if (typeof rawResult !== "object" || rawResult === null) continue;
+    const item = rawResult as Record<string, unknown>;
+    const title = typeof item.title === "string" ? item.title : "";
+    const url = typeof item.url === "string" ? item.url : "";
+    const snippet = typeof item.snippet === "string" ? item.snippet : "";
+    if (!title || !url) continue;
+    resultLines.push(`${index + 1}. ${title}`, `   ${url}`, ...(snippet ? [`   ${snippet}`] : []), "");
+  }
+
+  const output = resultLines.length > 0 ? resultLines.join("\n").trimEnd() : "No search results.";
+  const details = [
+    `Query: ${query}`,
+    `Provider: ${provider}`,
+    `Results: ${String(rawResults.length)}`,
+    "",
+    output
+  ].join("\n");
+  return {
+    output,
+    details,
+    durationMs,
+    outputLines: outputLines ?? logicalLineCount(output),
     truncated
   };
 }

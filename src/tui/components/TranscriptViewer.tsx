@@ -1,9 +1,9 @@
 import React, { useMemo, useState } from "react";
-import { Box, Text, useInput } from "ink";
+import { Box, useInput } from "ink";
 import type { ExpandableTranscript } from "../transcriptViewer.js";
-import { stripAnsi, truncateToTerminalWidth, wrapTerminalLines } from "../terminalText.js";
-import { tuiColors } from "../theme/index.js";
+import { stripAnsi, wrapTerminalLines } from "../terminalText.js";
 import { MarkdownText } from "./MarkdownText.js";
+import { DialogFrame, dialogBodyRows } from "./DialogFrame.js";
 
 export interface TranscriptViewerProps {
   transcript: ExpandableTranscript;
@@ -22,7 +22,7 @@ export function TranscriptViewer({ transcript, width, height, onExit }: Transcri
   const footer = `${String(page.safeScrollTop + 1)}-${String(Math.min(page.lines.length, page.safeScrollTop + page.bodyRows))} / ${String(page.lines.length)} visual lines`;
 
   useInput((input, key) => {
-    if (key.escape || input.toLowerCase() === "q") {
+    if (key.escape) {
       onExit();
       return;
     }
@@ -44,18 +44,19 @@ export function TranscriptViewer({ transcript, width, height, onExit }: Transcri
   });
 
   return (
-    <Box flexDirection="column" width={safeWidth} height={Math.max(1, height)} overflow="hidden">
-      <Text color={tuiColors.primary} bold>{truncateToTerminalWidth(transcript.title, safeWidth)}</Text>
-      {page.showHint ? <Text color={tuiColors.textMuted}>{truncateToTerminalWidth("up/down navigate · pgup/pgdn page · esc close", safeWidth)}</Text> : null}
-      <Box flexDirection="column" height={page.bodyRows} overflow="hidden">
+    <DialogFrame
+      title={transcript.title}
+      hint="↑↓ navigate · PgUp/PgDn page · Esc cancel"
+      footer={footer}
+      width={safeWidth}
+      height={Math.max(1, height)}
+    >
+      <Box height={page.bodyRows} overflow="hidden" flexDirection="column">
         {page.visible.map((line, index) => (
           <MarkdownText key={`${String(page.safeScrollTop + index)}-${line}`} line={line} />
         ))}
       </Box>
-      {page.showFooter ? (
-        <Text color={tuiColors.textMuted}>{truncateToTerminalWidth(footer, safeWidth)}</Text>
-      ) : null}
-    </Box>
+    </DialogFrame>
   );
 }
 
@@ -70,9 +71,9 @@ export function transcriptViewerPage(content: string, width: number, height: num
 } {
   const safeWidth = Math.max(1, Math.floor(width));
   const safeHeight = Math.max(1, Math.floor(height));
-  const showHint = safeHeight >= 4;
+  const showHint = safeHeight >= 3;
   const showFooter = safeHeight >= 3;
-  const bodyRows = Math.max(1, safeHeight - 1 - Number(showHint) - Number(showFooter));
+  const bodyRows = dialogBodyRows(safeHeight, { hint: true, footer: true, blankBeforeBody: true });
   const lines = wrapTerminalLines(stripAnsi(content).replaceAll("\t", "    "), safeWidth);
   const maxScroll = Math.max(0, lines.length - bodyRows);
   const safeScrollTop = Math.min(Math.max(0, Math.floor(scrollTop)), maxScroll);

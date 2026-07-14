@@ -97,9 +97,6 @@ export interface TuiState {
   turnStartedAt?: number;
   lastWorkedMs?: number;
   transcript: TranscriptState;
-  transcriptScrollOffset: number;
-  followLatest: boolean;
-  expandedToolId?: string;
   permissionDetailsExpanded: boolean;
   permission?: TuiPermissionRequest;
 }

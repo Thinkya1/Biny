@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from "react";
-import { Box, Text, useInput } from "ink";
+import { Text, useInput } from "ink";
 import type { PermissionMode } from "../../permission/PermissionManager.js";
 import {
   movePermissionModeSelection,
   permissionModeOptionIndex,
   permissionModeOptions
 } from "../permissionModeOptions.js";
+import { DialogFrame } from "./DialogFrame.js";
 import { tuiColors } from "../theme/index.js";
 
 export interface PermissionModePickerProps {
@@ -35,31 +36,30 @@ export function PermissionModePicker({ currentMode, onSelect, onCancel }: Permis
       if (option) onSelect(option.mode);
       return;
     }
-    if (key.escape || input.toLowerCase() === "q") {
+    if (key.escape) {
       onCancel();
     }
   });
 
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={tuiColors.borderFocus} paddingX={1} marginBottom={1}>
-      <Text color={tuiColors.primary} bold>Update Model Permissions</Text>
-      <Text color={tuiColors.textMuted}>↑↓ navigate · Enter select · Esc cancel</Text>
-      <Box flexDirection="column" marginTop={1}>
-        {permissionModeOptions.map((option, index) => {
-          const selected = index === selectedIndex;
-          const current = option.mode === currentMode;
-          return (
-            <Box key={option.mode} flexDirection="column">
-              <Text color={selected ? tuiColors.primary : tuiColors.text} bold={selected}>
-                {selected ? "❯ " : "  "}
-                {String(index + 1)}. {option.label}
-                {current ? <Text color={tuiColors.success}> ← current</Text> : null}
-              </Text>
-              <Text color={tuiColors.textMuted}>    {option.description}</Text>
-            </Box>
-          );
-        })}
-      </Box>
-    </Box>
+    <DialogFrame
+      title="Select Permission Mode"
+      hint="↑↓ navigate · Enter select · Esc cancel"
+      footer="Press enter to select or esc to cancel"
+    >
+      <Text> </Text>
+      {permissionModeOptions.map((option, index) => {
+        const selected = index === selectedIndex;
+        const current = option.mode === currentMode;
+        return (
+          <Text key={option.mode} color={selected ? tuiColors.primary : tuiColors.text} bold={selected} wrap="truncate-end">
+            {selected ? "❯ " : "  "}
+            {String(index + 1)}. {option.label}
+            <Text color={tuiColors.textMuted}>  {option.description}</Text>
+            {current ? <Text color={tuiColors.success}> ← current</Text> : null}
+          </Text>
+        );
+      })}
+    </DialogFrame>
   );
 }

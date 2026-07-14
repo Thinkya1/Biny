@@ -24,9 +24,6 @@ import type {
 export type TuiAction = RuntimeEvent
   | { type: "transcript.cleared" }
   | { type: "transcript.replaced"; items: TranscriptItem[]; viewingSessionId?: string }
-  | { type: "transcript.scrolled"; direction: -1 | 1; amount?: number }
-  | { type: "transcript.follow_latest" }
-  | { type: "tool.details.toggled" }
   | { type: "permission.details.toggled" };
 
 export function createInitialTuiState(workspaceRoot: string): TuiState {
@@ -42,9 +39,6 @@ export function createInitialTuiState(workspaceRoot: string): TuiState {
     turnStartedAt: undefined,
     lastWorkedMs: undefined,
     transcript: { committed: [], active: [] },
-    transcriptScrollOffset: 0,
-    followLatest: true,
-    expandedToolId: undefined,
     permissionDetailsExpanded: false
   };
 }
@@ -113,26 +107,10 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
     case "transcript.cleared":
       return {
         ...state,
-        transcript: { committed: [], active: [] },
-        expandedToolId: undefined,
-        transcriptScrollOffset: 0,
-        followLatest: true
+        transcript: { committed: [], active: [] }
       };
     case "transcript.replaced":
       return replaceTranscript(state, event.items, event.viewingSessionId);
-    case "transcript.scrolled":
-      return {
-        ...state,
-        followLatest: false,
-        transcriptScrollOffset: Math.max(0, state.transcriptScrollOffset + event.direction * (event.amount ?? 1))
-      };
-    case "transcript.follow_latest":
-      return { ...state, followLatest: true, transcriptScrollOffset: 0 };
-    case "tool.details.toggled": {
-      const latest = latestToolItem(state.transcript);
-      if (!latest) return state;
-      return { ...state, expandedToolId: state.expandedToolId === latest.id ? undefined : latest.id };
-    }
     case "permission.details.toggled":
       return { ...state, permissionDetailsExpanded: !state.permissionDetailsExpanded };
     case "user.message":
@@ -164,7 +142,6 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
       return {
         ...state,
         status: "running",
-        expandedToolId: undefined,
         transcript: startTool(state.transcript, event)
       };
     case "tool.call.progress":
@@ -338,26 +315,11 @@ function nextTranscriptId(transcript: TranscriptState, prefix: string): string {
   return `${prefix}-${String(transcript.committed.length + transcript.active.length + 1)}`;
 }
 
-function latestToolItem(transcript: TranscriptState): ToolTranscriptItem | undefined {
-  for (let index = transcript.active.length - 1; index >= 0; index -= 1) {
-    const item = transcript.active[index];
-    if (item?.kind === "tool") return item;
-  }
-  for (let index = transcript.committed.length - 1; index >= 0; index -= 1) {
-    const item = transcript.committed[index];
-    if (item?.kind === "tool") return item;
-  }
-  return undefined;
-}
-
 function replaceTranscript(state: TuiState, items: TranscriptItem[], viewingSessionId: string | undefined): TuiState {
   return {
     ...state,
     viewingSessionId,
     transcript: { committed: items, active: [] },
-    expandedToolId: undefined,
-    transcriptScrollOffset: 0,
-    followLatest: true,
     turnStartedAt: undefined,
     lastWorkedMs: undefined
   };

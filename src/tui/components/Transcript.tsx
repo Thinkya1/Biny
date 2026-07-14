@@ -1,6 +1,6 @@
 /** Width-aware committed transcript and active-cell renderer. */
 import React, { useEffect, useState } from "react";
-import { Box, Text } from "ink";
+import { Box, Static, Text } from "ink";
 import { tuiColors } from "../theme/index.js";
 import { visibleTranscriptRows, type TranscriptDisplayRow } from "../transcriptRows.js";
 import type { TranscriptState } from "../types.js";
@@ -9,13 +9,9 @@ import { MarkdownText } from "./MarkdownText.js";
 export interface TranscriptProps {
   transcript: TranscriptState;
   width: number;
-  height: number;
-  scrollOffset: number;
-  followLatest: boolean;
-  expandedToolId?: string;
 }
 
-export function Transcript({ transcript, width, height, scrollOffset, followLatest, expandedToolId }: TranscriptProps): React.ReactElement {
+export function Transcript({ transcript, width }: TranscriptProps): React.ReactElement {
   const hasRunningTool = transcript.active.some((item) => item.kind === "tool" && item.status === "running");
   const [, setClock] = useState(0);
   useEffect(() => {
@@ -23,16 +19,26 @@ export function Transcript({ transcript, width, height, scrollOffset, followLate
     const timer = setInterval(() => setClock(Date.now()), 1_000);
     return () => clearInterval(timer);
   }, [hasRunningTool]);
-  const rows = visibleTranscriptRows(transcript, {
-    width,
-    height,
-    scrollOffset,
-    followLatest,
-    expandedToolId
-  });
   return (
-    <Box flexDirection="column" justifyContent="flex-end" width="100%" height={Math.max(0, height)} overflow="hidden">
-      {rows.map((row) => <TranscriptRow key={row.id} row={row} />)}
+    <Box flexDirection="column" width="100%">
+      <Static items={transcript.committed}>
+        {(item) => (
+          <Box key={item.id} flexDirection="column" width="100%">
+            {visibleTranscriptRows({ committed: [item], active: [] }, {
+              width,
+              height: Number.MAX_SAFE_INTEGER,
+              scrollOffset: 0,
+              followLatest: true
+            }).map((row) => <TranscriptRow key={row.id} row={row} />)}
+          </Box>
+        )}
+      </Static>
+      {visibleTranscriptRows({ committed: [], active: transcript.active }, {
+        width,
+        height: Number.MAX_SAFE_INTEGER,
+        scrollOffset: 0,
+        followLatest: true
+      }).map((row) => <TranscriptRow key={row.id} row={row} />)}
     </Box>
   );
 }

@@ -263,19 +263,18 @@ interface SlashPaletteProps {
 function SlashPalette({ rows, selected }: SlashPaletteProps): React.ReactElement {
   // SlashPalette 只负责展示 rows；过滤和选中状态由 slashMenu 工具函数维护。
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor={tuiColors.border} paddingX={1} width="100%">
-      {rows.length === 0 ? <Text color={tuiColors.textDim}>no matching commands</Text> : null}
+    <Box flexDirection="column" borderStyle="single" borderColor={tuiColors.primary} borderLeft={false} borderRight={false} paddingX={1} width="100%">
+      {rows.length === 0 ? <Text color={tuiColors.textMuted}>No matching commands</Text> : null}
       {rows.map((row, index) => {
         if (row.type === "header") {
-          return <Text key={`header-${row.label}-${String(index)}`} color={tuiColors.textDim}>{row.label}</Text>;
+          return <Text key={`header-${row.label}-${String(index)}`} color={tuiColors.textMuted} bold>{row.label}</Text>;
         }
         const isSelected = row.index === selected;
         return (
-          <Text key={row.command.name} inverse={isSelected}>
-            {isSelected ? "> " : "  "}
-            {row.command.name.padEnd(12)}
-            {" "}
-            <Text color={isSelected ? undefined : tuiColors.textDim}>{row.command.description}</Text>
+          <Text key={row.command.name} color={isSelected ? tuiColors.primary : tuiColors.text} bold={isSelected} wrap="truncate-end">
+            {isSelected ? "❯ " : "  "}
+            {row.command.name.padEnd(14)}
+            <Text color={tuiColors.textMuted}>{row.command.description}</Text>
           </Text>
         );
       })}

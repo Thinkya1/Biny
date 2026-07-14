@@ -16,7 +16,6 @@ export async function startTui(workspaceRoot: string): Promise<void> {
     exitSummary = summary;
   }} />, { exitOnCtrlC: false });
   await instance.waitUntilExit();
-  clearTerminal();
   if (exitSummary) {
     const relativeSessionFile = path.relative(workspaceRoot, exitSummary.sessionFile);
     process.stdout.write([
@@ -29,10 +28,4 @@ export async function startTui(workspaceRoot: string): Promise<void> {
       ""
     ].join("\n"));
   }
-}
-
-function clearTerminal(): void {
-  // 只在 TTY 中清屏；管道或测试环境保持输出可捕获。
-  if (!process.stdout.isTTY) return;
-  process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
 }

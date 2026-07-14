@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import React from "react";
 import { renderToString } from "ink";
 import { Transcript } from "../src/tui/components/Transcript.js";
+import { HelpDialog } from "../src/tui/components/HelpDialog.js";
+import { ModelPicker, ReasoningPicker, reasoningOptions } from "../src/tui/components/ModelPicker.js";
 import { TranscriptViewer, transcriptViewerPage } from "../src/tui/components/TranscriptViewer.js";
 import { diffLineStyle } from "../src/tui/diffLines.js";
 import { createInitialTuiState, tuiReducer } from "../src/tui/state.js";
@@ -16,7 +18,11 @@ import {
 import { transcriptRowsForDisplay, visibleTranscriptRows, type TranscriptDisplayRow } from "../src/tui/transcriptRows.js";
 import { latestExpandableTranscript } from "../src/tui/transcriptViewer.js";
 import type { ToolTranscriptItem } from "../src/tui/types.js";
+import type { ModelChoice } from "../src/llm/ModelManager.js";
 import { statusBarLayout } from "../src/tui/components/StatusBar.js";
+import { Welcome } from "../src/tui/components/Welcome.js";
+import { CHAT_SLASH_COMMANDS } from "../src/cli/commands/chatSlash.js";
+import { TUI_SLASH_COMMANDS } from "../src/tui/slashCommands.js";
 import type { SessionEvent } from "../src/session/recorder.js";
 
 function main(): void {
@@ -45,11 +51,80 @@ function main(): void {
   testSessionReplayUsesToolItems();
   testSessionReplayFinalizesPendingTools();
   testViewportKeepsLatestRowsVisible();
+  testTranscriptDoesNotClipLongOutput();
   testFooterContainsOnlyRuntimeSummary();
+  testWelcomeRendersCatAndWorkspace();
   testTranscriptComponentRendersToolHierarchy();
   testTranscriptViewerPagesByVisualLines();
   testTranscriptViewerFitsNarrowViewport();
+  testModelPickerDialogs();
+  testHelpDialogLayout();
+  testSlashCommandParity();
   testDiffUsesForegroundSemanticColors();
+}
+
+function testSlashCommandParity(): void {
+  assert.deepEqual(
+    CHAT_SLASH_COMMANDS.map((command) => command.name),
+    TUI_SLASH_COMMANDS.map((command) => command.name)
+  );
+  assert.equal(TUI_SLASH_COMMANDS.length, 19);
+  assert.equal(TUI_SLASH_COMMANDS.find((command) => command.name === "/plan")?.requiresArgs, undefined);
+}
+
+function testModelPickerDialogs(): void {
+  const model: ModelChoice = {
+    alias: "terra",
+    displayName: "gpt-5.6-terra",
+    description: "Balanced agentic coding model for everyday work.",
+    provider: "openai",
+    providerType: "openai",
+    model: "gpt-5.6-terra",
+    efforts: ["high", "max"],
+    defaultThinking: "high"
+  };
+  const modelView = stripAnsi(renderToString(React.createElement(ModelPicker, {
+    models: [model],
+    currentAlias: "terra",
+    currentThinking: "high",
+    onSelect: () => undefined,
+    onCancel: () => undefined
+  })));
+  assert.match(modelView, /Select Model and Effort/u);
+  assert.match(modelView, /❯ 1\. gpt-5\.6-terra/u);
+  assert.match(modelView, /Balanced agentic coding model/u);
+
+  const reasoningView = stripAnsi(renderToString(React.createElement(ReasoningPicker, {
+    model,
+    options: reasoningOptions(model),
+    selectedIndex: 1,
+    currentAlias: "terra",
+    currentThinking: "high"
+  })));
+  assert.match(reasoningView, /Select Reasoning Level for gpt-5\.6-terra/u);
+  assert.match(reasoningView, /❯ 2\. High/u);
+  assert.match(reasoningView, /Press enter to confirm or esc to go back/u);
+}
+
+function testHelpDialogLayout(): void {
+  const output = stripAnsi(renderToString(React.createElement(HelpDialog, {
+    commands: TUI_SLASH_COMMANDS,
+    message: "Unknown command: /missing",
+    onExit: () => undefined
+  })));
+  assert.match(output, /Commands/u);
+  assert.match(output, /Unknown command: \/missing/u);
+  assert.match(output, /❯ 1\. \/help/u);
+  assert.match(output, /1 \/ 19/u);
+  assert.match(output, /Press esc to cancel/u);
+}
+
+function testWelcomeRendersCatAndWorkspace(): void {
+  const output = renderToString(React.createElement(Welcome, { cwd: "~/CodingAgent/biny" }));
+  assert.match(output, /Biny is ready/u);
+  assert.match(output, /████/u);
+  assert.match(output, /███\s+████\s+████/u);
+  assert.match(output, /Workspace · ~\/CodingAgent\/biny/u);
 }
 
 function testStripAnsi(): void {
@@ -453,6 +528,23 @@ function testViewportKeepsLatestRowsVisible(): void {
   assert.deepEqual(scrolled.map(rowText), ["• line 2", "• line 3"]);
 }
 
+function testTranscriptDoesNotClipLongOutput(): void {
+  const transcript = {
+    committed: Array.from({ length: 40 }, (_, index) => ({
+      id: `assistant-${String(index)}`,
+      kind: "assistant" as const,
+      content: `long output line ${String(index)}`
+    })),
+    active: []
+  };
+  const output = stripAnsi(renderToString(React.createElement(Transcript, {
+    transcript,
+    width: 40
+  }), { columns: 40 }));
+  assert.match(output, /long output line 0/);
+  assert.match(output, /long output line 39/);
+}
+
 function testFooterContainsOnlyRuntimeSummary(): void {
   const layout = statusBarLayout({
     modelLabel: "deepseek-v4-pro",
@@ -470,6 +562,11 @@ function testFooterContainsOnlyRuntimeSummary(): void {
   assert.equal(text.includes("Snapshot"), false);
   assert.equal(text.includes("RepoMap"), false);
   assert.equal(terminalWidth(text), 100);
+
+  const plan = statusBarLayout({ modelLabel: "deepseek-v4-pro", status: "idle", mode: "plan", width: 100 });
+  const planText = `${plan.model}${plan.context}${plan.status}${plan.gap}${plan.shortcuts}`;
+  assert.match(planText, /Plan mode/);
+  assert.match(planText, /shift\+tab to cycle/);
 
   const narrow = statusBarLayout({ modelLabel: "very-long-model-name", status: "idle", mode: "chat", width: 12 });
   assert.equal(terminalWidth(`${narrow.model}${narrow.context}${narrow.status}${narrow.gap}${narrow.shortcuts}`) <= 12, true);
@@ -492,10 +589,7 @@ function testTranscriptComponentRendersToolHierarchy(): void {
   };
   const output = stripAnsi(renderToString(React.createElement(Transcript, {
     transcript,
-    width: 40,
-    height: 8,
-    scrollOffset: 0,
-    followLatest: true
+    width: 40
   }), { columns: 40 }));
   assert.match(output, /• Ran tests\s+1\.2s/);
   assert.match(output, /└ tests passed/);
@@ -506,14 +600,14 @@ function testTranscriptComponentRendersToolHierarchy(): void {
 function testTranscriptViewerPagesByVisualLines(): void {
   const first = transcriptViewerPage("中".repeat(40), 10, 6, 0);
   assert.equal(first.lines.length, 8);
-  assert.equal(first.bodyRows, 3);
-  assert.equal(first.maxScroll, 5);
-  assert.equal(first.visible.length, 3);
+  assert.equal(first.bodyRows, 1);
+  assert.equal(first.maxScroll, 7);
+  assert.equal(first.visible.length, 1);
   for (const line of first.lines) assert.equal(terminalWidth(line) <= 10, true);
 
   const last = transcriptViewerPage("中".repeat(40), 10, 6, 99);
-  assert.equal(last.safeScrollTop, 5);
-  assert.deepEqual(last.visible, last.lines.slice(5));
+  assert.equal(last.safeScrollTop, 7);
+  assert.deepEqual(last.visible, last.lines.slice(7));
 }
 
 function testTranscriptViewerFitsNarrowViewport(): void {

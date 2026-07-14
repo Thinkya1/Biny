@@ -27,18 +27,18 @@ export async function createStructuredPlan(runtime: TuiRuntime, task: string): P
       "list_files",
       "read_file",
       "search_files",
-      "write_file / edit_file (only after confirmation)",
-      "run_command (only after confirmation)"
+      "grep_search",
+      "git_status / git_diff",
+      "registered read-only extension tools"
     ],
     steps: [
       "Read the smallest set of relevant files.",
       "Identify the exact code paths and expected behavior.",
       "Make a focused change with the existing project style.",
-      "Show a diff before file writes or edits.",
-      "Run validation commands only after confirmation."
+      "Keep all plan-mode investigation read-only."
     ],
     risks: [
-      "Plan mode does not execute tools or modify files.",
+      "Plan mode may use registered read-only tools but does not modify files or execute shell commands.",
       "The plan may need revision after inspecting specific files.",
       "Commands and writes still require explicit approval in execution."
     ]

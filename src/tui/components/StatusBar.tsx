@@ -9,6 +9,7 @@ export interface StatusBarProps {
   modelLabel: string;
   contextUsedTokens?: number;
   contextMaxTokens?: number;
+  contextSource?: "estimated" | "provider";
   status: RuntimeStatus;
   mode: "chat" | "plan";
   width: number;
@@ -35,14 +36,15 @@ export function statusBarLayout(props: StatusBarProps): {
 } {
   const width = Math.max(1, Math.floor(props.width));
   const model = props.modelLabel || "No model";
-  const contextLabel = `ctx ${formatContextUsage(props.contextUsedTokens, props.contextMaxTokens)}`;
+  const contextLabel = `ctx ${formatContextUsage(props.contextUsedTokens, props.contextMaxTokens, props.contextSource)}`;
   const statusLabel = runtimeStatusLabel(props.status, props.mode);
   const context = ` · ${contextLabel}`;
   const status = ` · ${statusLabel}`;
   const left = `${model}${context}${status}`;
+  const modeShortcut = props.mode === "plan" ? "shift+tab to cycle" : "shift+tab plan mode";
   const shortcuts = props.status === "thinking" || props.status === "running" || props.status === "waiting_permission"
-    ? "esc stop · ctrl+o details"
-    : "ctrl+o details · pgup scroll · shift+tab mode";
+    ? `esc stop · ctrl+o details · ${modeShortcut}`
+    : `ctrl+o details · ${modeShortcut}`;
   const needed = terminalWidth(left) + 1 + terminalWidth(shortcuts);
   if (needed <= width) {
     return { model, context, status, gap: " ".repeat(width - terminalWidth(left) - terminalWidth(shortcuts)), shortcuts };
@@ -69,19 +71,26 @@ export function statusBarLayout(props: StatusBarProps): {
   };
 }
 
-export function formatContextUsage(used: number | undefined, max: number | undefined): string {
+export function formatContextUsage(used: number | undefined, max: number | undefined, source?: "estimated" | "provider"): string {
   if (used === undefined || max === undefined || max <= 0) return "—";
   const percent = Math.min(999, Math.max(0, Math.round((used / max) * 100)));
-  return `${String(percent)}%`;
+  return `${source === "estimated" ? "~" : ""}${String(percent)}%`;
 }
 
 function runtimeStatusLabel(status: RuntimeStatus, mode: "chat" | "plan"): string {
-  if (status === "thinking") return "thinking";
-  if (status === "running") return "running";
-  if (status === "waiting_permission") return "waiting approval";
-  if (status === "error") return "error";
-  if (status === "completed") return "done";
-  return mode === "plan" ? "plan" : "idle";
+  const activity = status === "thinking"
+    ? "thinking"
+    : status === "running"
+      ? "running"
+      : status === "waiting_permission"
+        ? "waiting approval"
+        : status === "error"
+          ? "error"
+          : status === "completed"
+            ? "done"
+            : "idle";
+  if (mode !== "plan") return activity;
+  return activity === "idle" ? "Plan mode" : `${activity} · Plan mode`;
 }
 
 function statusColor(status: RuntimeStatus): string {

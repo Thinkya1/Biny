@@ -5,9 +5,12 @@
  * 但真正读取 session 文件的逻辑由 App 和 runtime 处理。
  */
 import React from "react";
-import { Box, Text, useInput } from "ink";
+import { Text, useInput } from "ink";
 import type { SessionSummary } from "../../session/events.js";
+import { DialogFrame } from "./DialogFrame.js";
 import { tuiColors } from "../theme/index.js";
+
+export const sessionPickerPageSize = 6;
 
 export interface SessionPickerProps {
   sessions: SessionSummary[];
@@ -15,15 +18,17 @@ export interface SessionPickerProps {
   query: string;
   onQueryChange: (query: string) => void;
   onMove: (direction: -1 | 1) => void;
+  onPageMove: (direction: -1 | 1) => void;
   onSelect: () => void;
   onExit: () => void;
 }
 
-export function SessionPicker({ sessions, selectedIndex, query, onQueryChange, onMove, onSelect, onExit }: SessionPickerProps): React.ReactElement {
+export function SessionPicker({ sessions, selectedIndex, query, onQueryChange, onMove, onPageMove, onSelect, onExit }: SessionPickerProps): React.ReactElement {
   useInput((input, key) => {
     // SessionPicker 是独占视图，键盘输入只用于过滤、选择或退出选择器。
     if (key.escape) {
-      onExit();
+      if (query) onQueryChange("");
+      else onExit();
       return;
     }
     if (key.return) {
@@ -34,41 +39,58 @@ export function SessionPicker({ sessions, selectedIndex, query, onQueryChange, o
       onMove(key.upArrow ? -1 : 1);
       return;
     }
+    if (key.pageUp || key.pageDown) {
+      onPageMove(key.pageUp ? -1 : 1);
+      return;
+    }
     if (key.backspace || key.delete) {
       onQueryChange(query.slice(0, -1));
       return;
     }
     if (key.ctrl || key.meta || key.tab || key.leftArrow || key.rightArrow) return;
     const nextInput = input.replaceAll("\r", "").replaceAll("\n", "");
-    if (nextInput.length !== 1) return;
+    if (!nextInput) return;
     onQueryChange(`${query}${nextInput}`);
   });
 
+  const selectedPosition = Math.min(selectedIndex, Math.max(0, sessions.length - 1));
+  const pageStart = Math.floor(selectedPosition / sessionPickerPageSize) * sessionPickerPageSize;
+  const visibleSessions = sessions.slice(pageStart, pageStart + sessionPickerPageSize);
+
   return (
-    <Box flexDirection="column" width="100%">
-      <Text color={tuiColors.primary} bold>Resume a previous session</Text>
-      <Text color={tuiColors.textDim}>Filter: Cwd   Sort: Updated   Search: {query || ""}</Text>
-      <Box flexDirection="column" marginTop={1}>
-        {sessions.length === 0 ? <Text color={tuiColors.textDim} italic>No sessions yet</Text> : null}
-        {sessions.slice(0, 12).map((session, index) => {
-          const selected = index === selectedIndex;
-          return (
-            <Box key={session.fileName} flexDirection="column">
-              <Text inverse={selected}>
-                {selected ? ">" : " "}
-                {" "}
-                {preview(session.firstUserMessage)}
-                <Text color={selected ? undefined : tuiColors.textDim}>  {relativeTime(session.updatedAt)}</Text>
-              </Text>
-            </Box>
-          );
-        })}
-      </Box>
-      <Box marginTop={1}>
-        <Text color={tuiColors.textDim}>enter resume   esc exit   ↑/↓ browse   type filter</Text>
-      </Box>
-    </Box>
+    <DialogFrame
+      title={<>
+        Select a session
+        {!query ? <Text color={tuiColors.textMuted}> (type to search)</Text> : null}
+      </>}
+      hint={sessionHint(query, sessions.length > sessionPickerPageSize)}
+      footer="Press enter to resume or esc to cancel"
+    >
+      <Text> </Text>
+      {query ? <Text><Text color={tuiColors.primary}>Search: </Text>{query}</Text> : null}
+      {sessions.length === 0 ? <Text color={tuiColors.textMuted}>No sessions yet</Text> : null}
+      {visibleSessions.map((session, index) => {
+        const absoluteIndex = pageStart + index;
+        const selected = absoluteIndex === selectedPosition;
+        const prefix = selected ? "❯ " : "  ";
+        const label = `${prefix}${String(absoluteIndex + 1)}. ${preview(session.firstUserMessage)}  ${relativeTime(session.updatedAt)}`;
+        return (
+          <Text key={session.fileName} color={selected ? tuiColors.primary : tuiColors.text} bold={selected} wrap="truncate-end">
+            {label}
+          </Text>
+        );
+      })}
+      <Text> </Text>
+      {sessions.length > sessionPickerPageSize ? <Text color={tuiColors.textMuted}>{query ? `${String(selectedPosition + 1)} / ${String(sessions.length)}` : `▼ ${String(Math.max(0, sessions.length - visibleSessions.length))} more`}</Text> : null}
+    </DialogFrame>
   );
+}
+
+function sessionHint(query: string, hasPages: boolean): string {
+  const page = hasPages ? " · PgUp/PgDn page" : "";
+  return query
+    ? `↑↓ navigate${page} · Enter resume · Esc cancel · Backspace clear`
+    : `↑↓ navigate${page} · Enter resume · Esc cancel`;
 }
 
 function preview(value: string): string {
