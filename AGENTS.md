@@ -8,7 +8,7 @@
 - 除了包自身的 `index.ts` 外，其他 `index.ts` 文件应优先使用 `export * from "./module"`。
 - 不要过度封装，尤其是一两行的小函数，不要为了形式引入两层包装，直接内联即可。
 - 减少冗余；每个函数、文件和模块只承担一个清晰职责。不要把无关逻辑堆进同一文件，优先通过明确边界解耦。
-- 完成一个任务及时更新PROJECT_DESCRIPTION.local.md
+- 只有新增、删除或改变功能/用户可见行为时才更新 `PROJECT_DESCRIPTION.local.md`；纯重构、测试、格式化或其他非功能改动无需更新。
 ## 当前项目约束
 
 - 当前不保留 `MockProvider`；模型通过命名 provider profile 或通用 OpenAI-compatible 接口接入。
