@@ -5,7 +5,7 @@
  */
 import { createInterface } from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
-import type { AgentSession } from "../../agent/AgentSession.js";
+import type { CommandRuntime } from "../../runtime/CommandRuntime.js";
 import { withCommandRuntime } from "../../runtime/CommandRuntime.js";
 import { readInteractiveLine } from "../prompt/interactivePrompt.js";
 import { CHAT_SLASH_COMMANDS, completeChatSlashCommand, executeChatSlashCommand } from "./chatSlash.js";
@@ -23,18 +23,19 @@ export async function chatCommand(workspaceRoot: string, options: ChatCommandOpt
       const resumed = await runtime.agent.resume(options.session);
       console.log(`Resumed: ${resumed.filePath}`);
     }
-    await runChatLoop(runtime.agent);
+    await runChatLoop(runtime);
   });
 }
 
-async function runChatLoop(agent: AgentSession): Promise<void> {
+async function runChatLoop(runtime: CommandRuntime): Promise<void> {
+  const agent = runtime.agent;
   console.log(`Session: ${agent.getInfo().sessionFile}`);
   console.log("输入 / 查看命令。使用 ↑/↓ 选择，Enter 确认，Tab 补全，输入 /exit 退出。");
   if (input.isTTY && output.isTTY) {
     while (true) {
       const line = await readInteractiveLine("> ", CHAT_SLASH_COMMANDS);
       if (line === undefined) break;
-      if (!await handleInputLine(agent, line)) break;
+      if (!await handleInputLine(runtime, line)) break;
     }
     return;
   }
@@ -43,7 +44,7 @@ async function runChatLoop(agent: AgentSession): Promise<void> {
   try {
     if (output.isTTY) readline.prompt();
     for await (const line of readline) {
-      if (!await handleInputLine(agent, line)) break;
+      if (!await handleInputLine(runtime, line)) break;
       if (output.isTTY) readline.prompt();
     }
   } finally {
@@ -51,18 +52,18 @@ async function runChatLoop(agent: AgentSession): Promise<void> {
   }
 }
 
-async function handleInputLine(agent: AgentSession, line: string): Promise<boolean> {
+async function handleInputLine(runtime: CommandRuntime, line: string): Promise<boolean> {
   const text = line.trim();
   if (!text) return true;
   if (text.startsWith("/")) {
     try {
-      return await executeChatSlashCommand(agent, text);
+      return await executeChatSlashCommand(runtime, text);
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
       return true;
     }
   }
 
-  console.log(await agent.runTask(text));
+  console.log(await runtime.agent.runTask(text));
   return true;
 }

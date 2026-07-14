@@ -9,7 +9,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "node --import tsx src/cli/index.ts",
-    "test": "tsx tests/ai-sdk-agent.test.ts && tsx tests/tui-transcript.test.ts && tsx tests/context.test.ts && tsx tests/llm-provider.test.ts",
+    "test": "tsx tests/ai-sdk-agent.test.ts && tsx tests/tui-transcript.test.ts && tsx tests/context.test.ts && tsx tests/llm-provider.test.ts && tsx tests/extensions.test.ts && tsx tests/web-search.test.ts",
     "typecheck": "tsc --noEmit",
     "start": "node dist/cli/index.js"
   },
@@ -20,6 +20,7 @@
     "@ai-sdk/moonshotai": "^3.0.9",
     "@ai-sdk/openai": "^4.0.11",
     "@ai-sdk/openai-compatible": "^3.0.7",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "ai": "^7.0.22",
     "commander": "^13.1.0",
     "ink": "^7.1.0",

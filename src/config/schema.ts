@@ -8,13 +8,13 @@ import { z } from "zod";
 
 const permissionSchema = z.object({
   mode: z.enum(["safe", "ask", "read-only", "auto", "full-access"]).default("ask"),
-  allowTools: z.array(z.string()).default(["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff"]),
+  allowTools: z.array(z.string()).default(["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search"]),
   allowPaths: z.array(z.string()).default([]),
   denyPaths: z.array(z.string()).default([".env", ".env.local", ".ssh/", "node_modules/"]),
   criticalAlwaysAsk: z.boolean().default(true)
 }).default({
   mode: "ask",
-  allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff"],
+  allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search"],
   allowPaths: [],
   denyPaths: [".env", ".env.local", ".ssh/", "node_modules/"],
   criticalAlwaysAsk: true
@@ -66,6 +66,64 @@ const providerConfigSchema = z.object({
   }
 });
 
+const modelPricingSchema = z.object({
+  inputPerMillionTokens: z.number().nonnegative().optional(),
+  outputPerMillionTokens: z.number().nonnegative().optional(),
+  cacheReadPerMillionTokens: z.number().nonnegative().optional(),
+  cacheWritePerMillionTokens: z.number().nonnegative().optional()
+});
+
+const mcpServerSchema = z.object({
+  command: z.string().min(1),
+  args: z.array(z.string()).default([]),
+  env: z.record(z.string()).optional(),
+  cwd: z.string().min(1).optional(),
+  stderr: z.enum(["ignore", "inherit", "pipe"]).default("ignore"),
+  enabled: z.boolean().default(true)
+});
+
+const extensionsSchema = z.object({
+  mcp: z.record(mcpServerSchema).default({}),
+  skills: z.array(z.string()).default([".agent/skills"]),
+  plugins: z.array(z.string()).default([".agent/plugins"]),
+  subagent: z.object({
+    enabled: z.boolean().default(true),
+    maxSteps: z.number().int().min(1).max(12).default(4),
+    maxOutputTokens: z.number().int().min(256).max(32_768).default(4_000)
+  }).default({ enabled: true, maxSteps: 4, maxOutputTokens: 4_000 })
+}).default({
+  mcp: {},
+  skills: [".agent/skills"],
+  plugins: [".agent/plugins"],
+  subagent: { enabled: true, maxSteps: 4, maxOutputTokens: 4_000 }
+});
+
+const webSearchSchema = z.object({
+  enabled: z.boolean().default(true),
+  provider: z.enum(["duckduckgo", "brave"]).default("duckduckgo"),
+  apiKeyEnv: z.string().min(1).optional(),
+  timeoutMs: z.number().int().min(1_000).max(60_000).default(10_000),
+  maxResults: z.number().int().min(1).max(10).default(5)
+}).default({
+  enabled: true,
+  provider: "duckduckgo",
+  apiKeyEnv: undefined,
+  timeoutMs: 10_000,
+  maxResults: 5
+});
+
+const webSchema = z.object({
+  search: webSearchSchema
+}).default({
+  search: {
+    enabled: true,
+    provider: "duckduckgo",
+    apiKeyEnv: undefined,
+    timeoutMs: 10_000,
+    maxResults: 5
+  }
+});
+
 const modelThinkingSchema = z.object({
   efforts: z.array(reasoningEffortSchema).min(1).default(["high", "max"]),
   defaultEffort: reasoningEffortSchema.default("high")
@@ -83,8 +141,10 @@ const modelAliasSchema = z.object({
   provider: z.string().min(1),
   model: z.string().min(1),
   displayName: z.string().min(1).optional(),
+  description: z.string().min(1).optional(),
   maxOutputTokens: z.number().int().min(1).max(131_072).optional(),
-  thinking: modelThinkingSchema.optional()
+  thinking: modelThinkingSchema.optional(),
+  pricing: modelPricingSchema.optional()
 });
 
 const canonicalConfigSchema = z.object({
@@ -96,7 +156,14 @@ const canonicalConfigSchema = z.object({
   workspace: z.object({
     ignore: z.array(z.string())
   }),
-  context: contextSchema
+  context: contextSchema,
+  web: webSchema,
+  telemetry: z.object({
+    enabled: z.boolean().default(true),
+    recordInputs: z.boolean().default(false),
+    recordOutputs: z.boolean().default(false)
+  }).default({ enabled: true, recordInputs: false, recordOutputs: false }),
+  extensions: extensionsSchema
 }).superRefine((config, context) => {
   const activeModel = config.models[config.defaultModel];
   if (!activeModel) {
@@ -117,13 +184,8 @@ const canonicalConfigSchema = z.object({
       });
       continue;
     }
-    if (model.thinking !== undefined && provider.type !== "deepseek") {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["models", alias, "thinking"],
-        message: "Thinking controls are currently supported only by DeepSeek providers."
-      });
-    }
+    // Reasoning is opt-in per model. The provider adapter decides how the
+    // configured effort maps to its native SDK options.
   }
 
   if (config.thinking.enabled && activeModel?.thinking === undefined) {
@@ -150,6 +212,11 @@ export type ProviderConfig = z.infer<typeof providerConfigSchema>;
 export type ModelAliasConfig = z.infer<typeof modelAliasSchema>;
 export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
 export type ModelReasoningConfig = z.infer<typeof thinkingSchema>;
+export type ModelPricing = z.infer<typeof modelPricingSchema>;
+export type McpServerConfig = z.infer<typeof mcpServerSchema>;
+export type ExtensionsConfig = z.infer<typeof extensionsSchema>;
+export type WebSearchConfig = z.infer<typeof webSearchSchema>;
+export type WebConfig = z.infer<typeof webSchema>;
 
 const defaultWorkspaceIgnore = [
   "node_modules",
@@ -178,19 +245,21 @@ export const defaultConfig: AgentConfig = {
       provider: "deepseek",
       model: "deepseek-v4-flash",
       displayName: "DeepSeek V4 Flash",
+      description: "Fast and affordable model for everyday work.",
       thinking: { efforts: ["high", "max"], defaultEffort: "high" }
     },
     "deepseek-v4-pro": {
       provider: "deepseek",
       model: "deepseek-v4-pro",
       displayName: "DeepSeek V4 Pro",
+      description: "Frontier model for complex coding, research, and real-world work.",
       thinking: { efforts: ["high", "max"], defaultEffort: "high" }
     }
   },
   thinking: { enabled: true, effort: "high" },
   permission: {
     mode: "ask",
-    allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff"],
+    allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search"],
     allowPaths: [],
     denyPaths: [".env", ".env.local", ".ssh/", "node_modules/"],
     criticalAlwaysAsk: true
@@ -202,6 +271,22 @@ export const defaultConfig: AgentConfig = {
     maxInputTokens: 24_000,
     instructionsMaxBytes: 32 * 1024,
     memory: { enabled: true }
+  },
+  web: {
+    search: {
+      enabled: true,
+      provider: "duckduckgo",
+      apiKeyEnv: undefined,
+      timeoutMs: 10_000,
+      maxResults: 5
+    }
+  },
+  telemetry: { enabled: true, recordInputs: false, recordOutputs: false },
+  extensions: {
+    mcp: {},
+    skills: [".agent/skills"],
+    plugins: [".agent/plugins"],
+    subagent: { enabled: true, maxSteps: 4, maxOutputTokens: 4_000 }
   }
 };
 

@@ -11,10 +11,17 @@ import { SessionRecorder } from "../session/recorder.js";
 import { ensureAgentDirs } from "../session/store.js";
 import { createToolRegistry } from "../tools/registry.js";
 import { PermissionManager } from "../permission/PermissionManager.js";
+import { loadSkills } from "../extensions/skills.js";
+import { loadPlugins } from "../extensions/plugins.js";
+import { McpToolHost } from "../extensions/mcp.js";
+import { createSubagentTool, runSubagentTask, type SubagentOptions } from "../extensions/subagent.js";
+import { createToolCounts, formatExtensionReport, type ExtensionSection, type ExtensionStatus } from "../extensions/report.js";
 
 export interface CommandRuntime {
   workspaceRoot: string;
   agent: AgentSession;
+  extensionReport(section?: ExtensionSection): string;
+  runSubagentTask(task: string): Promise<string>;
   close(): Promise<void>;
 }
 
@@ -24,23 +31,67 @@ export async function createCommandRuntime(workspaceRoot: string): Promise<Comma
   const modelManager = new ModelManager(workspaceRoot, config);
   await ensureAgentDirs(workspaceRoot);
   const recorder = new SessionRecorder(workspaceRoot);
-  const toolRegistry = createToolRegistry({ workspaceRoot, ignore: config.workspace.ignore });
+  const toolRegistry = createToolRegistry({ workspaceRoot, ignore: config.workspace.ignore }, config.web.search);
   const permissionManager = new PermissionManager({ ...config.permission, source: "agent.config.json" });
-  const agent = new AgentSession({
+  const skills = await loadSkills(workspaceRoot, config.extensions.skills);
+  const mcpHost = new McpToolHost();
+  const subagentOptions: SubagentOptions = {
     workspaceRoot,
     config,
-    model: modelManager.getModel(),
-    modelManager,
+    getModel: () => modelManager.getModel(),
+    getModelSettings: () => modelManager.getModelSettings(),
     toolRegistry,
-    permissionManager,
-    recorder
-  });
-  await agent.initialize();
+    onUsage: async (usage, operation) => agent?.observeModelUsage(usage, operation)
+  };
+  let agent: AgentSession | undefined;
+  let loadedPlugins: string[] = [];
+  try {
+    await mcpHost.connectConfiguredServers(workspaceRoot, config, toolRegistry);
+    loadedPlugins = await loadPlugins(workspaceRoot, config.extensions.plugins, config, toolRegistry);
+    if (config.extensions.subagent.enabled) {
+      toolRegistry.registerSubagentTool(createSubagentTool(subagentOptions));
+    }
+    agent = new AgentSession({
+      workspaceRoot,
+      config,
+      model: modelManager.getModel(),
+      modelManager,
+      toolRegistry,
+      permissionManager,
+      recorder,
+      skillPrompt: skills.prompt
+    });
+    await agent.initialize();
+  } catch (error) {
+    await mcpHost.close();
+    await recorder.close();
+    throw error;
+  }
+  if (!agent) throw new Error("Failed to initialize Biny agent runtime.");
+
+  const extensionStatus: ExtensionStatus = {
+    mcp: mcpHost.listServers(),
+    skills: [...skills.paths],
+    plugins: [...loadedPlugins],
+    subagent: { ...config.extensions.subagent },
+    toolCounts: createToolCounts(toolRegistry.listEntries())
+  };
 
   const runtime: CommandRuntime = {
     workspaceRoot,
     agent,
-    close: async () => await agent.close()
+    extensionReport: (section?: ExtensionSection): string => formatExtensionReport(extensionStatus, section),
+    runSubagentTask: async (task: string): Promise<string> => {
+      if (!config.extensions.subagent.enabled) throw new Error("Subagent extension is disabled in agent.config.json.");
+      return await runSubagentTask(subagentOptions, task);
+    },
+    close: async () => {
+      try {
+        await agent.close();
+      } finally {
+        await mcpHost.close();
+      }
+    }
   };
   return runtime;
 }

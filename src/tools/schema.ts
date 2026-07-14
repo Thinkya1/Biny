@@ -23,6 +23,8 @@ export interface JsonStringSchema {
   type: "string";
   description?: string;
   minLength?: number;
+  maxLength?: number;
+  enum?: string[];
 }
 
 export interface JsonNumberSchema {
@@ -41,6 +43,7 @@ export interface JsonArraySchema {
   type: "array";
   description?: string;
   items?: JsonSchema;
+  maxItems?: number;
 }
 
 export interface JsonSchemaValidationResult {
@@ -105,6 +108,12 @@ function validateString(schema: JsonStringSchema, value: unknown, path: string, 
   if (schema.minLength !== undefined && value.length < schema.minLength) {
     errors.push(`${path} must contain at least ${String(schema.minLength)} character(s)`);
   }
+  if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+    errors.push(`${path} must contain at most ${String(schema.maxLength)} character(s)`);
+  }
+  if (schema.enum !== undefined && !schema.enum.includes(value)) {
+    errors.push(`${path} must be one of: ${schema.enum.join(", ")}`);
+  }
 }
 
 function validateNumber(schema: JsonNumberSchema, value: unknown, path: string, errors: string[]): void {
@@ -121,6 +130,9 @@ function validateArray(schema: JsonArraySchema, value: unknown, path: string, er
   if (!Array.isArray(value)) {
     errors.push(`${path} must be an array`);
     return;
+  }
+  if (schema.maxItems !== undefined && value.length > schema.maxItems) {
+    errors.push(`${path} must contain at most ${String(schema.maxItems)} item(s)`);
   }
   if (!schema.items) return;
   value.forEach((item, index) => validateValue(schema.items as JsonSchema, item, `${path}[${String(index)}]`, errors));

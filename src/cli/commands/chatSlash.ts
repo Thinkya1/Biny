@@ -1,4 +1,4 @@
-import type { AgentSession } from "../../agent/AgentSession.js";
+import type { CommandRuntime } from "../../runtime/CommandRuntime.js";
 import { parseThinkingSelection } from "../../llm/ModelManager.js";
 import type { SlashCommand } from "../prompt/slashMenu.js";
 import { printSessionSummaries } from "./sessions.js";
@@ -7,8 +7,15 @@ export const CHAT_SLASH_COMMANDS: SlashCommand[] = [
   { name: "/help", description: "Show available commands", category: "system" },
   { name: "/clear", description: "Clear the terminal", category: "system" },
   { name: "/context", description: "Show loaded context and budget", category: "system" },
+  { name: "/usage", description: "Show SDK token usage and cost", category: "system" },
   { name: "/compact", description: "Compact older conversation history", category: "system" },
   { name: "/model", description: "Switch model and thinking effort", category: "system" },
+  { name: "/status", description: "Show model, permissions and extensions", category: "system" },
+  { name: "/mcp", description: "List configured MCP servers and tools", category: "extension" },
+  { name: "/skills", description: "List loaded workspace skills", category: "extension" },
+  { name: "/plugins", description: "List loaded plugins", category: "extension" },
+  { name: "/subagent", description: "Run a bounded read-only subagent", category: "extension", requiresArgs: true },
+  { name: "/review", description: "Review current changes with a read-only subagent", category: "extension" },
   { name: "/sessions", description: "List recorded sessions", category: "session" },
   { name: "/resume", description: "Continue a previous session", category: "session" },
   { name: "/permissions", description: "View or change permission mode", category: "system" },
@@ -18,7 +25,8 @@ export const CHAT_SLASH_COMMANDS: SlashCommand[] = [
   { name: "/quit", description: "Exit chat", category: "system" }
 ];
 
-export async function executeChatSlashCommand(agent: AgentSession, text: string): Promise<boolean> {
+export async function executeChatSlashCommand(runtime: CommandRuntime, text: string): Promise<boolean> {
+  const agent = runtime.agent;
   const [command, ...args] = text.split(/\s+/);
 
   if (command === "/" || command === "/help") {
@@ -32,6 +40,43 @@ export async function executeChatSlashCommand(agent: AgentSession, text: string)
   }
   if (command === "/context") {
     console.log(await agent.contextReport());
+    return true;
+  }
+  if (command === "/usage") {
+    console.log(agent.usageReport());
+    return true;
+  }
+  if (command === "/status") {
+    console.log(`Model: ${agent.getInfo().modelLabel} (${agent.getInfo().reasoningLabel})`);
+    console.log(`Permissions: ${agent.getPermissionMode()}`);
+    console.log(runtime.extensionReport());
+    return true;
+  }
+  if (command === "/mcp") {
+    console.log(runtime.extensionReport("mcp"));
+    return true;
+  }
+  if (command === "/skills") {
+    console.log(runtime.extensionReport("skills"));
+    return true;
+  }
+  if (command === "/plugins") {
+    console.log(runtime.extensionReport("plugins"));
+    return true;
+  }
+  if (command === "/subagent") {
+    const task = args.join(" ").trim();
+    if (!task) {
+      console.log("Usage: /subagent <read-only task>");
+      return true;
+    }
+    console.log(await runtime.runSubagentTask(task));
+    return true;
+  }
+  if (command === "/review") {
+    const instructions = args.join(" ").trim();
+    const task = instructions || "Review the current git changes for correctness, regressions, missing tests, and concrete risks. Return concise findings with exact file paths and line numbers.";
+    console.log(await runtime.runSubagentTask(task));
     return true;
   }
   if (command === "/compact") {

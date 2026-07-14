@@ -35,25 +35,14 @@ class ContextTestModel {
       });
     }
     if (prompt.includes("Summarize this coding-agent")) {
-      return [
-        "Goal",
-        "- Keep context bounded.",
-        "",
-        "Decisions",
-        "- Use a Markdown handoff.",
-        "",
-        "Files",
-        "- src/agent/context/ContextMemory.ts",
-        "",
-        "Command Results",
-        "- Tests passed.",
-        "",
-        "Verification",
-        "- Review the latest tool result.",
-        "",
-        "TODO",
-        "- Continue the requested change."
-      ].join("\n");
+      return JSON.stringify({
+        goal: "Keep context bounded.",
+        decisions: ["Use a structured handoff."],
+        files: ["src/agent/context/ContextMemory.ts"],
+        commandResults: ["Tests passed."],
+        verification: ["Review the latest tool result."],
+        todo: ["Continue the requested change."]
+      });
     }
     return "ok";
   }
@@ -134,6 +123,7 @@ async function main(): Promise<void> {
   await testInstructionLoadingWaitsForToolAccess();
   await testRepoMapExactCandidate();
   await testBudgetAndCompaction();
+  await testRestoreWithoutPersistedBudgetUsesHistoryEstimate();
   await testSessionReplayAndAgentResume();
   await testMemoryRedactionDedupAndWriter();
   await testToolWriteMarksSnapshotAndRepoMapDirty();
@@ -223,16 +213,60 @@ async function testBudgetAndCompaction(): Promise<void> {
   });
 }
 
+async function testRestoreWithoutPersistedBudgetUsesHistoryEstimate(): Promise<void> {
+  await withTempWorkspace(async (workspaceRoot) => {
+    const provider = new ContextTestModel();
+    const memory = new ContextMemory(
+      () => provider.model,
+      new WorkspaceContext(workspaceRoot, [], 32 * 1024),
+      undefined,
+      120,
+      32 * 1024
+    );
+    memory.restore([
+      { role: "user", content: "historical request ".repeat(4) },
+      { role: "assistant", content: "historical answer ".repeat(4) }
+    ]);
+    const status = await memory.status();
+    assert.equal(status.budget.usedTokens > 0, true);
+    assert.equal(status.budget.maxTokens, 120);
+  });
+}
+
 async function testSessionReplayAndAgentResume(): Promise<void> {
   await withTempWorkspace(async (workspaceRoot) => {
     await ensureAgentDirs(workspaceRoot);
     const events: SessionEvent[] = [
-      { type: "user_message", content: "inspect src/index.ts" },
+      {
+        type: "user_message",
+        content: "inspect src/index.ts",
+        contextUsage: { maxTokens: 24_000, usedTokens: 1_234, omitted: [], autoCompacted: false }
+      },
       { type: "tool_call", tool: "read_file", args: { path: "src/index.ts" }, toolCallId: "call-7", sequence: 7, assistantContent: "I will inspect the entry.", reasoningContent: "The entry file is the first target." },
       { type: "tool_result", tool: "read_file", result: { path: "src/index.ts", content: "export {}" }, toolCallId: "call-7", sequence: 7 },
       { type: "tool_call", tool: "read_file", args: { path: "src/worker.ts" }, toolCallId: "call-8", sequence: 8, assistantContent: "I will inspect the worker.", reasoningContent: "The worker is the second target." },
       { type: "tool_result", tool: "read_file", result: { path: "src/worker.ts", content: "export class Worker {}" }, toolCallId: "call-8", sequence: 8 },
-      { type: "assistant_message", content: "The files define the entry and worker.", reasoningContent: "Both requested files were inspected." }
+      {
+        type: "assistant_message",
+        content: "The files define the entry and worker.",
+        reasoningContent: "Both requested files were inspected.",
+        usage: {
+          operation: "agent",
+          modelAlias: "deepseek-v4-flash",
+          provider: "deepseek",
+          model: "deepseek-v4-flash",
+          inputTokens: 1_234,
+          outputTokens: 40,
+          totalTokens: 1_274,
+          pricingKnown: false
+        },
+        contextState: {
+          summary: "Persisted handoff summary.",
+          compactedMessages: 4,
+          memoryTopics: ["context"],
+          budget: { maxTokens: 24_000, usedTokens: 1_234, omitted: [], autoCompacted: false, source: "provider" }
+        }
+      }
     ];
     const filePath = sessionFilePath(workspaceRoot, "saved-session");
     await fs.writeFile(filePath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
@@ -246,6 +280,8 @@ async function testSessionReplayAndAgentResume(): Promise<void> {
     assert.equal(messageReasoning(replay.messages[3]!), "The worker is the second target.");
     assert.equal(messageReasoning(replay.messages[5]!), "Both requested files were inspected.");
     assert.equal(sessionEventsToConversation(events).length, 6);
+    assert.equal(replay.contextState?.summary, "Persisted handoff summary.");
+    assert.equal(replay.usage[0]?.inputTokens, 1_234);
 
     const config = testConfig();
     config.context.memory.enabled = false;
@@ -264,7 +300,10 @@ async function testSessionReplayAndAgentResume(): Promise<void> {
     const resumed = await agent.resume("saved-session");
     assert.equal(resumed.sessionId, "saved-session");
     assert.equal(agent.getInfo().sessionId, "saved-session");
-    assert.equal((await agent.contextStatus()).activePaths.includes("src/index.ts"), true);
+    const restoredContext = await agent.contextStatus();
+    assert.equal(restoredContext.activePaths.includes("src/index.ts"), true);
+    assert.equal(restoredContext.budget.usedTokens, 1_234);
+    assert.equal(restoredContext.compaction.summaryPresent, true);
     await agent.runTask("continue the review");
     assert.equal(provider.requests.at(-1)?.some((message) => hasToolCall(message, "call-7")), true);
     assert.equal(provider.requests.at(-1)?.some((message) => messageReasoning(message) === "The worker is the second target."), true);

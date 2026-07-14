@@ -12,6 +12,7 @@ export type ThinkingSelection = "off" | ReasoningEffort;
 export interface ModelChoice {
   alias: string;
   displayName: string;
+  description?: string;
   provider: string;
   providerType: string;
   model: string;
@@ -82,6 +83,7 @@ export function listModelChoices(config: AgentConfig): ModelChoice[] {
     return {
       alias,
       displayName: model.displayName ?? model.model,
+      description: model.description,
       provider: model.provider,
       providerType: provider?.type ?? model.provider,
       model: model.model,

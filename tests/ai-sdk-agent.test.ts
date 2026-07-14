@@ -16,6 +16,7 @@ import type { Tool } from "../src/tools/types.js";
 async function main(): Promise<void> {
   await testAgentStreamsFinalAnswer();
   await testAgentRunsToolAndKeepsSessionEvents();
+  await testPlanModeExposesOnlyReadTools();
   await testInvalidToolInputUsesCoordinatorValidation();
   await testParallelPermissionGate();
   await testModelFailureIsNotRetried();
@@ -30,19 +31,27 @@ async function testAgentStreamsFinalAnswer(): Promise<void> {
     return sseResponse([
       { choices: [{ index: 0, delta: { content: "hello" }, finish_reason: null }] },
       { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { choices: [], usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15 } },
       "[DONE]"
     ]);
   }) as typeof fetch;
 
-  const { agent, cleanup } = await createAgent();
+  const { agent, cleanup, sessionFile, workspaceRoot } = await createAgent();
   try {
     const events = await collect(runAgent(agent, "hi"));
     assert.equal(calls, 1);
     assert.equal(events.some((event) => event.type === "sdk" && event.part.type === "text-delta"), true);
     assert.equal(events.some((event) => event.type === "done" && event.content === "hello"), true);
+    await agent.close();
+    const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; usage?: { inputTokens?: number }; contextState?: { budget?: { source?: string } } });
+    const assistant = sessionEvents.find((event) => event.type === "assistant_message");
+    assert.equal(assistant?.usage?.inputTokens, 12);
+    assert.equal(assistant?.contextState?.budget?.source, "provider");
+    const telemetry = await readFile(path.join(workspaceRoot, ".agent", "telemetry.jsonl"), "utf8");
+    assert.match(telemetry, /"type":"end"/);
   } finally {
     globalThis.fetch = originalFetch;
-    await cleanup(agent);
+    await cleanup(agent, true);
   }
 }
 
@@ -75,8 +84,9 @@ async function testAgentRunsToolAndKeepsSessionEvents(): Promise<void> {
     assert.equal(events.some((event) => event.type === "sdk" && event.part.type === "tool-result"), true);
     assert.equal(events.some((event) => event.type === "done" && event.content === "README read"), true);
     await agent.close();
-    const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string });
+    const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; contextUsage?: { usedTokens?: number } });
     assert.deepEqual(sessionEvents.map((event) => event.type), ["user_message", "tool_call", "tool_result", "assistant_message"]);
+    assert.equal(typeof sessionEvents[0]?.contextUsage?.usedTokens, "number");
   } finally {
     globalThis.fetch = originalFetch;
     await cleanup(agent, true);
@@ -109,6 +119,43 @@ async function testInvalidToolInputUsesCoordinatorValidation(): Promise<void> {
     const events = await collect(runAgent(agent, "Read README.md"));
     assert.equal(requests.length, 2);
     assert.equal(events.some((event) => event.type === "error" && /invalid tool arguments/i.test(event.message)), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanup(agent);
+  }
+}
+
+async function testPlanModeExposesOnlyReadTools(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    requests.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+    return sseResponse([
+      { choices: [{ index: 0, delta: { content: "plan answer" }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      "[DONE]"
+    ]);
+  }) as typeof fetch;
+
+  const registry = new ToolRegistry();
+  registry.register({ ...readFileTool(), risk: "read" });
+  registry.register({
+    name: "write_file",
+    description: "Write a workspace file.",
+    parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"], additionalProperties: false },
+    schema: z.object({ path: z.string(), content: z.string() }),
+    risk: "write",
+    resolveExecution() {
+      return { approvalRule: "write_file", async execute() { return { written: true }; } };
+    }
+  } as Tool);
+
+  const { agent, cleanup } = await createAgent(registry);
+  try {
+    const events = await collect(agent.run("Research this task", { mode: "plan" }));
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requestToolNames(requests[0]), ["read_file"]);
+    assert.equal(events.some((event) => event.type === "done" && event.content === "plan answer"), true);
   } finally {
     globalThis.fetch = originalFetch;
     await cleanup(agent);
@@ -214,13 +261,28 @@ function readFileTool(): Tool {
     description: "Read a workspace file.",
     parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false },
     schema: z.object({ path: z.string() }),
+    risk: "read",
     resolveExecution(args: { path: string }) {
       return { approvalRule: "read_file", async execute() { return { path: args.path, content: "# Biny" }; } };
     }
   } as Tool;
 }
 
-async function createAgent(registry = new ToolRegistry()): Promise<{ agent: AgentSession; sessionFile: string; cleanup: (agent: AgentSession, alreadyClosed?: boolean) => Promise<void> }> {
+function requestToolNames(request: Record<string, unknown> | undefined): string[] {
+  if (!request || !Array.isArray(request.tools)) return [];
+  return request.tools.flatMap((entry) => {
+    if (!isRecord(entry)) return [];
+    if (typeof entry.name === "string") return [entry.name];
+    if (!isRecord(entry.function) || typeof entry.function.name !== "string") return [];
+    return [entry.function.name];
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function createAgent(registry = new ToolRegistry()): Promise<{ agent: AgentSession; sessionFile: string; workspaceRoot: string; cleanup: (agent: AgentSession, alreadyClosed?: boolean) => Promise<void> }> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-sdk-runtime-"));
   await ensureAgentDirs(workspaceRoot);
   const config = configFor();
@@ -237,6 +299,7 @@ async function createAgent(registry = new ToolRegistry()): Promise<{ agent: Agen
   return {
     agent,
     sessionFile: recorder.filePath,
+    workspaceRoot,
     cleanup: async (current, alreadyClosed = false) => {
       if (!alreadyClosed) await current.close();
       await rm(workspaceRoot, { recursive: true, force: true });

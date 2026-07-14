@@ -8,9 +8,50 @@ async function main(): Promise<void> {
   await testProviderMappingsUseNativeSdkModels();
   await testOpenAiEndpointAuthAndModelPayload();
   await testDeepSeekThinkingOptions();
+  await testReasoningControlsForOtherProviders();
   await testAnthropicMessagesAndToolSchema();
   await testMissingKeyAndCompatibilityEndpointAreHardErrors();
   await testModelSwitchValidatesBeforePersisting();
+}
+
+async function testReasoningControlsForOtherProviders(): Promise<void> {
+  const openai = configSchema.parse({
+    defaultModel: "reasoning-model",
+    providers: { active: { type: "openai", apiKey: "key" } },
+    models: {
+      "reasoning-model": {
+        provider: "active",
+        model: "o3-mini",
+        thinking: { efforts: ["high", "max"], defaultEffort: "max" }
+      }
+    },
+    thinking: { enabled: true, effort: "max" },
+    permission: defaultConfig.permission,
+    workspace: defaultConfig.workspace,
+    context: defaultConfig.context
+  });
+  const openaiSettings = createModelSettings(openai);
+  assert.equal(openaiSettings.reasoning, "xhigh");
+  assert.equal(openaiSettings.providerOptions?.openai?.reasoningEffort, "max");
+
+  const anthropic = configSchema.parse({
+    defaultModel: "reasoning-model",
+    providers: { active: { type: "anthropic", apiKey: "key" } },
+    models: {
+      "reasoning-model": {
+        provider: "active",
+        model: "claude-sonnet",
+        thinking: { efforts: ["high", "max"], defaultEffort: "high" }
+      }
+    },
+    thinking: { enabled: true, effort: "high" },
+    permission: defaultConfig.permission,
+    workspace: defaultConfig.workspace,
+    context: defaultConfig.context
+  });
+  const anthropicSettings = createModelSettings(anthropic);
+  assert.equal(anthropicSettings.providerOptions?.anthropic?.thinking?.type, "enabled");
+  assert.equal(anthropicSettings.providerOptions?.anthropic?.thinking?.budgetTokens, 4_096);
 }
 
 async function testProviderMappingsUseNativeSdkModels(): Promise<void> {

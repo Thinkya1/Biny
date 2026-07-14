@@ -1,5 +1,5 @@
 import { promises as fs } from "node:fs";
-import { stepCountIs, streamText, ToolLoopAgent, type LanguageModel, type TextStreamPart, type ToolLoopAgentSettings, type ToolSet } from "ai";
+import { stepCountIs, streamText, ToolLoopAgent, type LanguageModel, type LanguageModelUsage, type TextStreamPart, type ToolLoopAgentSettings, type ToolSet } from "ai";
 import type { AgentConfig } from "../config/schema.js";
 import { saveConfig } from "../config/loader.js";
 import {
@@ -24,6 +24,9 @@ import { ContextMemory } from "./context/ContextMemory.js";
 import { LocalMemory } from "./context/LocalMemory.js";
 import { WorkspaceContext } from "./context/WorkspaceContext.js";
 import type { ContextStatus } from "./context/types.js";
+import { createSdkTelemetry } from "../observability/telemetry.js";
+import { createSessionUsage, formatUsageSummary, summarizeUsage, type UsageModelInfo } from "../observability/usage.js";
+import type { SessionUsage } from "../session/metadata.js";
 
 export interface AgentSessionOptions {
   workspaceRoot: string;
@@ -33,11 +36,13 @@ export interface AgentSessionOptions {
   permissionManager: PermissionManager;
   recorder: SessionRecorder;
   modelManager?: ModelManager;
+  skillPrompt?: string;
 }
 
 export interface AgentRunOptions {
   abortSignal?: AbortSignal;
   confirmPermission?: (request: AgentPermissionRequest) => Promise<AgentPermissionResult>;
+  mode?: AgentRunMode;
 }
 
 export interface AgentSessionInfo {
@@ -51,6 +56,8 @@ export interface AgentSessionInfo {
   thinking: ThinkingSelection;
 }
 
+export type AgentRunMode = "chat" | "plan";
+
 export interface ResumedAgentSession extends SessionReplay {
   filePath: string;
   sessionId: string;
@@ -62,6 +69,7 @@ export interface ResumedAgentSession extends SessionReplay {
  */
 export class AgentSession {
   private readonly contextMemory: ContextMemory;
+  private usageRecords: SessionUsage[] = [];
   private recorder: SessionRecorder;
 
   constructor(private readonly options: AgentSessionOptions) {
@@ -75,15 +83,21 @@ export class AgentSession {
       if (!model) throw new Error("Vercel AI SDK model is not configured.");
       return model;
     };
+    const onUsage = async (usage: LanguageModelUsage, operation: "agent" | "plan" | "compaction" | "memory" | "subagent"): Promise<void> => {
+      this.recordModelUsage(usage, operation);
+    };
+    const telemetry = (functionId: string) => createSdkTelemetry(options.config, options.workspaceRoot, functionId);
     const localMemory = options.config.context.memory.enabled
-      ? new LocalMemory(options.workspaceRoot, getModel)
+      ? new LocalMemory(options.workspaceRoot, getModel, onUsage, telemetry)
       : undefined;
     this.contextMemory = new ContextMemory(
       getModel,
       workspace,
       localMemory,
       options.config.context.maxInputTokens,
-      options.config.context.instructionsMaxBytes
+      options.config.context.instructionsMaxBytes,
+      onUsage,
+      telemetry
     );
     this.recorder = options.recorder;
   }
@@ -100,12 +114,18 @@ export class AgentSession {
     const model = this.options.modelManager?.getModel() ?? this.options.model;
     if (!model) throw new Error("Vercel AI SDK model is not configured.");
     const settings = this.options.modelManager?.getModelSettings();
-    const messages = await this.contextMemory.prepareTurn(input, buildSystemPrompt("qa"));
+    const usageBeforePreparation = this.usageRecords.length;
+    const mode = runOptions.mode ?? "chat";
+    const messages = await this.contextMemory.prepareTurn(input, buildSystemPrompt(mode === "plan" ? "plan" : "qa", this.options.skillPrompt));
+    const preparationUsage = this.usageRecords.slice(usageBeforePreparation);
     const permissionManager = this.options.permissionManager;
     const stepContext = { assistantContent: "", reasoningContent: "" };
     const queue = createSessionEventQueue();
     const runtime = this.runtimeContext(runOptions);
-    const coordinator = new SdkToolExecutionCoordinator(runtime, permissionManager, queue.push, () => ({ ...stepContext }));
+    const allowedToolNames = mode === "plan"
+      ? new Set(this.options.toolRegistry.list().filter((tool) => tool.risk === "read").map((tool) => tool.name))
+      : undefined;
+    const coordinator = new SdkToolExecutionCoordinator(runtime, permissionManager, queue.push, () => ({ ...stepContext }), allowedToolNames);
     const agentSettings = {
       model,
       tools: coordinator.createTools(),
@@ -113,15 +133,17 @@ export class AgentSession {
       stopWhen: stepCountIs(8),
       maxRetries: 0,
       providerOptions: settings?.providerOptions,
+      reasoning: settings?.reasoning,
       timeout: settings?.timeoutMs,
       maxOutputTokens: settings?.maxOutputTokens,
+      telemetry: createSdkTelemetry(this.options.config, this.options.workspaceRoot, "biny.agent"),
       // ToolLoopAgent forwards unknown stream options to streamText at runtime;
       // suppress its console.error default so Ink remains the only output sink.
       onError: () => undefined
     } as ToolLoopAgentSettings<never, ToolSet> & { onError: () => undefined };
     const agent = new ToolLoopAgent<never, ToolSet>(agentSettings);
 
-    this.recorder.record({ type: "user_message", content: input });
+    this.recorder.record({ type: "user_message", content: input, contextUsage: this.contextMemory.getBudget(), contextState: this.contextMemory.persistedState(), preparationUsage });
     yield { type: "status", status: "thinking" };
 
     let result: Awaited<ReturnType<typeof agent.stream>>;
@@ -167,12 +189,24 @@ export class AgentSession {
     await streamTask;
 
     try {
-      const [content, reasoningContent, responseMessages] = await Promise.all([result.text, result.reasoningText, result.responseMessages]);
+      const [content, reasoningContent, responseMessages, usage, finalStep] = await Promise.all([
+        result.text,
+        result.reasoningText,
+        result.responseMessages,
+        result.usage,
+        result.finalStep
+      ]);
+      this.contextMemory.recordProviderUsage(finalStep.usage.inputTokens !== undefined ? finalStep.usage : usage);
       const nextMessages = [...messages, ...responseMessages];
       this.contextMemory.replaceHistory(nextMessages);
-      if (content) {
-        this.recorder.record({ type: "assistant_message", content, reasoningContent: reasoningContent ?? undefined });
-      }
+      const usageRecord = this.recordModelUsage(usage, "agent");
+      this.recorder.record({
+        type: "assistant_message",
+        content,
+        reasoningContent: reasoningContent ?? undefined,
+        usage: usageRecord,
+        contextState: this.contextMemory.snapshot()
+      });
       yield { type: "status", status: "completed" };
       yield { type: "done", content };
     } catch (error) {
@@ -195,8 +229,10 @@ export class AgentSession {
 
   async createPlan(task: string, onDelta?: (delta: string) => void, abortSignal?: AbortSignal): Promise<string> {
     const userContent = `plan: ${task}`;
-    this.recorder.record({ type: "user_message", content: userContent });
-    const messages = await this.contextMemory.prepareTurn(task, buildSystemPrompt("plan"));
+    const usageBeforePreparation = this.usageRecords.length;
+    const messages = await this.contextMemory.prepareTurn(task, buildSystemPrompt("oneShotPlan", this.options.skillPrompt));
+    const preparationUsage = this.usageRecords.slice(usageBeforePreparation);
+    this.recorder.record({ type: "user_message", content: userContent, contextUsage: this.contextMemory.getBudget(), contextState: this.contextMemory.persistedState(), preparationUsage });
 
     try {
       const model = this.options.modelManager?.getModel() ?? this.options.model;
@@ -208,18 +244,28 @@ export class AgentSession {
         abortSignal,
         maxRetries: 0,
         providerOptions: this.options.modelManager?.getModelSettings().providerOptions,
+        reasoning: this.options.modelManager?.getModelSettings().reasoning,
         timeout: this.options.modelManager?.getModelSettings().timeoutMs,
         maxOutputTokens: this.options.modelManager?.getModelSettings().maxOutputTokens,
+        telemetry: createSdkTelemetry(this.options.config, this.options.workspaceRoot, "biny.plan"),
         onError: () => undefined
       });
       for await (const delta of result.textStream) onDelta?.(delta);
       const output = await result.text;
+      const [usage, finalStep] = await Promise.all([result.usage, result.finalStep]);
+      this.contextMemory.recordProviderUsage(finalStep.usage.inputTokens !== undefined ? finalStep.usage : usage);
       this.contextMemory.replaceHistory([
         ...this.contextMemory.getHistory(),
         { role: "user", content: userContent },
         { role: "assistant", content: output }
       ]);
-      this.recorder.record({ type: "assistant_message", content: output });
+      this.recorder.record({
+        type: "assistant_message",
+        content: output,
+        reasoningContent: undefined,
+        usage: this.recordModelUsage(usage, "plan"),
+        contextState: this.contextMemory.snapshot()
+      });
       return output;
     } catch (error) {
       this.recordError(error);
@@ -238,7 +284,8 @@ export class AgentSession {
     this.recorder = new SessionRecorder(this.options.workspaceRoot, sessionIdFromFile(filePath));
     this.recorder.restoreToolCallSequence(maxToolCallSequence(replay.events));
     this.options.permissionManager.resetSession();
-    this.contextMemory.restore(replay.messages);
+    this.usageRecords = [...replay.usage];
+    this.contextMemory.restore(replay.messages, replay.contextState ?? replay.contextUsage);
     return { ...replay, filePath, sessionId: this.recorder.sessionId };
   }
 
@@ -254,8 +301,26 @@ export class AgentSession {
     return await this.contextMemory.status();
   }
 
+  usageReport(): string {
+    return formatUsageSummary(summarizeUsage(this.usageRecords));
+  }
+
+  observeModelUsage(usage: LanguageModelUsage, operation: "agent" | "plan" | "compaction" | "memory" | "subagent"): void {
+    this.recordModelUsage(usage, operation);
+  }
+
   async compactConversation(hint?: string): Promise<string> {
-    return this.contextMemory.formatCompaction(await this.contextMemory.compact(hint));
+    const usageBeforeCompaction = this.usageRecords.length;
+    const result = await this.contextMemory.compact(hint);
+    const compactionUsage = this.usageRecords.slice(usageBeforeCompaction).at(-1);
+    this.recorder.record({
+      type: "assistant_message",
+      content: "",
+      reasoningContent: undefined,
+      usage: compactionUsage,
+      contextState: this.contextMemory.snapshot()
+    });
+    return this.contextMemory.formatCompaction(result);
   }
 
   listModels(): ModelChoice[] {
@@ -306,6 +371,21 @@ export class AgentSession {
     await this.recorder.close();
   }
 
+  private recordModelUsage(usage: LanguageModelUsage, operation: "agent" | "plan" | "compaction" | "memory" | "subagent"): SessionUsage {
+    const model = this.options.modelManager?.getModel() ?? this.options.model;
+    const info = this.options.modelManager?.getInfo() ?? modelRuntimeInfo(this.options.config);
+    const resolved = this.options.config.models[info.modelAlias];
+    const modelInfo: UsageModelInfo = {
+      modelAlias: info.modelAlias,
+      provider: info.provider,
+      model: model ? modelIdentifier(model) : info.modelLabel,
+      pricing: resolved?.pricing
+    };
+    const record = createSessionUsage(usage, operation, modelInfo);
+    this.usageRecords.push(record);
+    return record;
+  }
+
   private runtimeContext(runOptions: AgentRunOptions): AgentRuntimeContext {
     const model = this.options.modelManager?.getModel() ?? this.options.model;
     if (!model) throw new Error("Vercel AI SDK model is not configured.");
@@ -321,6 +401,10 @@ export class AgentSession {
       abortSignal: runOptions.abortSignal
     };
   }
+}
+
+function modelIdentifier(model: LanguageModel): string {
+  return typeof model === "string" ? model : model.modelId;
 }
 
 function maxToolCallSequence(events: SessionReplay["events"]): number {

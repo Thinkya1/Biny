@@ -1,15 +1,50 @@
 import type { ModelMessage } from "ai";
 import { readSessionEvents } from "./events.js";
-import type { SessionEvent } from "./recorder.js";
+import type { SessionContextState, SessionContextUsage, SessionEvent, SessionUsage } from "./recorder.js";
 
 export interface SessionReplay {
   events: SessionEvent[];
   messages: ModelMessage[];
+  contextUsage?: SessionContextUsage;
+  contextState?: SessionContextState;
+  usage: SessionUsage[];
 }
 
 export async function replaySession(filePath: string): Promise<SessionReplay> {
   const events = await readSessionEvents(filePath);
-  return { events, messages: sessionEventsToConversation(events) };
+  return {
+    events,
+    messages: sessionEventsToConversation(events),
+    contextUsage: latestContextUsage(events),
+    contextState: latestContextState(events),
+    usage: sessionUsage(events)
+  };
+}
+
+function latestContextUsage(events: SessionEvent[]): SessionContextUsage | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.type === "assistant_message" && event.contextState !== undefined) return event.contextState.budget;
+    if (event?.type === "user_message" && event.contextState !== undefined) return event.contextState.budget;
+    if (event?.type === "user_message" && event.contextUsage !== undefined) return event.contextUsage;
+  }
+  return undefined;
+}
+
+function latestContextState(events: SessionEvent[]): SessionContextState | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if ((event?.type === "assistant_message" || event?.type === "user_message") && event.contextState !== undefined) return event.contextState;
+  }
+  return undefined;
+}
+
+function sessionUsage(events: SessionEvent[]): SessionUsage[] {
+  return events.flatMap((event) => {
+    if (event.type === "assistant_message" && event.usage !== undefined) return [event.usage];
+    if (event.type === "user_message" && event.preparationUsage !== undefined) return event.preparationUsage;
+    return [];
+  });
 }
 
 export function sessionEventsToConversation(events: SessionEvent[]): ModelMessage[] {
@@ -52,6 +87,7 @@ export function sessionEventsToConversation(events: SessionEvent[]): ModelMessag
     if (event.type === "assistant_message") {
       flushPendingCalls();
       resetPendingCalls();
+      if (!event.content && !event.reasoningContent) continue;
       messages.push({
         role: "assistant",
         content: [

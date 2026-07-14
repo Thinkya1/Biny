@@ -48,12 +48,14 @@ export class SdkToolExecutionCoordinator {
     private readonly context: AgentRuntimeContext,
     private readonly permissionManager: PermissionManager,
     private readonly emit: (event: Exclude<AgentSessionEvent, { type: "sdk" | "status" | "done" }>) => void,
-    private readonly getStepContext: () => AgentStepContext = () => ({})
+    private readonly getStepContext: () => AgentStepContext = () => ({}),
+    private readonly allowedToolNames?: ReadonlySet<string>
   ) {}
 
   createTools(): ToolSet {
     const tools: Record<string, unknown> = {};
     for (const registered of this.context.toolRegistry.list()) {
+      if (this.allowedToolNames && !this.allowedToolNames.has(registered.name)) continue;
       tools[registered.name] = tool({
         description: registered.description,
         inputSchema: registered.schema,
@@ -64,6 +66,23 @@ export class SdkToolExecutionCoordinator {
   }
 
   async handleInvalidToolCall(toolName: string, toolCallId: string, input: unknown, signal?: AbortSignal): Promise<unknown> {
+    if (this.allowedToolNames && !this.allowedToolNames.has(toolName)) {
+      const call = { id: toolCallId, name: toolName, args: input };
+      const sequence = this.nextSequence();
+      const errorMessage = `Tool ${toolName} is not available in the current mode.`;
+      const stepContext = this.getStepContext();
+      this.context.recorder.record({
+        type: "tool_call",
+        tool: toolName,
+        args: input,
+        toolCallId,
+        sequence,
+        assistantContent: stepContext.assistantContent,
+        reasoningContent: stepContext.reasoningContent
+      });
+      this.emit({ type: "tool-started", toolCallId, tool: toolName, args: input });
+      return await this.finishSyntheticCall(call, sequence, { error: errorMessage }, errorMessage);
+    }
     let registered: Tool;
     try {
       registered = this.context.toolRegistry.get(toolName);

@@ -20,7 +20,7 @@ const program = new Command();
 // CLI 的工作区以用户执行 biny 时的当前目录为准。
 const workspaceRoot = process.cwd();
 
-program.name("biny").description("Biny TypeScript coding agent").version("0.1.0");
+program.name("biny").description("Biny local desktop assistant").version("0.1.0");
 
 program.command("init").description("Initialize config and .agent directories").action(wrap(() => initCommand(workspaceRoot)));
 program.command("doctor").description("Check local environment").action(wrap(() => doctorCommand(workspaceRoot)));

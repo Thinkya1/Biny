@@ -35,7 +35,7 @@
   },
   "thinking": {
     "enabled": true,
-    "effort": "high"
+    "effort": "max"
   },
   "permission": {
     "mode": "full-access",
@@ -45,7 +45,8 @@
       "search_files",
       "grep_search",
       "git_status",
-      "git_diff"
+      "git_diff",
+      "web_search"
     ],
     "allowPaths": [],
     "denyPaths": [
@@ -75,6 +76,33 @@
     "instructionsMaxBytes": 32768,
     "memory": {
       "enabled": true
+    }
+  },
+  "web": {
+    "search": {
+      "enabled": true,
+      "provider": "duckduckgo",
+      "timeoutMs": 10000,
+      "maxResults": 5
+    }
+  },
+  "telemetry": {
+    "enabled": true,
+    "recordInputs": false,
+    "recordOutputs": false
+  },
+  "extensions": {
+    "mcp": {},
+    "skills": [
+      ".agent/skills"
+    ],
+    "plugins": [
+      ".agent/plugins"
+    ],
+    "subagent": {
+      "enabled": true,
+      "maxSteps": 4,
+      "maxOutputTokens": 4000
     }
   }
 }

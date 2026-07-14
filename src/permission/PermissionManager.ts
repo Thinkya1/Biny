@@ -82,7 +82,7 @@ export interface PermissionStatus {
 
 const defaultPolicy: ProjectPermissionPolicy = {
   mode: "ask",
-  allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff"],
+  allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search"],
   allowPaths: [],
   denyPaths: [".env", ".ssh/", "node_modules/"],
   criticalAlwaysAsk: true

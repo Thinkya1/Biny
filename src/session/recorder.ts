@@ -7,11 +7,14 @@
 import { createWriteStream, type WriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { sessionFilePath } from "./store.js";
+import type { SessionContextState, SessionContextUsage, SessionUsage } from "./metadata.js";
+
+export type { SessionContextState, SessionContextUsage, SessionUsage, UsageOperation } from "./metadata.js";
 
 export type SessionEvent =
   // session 事件类型要保持稳定；resume、未来上下文压缩和记忆功能都会依赖这几个基础类型。
-  | { type: "user_message"; content: string; time?: string }
-  | { type: "assistant_message"; content: string; reasoningContent?: string; time?: string }
+  | { type: "user_message"; content: string; contextUsage?: SessionContextUsage; contextState?: SessionContextState; preparationUsage?: SessionUsage[]; time?: string }
+  | { type: "assistant_message"; content: string; reasoningContent?: string; usage?: SessionUsage; contextState?: SessionContextState; time?: string }
   | { type: "tool_call"; tool: string; args: unknown; toolCallId?: string; sequence?: number; assistantContent?: string; reasoningContent?: string; time?: string }
   | { type: "tool_result"; tool: string; result: unknown; toolCallId?: string; sequence?: number; time?: string }
   | { type: "error"; message: string; detail?: unknown; time?: string };

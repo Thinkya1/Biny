@@ -40,6 +40,8 @@ export interface ContextBudgetStatus {
   usedTokens: number;
   omitted: string[];
   autoCompacted: boolean;
+  source?: "estimated" | "provider";
+  measuredAt?: string;
 }
 
 export interface CompactionStatus {

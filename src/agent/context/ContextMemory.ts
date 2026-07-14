@@ -1,9 +1,12 @@
-import { generateText, type LanguageModel, type ModelMessage } from "ai";
+import { generateText, Output, type LanguageModel, type LanguageModelUsage, type ModelMessage, type TelemetryOptions } from "ai";
+import { z } from "zod";
 import { cloneModelMessages, messageReasoning, messageText, messageToolName } from "../modelMessages.js";
 import { formatProjectContext } from "../../project/ProjectContext.js";
 import { formatMemoryMatches, LocalMemory, redactSecrets } from "./LocalMemory.js";
 import { formatRepoMapCandidates, WorkspaceContext } from "./WorkspaceContext.js";
 import type { CompactionResult, CompactionStatus, ContextBudgetStatus, ContextStatus, LoadedInstruction, MemoryMatch, RecentWorkspaceActivity, WorkspaceTurnData } from "./types.js";
+import type { ModelUsageObserver } from "../../observability/usage.js";
+import type { SessionContextState } from "../../session/metadata.js";
 
 const retainedHistoryTokens = 5_000;
 const summaryTokens = 2_800;
@@ -26,9 +29,11 @@ export class ContextMemory {
     private readonly workspace: WorkspaceContext,
     private readonly localMemory: LocalMemory | undefined,
     private readonly maxTokens: number,
-    private readonly instructionMaxBytes: number
+    private readonly instructionMaxBytes: number,
+    private readonly onUsage: ModelUsageObserver = () => undefined,
+    private readonly telemetry?: (functionId: string) => TelemetryOptions
   ) {
-    this.lastBudget = { maxTokens, usedTokens: 0, omitted: [], autoCompacted: false };
+    this.lastBudget = { maxTokens, usedTokens: 0, omitted: [], autoCompacted: false, source: "estimated", measuredAt: undefined };
   }
 
   async initialize(): Promise<void> {
@@ -59,6 +64,35 @@ export class ContextMemory {
     this.history.splice(0, this.history.length, ...messages.filter((message) => message.role !== "system"));
   }
 
+  getBudget(): ContextBudgetStatus {
+    return cloneBudget(this.lastBudget);
+  }
+
+  recordProviderUsage(usage: LanguageModelUsage): void {
+    if (usage.inputTokens === undefined) return;
+    this.lastBudget = {
+      ...this.lastBudget,
+      usedTokens: Math.max(0, usage.inputTokens),
+      source: "provider",
+      measuredAt: new Date().toISOString()
+    };
+  }
+
+  snapshot(): SessionContextState {
+    return {
+      summary: this.summary,
+      compactedMessages: this.compactedMessages,
+      lastCompactedAt: this.lastCompactedAt,
+      memoryTopics: [...this.memoryTopics],
+      budget: cloneBudget(this.lastBudget)
+    };
+  }
+
+  persistedState(): SessionContextState | undefined {
+    const state = this.snapshot();
+    return state.summary !== undefined || state.compactedMessages > 0 ? state : undefined;
+  }
+
   getHistory(): ModelMessage[] {
     return cloneModelMessages(this.history);
   }
@@ -82,16 +116,19 @@ export class ContextMemory {
     this.compactedMessages += compacted.length;
     this.lastCompactedAt = new Date().toISOString();
     this.replaceHistory(retained);
+    this.refreshEstimatedBudget();
     return { compacted: true, compactedMessageCount: compacted.length, summary: this.summary };
   }
 
-  restore(messages: ModelMessage[]): void {
+  restore(messages: ModelMessage[], state?: ContextBudgetStatus | SessionContextState): void {
     this.replaceHistory(messages);
-    this.summary = undefined;
-    this.compactedMessages = 0;
-    this.lastCompactedAt = undefined;
-    this.memoryTopics = [];
-    this.lastBudget = { maxTokens: this.maxTokens, usedTokens: 0, omitted: [], autoCompacted: false };
+    const contextState = isContextState(state) ? state : undefined;
+    const budget: ContextBudgetStatus | undefined = contextState?.budget ?? (isContextState(state) ? undefined : state);
+    this.summary = contextState?.summary;
+    this.compactedMessages = contextState?.compactedMessages ?? 0;
+    this.lastCompactedAt = contextState?.lastCompactedAt;
+    this.memoryTopics = [...(contextState?.memoryTopics ?? [])];
+    this.lastBudget = budget === undefined ? estimateRestoredBudget(this.history, this.maxTokens) : normalizeRestoredBudget(budget, this.maxTokens);
     this.workspace.restoreFromHistory(messages);
   }
 
@@ -123,7 +160,7 @@ export class ContextMemory {
       activePaths: workspace.activePaths,
       recentActivity: workspace.recentActivity,
       compaction: this.compactionStatus(),
-      budget: { ...this.lastBudget, omitted: [...this.lastBudget.omitted] },
+      budget: cloneBudget(this.lastBudget),
       memoryEnabled: Boolean(this.localMemory),
       memoryTopics: [...this.memoryTopics]
     };
@@ -134,7 +171,7 @@ export class ContextMemory {
     return [
       "Context",
       "",
-      `Budget: ${String(status.budget.usedTokens)}/${String(status.budget.maxTokens)} estimated tokens`,
+      `Budget: ${String(status.budget.usedTokens)}/${String(status.budget.maxTokens)} ${status.budget.source === "provider" ? "provider tokens" : "estimated tokens"}`,
       `Auto compacted this turn: ${status.budget.autoCompacted ? "yes" : "no"}`,
       `Snapshot: ${status.snapshotRefreshedAt ?? "not loaded"}${status.snapshotDirty ? " (dirty)" : ""}`,
       `RepoMap: ${String(status.repoMapEntries)} entries, ${status.repoMapRefreshedAt ?? "not loaded"}${status.repoMapDirty ? " (dirty)" : ""}`,
@@ -174,16 +211,24 @@ export class ContextMemory {
     ].filter(Boolean).join("\n\n");
 
     try {
-      const result = redactSecrets((await generateText({
+      const result = await generateText({
         model: this.getModel(),
         allowSystemInMessages: true,
         maxRetries: 0,
+        output: Output.object({
+          schema: summarySchema,
+          name: "coding-session-summary",
+          description: "A compact factual handoff summary for a local assistant session."
+        }),
+        telemetry: this.telemetry?.("biny.compaction"),
         messages: [
           { role: "system", content: "You create compact, factual coding-session handoff notes." },
           { role: "user", content: prompt }
         ]
-      })).text.trim());
-      if (result) return truncateTextToTokens(result, summaryTokens);
+      });
+      await this.onUsage(await result.usage, "compaction");
+      const summary = formatStructuredSummary(await result.output);
+      if (summary) return truncateTextToTokens(redactSecrets(summary), summaryTokens);
     } catch {
       // A compaction failure must not block the active coding task.
     }
@@ -206,6 +251,86 @@ export class ContextMemory {
       lastCompactedAt: this.lastCompactedAt
     };
   }
+
+  private refreshEstimatedBudget(): void {
+    const summaryTokens = this.summary ? estimateTokens(this.summary) + 4 : 0;
+    const usedTokens = estimateMessageTokens(this.history) + summaryTokens;
+    this.lastBudget = {
+      ...this.lastBudget,
+      usedTokens,
+      source: "estimated",
+      measuredAt: undefined
+    };
+  }
+}
+
+const summarySchema = z.object({
+  goal: z.string().default(""),
+  decisions: z.array(z.string()).default([]),
+  files: z.array(z.string()).default([]),
+  commandResults: z.array(z.string()).default([]),
+  verification: z.array(z.string()).default([]),
+  todo: z.array(z.string()).default([])
+});
+
+type StructuredSummary = z.infer<typeof summarySchema>;
+
+function formatStructuredSummary(summary: StructuredSummary): string {
+  return [
+    "Goal",
+    `- ${summary.goal || "(not recorded)"}`,
+    "",
+    "Decisions",
+    ...formatSummaryItems(summary.decisions),
+    "",
+    "Files",
+    ...formatSummaryItems(summary.files),
+    "",
+    "Command Results",
+    ...formatSummaryItems(summary.commandResults),
+    "",
+    "Verification",
+    ...formatSummaryItems(summary.verification),
+    "",
+    "TODO",
+    ...formatSummaryItems(summary.todo)
+  ].join("\n");
+}
+
+function formatSummaryItems(items: string[]): string[] {
+  return items.length ? items.map((item) => `- ${item}`) : ["- (none recorded)"];
+}
+
+function isContextState(value: ContextBudgetStatus | SessionContextState | undefined): value is SessionContextState {
+  return value !== undefined && "budget" in value;
+}
+
+function cloneBudget(budget: ContextBudgetStatus): ContextBudgetStatus {
+  return { ...budget, omitted: [...budget.omitted] };
+}
+
+function normalizeRestoredBudget(budget: ContextBudgetStatus, maxTokens: number): ContextBudgetStatus {
+  const source = budget.source ?? "estimated";
+  return {
+    ...budget,
+    maxTokens,
+    usedTokens: source === "provider" ? Math.max(0, budget.usedTokens) : Math.min(maxTokens, Math.max(0, budget.usedTokens)),
+    omitted: [...budget.omitted],
+    source,
+    measuredAt: budget.measuredAt
+  };
+}
+
+function estimateRestoredBudget(history: ModelMessage[], maxTokens: number): ContextBudgetStatus {
+  const estimatedTokens = estimateMessageTokens(history);
+  return {
+    maxTokens,
+    usedTokens: Math.min(maxTokens, estimatedTokens),
+    omitted: estimatedTokens > maxTokens ? ["older conversation messages"] : [],
+    autoCompacted: false,
+    source: "estimated",
+    measuredAt: undefined
+  };
 }
 
 interface ContextAssembly {
@@ -263,7 +388,7 @@ function assembleContext(
   const messages = [...systemMessages, ...selectedHistory, { role: "user" as const, content: taskContent }];
   return {
     messages,
-    budget: { maxTokens, usedTokens: estimateMessageTokens(messages), omitted, autoCompacted }
+    budget: { maxTokens, usedTokens: estimateMessageTokens(messages), omitted, autoCompacted, source: "estimated", measuredAt: undefined }
   };
 }
 

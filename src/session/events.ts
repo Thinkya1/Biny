@@ -36,7 +36,8 @@ export async function listSessionSummaries(workspaceRoot: string): Promise<Sessi
       const filePath = path.join(sessionsDir, fileName);
       const [events, stat] = await Promise.all([readSessionEvents(filePath), fs.stat(filePath)]);
       const firstUserMessage = events.find((event) => event.type === "user_message")?.content ?? "";
-      const lastAssistantMessage = [...events].reverse().find((event) => event.type === "assistant_message")?.content ?? "";
+      const lastAssistant = [...events].reverse().find((event): event is Extract<SessionEvent, { type: "assistant_message" }> => event.type === "assistant_message" && Boolean(event.content));
+      const lastAssistantMessage = lastAssistant?.content ?? "";
       const firstTime = events.find((event) => typeof event.time === "string")?.time;
       const lastTime = [...events].reverse().find((event) => typeof event.time === "string")?.time;
       return {

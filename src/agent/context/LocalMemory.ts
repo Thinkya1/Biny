@@ -1,9 +1,11 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { generateText, type LanguageModel } from "ai";
+import { generateText, Output, type LanguageModel, type TelemetryOptions } from "ai";
+import { z } from "zod";
 import { agentDir } from "../../session/store.js";
 import { ensureDir } from "../../utils/fs.js";
 import type { MemoryEntry, MemoryMatch } from "./types.js";
+import type { ModelUsageObserver } from "../../observability/usage.js";
 
 const indexFileName = "MEMORY.md";
 const maxTopicChars = 24_000;
@@ -20,7 +22,9 @@ export interface MemoryWriteResult {
 export class LocalMemory {
   constructor(
     private readonly workspaceRoot: string,
-    private readonly getModel: () => LanguageModel
+    private readonly getModel: () => LanguageModel,
+    private readonly onUsage: ModelUsageObserver = () => undefined,
+    private readonly telemetry?: (functionId: string) => TelemetryOptions
   ) {}
 
   async findRelevant(query: string, paths: string[], limit = 3): Promise<MemoryMatch[]> {
@@ -99,12 +103,19 @@ export class LocalMemory {
         model: this.getModel(),
         allowSystemInMessages: true,
         maxRetries: 0,
+        output: Output.object({
+          schema: memoryEntrySchema,
+          name: "biny-memory-entry",
+          description: "A durable local project memory entry."
+        }),
+        telemetry: this.telemetry?.("biny.memory"),
         messages: [
           { role: "system", content: "You write concise project memory records, not explanations." },
           { role: "user", content: prompt }
         ]
       });
-      return parseMemoryEntry(response.text);
+      await this.onUsage(await response.usage, "memory");
+      return parseMemoryEntry(await response.output);
     } catch {
       return undefined;
     }
@@ -149,9 +160,20 @@ export function normalizeTopic(value: string): string {
   return normalized || "project";
 }
 
-function parseMemoryEntry(value: string): MemoryEntry | undefined {
+const memoryEntrySchema = z.object({
+  topic: z.enum(["decisions", "debugging", "workflows", "project"]),
+  title: z.string(),
+  summary: z.string(),
+  decisions: z.array(z.string()).default([]),
+  paths: z.array(z.string()).default([]),
+  keywords: z.array(z.string()).default([])
+});
+
+function parseMemoryEntry(value: unknown): MemoryEntry | undefined {
   try {
-    const parsed = JSON.parse(stripCodeFence(value)) as Record<string, unknown>;
+    const parsed = typeof value === "string"
+      ? JSON.parse(stripCodeFence(value)) as Record<string, unknown>
+      : value as Record<string, unknown>;
     const summary = stringValue(parsed.summary);
     if (!summary) return undefined;
     return {

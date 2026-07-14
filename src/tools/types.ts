@@ -8,7 +8,7 @@ import type { z } from "zod";
 import type { ToolAccessList } from "./access.js";
 import type { JsonObjectSchema } from "./schema.js";
 
-export type ToolSource = "builtin" | "mcp" | "skill" | "plugin";
+export type ToolSource = "builtin" | "mcp" | "skill" | "plugin" | "subagent";
 export type ToolRisk = "read" | "write" | "execute";
 
 export type ToolUpdateKind = "stdout" | "stderr" | "progress" | "status" | "custom";

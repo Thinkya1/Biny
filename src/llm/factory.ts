@@ -24,6 +24,7 @@ export interface ResolvedModelConfig {
 export interface ModelSettings {
   model: LanguageModel;
   providerOptions?: Record<string, any>;
+  reasoning?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
   timeoutMs?: number;
   maxOutputTokens?: number;
 }
@@ -47,6 +48,7 @@ export function createModelSettings(config: AgentConfig, alias = config.defaultM
   return {
     model: createLanguageModel(resolved.provider.type, baseUrl, apiKey, resolved.model.model),
     providerOptions: createProviderOptions(resolved.provider.type, config),
+    reasoning: config.thinking.enabled ? config.thinking.effort === "max" ? "xhigh" : "high" : "none",
     timeoutMs: resolved.provider.timeoutMs,
     maxOutputTokens: resolved.model.maxOutputTokens
   };
@@ -90,11 +92,24 @@ function createLanguageModel(providerType: AgentConfig["providers"][string]["typ
 }
 
 function createProviderOptions(providerType: AgentConfig["providers"][string]["type"], config: AgentConfig): Record<string, any> | undefined {
-  if (providerType !== "deepseek") return undefined;
-  return {
-    deepseek: {
-      thinking: { type: config.thinking.enabled ? "enabled" : "disabled" },
-      reasoningEffort: config.thinking.enabled ? config.thinking.effort : undefined
-    }
-  };
+  const enabled = config.thinking.enabled;
+  const effort = config.thinking.effort;
+  const budgetTokens = effort === "max" ? 8_192 : 4_096;
+  if (providerType === "deepseek") {
+    return {
+      deepseek: {
+        thinking: { type: enabled ? "enabled" : "disabled" },
+        reasoningEffort: enabled ? effort : undefined
+      }
+    };
+  }
+  if (providerType === "openai") return { openai: { reasoningEffort: enabled ? effort : "none" } };
+  if (providerType === "anthropic") {
+    return { anthropic: { thinking: enabled ? { type: "enabled", budgetTokens } : { type: "disabled" } } };
+  }
+  if (providerType === "qwen") return { alibaba: { enableThinking: enabled, thinkingBudget: enabled ? budgetTokens : undefined } };
+  if (providerType === "kimi") {
+    return { moonshotai: { thinking: { type: enabled ? "enabled" : "disabled", budgetTokens: enabled ? budgetTokens : undefined } } };
+  }
+  return undefined;
 }

@@ -1,7 +1,7 @@
 import type { ModelProvider } from "../config/schema.js";
 
 export type ProviderProtocol = "anthropic" | "openai-compatible";
-export type ReasoningProtocol = "deepseek";
+export type ReasoningProtocol = "deepseek" | "openai" | "anthropic" | "alibaba" | "moonshotai";
 
 export interface ProviderProfile {
   protocol: ProviderProtocol;
@@ -23,13 +23,15 @@ const providerProfiles: Record<ModelProvider, ProviderProfile> = {
     protocol: "openai-compatible",
     baseUrl: "https://api.openai.com/v1",
     apiKeyEnv: "OPENAI_API_KEY",
-    requiresApiKey: true
+    requiresApiKey: true,
+    reasoningProtocol: "openai"
   },
   anthropic: {
     protocol: "anthropic",
     baseUrl: "https://api.anthropic.com",
     apiKeyEnv: "ANTHROPIC_API_KEY",
-    requiresApiKey: true
+    requiresApiKey: true,
+    reasoningProtocol: "anthropic"
   },
   gemini: {
     protocol: "openai-compatible",
@@ -41,13 +43,15 @@ const providerProfiles: Record<ModelProvider, ProviderProfile> = {
     protocol: "openai-compatible",
     baseUrl: "https://api.moonshot.ai/v1",
     apiKeyEnv: "MOONSHOT_API_KEY",
-    requiresApiKey: true
+    requiresApiKey: true,
+    reasoningProtocol: "moonshotai"
   },
   qwen: {
     protocol: "openai-compatible",
     baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     apiKeyEnv: "DASHSCOPE_API_KEY",
-    requiresApiKey: true
+    requiresApiKey: true,
+    reasoningProtocol: "alibaba"
   },
   ollama: {
     protocol: "openai-compatible",

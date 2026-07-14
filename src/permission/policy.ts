@@ -15,7 +15,8 @@ export type ToolName =
   | "grep_search"
   | "git_status"
   | "git_diff"
-  | "run_command";
+  | "run_command"
+  | "web_search";
 
 export interface AnalyzePermissionInput {
   toolName: string;
@@ -67,6 +68,24 @@ export function analyzePermissionRequest(input: AnalyzePermissionInput): Permiss
 
   if (input.toolName === "run_command") {
     return analyzeCommand(input, getStringField(input.args, "command"));
+  }
+
+  if (input.toolName === "delegate_task") {
+    return {
+      ...base(input),
+      actionType: "read",
+      riskLevel: "low",
+      reason: "delegates a bounded read-only repository investigation"
+    };
+  }
+
+  if (input.toolName === "web_search") {
+    return {
+      ...base(input),
+      actionType: "read",
+      riskLevel: "low",
+      reason: "searches the public web without changing local state"
+    };
   }
 
   return {
