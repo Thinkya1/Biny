@@ -6,17 +6,18 @@
  */
 import type { RuntimeEvent, RuntimeEventSink } from "./events.js";
 
-export class AgentEventBus {
-  private readonly listeners = new Set<RuntimeEventSink>();
+export class AgentEventBus<TEvent = RuntimeEvent> {
+  private readonly listeners = new Set<(event: TEvent) => void>();
 
-  emit(event: RuntimeEvent): void {
+  emit(event: TEvent): void {
     for (const listener of [...this.listeners]) listener(event);
   }
 
-  subscribe(listener: RuntimeEventSink): () => void {
-    this.listeners.add(listener);
+  subscribe(listener: TEvent extends RuntimeEvent ? RuntimeEventSink : (event: TEvent) => void): () => void {
+    const eventListener = listener as (event: TEvent) => void;
+    this.listeners.add(eventListener);
     return () => {
-      this.listeners.delete(listener);
+      this.listeners.delete(eventListener);
     };
   }
 }

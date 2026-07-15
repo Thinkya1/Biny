@@ -151,12 +151,12 @@ export class SdkToolExecutionCoordinator {
           return result;
         }
         if (gatedEvaluation.decision === "allow") return { approved: true as const, scope: "once" as const };
-        this.emit({ type: "permission-requested", request: permissionRequest });
+        this.emit({ type: "permission-requested", toolCallId: call.id, request: permissionRequest });
         const result = this.context.confirmPermission
           ? await this.context.confirmPermission(permissionRequest)
           : await confirmPermissionRequest(permissionRequest);
         this.permissionManager.applyResult(permissionRequest, result);
-        this.emit({ type: "permission-result", request: permissionRequest, result });
+        this.emit({ type: "permission-result", toolCallId: call.id, request: permissionRequest, result });
         return result;
       });
       if (!permissionResult.approved) {

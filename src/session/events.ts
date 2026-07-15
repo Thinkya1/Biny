@@ -35,6 +35,7 @@ export async function listSessionSummaries(workspaceRoot: string): Promise<Sessi
     fileNames.map(async (fileName) => {
       const filePath = path.join(sessionsDir, fileName);
       const [events, stat] = await Promise.all([readSessionEvents(filePath), fs.stat(filePath)]);
+      if (!events.some((event) => event.type === "user_message")) return undefined;
       const firstUserMessage = events.find((event) => event.type === "user_message")?.content ?? "";
       const lastAssistant = [...events].reverse().find((event): event is Extract<SessionEvent, { type: "assistant_message" }> => event.type === "assistant_message" && Boolean(event.content));
       const lastAssistantMessage = lastAssistant?.content ?? "";
@@ -50,7 +51,7 @@ export async function listSessionSummaries(workspaceRoot: string): Promise<Sessi
       };
     })
   );
-  return summaries.sort((a, b) => a.fileName.localeCompare(b.fileName));
+  return summaries.filter((summary): summary is SessionSummary => summary !== undefined).sort((a, b) => a.fileName.localeCompare(b.fileName));
 }
 
 function parseSessionEvent(line: string, lineNumber: number): SessionEvent {

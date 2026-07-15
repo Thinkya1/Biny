@@ -142,6 +142,7 @@ const modelAliasSchema = z.object({
   model: z.string().min(1),
   displayName: z.string().min(1).optional(),
   description: z.string().min(1).optional(),
+  supportsTools: z.boolean().optional(),
   maxOutputTokens: z.number().int().min(1).max(131_072).optional(),
   thinking: modelThinkingSchema.optional(),
   pricing: modelPricingSchema.optional()
@@ -246,6 +247,7 @@ export const defaultConfig: AgentConfig = {
       model: "deepseek-v4-flash",
       displayName: "DeepSeek V4 Flash",
       description: "Fast and affordable model for everyday work.",
+      supportsTools: true,
       thinking: { efforts: ["high", "max"], defaultEffort: "high" }
     },
     "deepseek-v4-pro": {
@@ -253,6 +255,7 @@ export const defaultConfig: AgentConfig = {
       model: "deepseek-v4-pro",
       displayName: "DeepSeek V4 Pro",
       description: "Frontier model for complex coding, research, and real-world work.",
+      supportsTools: true,
       thinking: { efforts: ["high", "max"], defaultEffort: "high" }
     }
   },
@@ -311,6 +314,7 @@ function migrateLegacyConfig(value: unknown): unknown {
     [modelAlias]: {
       provider: providerAlias,
       model: modelAlias,
+      supportsTools: true,
       maxOutputTokens: typeof legacy.maxOutputTokens === "number" ? legacy.maxOutputTokens : undefined,
       thinking: thinkingCapability
     }
@@ -321,12 +325,14 @@ function migrateLegacyConfig(value: unknown): unknown {
       provider: providerAlias,
       model: "deepseek-v4-flash",
       displayName: "DeepSeek V4 Flash",
+      supportsTools: true,
       thinking: thinkingCapability
     };
     models["deepseek-v4-pro"] ??= {
       provider: providerAlias,
       model: "deepseek-v4-pro",
       displayName: "DeepSeek V4 Pro",
+      supportsTools: true,
       thinking: thinkingCapability
     };
   }

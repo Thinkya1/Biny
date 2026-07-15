@@ -49,6 +49,7 @@ export async function createToolPermissionRequest(
   const summary = await rule.summarize(call.args, context);
   return {
     ...requestContext,
+    toolCallId: call.id,
     tool: call.name,
     title: rule.title,
     details: summary.details,

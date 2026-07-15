@@ -1,0 +1,268 @@
+import { createHash, randomBytes } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { promisify } from "node:util";
+import { loadConfig } from "../../../config/loader.js";
+import { listModelChoices, type ModelChoice } from "../../../llm/ModelManager.js";
+import type { AgentHostEvent, InteractiveRuntimeSnapshot } from "../../../runtime/agentEvents.js";
+import { listSessionSummaries } from "../../../session/events.js";
+import { readSessionEvents } from "../../../session/events.js";
+import { ensureAgentDirs, sessionFilePath } from "../../../session/store.js";
+import { resolveWorkspacePath } from "../../../workspace/resolvePath.js";
+import type {
+  DesktopAttachment,
+  DesktopProject,
+  DesktopSessionDocument,
+  DesktopSessionStatus,
+  DesktopSessionSummary
+} from "../../protocol.js";
+import { DesktopStateStore } from "./DesktopStateStore.js";
+
+const execFileAsync = promisify(execFile);
+
+export class DesktopProjectService {
+  constructor(private readonly state: DesktopStateStore) {}
+
+  async createProject(projectPath: string): Promise<DesktopProject> {
+    const resolvedPath = path.resolve(projectPath);
+    const stat = await fs.stat(resolvedPath);
+    if (!stat.isDirectory()) throw new Error("Selected project path is not a directory.");
+    const existing = this.state.projects().find((project) => project.path === resolvedPath);
+    const now = new Date().toISOString();
+    const project = await this.inspectProject({
+      id: existing?.id ?? projectId(resolvedPath),
+      path: resolvedPath,
+      name: existing?.name ?? path.basename(resolvedPath),
+      branch: existing?.branch,
+      dirty: existing?.dirty ?? false,
+      missing: false,
+      pinned: existing?.pinned ?? false,
+      addedAt: existing?.addedAt ?? now,
+      lastOpenedAt: now
+    });
+    await ensureAgentDirs(resolvedPath);
+    await this.state.upsertProject(project);
+    return project;
+  }
+
+  async createEmptyProject(projectPath: string): Promise<DesktopProject> {
+    const resolvedPath = path.resolve(projectPath);
+    try {
+      await fs.mkdir(resolvedPath);
+    } catch (error) {
+      if (isAlreadyExists(error)) throw new Error("项目文件夹已存在，请选择其他名称。");
+      throw error;
+    }
+    return await this.createProject(resolvedPath);
+  }
+
+  async inspectProject(project: DesktopProject): Promise<DesktopProject> {
+    const missing = !await directoryExists(project.path);
+    if (missing) return { ...project, branch: undefined, dirty: false, missing: true };
+    const [branch, status] = await Promise.all([
+      gitOutput(project.path, ["branch", "--show-current"]),
+      gitOutput(project.path, ["status", "--porcelain"])
+    ]);
+    return {
+      ...project,
+      branch: branch?.trim() || undefined,
+      dirty: Boolean(status?.trim()),
+      missing: false
+    };
+  }
+
+  async refreshStoredProject(projectIdValue: string): Promise<DesktopProject> {
+    const project = this.requireProject(projectIdValue);
+    const refreshed = await this.inspectProject(project);
+    await this.state.upsertProject({ ...refreshed, lastOpenedAt: new Date().toISOString() });
+    return refreshed;
+  }
+
+  async refreshAllProjects(): Promise<DesktopProject[]> {
+    const activeProjectId = this.state.activeProjectId();
+    const projects = await Promise.all(this.state.projects().map(async (project) => await this.inspectProject(project)));
+    await Promise.all(projects.map(async (project) => await this.state.upsertProject(project)));
+    if (activeProjectId) await this.state.setActiveProject(activeProjectId);
+    return projects;
+  }
+
+  async listModels(project: DesktopProject): Promise<ModelChoice[]> {
+    return listModelChoices(await loadConfig(project.path));
+  }
+
+  async listSessions(
+    project: DesktopProject,
+    runtime: InteractiveRuntimeSnapshot | undefined,
+    liveEvents: ReadonlyMap<string, AgentHostEvent[]>
+  ): Promise<DesktopSessionSummary[]> {
+    if (project.missing) return [];
+    await ensureAgentDirs(project.path);
+    const summaries = await listSessionSummaries(project.path);
+    const sessions = summaries.map((summary) => {
+      const id = summary.fileName.replace(/\.jsonl$/, "");
+      const metadata = this.state.sessionMetadata(project.id, id);
+      return {
+        id,
+        projectId: project.id,
+        fileName: summary.fileName,
+        title: metadata.title ?? sessionTitle(summary.firstUserMessage),
+        firstUserMessage: summary.firstUserMessage,
+        lastAssistantMessage: summary.lastAssistantMessage,
+        eventCount: summary.eventCount,
+        createdAt: summary.createdAt,
+        updatedAt: summary.updatedAt,
+        pinned: metadata.pinned ?? false,
+        status: sessionStatus(id, summary.lastAssistantMessage, runtime, liveEvents.get(id))
+      } satisfies DesktopSessionSummary;
+    });
+
+    const runtimeInfo = runtime?.info;
+    const runtimeEvents = runtimeInfo ? liveEvents.get(runtimeInfo.sessionId) : undefined;
+    if (runtimeInfo && runtimeEvents?.some((event) => event.type === "message.user") && !sessions.some((session) => session.id === runtimeInfo.sessionId)) {
+      const metadata = this.state.sessionMetadata(project.id, runtimeInfo.sessionId);
+      const now = new Date().toISOString();
+      sessions.push({
+        id: runtimeInfo.sessionId,
+        projectId: project.id,
+        fileName: path.basename(runtimeInfo.sessionFile),
+        title: metadata.title ?? "新任务",
+        firstUserMessage: "",
+        lastAssistantMessage: "",
+        eventCount: 0,
+        createdAt: now,
+        updatedAt: now,
+        pinned: metadata.pinned ?? false,
+        status: sessionStatus(runtimeInfo.sessionId, "", runtime, liveEvents.get(runtimeInfo.sessionId))
+      });
+    }
+
+    return [...sessions].sort((left, right) => {
+      if (left.pinned !== right.pinned) return left.pinned ? -1 : 1;
+      return Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
+    });
+  }
+
+  async openSession(
+    project: DesktopProject,
+    sessionId: string,
+    runtime: InteractiveRuntimeSnapshot | undefined,
+    liveEvents: ReadonlyMap<string, AgentHostEvent[]>
+  ): Promise<DesktopSessionDocument> {
+    const sessions = await this.listSessions(project, runtime, liveEvents);
+    const session = sessions.find((candidate) => candidate.id === sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    const filePath = sessionFilePath(project.path, sessionId);
+    const events = await readSessionEvents(filePath).catch((error: unknown) => {
+      if (isNotFound(error)) return [];
+      throw error;
+    });
+    return { session, events, liveEvents: [...(liveEvents.get(sessionId) ?? [])] };
+  }
+
+  async duplicateSession(project: DesktopProject, sessionId: string): Promise<string> {
+    const targetSessionId = createSessionId();
+    await fs.copyFile(sessionFilePath(project.path, sessionId), sessionFilePath(project.path, targetSessionId));
+    await this.state.copySessionMetadata(project.id, sessionId, targetSessionId);
+    return targetSessionId;
+  }
+
+  async deleteSession(project: DesktopProject, sessionId: string): Promise<void> {
+    await fs.rm(sessionFilePath(project.path, sessionId), { force: true });
+    await this.state.deleteSessionMetadata(project.id, sessionId);
+  }
+
+  async saveAttachment(project: DesktopProject, name: string, mimeType: string, bytes: Uint8Array): Promise<DesktopAttachment> {
+    const safeName = sanitizeFileName(name);
+    const directory = path.join(project.path, ".agent", "attachments");
+    await fs.mkdir(directory, { recursive: true });
+    const fileName = `${String(Date.now())}-${randomBytes(3).toString("hex")}-${safeName}`;
+    const filePath = path.join(directory, fileName);
+    await fs.writeFile(filePath, bytes);
+    return {
+      name: safeName,
+      path: path.relative(project.path, filePath),
+      mimeType,
+      size: bytes.byteLength
+    };
+  }
+
+  workspaceFile(project: DesktopProject, relativePath: string): string {
+    return resolveWorkspacePath(project.path, relativePath, ["node_modules", ".git"]);
+  }
+
+  requireProject(projectIdValue: string): DesktopProject {
+    const project = this.state.project(projectIdValue);
+    if (!project) throw new Error(`Unknown project: ${projectIdValue}`);
+    return project;
+  }
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+}
+
+function projectId(projectPath: string): string {
+  return createHash("sha256").update(projectPath).digest("hex").slice(0, 20);
+}
+
+async function directoryExists(directory: string): Promise<boolean> {
+  try {
+    return (await fs.stat(directory)).isDirectory();
+  } catch (error) {
+    if (isNotFound(error)) return false;
+    throw error;
+  }
+}
+
+async function gitOutput(cwd: string, args: string[]): Promise<string | undefined> {
+  try {
+    return (await execFileAsync("git", args, { cwd, timeout: 4_000, maxBuffer: 512 * 1024 })).stdout;
+  } catch {
+    return undefined;
+  }
+}
+
+function sessionTitle(firstUserMessage: string): string {
+  const normalized = firstUserMessage.replace(/\s+/g, " ").trim();
+  return normalized ? normalized.slice(0, 64) : "新任务";
+}
+
+function sessionStatus(
+  sessionId: string,
+  lastAssistantMessage: string,
+  runtime: InteractiveRuntimeSnapshot | undefined,
+  events: AgentHostEvent[] | undefined
+): DesktopSessionStatus {
+  if (runtime?.pendingPermission?.sessionId === sessionId) return "waiting_permission";
+  if (runtime?.activeRun?.sessionId === sessionId) return "running";
+  const finalEvent = events
+    ? [...events].reverse().find((event) => event.type === "run.completed" || event.type === "run.failed" || event.type === "run.aborted")
+    : undefined;
+  if (finalEvent?.type === "run.failed") return "failed";
+  if (finalEvent?.type === "run.completed") return "completed";
+  return lastAssistantMessage ? "completed" : "idle";
+}
+
+function createSessionId(): string {
+  const now = new Date();
+  const stamp = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, "0"),
+    String(now.getDate()).padStart(2, "0"),
+    "-",
+    String(now.getHours()).padStart(2, "0"),
+    String(now.getMinutes()).padStart(2, "0"),
+    String(now.getSeconds()).padStart(2, "0")
+  ].join("");
+  return `${stamp}-${randomBytes(4).toString("hex")}`;
+}
+
+function sanitizeFileName(value: string): string {
+  const sanitized = path.basename(value).replace(/[^A-Za-z0-9._\-\u4e00-\u9fff]/g, "-").slice(0, 120);
+  return sanitized || "attachment";
+}
+
+function isNotFound(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}

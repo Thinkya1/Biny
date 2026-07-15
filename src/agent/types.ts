@@ -5,6 +5,7 @@ import type { SessionRecorder } from "../session/recorder.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { ToolInputDisplay, ToolUpdate } from "../tools/types.js";
 import type { PermissionManager, PermissionPrompt, PermissionResult } from "../permission/PermissionManager.js";
+import type { SessionUsage } from "../session/metadata.js";
 import type { ContextMemory } from "./context/ContextMemory.js";
 
 export type IntentType = "qa" | "read_file" | "write_file" | "edit_file" | "search_files" | "git_diff" | "run_command";
@@ -29,10 +30,10 @@ export type AgentSessionEvent =
   | { type: "sdk"; part: TextStreamPart<ToolSet> }
   | { type: "tool-started"; toolCallId: string; tool: string; args: unknown; description?: string; display?: ToolInputDisplay }
   | { type: "tool-progress"; toolCallId: string; tool: string; update: ToolUpdate }
-  | { type: "permission-requested"; request: AgentPermissionRequest }
-  | { type: "permission-result"; request: AgentPermissionRequest; result: AgentPermissionResult }
+  | { type: "permission-requested"; toolCallId: string; request: AgentPermissionRequest }
+  | { type: "permission-result"; toolCallId: string; request: AgentPermissionRequest; result: AgentPermissionResult }
   | { type: "error"; message: string; recorded?: boolean }
-  | { type: "done"; content: string };
+  | { type: "done"; content: string; usage?: SessionUsage };
 
 export interface AgentRuntimeContext {
   // Agent loop 的所有外部依赖都由 runtime 注入，方便 CLI 和 TUI 复用同一套执行逻辑。

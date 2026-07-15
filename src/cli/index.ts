@@ -3,7 +3,7 @@
  * Biny 的命令行入口模块。
  *
  * 这里集中声明 `init`、`run`、`chat`、`tui` 等子命令，并把执行逻辑转交给
- * `commands/` 下的具体实现。入口层只处理参数拼接、默认命令和异常展示，
+ * `commands/` 下的具体实现。入口层只处理参数拼接、默认 TUI 和异常展示，
  * 不直接承载 agent、工具或 TUI 的业务流程。
  */
 import { Command } from "commander";
@@ -49,9 +49,9 @@ program
   .argument("[session]", "session id, .jsonl path, or omit for latest")
   .action((session: string | undefined) => wrap(() => resumeCommand(workspaceRoot, session))());
 
-// 不带子命令时默认进入 chat，这是当前最常用的入口；help 仍可通过 `biny help` 查看。
+
 if (process.argv.length <= 2) {
-  await wrap(() => chatCommand(workspaceRoot))();
+  await wrap(() => tuiCommand(workspaceRoot))();
 } else {
   await program.parseAsync(process.argv);
 }

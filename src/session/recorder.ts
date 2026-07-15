@@ -22,7 +22,7 @@ export type SessionEvent =
 export class SessionRecorder {
   readonly sessionId: string;
   readonly filePath: string;
-  private readonly stream: WriteStream;
+  private stream?: WriteStream;
   private closePromise?: Promise<void>;
   private toolCallSequence = 0;
   private recordedEvents = 0;
@@ -31,12 +31,12 @@ export class SessionRecorder {
     // sessionId 默认按时间和随机后缀生成，便于人工排序也避免同秒冲突。
     this.sessionId = sessionId;
     this.filePath = sessionFilePath(workspaceRoot, this.sessionId);
-    this.stream = createWriteStream(this.filePath, { flags: "a" });
   }
 
   record(event: SessionEvent): void {
     // 每个事件一行 JSON，便于追加写入，也方便后续按行读取和压缩。
     const line = JSON.stringify({ ...event, time: event.time ?? new Date().toISOString() });
+    this.stream ??= createWriteStream(this.filePath, { flags: "a" });
     this.stream.write(`${line}\n`);
     this.recordedEvents += 1;
   }
@@ -56,8 +56,9 @@ export class SessionRecorder {
 
   close(): Promise<void> {
     // close 可能被 finally 和外部清理重复调用，用同一个 promise 保证只 end 一次。
+    if (!this.stream) return Promise.resolve();
     this.closePromise ??= new Promise((resolve, reject) => {
-      this.stream.end((error?: Error | null) => {
+      this.stream?.end((error?: Error | null) => {
         if (error) reject(error);
         else resolve();
       });

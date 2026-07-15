@@ -1,0 +1,22 @@
+appId: com.biny.desktop
+productName: Biny
+asar: true
+directories:
+  output: release
+  buildResources: build
+files:
+  - out/**/*
+  - package.json
+mac:
+  category: public.app-category.developer-tools
+  icon: build/icon.icns
+  identity: null
+  hardenedRuntime: false
+  target:
+    - dir
+    - dmg
+    - zip
+dmg:
+  title: Biny ${version}
+artifactName: Biny-${version}-${arch}.${ext}
+npmRebuild: false

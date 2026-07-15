@@ -1,18 +1,19 @@
 /**
- * TUI host bridge. Ink consumes agent events through this narrow interface and
- * never reaches into the provider, tool registry, recorder or context state.
+ * Ink host adapter over the shared InteractiveAgentRuntime. TUI components see
+ * the existing RuntimeEvent contract while Desktop consumes AgentHostEvent
+ * directly from the same runtime.
  */
 import type { AgentRunMode, AgentSessionInfo, ResumedAgentSession } from "../../agent/AgentSession.js";
-import type { AgentPermissionRequest, AgentPermissionResult, AgentSessionEvent } from "../../agent/types.js";
-import type { PermissionMode } from "../../permission/PermissionManager.js";
+import type { ContextStatus } from "../../agent/context/types.js";
+import type { ExtensionSection } from "../../extensions/report.js";
 import type { ModelChoice, ModelRuntimeInfo, ThinkingSelection } from "../../llm/ModelManager.js";
-import { createCommandRuntime } from "../../runtime/CommandRuntime.js";
+import type { PermissionMode } from "../../permission/PermissionManager.js";
+import { createInteractiveAgentRuntime } from "../../runtime/InteractiveAgentRuntime.js";
 import type { RuntimeEventSink } from "../../runtime/events.js";
 import type { SessionSummary } from "../../session/events.js";
-import type { ContextStatus } from "../../agent/context/types.js";
 import type { PermissionChoice } from "../types.js";
+import { agentEventToRuntimeEvents } from "./agentEventAdapter.js";
 import { TuiEventBridge } from "./eventBridge.js";
-import type { ExtensionSection } from "../../extensions/report.js";
 
 export interface TuiRuntime {
   getInfo(): AgentSessionInfo;
@@ -38,33 +39,30 @@ export interface TuiRuntime {
 
 export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntime> {
   const bridge = new TuiEventBridge();
-  const commandRuntime = await createCommandRuntime(workspaceRoot);
-  const agent = commandRuntime.agent;
-  let pendingPermission: ((result: AgentPermissionResult) => void) | undefined;
-  let queuedPermissionChoice: PermissionChoice | undefined;
-  let busy = false;
-  let abortController: AbortController | undefined;
+  const host = await createInteractiveAgentRuntime(workspaceRoot);
+  const unsubscribeHost = host.subscribe((event) => {
+    for (const runtimeEvent of agentEventToRuntimeEvents(event)) bridge.emit(runtimeEvent);
+  });
   let closePromise: Promise<void> | undefined;
 
   return {
     getInfo(): AgentSessionInfo {
-      return agent.getInfo();
+      return host.getInfo();
     },
     getPermissionMode(): PermissionMode {
-      return agent.getPermissionMode();
+      return host.getPermissionMode();
     },
     async setPermissionMode(mode: PermissionMode): Promise<void> {
-      await agent.setPermissionMode(mode);
+      await host.setPermissionMode(mode);
     },
     async runPermissionCommand(args: string[]): Promise<string> {
-      return await agent.runPermissionCommand(args);
+      return await host.runPermissionCommand(args);
     },
     listModels(): ModelChoice[] {
-      return agent.listModels();
+      return host.listModels();
     },
     async switchModel(alias: string, thinking?: ThinkingSelection): Promise<ModelRuntimeInfo> {
-      if (busy) throw new Error("Cannot switch models while a turn is running.");
-      const info = await agent.switchModel(alias, thinking);
+      const info = await host.switchModel(alias, thinking);
       bridge.emit({
         type: "model.changed",
         provider: info.provider,
@@ -74,40 +72,11 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
       return info;
     },
     async sendPrompt(prompt: string, mode: AgentRunMode = "chat"): Promise<void> {
-      if (busy) return;
-      busy = true;
-      abortController = new AbortController();
-      try {
-        bridge.emit({ type: "user.message", content: prompt });
-        for await (const event of agent.runSdk(prompt, {
-          abortSignal: abortController.signal,
-          confirmPermission: async (request) => await waitForPermission(request),
-          mode
-        })) {
-          bridgeAgentSessionEvent(event);
-        }
-      } catch (error) {
-        if (abortController.signal.aborted) {
-          agent.recordError(new Error("Current turn interrupted."));
-          bridge.emit({ type: "system.message", content: "当前轮次已中断。" });
-          bridge.emit({ type: "session.completed", sessionId: agent.getInfo().sessionId });
-          return;
-        }
-        bridge.emit({
-          type: "session.error",
-          sessionId: agent.getInfo().sessionId,
-          message: error instanceof Error ? error.message : String(error)
-        });
-      } finally {
-        busy = false;
-        abortController = undefined;
-        pendingPermission = undefined;
-      }
+      await host.submitPrompt(prompt, mode).completion;
     },
     async resumeSession(session: string): Promise<ResumedAgentSession> {
-      if (busy) throw new Error("Cannot resume another session while a turn is running.");
-      const resumed = await agent.resume(session);
-      const info = agent.getInfo();
+      const resumed = await host.resumeSession(session);
+      const info = host.getInfo();
       bridge.emit({
         type: "session.started",
         sessionId: info.sessionId,
@@ -120,129 +89,49 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
       return resumed;
     },
     async listSessions(): Promise<SessionSummary[]> {
-      return await agent.listSessions();
+      return await host.listSessions();
     },
     extensionReport(section?: ExtensionSection): string {
-      return commandRuntime.extensionReport(section);
+      return host.extensionReport(section);
     },
     async runSubagentTask(task: string): Promise<string> {
-      if (busy) throw new Error("Cannot run a subagent while a turn is running.");
-      busy = true;
-      try {
-        return await commandRuntime.runSubagentTask(task);
-      } finally {
-        busy = false;
-      }
+      return await host.runSubagentTask(task);
     },
     async contextReport(): Promise<string> {
-      return await agent.contextReport();
+      return await host.contextReport();
     },
     usageReport(): string {
-      return agent.usageReport();
+      return host.usageReport();
     },
     async contextStatus(): Promise<ContextStatus> {
-      return await agent.contextStatus();
+      return await host.contextStatus();
     },
     async compactConversation(hint?: string): Promise<string> {
-      return await agent.compactConversation(hint);
+      return await host.compactConversation(hint);
     },
     cancelCurrentTurn(): void {
-      if (!busy || !abortController) return;
-      abortController.abort();
-      if (pendingPermission) {
-        pendingPermission({ approved: false, scope: "once", message: "Current turn interrupted." });
-        pendingPermission = undefined;
-      }
+      host.cancelCurrentRun();
     },
     answerPermission(choice: PermissionChoice): void {
-      if (!pendingPermission) {
-        queuedPermissionChoice = choice;
-        return;
-      }
-      pendingPermission(permissionChoiceToResult(choice));
-      pendingPermission = undefined;
+      const pending = host.getSnapshot().pendingPermission;
+      if (!pending) return;
+      host.answerPermission(pending.requestId, permissionChoiceToResult(choice));
     },
     subscribe(listener: RuntimeEventSink): () => void {
       return bridge.subscribe(listener);
     },
     close(): Promise<void> {
-      closePromise ??= commandRuntime.close();
+      closePromise ??= (async () => {
+        unsubscribeHost();
+        await host.close();
+      })();
       return closePromise;
     }
   };
-
-  async function waitForPermission(_request: AgentPermissionRequest): Promise<AgentPermissionResult> {
-    if (queuedPermissionChoice !== undefined) {
-      const choice = queuedPermissionChoice;
-      queuedPermissionChoice = undefined;
-      return permissionChoiceToResult(choice);
-    }
-    return await new Promise<AgentPermissionResult>((resolve) => {
-      pendingPermission = resolve;
-    });
-  }
-
-  function bridgeAgentSessionEvent(event: AgentSessionEvent): void {
-    if (event.type === "status") {
-      bridge.emit({ type: "runtime.status", status: event.status });
-      return;
-    }
-    if (event.type === "sdk") {
-      const part = event.part;
-      if (part.type === "text-delta") {
-        bridge.emit({ type: "assistant.delta", content: part.text });
-      } else if (part.type === "tool-result") {
-        bridge.emit({ type: "tool.call.completed", toolCallId: part.toolCallId, tool: part.toolName, result: part.output });
-      } else if (part.type === "tool-error") {
-        bridge.emit({ type: "tool.call.failed", toolCallId: part.toolCallId, tool: part.toolName, error: String(part.error) });
-      }
-      return;
-    }
-    if (event.type === "tool-started") {
-      bridge.emit({ type: "tool.call.started", toolCallId: event.toolCallId, tool: event.tool, args: event.args, description: event.description, display: event.display });
-      return;
-    }
-    if (event.type === "tool-progress") {
-      bridge.emit({ type: "tool.call.progress", toolCallId: event.toolCallId, tool: event.tool, update: event.update });
-      return;
-    }
-    if (event.type === "permission-requested") {
-      bridge.emit({
-        type: "permission.requested",
-        tool: event.request.tool,
-        title: event.request.title,
-        details: event.request.details,
-        requireFullYes: event.request.requireFullYes,
-        diff: event.request.diff,
-        preview: event.request.preview,
-        actionType: event.request.actionType,
-        riskLevel: event.request.riskLevel,
-        targetPath: event.request.targetPath,
-        command: event.request.command,
-        reason: event.request.reason,
-        changeSummary: event.request.changeSummary
-      });
-      return;
-    }
-    if (event.type === "permission-result") {
-      bridge.emit(event.result.approved
-        ? { type: "permission.approved", tool: event.request.tool, scope: event.result.scope ?? "once" }
-        : { type: "permission.rejected", tool: event.request.tool, reason: event.result.message });
-      return;
-    }
-    if (event.type === "error") {
-      bridge.emit({ type: "error.message", message: event.message });
-      return;
-    }
-    if (event.type === "done") {
-      if (event.content) bridge.emit({ type: "assistant.completed", content: event.content });
-      bridge.emit({ type: "session.completed", sessionId: agent.getInfo().sessionId });
-    }
-  }
 }
 
-function permissionChoiceToResult(choice: PermissionChoice): AgentPermissionResult {
-  if (choice === "approve_once") return { approved: true, scope: "once" };
-  if (choice === "approve_command") return { approved: true, scope: "command" };
-  return { approved: false, scope: "once", message: "Denied by user." };
+function permissionChoiceToResult(choice: PermissionChoice) {
+  if (choice === "approve_once") return { approved: true as const, scope: "once" as const };
+  if (choice === "approve_command") return { approved: true as const, scope: "command" as const };
+  return { approved: false as const, scope: "once" as const, message: "Denied by user." };
 }

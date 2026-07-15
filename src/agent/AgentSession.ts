@@ -208,7 +208,7 @@ export class AgentSession {
         contextState: this.contextMemory.snapshot()
       });
       yield { type: "status", status: "completed" };
-      yield { type: "done", content };
+      yield { type: "done", content, usage: usageRecord };
     } catch (error) {
       const failure = streamError ?? error;
       const message = failure instanceof Error ? failure.message : String(failure);

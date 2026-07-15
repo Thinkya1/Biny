@@ -16,6 +16,7 @@ export interface ModelChoice {
   provider: string;
   providerType: string;
   model: string;
+  supportsTools?: boolean;
   efforts: ReasoningEffort[];
   defaultThinking: ThinkingSelection;
 }
@@ -87,6 +88,7 @@ export function listModelChoices(config: AgentConfig): ModelChoice[] {
       provider: model.provider,
       providerType: provider?.type ?? model.provider,
       model: model.model,
+      supportsTools: model.supportsTools,
       efforts: [...(model.thinking?.efforts ?? [])],
       defaultThinking: model.thinking?.defaultEffort ?? "off"
     };

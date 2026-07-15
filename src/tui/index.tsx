@@ -1,7 +1,7 @@
 /**
  * TUI 启动模块。
  *
- * 这里调用 Ink `render` 挂载顶层 App，并在界面退出后清理终端、打印当前 session id 和恢复提示。
+ * 这里调用 Ink `render` 挂载顶层 App，并在界面退出后打印当前 session id 和恢复提示。
  * 这样 TUI 的交互输出不会和退出后的普通命令行信息混在一起。
  */
 import React from "react";
@@ -23,7 +23,7 @@ export async function startTui(workspaceRoot: string): Promise<void> {
       `File: ${relativeSessionFile}`,
       "",
       "Resume:",
-      `  pnpm dev -- tui`,
+      `  biny`,
       `  /resume ${exitSummary.sessionId}`,
       ""
     ].join("\n"));

@@ -1,5 +1,5 @@
 {
-  "defaultModel": "deepseek-v4-pro",
+  "defaultModel": "deepseek-v4-flash",
   "providers": {
     "deepseek": {
       "type": "deepseek",
@@ -35,7 +35,7 @@
   },
   "thinking": {
     "enabled": true,
-    "effort": "max"
+    "effort": "high"
   },
   "permission": {
     "mode": "full-access",

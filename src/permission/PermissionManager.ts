@@ -35,6 +35,7 @@ export interface PermissionRequestContext {
 }
 
 export interface PermissionPrompt extends PermissionRequestContext {
+  toolCallId: string;
   tool: string;
   title: string;
   details: string;
