@@ -37,6 +37,7 @@ export interface AgentSessionOptions {
   recorder: SessionRecorder;
   modelManager?: ModelManager;
   skillPrompt?: string;
+  skillPaths?: string[];
 }
 
 export interface AgentRunOptions {
@@ -54,6 +55,7 @@ export interface AgentSessionInfo {
   reasoningLabel: string;
   modelAlias: string;
   thinking: ThinkingSelection;
+  skills?: string[];
 }
 
 export type AgentRunMode = "chat" | "plan";
@@ -143,7 +145,7 @@ export class AgentSession {
     } as ToolLoopAgentSettings<never, ToolSet> & { onError: () => undefined };
     const agent = new ToolLoopAgent<never, ToolSet>(agentSettings);
 
-    this.recorder.record({ type: "user_message", content: input, contextUsage: this.contextMemory.getBudget(), contextState: this.contextMemory.persistedState(), preparationUsage });
+    this.recorder.record({ type: "user_message", content: input, skills: this.options.skillPaths, contextUsage: this.contextMemory.getBudget(), contextState: this.contextMemory.persistedState(), preparationUsage });
     yield { type: "status", status: "thinking" };
 
     let result: Awaited<ReturnType<typeof agent.stream>>;
@@ -232,7 +234,7 @@ export class AgentSession {
     const usageBeforePreparation = this.usageRecords.length;
     const messages = await this.contextMemory.prepareTurn(task, buildSystemPrompt("oneShotPlan", this.options.skillPrompt));
     const preparationUsage = this.usageRecords.slice(usageBeforePreparation);
-    this.recorder.record({ type: "user_message", content: userContent, contextUsage: this.contextMemory.getBudget(), contextState: this.contextMemory.persistedState(), preparationUsage });
+    this.recorder.record({ type: "user_message", content: userContent, skills: this.options.skillPaths, contextUsage: this.contextMemory.getBudget(), contextState: this.contextMemory.persistedState(), preparationUsage });
 
     try {
       const model = this.options.modelManager?.getModel() ?? this.options.model;
@@ -332,13 +334,19 @@ export class AgentSession {
     return await this.options.modelManager.switchModel(alias, thinking);
   }
 
+  async refreshModelFromDisk(): Promise<ModelRuntimeInfo> {
+    if (!this.options.modelManager) throw new Error("This agent runtime does not support model switching.");
+    return await this.options.modelManager.refreshFromDisk();
+  }
+
   getInfo(): AgentSessionInfo {
     const model = this.options.modelManager?.getInfo() ?? modelRuntimeInfo(this.options.config);
     return {
       workspaceRoot: this.options.workspaceRoot,
       sessionId: this.recorder.sessionId,
       sessionFile: this.recorder.filePath,
-      ...model
+      ...model,
+      skills: this.options.skillPaths
     };
   }
 

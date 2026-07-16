@@ -1,4 +1,4 @@
-import { saveConfig } from "../config/loader.js";
+import { loadConfig, saveConfig } from "../config/loader.js";
 import {
   configSchema,
   type AgentConfig,
@@ -76,12 +76,28 @@ export class ModelManager {
     this.activeSettings = nextSettings;
     return this.getInfo();
   }
+
+  async refreshFromDisk(): Promise<ModelRuntimeInfo> {
+    const nextConfig = await loadConfig(this.workspaceRoot);
+    const nextSettings = createModelSettings(nextConfig);
+    Object.assign(this.config, nextConfig);
+    this.activeSettings = nextSettings;
+    return this.getInfo();
+  }
 }
 
 export function listModelChoices(config: AgentConfig): ModelChoice[] {
-  return Object.entries(config.models).map(([alias, model]) => {
+  const entries = [
+    ...Object.entries(config.models).filter(([alias]) => alias === config.defaultModel),
+    ...Object.entries(config.models).filter(([alias]) => alias !== config.defaultModel)
+  ];
+  const seenModels = new Set<string>();
+  return entries.flatMap(([alias, model]) => {
+    const modelKey = `${model.provider}\u0000${model.model}`;
+    if (seenModels.has(modelKey)) return [];
+    seenModels.add(modelKey);
     const provider = config.providers[model.provider];
-    return {
+    return [{
       alias,
       displayName: model.displayName ?? model.model,
       description: model.description,
@@ -91,7 +107,7 @@ export function listModelChoices(config: AgentConfig): ModelChoice[] {
       supportsTools: model.supportsTools,
       efforts: [...(model.thinking?.efforts ?? [])],
       defaultThinking: model.thinking?.defaultEffort ?? "off"
-    };
+    }];
   });
 }
 

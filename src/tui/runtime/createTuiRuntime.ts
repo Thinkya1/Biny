@@ -22,6 +22,7 @@ export interface TuiRuntime {
   runPermissionCommand(args: string[]): Promise<string>;
   listModels(): ModelChoice[];
   switchModel(alias: string, thinking?: ThinkingSelection): Promise<ModelRuntimeInfo>;
+  refreshModelFromDisk(): Promise<ModelRuntimeInfo>;
   sendPrompt(prompt: string, mode?: AgentRunMode): Promise<void>;
   resumeSession(session: string): Promise<ResumedAgentSession>;
   listSessions(): Promise<SessionSummary[]>;
@@ -44,6 +45,14 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
     for (const runtimeEvent of agentEventToRuntimeEvents(event)) bridge.emit(runtimeEvent);
   });
   let closePromise: Promise<void> | undefined;
+  const emitModelChanged = (info: ModelRuntimeInfo): void => {
+    bridge.emit({
+      type: "model.changed",
+      provider: info.provider,
+      modelLabel: info.modelLabel,
+      reasoningLabel: info.reasoningLabel
+    });
+  };
 
   return {
     getInfo(): AgentSessionInfo {
@@ -63,15 +72,17 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
     },
     async switchModel(alias: string, thinking?: ThinkingSelection): Promise<ModelRuntimeInfo> {
       const info = await host.switchModel(alias, thinking);
-      bridge.emit({
-        type: "model.changed",
-        provider: info.provider,
-        modelLabel: info.modelLabel,
-        reasoningLabel: info.reasoningLabel
-      });
+      emitModelChanged(info);
+      return info;
+    },
+    async refreshModelFromDisk(): Promise<ModelRuntimeInfo> {
+      const info = await host.refreshModelFromDisk();
+      emitModelChanged(info);
       return info;
     },
     async sendPrompt(prompt: string, mode: AgentRunMode = "chat"): Promise<void> {
+      const info = await host.refreshModelFromDisk();
+      emitModelChanged(info);
       await host.submitPrompt(prompt, mode).completion;
     },
     async resumeSession(session: string): Promise<ResumedAgentSession> {

@@ -18,6 +18,7 @@ export interface RunStartedEvent extends AgentEventBase {
   input: string;
   mode: AgentRunMode;
   model: AgentRunModel;
+  skills: string[];
 }
 
 export interface AgentRunModel {
@@ -33,6 +34,7 @@ export type AgentHostEvent =
   | (AgentEventBase & { type: "assistant.delta"; messageId: string; content: string })
   | (AgentEventBase & { type: "assistant.completed"; messageId: string; content: string })
   | (AgentEventBase & { type: "reasoning.started"; messageId: string; status: string })
+  | (AgentEventBase & { type: "reasoning.delta"; messageId: string; content: string })
   | (AgentEventBase & { type: "reasoning.status"; messageId: string; status: string })
   | (AgentEventBase & { type: "reasoning.completed"; messageId: string; status: string })
   | (AgentEventBase & { type: "tool.started"; toolCallId: string; tool: string; args: unknown; description?: string; display?: ToolInputDisplay })

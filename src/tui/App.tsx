@@ -423,6 +423,7 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
 
     if (command === "/model") {
       if (!args[0]) {
+        await runtime.refreshModelFromDisk();
         const info = runtime.getInfo();
         setModelPicker({
           models: runtime.listModels(),
