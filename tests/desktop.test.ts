@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentRunOptions, AgentSessionInfo } from "../src/agent/AgentSession.js";
@@ -8,10 +8,12 @@ import type { ContextStatus } from "../src/agent/context/types.js";
 import type { CommandRuntime } from "../src/runtime/CommandRuntime.js";
 import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.js";
 import type { AgentHostEvent } from "../src/runtime/agentEvents.js";
-import { loadConfig } from "../src/config/loader.js";
+import { loadConfig, saveConfig } from "../src/config/loader.js";
+import { defaultConfig } from "../src/config/schema.js";
 import { DesktopAgentManager } from "../src/desktop/electron/main/DesktopAgentManager.js";
 import { DesktopProjectService } from "../src/desktop/electron/main/DesktopProjectService.js";
 import { DesktopStateStore } from "../src/desktop/electron/main/DesktopStateStore.js";
+import { clampFilePanelWidth, DEFAULT_FILE_PANEL_WIDTH, MAX_FILE_PANEL_WIDTH, MIN_FILE_PANEL_WIDTH } from "../src/desktop/filePanelSizing.js";
 import {
   canNavigateBack,
   canNavigateForward,
@@ -20,7 +22,10 @@ import {
   pushNavigation,
   replaceNavigation
 } from "../src/desktop/renderer/src/navigationHistory.js";
-import { buildSessionTimeline } from "../src/desktop/renderer/src/sessionTimeline.js";
+import { buildSessionTimeline, listChangedFiles, listTimelineFiles } from "../src/desktop/renderer/src/sessionTimeline.js";
+import { highlightWorkspaceFile } from "../src/desktop/renderer/src/syntaxHighlight.js";
+import { workspaceFileMarker } from "../src/desktop/renderer/src/workspaceFileMarker.js";
+import { listModelChoices, ModelManager } from "../src/llm/ModelManager.js";
 import type { SessionEvent } from "../src/session/recorder.js";
 import { SessionRecorder } from "../src/session/recorder.js";
 import { listSessionSummaries } from "../src/session/events.js";
@@ -29,11 +34,20 @@ import { ensureAgentDirs, sessionFilePath } from "../src/session/store.js";
 await testInteractiveRuntimeProtocol();
 await testInteractiveRuntimeAbort();
 await testDraftSessionsDoNotReachTheSessionList();
+await testWorkspaceFilePreview();
+await testWorkspaceDirectoryListing();
+testWorkspaceSyntaxHighlighting();
+testWorkspaceFileMarkers();
+await testFilePanelSizing();
 await testDesktopModelConfiguration();
+testModelChoicesDeduplicateEquivalentAliases();
 testHistoricalAbortProjection();
 testHistoricalUsageProjection();
 testHistoricalToolProjection();
+testHistoricalReasoningAndSkillProjection();
+testChangedFileProjection();
 testLiveTimelineProjection();
+testLiveReasoningAndSkillProjection();
 testDesktopNavigationHistory();
 
 async function testInteractiveRuntimeProtocol(): Promise<void> {
@@ -110,9 +124,108 @@ async function testDraftSessionsDoNotReachTheSessionList(): Promise<void> {
   }
 }
 
+async function testWorkspaceFilePreview(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-file-preview-"));
+  try {
+    const state = new DesktopStateStore(path.join(workspaceRoot, "desktop-state.json"));
+    await state.load();
+    const projects = new DesktopProjectService(state);
+    const project = await projects.createProject(workspaceRoot);
+    await writeFile(path.join(workspaceRoot, "hello.py"), "print('hello')\n");
+    assert.deepEqual(await projects.readWorkspaceFile(project, "hello.py"), {
+      path: "hello.py",
+      content: "print('hello')\n",
+      bytes: 15,
+      binary: false,
+      truncated: false
+    });
+    await writeFile(path.join(workspaceRoot, "image.bin"), Buffer.from([0, 1, 2, 3]));
+    const binary = await projects.readWorkspaceFile(project, "image.bin");
+    assert.equal(binary.binary, true);
+    assert.equal(binary.content, undefined);
+    await writeFile(path.join(workspaceRoot, "large.txt"), "a".repeat(512 * 1024 + 8));
+    const large = await projects.readWorkspaceFile(project, "large.txt");
+    assert.equal(large.content?.length, 512 * 1024);
+    assert.equal(large.truncated, true);
+    await assert.rejects(projects.readWorkspaceFile(project, "../outside.txt"), /Path escapes workspace/);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testWorkspaceDirectoryListing(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-directory-listing-"));
+  try {
+    const state = new DesktopStateStore(path.join(workspaceRoot, "desktop-state.json"));
+    await state.load();
+    const projects = new DesktopProjectService(state);
+    const project = await projects.createProject(workspaceRoot);
+    await mkdir(path.join(workspaceRoot, "src"));
+    await writeFile(path.join(workspaceRoot, "README.md"), "# Biny\n");
+    await writeFile(path.join(workspaceRoot, "src", "index.ts"), "export {};\n");
+
+    const root = await projects.listWorkspaceDirectory(project, ".");
+    assert.equal(root.path, ".");
+    assert.deepEqual(root.entries.map((entry) => ({ name: entry.name, path: entry.path, kind: entry.kind })), [
+      { name: ".agent", path: ".agent", kind: "directory" },
+      { name: "src", path: "src", kind: "directory" },
+      { name: "desktop-state.json", path: "desktop-state.json", kind: "file" },
+      { name: "README.md", path: "README.md", kind: "file" }
+    ]);
+    const nested = await projects.listWorkspaceDirectory(project, "src");
+    assert.deepEqual(nested.entries.map((entry) => entry.path), ["src/index.ts"]);
+    await assert.rejects(projects.listWorkspaceDirectory(project, "../outside"), /Path escapes workspace/);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+function testWorkspaceSyntaxHighlighting(): void {
+  const highlighted = highlightWorkspaceFile("src/index.ts", "const answer: number = 42;\n");
+  assert.equal(highlighted.language, "typescript");
+  assert.match(highlighted.html, /hljs-keyword/);
+  assert.match(highlighted.html, /hljs-number/);
+}
+
+function testWorkspaceFileMarkers(): void {
+  assert.deepEqual(workspaceFileMarker("README.md"), { label: "MD", tone: "markdown" });
+  assert.deepEqual(workspaceFileMarker("src/App.tsx"), { label: "TSX", tone: "typescript" });
+  assert.deepEqual(workspaceFileMarker("agent.config.json"), { label: "{}", tone: "json" });
+  assert.deepEqual(workspaceFileMarker("pnpm-lock.yaml"), { label: "YML", tone: "yaml" });
+  assert.deepEqual(workspaceFileMarker(".gitignore"), { label: "◆", tone: "git" });
+  assert.deepEqual(workspaceFileMarker("preview.png"), { label: "IMG", tone: "image" });
+}
+
+async function testFilePanelSizing(): Promise<void> {
+  assert.equal(clampFilePanelWidth(650, 1_000, false), 650);
+  assert.equal(clampFilePanelWidth(650, 700, false), 380);
+  assert.equal(clampFilePanelWidth(700, 700, true), 656);
+
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-file-panel-"));
+  try {
+    const statePath = path.join(workspaceRoot, "desktop-state.json");
+    const state = new DesktopStateStore(statePath);
+    await state.load();
+    assert.equal(state.filePanelWidth(), DEFAULT_FILE_PANEL_WIDTH);
+    await state.setFilePanelWidth(600);
+    const restored = new DesktopStateStore(statePath);
+    await restored.load();
+    assert.equal(restored.filePanelWidth(), 600);
+    await restored.setFilePanelWidth(10_000);
+    assert.equal(restored.filePanelWidth(), MAX_FILE_PANEL_WIDTH);
+    await restored.setFilePanelWidth(1);
+    assert.equal(restored.filePanelWidth(), MIN_FILE_PANEL_WIDTH);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function testDesktopModelConfiguration(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-model-config-"));
   try {
+    const initialConfig = structuredClone(defaultConfig);
+    initialConfig.models["deepseek-deepseek-v4-flash"] = { ...initialConfig.models["deepseek-v4-flash"] };
+    await saveConfig(workspaceRoot, initialConfig);
     const state = new DesktopStateStore(path.join(workspaceRoot, "desktop-state.json"));
     await state.load();
     const projects = new DesktopProjectService(state);
@@ -135,10 +248,37 @@ async function testDesktopModelConfiguration(): Promise<void> {
     assert.equal(config.providers.local?.type, "ollama");
     assert.equal(config.models["local-qwen"]?.model, "qwen3:8b");
     assert.equal(snapshot.models.some((model) => model.alias === "local-qwen"), true);
+    const modelManager = new ModelManager(workspaceRoot, config);
+    const externallyUpdatedConfig = structuredClone(config);
+    externallyUpdatedConfig.defaultModel = "local-qwen-next";
+    externallyUpdatedConfig.models["local-qwen-next"] = { ...externallyUpdatedConfig.models["local-qwen"], model: "qwen3:14b", displayName: "本地 Qwen Next" };
+    await saveConfig(workspaceRoot, externallyUpdatedConfig);
+    const refreshedInfo = await modelManager.refreshFromDisk();
+    assert.equal(refreshedInfo.modelAlias, "local-qwen-next");
+    await agents.saveModelConfiguration(project.id, {
+      alias: "deepseek-v4-flash",
+      displayName: "DeepSeek V4 Flash",
+      providerAlias: "deepseek",
+      providerType: "deepseek",
+      model: "deepseek-v4-flash",
+      baseUrl: "https://api.deepseek.com",
+      apiKeyEnv: undefined,
+      apiKey: undefined,
+      supportsTools: true,
+      supportsThinking: true
+    });
+    const cleanedConfig = await loadConfig(workspaceRoot);
+    assert.equal(cleanedConfig.models["deepseek-deepseek-v4-flash"], undefined);
     await agents.closeAll();
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
   }
+}
+
+function testModelChoicesDeduplicateEquivalentAliases(): void {
+  const config = structuredClone(defaultConfig);
+  config.models["deepseek-deepseek-v4-flash"] = { ...config.models["deepseek-v4-flash"] };
+  assert.deepEqual(listModelChoices(config).map((model) => model.alias), ["deepseek-v4-flash", "deepseek-v4-pro"]);
 }
 
 function testHistoricalAbortProjection(): void {
@@ -185,6 +325,42 @@ function testHistoricalToolProjection(): void {
   assert.deepEqual(timeline[0]?.tools[0]?.display, { kind: "file_io", operation: "read", path: "src/index.ts" });
 }
 
+function testHistoricalReasoningAndSkillProjection(): void {
+  const timeline = buildSessionTimeline([
+    { type: "user_message", content: "explain", skills: [".agent/skills/programmatic-tools/SKILL.md"], time: "2026-01-01T00:00:00.000Z" },
+    { type: "tool_call", tool: "run_command", args: { command: "pwd" }, reasoningContent: "先确认当前工作目录。", time: "2026-01-01T00:00:01.000Z" },
+    { type: "assistant_message", content: "done", reasoningContent: "然后整理结果。", time: "2026-01-01T00:00:02.512Z" }
+  ], []);
+  assert.deepEqual(timeline[0]?.skills, ["programmatic-tools"]);
+  assert.equal(timeline[0]?.reasoning, "先确认当前工作目录。\n\n然后整理结果。");
+  assert.equal(timeline[0]?.durationMs, 2_512);
+}
+
+function testChangedFileProjection(): void {
+  const base = { sessionId: "session", runId: "write-run", timestamp: "2026-01-01T00:00:00.000Z" };
+  const started = buildSessionTimeline([], [
+    { ...base, type: "message.user", messageId: "message", content: "write" },
+    { ...base, type: "tool.started", toolCallId: "write-tool", tool: "write_file", args: { path: "hello.py" }, display: { kind: "file_io", operation: "write", path: "hello.py" } }
+  ]);
+  assert.equal(started[0]?.tools[0]?.path, "hello.py");
+  assert.deepEqual(listChangedFiles(started[0]!), [{ path: "hello.py", operation: "write", status: "writing" }]);
+
+  const completed = buildSessionTimeline([], [
+    { ...base, type: "message.user", messageId: "message", content: "write" },
+    { ...base, type: "tool.started", toolCallId: "write-tool", tool: "write_file", args: { path: "hello.py" }, display: { kind: "file_io", operation: "write", path: "hello.py" } },
+    { ...base, type: "tool.completed", toolCallId: "write-tool", tool: "write_file", result: { path: "hello.py" }, durationMs: 10 },
+    { ...base, type: "file.changed", toolCallId: "write-tool", path: "hello.py", operation: "write" }
+  ]);
+  assert.deepEqual(listChangedFiles(completed[0]!), [{ path: "hello.py", operation: "write", status: "completed" }]);
+
+  const edited = buildSessionTimeline([], [
+    { ...base, runId: "edit-run", type: "message.user", messageId: "edit-message", content: "edit" },
+    { ...base, runId: "edit-run", type: "tool.started", toolCallId: "edit-tool", tool: "edit_file", args: { path: "hello.py" }, display: { kind: "file_io", operation: "edit", path: "hello.py" } },
+    { ...base, runId: "edit-run", type: "tool.completed", toolCallId: "edit-tool", tool: "edit_file", result: { path: "hello.py" }, durationMs: 10 }
+  ]);
+  assert.deepEqual(listTimelineFiles([completed[0]!, edited[0]!]), [{ path: "hello.py", operation: "edit", status: "completed" }]);
+}
+
 function testLiveTimelineProjection(): void {
   const base = { sessionId: "session", runId: "run", timestamp: "2026-01-01T00:00:00.000Z" };
   const live: AgentHostEvent[] = [
@@ -199,6 +375,31 @@ function testLiveTimelineProjection(): void {
   assert.equal(timeline[0]?.assistant, "done");
   assert.equal(timeline[0]?.tools[0]?.diff?.includes("a.ts"), true);
   assert.equal(timeline[0]?.status, "completed");
+}
+
+function testLiveReasoningAndSkillProjection(): void {
+  const live: AgentHostEvent[] = [
+    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:00.000Z", type: "message.user", messageId: "message", content: "explain" },
+    {
+      sessionId: "session",
+      runId: "reasoning-run",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      type: "run.started",
+      messageId: "message",
+      input: "explain",
+      mode: "chat",
+      model: { alias: "test", provider: "test", label: "test/model", reasoning: "High" },
+      skills: [".agent/skills/programmatic-tools/SKILL.md"]
+    },
+    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:01.000Z", type: "reasoning.started", messageId: "message", status: "正在分析任务" },
+    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:02.512Z", type: "reasoning.delta", messageId: "message", content: "先拆分问题。" },
+    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:02.512Z", type: "reasoning.completed", messageId: "message", status: "分析完成" },
+    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:03.000Z", type: "run.completed", durationMs: 3_000 }
+  ];
+  const timeline = buildSessionTimeline([], live);
+  assert.deepEqual(timeline[0]?.skills, ["programmatic-tools"]);
+  assert.equal(timeline[0]?.reasoning, "先拆分问题。");
+  assert.equal(timeline[0]?.reasoningDurationMs, 1_512);
 }
 
 function testDesktopNavigationHistory(): void {

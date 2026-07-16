@@ -225,6 +225,16 @@ export function registerDesktopIpc(context: IpcContext): void {
     );
   });
 
+  handle(desktopIpc.readWorkspaceFile, async (_event, projectId: unknown, relativePath: unknown) => {
+    const project = context.projects.requireProject(idSchema.parse(projectId));
+    return await context.projects.readWorkspaceFile(project, z.string().min(1).max(2_000).parse(relativePath));
+  });
+
+  handle(desktopIpc.listWorkspaceDirectory, async (_event, projectId: unknown, relativePath: unknown) => {
+    const project = context.projects.requireProject(idSchema.parse(projectId));
+    return await context.projects.listWorkspaceDirectory(project, z.string().min(1).max(2_000).parse(relativePath));
+  });
+
   handle(desktopIpc.openWorkspaceFile, async (_event, projectId: unknown, relativePath: unknown) => {
     const project = context.projects.requireProject(idSchema.parse(projectId));
     const filePath = context.projects.workspaceFile(project, z.string().min(1).max(2_000).parse(relativePath));
@@ -234,6 +244,10 @@ export function registerDesktopIpc(context: IpcContext): void {
 
   handle(desktopIpc.setSidebarWidth, async (_event, width: unknown) => {
     await context.state.setSidebarWidth(z.number().finite().parse(width));
+  });
+
+  handle(desktopIpc.setFilePanelWidth, async (_event, width: unknown) => {
+    await context.state.setFilePanelWidth(z.number().finite().parse(width));
   });
 }
 

@@ -83,6 +83,11 @@ export class InteractiveAgentRuntime {
     return await this.commandRuntime.agent.switchModel(alias, thinking);
   }
 
+  async refreshModelFromDisk(): Promise<ModelRuntimeInfo> {
+    if (this.activeRun || this.queue.length) throw new Error("Cannot refresh the model while a turn is running.");
+    return await this.commandRuntime.agent.refreshModelFromDisk();
+  }
+
   submitPrompt(input: string, mode: AgentRunMode = "chat"): SubmittedAgentRun {
     if (this.closed) throw new Error("Agent runtime is closed.");
     const sessionId = this.getInfo().sessionId;
@@ -246,7 +251,8 @@ export class InteractiveAgentRuntime {
         provider: info.provider,
         label: info.modelLabel,
         reasoning: info.reasoningLabel
-      }
+      },
+      skills: info.skills ?? []
     });
 
     let failure: string | undefined;
@@ -326,6 +332,10 @@ export class InteractiveAgentRuntime {
       const part = event.part;
       if (part.type === "start-step" && !reasoningActive) {
         this.events.emit({ ...this.eventBase(run), type: "reasoning.started", messageId: run.messageId, status: "正在继续处理" });
+        return { reasoningActive: true };
+      }
+      if (part.type === "reasoning-delta") {
+        this.events.emit({ ...this.eventBase(run), type: "reasoning.delta", messageId: run.messageId, content: part.text });
         return { reasoningActive: true };
       }
       if (part.type === "text-delta") {

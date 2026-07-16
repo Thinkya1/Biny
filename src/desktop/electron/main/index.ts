@@ -61,7 +61,8 @@ async function startDesktopApplication(): Promise<void> {
       activeProjectId,
       selectedSessionId: activeProjectId ? state.selectedSessionId(activeProjectId) : undefined,
       workspace,
-      sidebarWidth: state.sidebarWidth()
+      sidebarWidth: state.sidebarWidth(),
+      filePanelWidth: state.filePanelWidth()
     };
   };
 

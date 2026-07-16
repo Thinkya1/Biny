@@ -196,6 +196,15 @@ function providerAliasFor(option: ProviderOption, baseUrl: string): string {
   return hostname || "custom";
 }
 
+function modelAliasFor(providerAlias: string, model: string): string {
+  const normalizedProvider = providerAlias.toLowerCase();
+  const normalizedModel = model.toLowerCase();
+  const alias = normalizedModel === normalizedProvider || normalizedModel.startsWith(`${normalizedProvider}-`)
+    ? model
+    : `${providerAlias}-${model}`;
+  return alias.replace(/[^a-z0-9.-]+/gi, "-");
+}
+
 function SettingsModels({ models, runtime, onChange, onSave }: { models: ModelChoice[]; runtime?: { modelAlias: string; thinking: ThinkingSelection }; onChange(alias: string, thinking: ThinkingSelection): void; onSave(configuration: DesktopModelConfigurationInput): Promise<void> }): React.JSX.Element {
   const [providerType, setProviderType] = useState<DesktopModelConfigurationInput["providerType"]>("deepseek");
   const [baseUrl, setBaseUrl] = useState<string>(providerOptions[0].baseUrl);
@@ -209,11 +218,12 @@ function SettingsModels({ models, runtime, onChange, onSave }: { models: ModelCh
     const configuredModel = isCustomProvider ? model.trim() : selectedProvider.model;
     const configuredBaseUrl = baseUrl.trim() || selectedProvider.baseUrl;
     const displayName = isCustomProvider ? configuredModel : selectedProvider.displayName;
+    const providerAlias = providerAliasFor(selectedProvider, configuredBaseUrl);
     try {
       await onSave({
-        alias: `${providerAliasFor(selectedProvider, configuredBaseUrl)}-${configuredModel}`.replace(/[^a-z0-9.-]+/gi, "-"),
+        alias: modelAliasFor(providerAlias, configuredModel),
         displayName,
-        providerAlias: providerAliasFor(selectedProvider, configuredBaseUrl),
+        providerAlias,
         providerType,
         model: configuredModel,
         baseUrl: configuredBaseUrl,

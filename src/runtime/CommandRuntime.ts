@@ -59,7 +59,8 @@ export async function createCommandRuntime(workspaceRoot: string): Promise<Comma
       toolRegistry,
       permissionManager,
       recorder,
-      skillPrompt: skills.prompt
+      skillPrompt: skills.prompt,
+      skillPaths: skills.paths
     });
     await agent.initialize();
   } catch (error) {

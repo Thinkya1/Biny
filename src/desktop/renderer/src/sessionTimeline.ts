@@ -44,7 +44,11 @@ export interface TimelineTurn {
   id: string;
   user: string;
   assistant: string;
+  reasoning: string;
   reasoningStatus?: string;
+  reasoningDurationMs?: number;
+  reasoningStartedAt?: string;
+  skills: string[];
   status: TimelineRunStatus;
   model?: AgentRunModel;
   tools: TimelineTool[];
@@ -52,6 +56,12 @@ export interface TimelineTurn {
   durationMs?: number;
   usage?: SessionUsage;
   timestamp?: string;
+}
+
+export interface TimelineChangedFile {
+  path: string;
+  operation: "write" | "edit";
+  status: "writing" | "completed";
 }
 
 export function buildSessionTimeline(events: SessionEvent[], liveEvents: AgentHostEvent[]): TimelineTurn[] {
@@ -88,12 +98,16 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
       anonymousIndex += 1;
       current = emptyTurn(`history-${String(anonymousIndex)}`, event.time);
       current.user = event.content;
+      current.skills = skillNames(event.skills);
       turns.push(current);
       continue;
     }
     if (event.type === "assistant_message") {
       const turn = ensureTurn(event.time);
       turn.assistant = event.content;
+      turn.reasoning = appendReasoning(turn.reasoning, event.reasoningContent);
+      turn.durationMs = elapsedMs(turn.timestamp, event.time) ?? turn.durationMs;
+      turn.timestamp = event.time ?? turn.timestamp;
       turn.status = "completed";
       turn.usage = event.usage;
       if (event.usage) {
@@ -109,6 +123,7 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
     if (event.type === "tool_call") {
       const turn = ensureTurn(event.time);
       const projection = historicalToolProjection(event.tool, event.args);
+      turn.reasoning = appendReasoning(turn.reasoning, event.reasoningContent);
       turn.tools.push({
         id: event.toolCallId ?? `history-tool-${String(turn.tools.length)}`,
         tool: event.tool,
@@ -134,6 +149,8 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
     }
     const turn = ensureTurn(event.time);
     turn.error = event.message;
+    turn.durationMs = elapsedMs(turn.timestamp, event.time) ?? turn.durationMs;
+    turn.timestamp = event.time ?? turn.timestamp;
     const aborted = /abort|中止|interrupted/i.test(event.message);
     turn.status = aborted ? "aborted" : "failed";
     if (aborted) {
@@ -185,12 +202,23 @@ function buildLiveTurns(events: AgentHostEvent[]): TimelineTurn[] {
     } else if (event.type === "run.started") {
       turn.status = "running";
       turn.model = event.model;
+      turn.skills = skillNames(event.skills);
     } else if (event.type === "assistant.delta") {
       turn.assistant += event.content;
     } else if (event.type === "assistant.completed") {
       turn.assistant = event.content || turn.assistant;
-    } else if (event.type === "reasoning.started" || event.type === "reasoning.status" || event.type === "reasoning.completed") {
+      turn.timestamp = event.timestamp;
+    } else if (event.type === "reasoning.started") {
       turn.reasoningStatus = event.status;
+      if (turn.reasoningStartedAt === undefined) turn.reasoningStartedAt = event.timestamp;
+    } else if (event.type === "reasoning.delta") {
+      turn.reasoning += event.content;
+    } else if (event.type === "reasoning.status") {
+      turn.reasoningStatus = event.status;
+    } else if (event.type === "reasoning.completed") {
+      turn.reasoningStatus = event.status;
+      turn.reasoningDurationMs = addReasoningDuration(turn.reasoningDurationMs, turn.reasoningStartedAt, event.timestamp);
+      turn.reasoningStartedAt = undefined;
     } else if (event.type === "tool.started") {
       const tool = toolFor(event, event.tool);
       tool.tool = event.tool;
@@ -198,6 +226,7 @@ function buildLiveTurns(events: AgentHostEvent[]): TimelineTurn[] {
       tool.status = "running";
       tool.description = event.description;
       tool.display = event.display;
+      if (event.display?.kind === "file_io") tool.path = event.display.path;
     } else if (event.type === "tool.progress") {
       const tool = toolFor(event, event.tool);
       tool.updates.push(event.update);
@@ -241,26 +270,37 @@ function buildLiveTurns(events: AgentHostEvent[]): TimelineTurn[] {
       tool.command.exitCode = event.exitCode;
       tool.durationMs = event.durationMs;
     } else if (event.type === "file.read" || event.type === "file.changed") {
-      toolFor(event, event.type === "file.read" ? "read_file" : "edit_file").path = event.path;
+      const tool = toolFor(event, event.type === "file.read" ? "read_file" : event.operation === "write" ? "write_file" : "edit_file");
+      tool.path = event.path;
+      if (event.type === "file.changed") tool.display ??= { kind: "file_io", operation: event.operation, path: event.path };
     } else if (event.type === "diff.created") {
       const tool = toolFor(event, "git_diff");
       tool.diff = event.diff;
       tool.path = event.path;
     } else if (event.type === "run.completed") {
       turn.status = "completed";
+      turn.timestamp = event.timestamp;
       turn.durationMs = event.durationMs;
+      turn.reasoningDurationMs = addReasoningDuration(turn.reasoningDurationMs, turn.reasoningStartedAt, event.timestamp);
+      turn.reasoningStartedAt = undefined;
       turn.usage = event.usage;
     } else if (event.type === "run.aborted") {
       turn.status = "aborted";
+      turn.timestamp = event.timestamp;
       turn.error = event.reason;
       turn.durationMs = event.durationMs;
+      turn.reasoningDurationMs = addReasoningDuration(turn.reasoningDurationMs, turn.reasoningStartedAt, event.timestamp);
+      turn.reasoningStartedAt = undefined;
       for (const tool of turn.tools) {
         if (tool.status === "running" || tool.status === "waiting") tool.status = "aborted";
       }
     } else if (event.type === "run.failed") {
       turn.status = "failed";
+      turn.timestamp = event.timestamp;
       turn.error = event.error;
       turn.durationMs = event.durationMs;
+      turn.reasoningDurationMs = addReasoningDuration(turn.reasoningDurationMs, turn.reasoningStartedAt, event.timestamp);
+      turn.reasoningStartedAt = undefined;
       for (const tool of turn.tools) {
         if (tool.status === "running" || tool.status === "waiting") tool.status = "failed";
       }
@@ -270,7 +310,42 @@ function buildLiveTurns(events: AgentHostEvent[]): TimelineTurn[] {
 }
 
 function emptyTurn(id: string, timestamp?: string): TimelineTurn {
-  return { id, user: "", assistant: "", status: "idle", tools: [], timestamp };
+  return { id, user: "", assistant: "", reasoning: "", skills: [], status: "idle", tools: [], timestamp };
+}
+
+function appendReasoning(existing: string, next: string | undefined): string {
+  if (!next) return existing;
+  if (!existing) return next;
+  if (existing.endsWith(next)) return existing;
+  return `${existing}\n\n${next}`;
+}
+
+function skillNames(paths: string[] | undefined): string[] {
+  const names = (paths ?? []).map(skillName).filter(Boolean);
+  return [...new Set(names)];
+}
+
+function skillName(value: string): string {
+  const parts = value.replaceAll("\\", "/").split("/").filter(Boolean);
+  const fileName = parts.at(-1) ?? value;
+  const stem = fileName.replace(/\.(?:md|markdown)$/i, "");
+  return /^skill$/i.test(stem) && parts.length > 1 ? parts.at(-2) ?? stem : stem;
+}
+
+function addReasoningDuration(total: number | undefined, startedAt: string | undefined, endedAt: string): number | undefined {
+  if (!startedAt) return total;
+  const start = Date.parse(startedAt);
+  const end = Date.parse(endedAt);
+  if (Number.isNaN(start) || Number.isNaN(end) || end < start) return total;
+  return (total ?? 0) + end - start;
+}
+
+function elapsedMs(startedAt: string | undefined, endedAt: string | undefined): number | undefined {
+  if (!startedAt || !endedAt) return undefined;
+  const start = Date.parse(startedAt);
+  const end = Date.parse(endedAt);
+  if (Number.isNaN(start) || Number.isNaN(end) || end < start) return undefined;
+  return end - start;
 }
 
 function permissionFallback(toolCallId: string, tool: string): AgentPermissionEventRequest {
@@ -324,4 +399,38 @@ function historicalToolProjection(tool: string, args: unknown): { display?: Tool
     return { path: undefined, display: { kind: "file_io", operation: "git", path: ".", detail: tool === "git_diff" ? "git diff" : "git status --short" } };
   }
   return { path: undefined, display: undefined };
+}
+
+export function listChangedFiles(turn: TimelineTurn): TimelineChangedFile[] {
+  const files = new Map<string, TimelineChangedFile>();
+  for (const tool of turn.tools) {
+    const operation = changedFileOperation(tool);
+    const path = tool.path ?? (tool.display?.kind === "file_io" ? tool.display.path : undefined);
+    if (!operation || !path || tool.status === "failed" || tool.status === "denied" || tool.status === "aborted") continue;
+    files.set(path, {
+      path,
+      operation,
+      status: tool.status === "success" ? "completed" : "writing"
+    });
+  }
+  return [...files.values()];
+}
+
+export function listTimelineFiles(turns: TimelineTurn[]): TimelineChangedFile[] {
+  const files = new Map<string, TimelineChangedFile>();
+  for (const turn of turns) {
+    for (const file of listChangedFiles(turn)) {
+      if (file.status !== "completed") continue;
+      files.delete(file.path);
+      files.set(file.path, file);
+    }
+  }
+  return [...files.values()].reverse();
+}
+
+function changedFileOperation(tool: TimelineTool): TimelineChangedFile["operation"] | undefined {
+  if (tool.display?.kind === "file_io" && (tool.display.operation === "write" || tool.display.operation === "edit")) return tool.display.operation;
+  if (tool.tool === "write_file") return "write";
+  if (tool.tool === "edit_file") return "edit";
+  return undefined;
 }

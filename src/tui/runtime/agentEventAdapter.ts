@@ -13,6 +13,8 @@ export function agentEventToRuntimeEvents(event: AgentHostEvent): RuntimeEvent[]
       return event.content ? [{ type: "assistant.completed", content: event.content }] : [];
     case "reasoning.started":
       return [{ type: "runtime.status", status: "thinking" }];
+    case "reasoning.delta":
+      return [];
     case "tool.started":
       return [{
         type: "tool.call.started",

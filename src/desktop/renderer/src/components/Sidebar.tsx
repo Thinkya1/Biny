@@ -3,27 +3,27 @@ import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { DesktopProject, DesktopSessionSummary } from "../../../protocol.js";
 import { AppIcon } from "./AppIcon.js";
 import { Icon } from "./Icon.js";
-import { NavigationControls } from "./NavigationControls.js";
 
 interface SidebarProps {
   visible: boolean;
   width: number;
+  resizing: boolean;
   version: string;
   projects: DesktopProject[];
   sessions: DesktopSessionSummary[];
   activeProjectId?: string;
-  canGoBack: boolean;
-  canGoForward: boolean;
+  selectedSessionId?: string;
   onWidthChange(width: number): void;
-  onToggleSidebar(): void;
-  onNavigateBack(): void;
-  onNavigateForward(): void;
+  onResizeStart(): void;
+  onResizeEnd(): void;
   onOpenProject(): void;
   onCreateEmptyProject(): void;
   onSelectProject(projectId: string): void;
+  onSelectSession(sessionId: string): void;
   onProjectPinned(projectId: string, pinned: boolean): void;
   onRevealProject(projectId: string): void;
   onRenameProject(projectId: string): void;
+  onNewTask(projectId: string): void;
   onRemoveProject(projectId: string): void;
   onSearch(): void;
   onSettings(): void;
@@ -38,33 +38,35 @@ type FloatingMenuAnchor = { readonly current: HTMLElement | null };
 export const Sidebar = memo(function Sidebar({
   visible,
   width,
+  resizing,
   version,
   projects,
   sessions,
   activeProjectId,
-  canGoBack,
-  canGoForward,
+  selectedSessionId,
   onWidthChange,
-  onToggleSidebar,
-  onNavigateBack,
-  onNavigateForward,
+  onResizeStart,
+  onResizeEnd,
   onOpenProject,
   onCreateEmptyProject,
   onSelectProject,
+  onSelectSession,
   onProjectPinned,
   onRevealProject,
   onRenameProject,
+  onNewTask,
   onRemoveProject,
   onSearch,
   onSettings,
   onUnavailable
-}: SidebarProps): React.JSX.Element | null {
+}: SidebarProps): React.JSX.Element {
   const [expandedSections, setExpandedSections] = useState<Record<SidebarSectionName, boolean>>({ pinned: true, projects: true });
   const [projectMenuOpen, setProjectMenuOpen] = useState<string>();
   const [projectOrganizationMenuOpen, setProjectOrganizationMenuOpen] = useState(false);
   const [projectCreateMenuOpen, setProjectCreateMenuOpen] = useState(false);
   const [projectGrouping, setProjectGrouping] = useState<ProjectGrouping>("by-project");
   const [projectSort, setProjectSort] = useState<ProjectSort>("priority");
+  const [collapsedProjectIds, setCollapsedProjectIds] = useState(() => new Set<string>());
   const projectOrganizationButtonRef = useRef<HTMLButtonElement>(null);
   const projectCreateButtonRef = useRef<HTMLButtonElement>(null);
 
@@ -92,18 +94,25 @@ export const Sidebar = memo(function Sidebar({
     };
   }, [projectCreateMenuOpen, projectMenuOpen, projectOrganizationMenuOpen]);
 
-  if (!visible) return null;
+  useEffect(() => {
+    if (visible) return;
+    setProjectMenuOpen(undefined);
+    setProjectOrganizationMenuOpen(false);
+    setProjectCreateMenuOpen(false);
+  }, [visible]);
+
   const orderedProjects = sortProjects(projects, projectSort);
   const pinnedProjects = orderedProjects.filter((project) => project.pinned);
+  const unpinnedProjects = orderedProjects.filter((project) => !project.pinned);
 
   const toggleSection = (section: SidebarSectionName): void => {
     setExpandedSections((current) => ({ ...current, [section]: !current[section] }));
   };
 
-  const openProjectMenu = (projectId: string): void => {
+  const openProjectMenu = (menuKey: string): void => {
     setProjectOrganizationMenuOpen(false);
     setProjectCreateMenuOpen(false);
-    setProjectMenuOpen((current) => current === projectId ? undefined : projectId);
+    setProjectMenuOpen((current) => current === menuKey ? undefined : menuKey);
   };
 
   const toggleProjectOrganizationMenu = (): void => {
@@ -118,98 +127,117 @@ export const Sidebar = memo(function Sidebar({
     setProjectCreateMenuOpen((current) => !current);
   };
 
+  const selectOrToggleProject = (projectId: string): void => {
+    if (projectId !== activeProjectId) {
+      setCollapsedProjectIds((current) => {
+        if (!current.has(projectId)) return current;
+        const next = new Set(current);
+        next.delete(projectId);
+        return next;
+      });
+      onSelectProject(projectId);
+      return;
+    }
+    setCollapsedProjectIds((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) next.delete(projectId);
+      else next.add(projectId);
+      return next;
+    });
+  };
+
   return (
-    <aside className="sidebar" style={{ width }}>
-      <div className="sidebar-titlebar-drag">
-        <NavigationControls
-          canGoBack={canGoBack}
-          canGoForward={canGoForward}
-          onBack={onNavigateBack}
-          onForward={onNavigateForward}
-          onToggleSidebar={onToggleSidebar}
-          sidebarVisible={visible}
-        />
-      </div>
-      <div className="sidebar-brand">
-        <div className="sidebar-brand-name"><AppIcon size={24} /><span>Biny</span></div>
-        <button aria-label="搜索" className="icon-button" onClick={onSearch} type="button"><Icon name="search" /></button>
-      </div>
+    <aside className={`sidebar t-resize${visible ? "" : " is-hidden"}${resizing ? " is-resizing" : ""}`} style={{ width: visible ? width : 0 }}>
+      <div aria-hidden={!visible} className="sidebar-surface" inert={!visible}>
+        <div className="sidebar-titlebar-drag" />
+        <div className="sidebar-brand">
+          <div className="sidebar-brand-name"><AppIcon size={24} /><span>Biny</span></div>
+          <button aria-label="搜索" className="icon-button" onClick={onSearch} type="button"><Icon name="search" /></button>
+        </div>
 
-      <div className="sidebar-scroll">
-        {pinnedProjects.length ? (
+        <div className="sidebar-scroll">
+          {pinnedProjects.length ? (
+            <SidebarFolder
+              expanded={expandedSections.pinned}
+              label="置顶"
+              onToggle={() => toggleSection("pinned")}
+            >
+              {pinnedProjects.map((project) => (
+                <div className="project-group" key={`pinned-${project.id}`}>
+                  <ProjectRow
+                    menuOpen={projectMenuOpen === `pinned-${project.id}`}
+                    onMenu={() => openProjectMenu(`pinned-${project.id}`)}
+                    onPin={() => { setProjectMenuOpen(undefined); onProjectPinned(project.id, !project.pinned); }}
+                    onReveal={() => { setProjectMenuOpen(undefined); onRevealProject(project.id); }}
+                    onRename={() => { setProjectMenuOpen(undefined); onRenameProject(project.id); }}
+                    onNewTask={() => { setProjectMenuOpen(undefined); onNewTask(project.id); }}
+                    onArchive={() => { setProjectMenuOpen(undefined); onUnavailable("归档任务"); }}
+                    onRemove={() => { setProjectMenuOpen(undefined); onRemoveProject(project.id); }}
+                    onSelect={selectOrToggleProject}
+                    project={project}
+                    running={project.id === activeProjectId && hasRunningSession(sessions)}
+                    selected={project.id === activeProjectId}
+                    sessionsExpanded={project.id === activeProjectId && !collapsedProjectIds.has(project.id)}
+                  />
+                  {project.id === activeProjectId ? <ProjectSessions expanded={!collapsedProjectIds.has(project.id)} onSelectSession={onSelectSession} selectedSessionId={selectedSessionId} sessions={sessions} /> : null}
+                </div>
+              ))}
+            </SidebarFolder>
+          ) : null}
+
           <SidebarFolder
-            expanded={expandedSections.pinned}
-            label="置顶"
-            onToggle={() => toggleSection("pinned")}
-          >
-            {pinnedProjects.map((project) => (
-              <ProjectRow
-                key={`pinned-${project.id}`}
-                menuOpen={projectMenuOpen === project.id}
-                onMenu={() => openProjectMenu(project.id)}
-                onPin={() => { setProjectMenuOpen(undefined); onProjectPinned(project.id, !project.pinned); }}
-                onReveal={() => { setProjectMenuOpen(undefined); onRevealProject(project.id); }}
-                onRename={() => { setProjectMenuOpen(undefined); onRenameProject(project.id); }}
-                onArchive={() => { setProjectMenuOpen(undefined); onUnavailable("归档任务"); }}
-                onRemove={() => { setProjectMenuOpen(undefined); onRemoveProject(project.id); }}
-                onSelect={onSelectProject}
-                project={project}
-                running={project.id === activeProjectId && hasRunningSession(sessions)}
-                selected={project.id === activeProjectId}
-              />
-            ))}
-          </SidebarFolder>
-        ) : null}
-
-        <SidebarFolder
-          actions={(
-            <div className="folder-section-actions sidebar-menu-anchor">
-              <button ref={projectOrganizationButtonRef} aria-label="项目整理和排序" className="section-action" onClick={toggleProjectOrganizationMenu} type="button"><Icon name="more" size={14} /></button>
-              <button ref={projectCreateButtonRef} aria-label="添加项目" className="section-action" onClick={toggleProjectCreateMenu} type="button"><Icon name="add" size={15} /></button>
-              {projectOrganizationMenuOpen ? <ProjectOrganizationMenu anchorRef={projectOrganizationButtonRef} grouping={projectGrouping} onGroupingChange={(value) => { setProjectGrouping(value); setProjectOrganizationMenuOpen(false); }} onSortChange={(value) => { setProjectSort(value); setProjectOrganizationMenuOpen(false); }} sort={projectSort} /> : null}
-              {projectCreateMenuOpen ? (
-                <ProjectCreationMenu
-                  anchorRef={projectCreateButtonRef}
-                  onCreateEmptyProject={() => { setProjectCreateMenuOpen(false); onCreateEmptyProject(); }}
-                  onOpenProject={() => { setProjectCreateMenuOpen(false); onOpenProject(); }}
-                />
-              ) : null}
-            </div>
-          )}
-          expanded={expandedSections.projects}
-          label="项目"
-          onToggle={() => toggleSection("projects")}
-        >
-          {orderedProjects.map((project) => {
-            return (
-              <div className="project-group" key={project.id}>
-                <ProjectRow
-                  menuOpen={projectMenuOpen === project.id}
-                  onMenu={() => openProjectMenu(project.id)}
-                  onPin={() => { setProjectMenuOpen(undefined); onProjectPinned(project.id, !project.pinned); }}
-                  onReveal={() => { setProjectMenuOpen(undefined); onRevealProject(project.id); }}
-                  onRename={() => { setProjectMenuOpen(undefined); onRenameProject(project.id); }}
-                  onArchive={() => { setProjectMenuOpen(undefined); onUnavailable("归档任务"); }}
-                  onRemove={() => { setProjectMenuOpen(undefined); onRemoveProject(project.id); }}
-                  onSelect={onSelectProject}
-                  project={project}
-                  running={project.id === activeProjectId && hasRunningSession(sessions)}
-                  selected={project.id === activeProjectId}
-                />
+            actions={(
+              <div className="folder-section-actions sidebar-menu-anchor">
+                <button ref={projectOrganizationButtonRef} aria-label="项目整理和排序" className="section-action" onClick={toggleProjectOrganizationMenu} type="button"><Icon name="more" size={14} /></button>
+                <button ref={projectCreateButtonRef} aria-label="添加项目" className="section-action" onClick={toggleProjectCreateMenu} type="button"><Icon name="add" size={15} /></button>
+                {projectOrganizationMenuOpen ? <ProjectOrganizationMenu anchorRef={projectOrganizationButtonRef} grouping={projectGrouping} onGroupingChange={(value) => { setProjectGrouping(value); setProjectOrganizationMenuOpen(false); }} onSortChange={(value) => { setProjectSort(value); setProjectOrganizationMenuOpen(false); }} sort={projectSort} /> : null}
+                {projectCreateMenuOpen ? (
+                  <ProjectCreationMenu
+                    anchorRef={projectCreateButtonRef}
+                    onCreateEmptyProject={() => { setProjectCreateMenuOpen(false); onCreateEmptyProject(); }}
+                    onOpenProject={() => { setProjectCreateMenuOpen(false); onOpenProject(); }}
+                  />
+                ) : null}
               </div>
-            );
-          })}
-          {!projects.length ? <div className="empty-folder-row">暂无项目，点击 + 添加</div> : null}
-        </SidebarFolder>
-      </div>
+            )}
+            expanded={expandedSections.projects}
+            label="项目"
+            onToggle={() => toggleSection("projects")}
+          >
+            {unpinnedProjects.map((project) => {
+              return (
+                <div className="project-group" key={project.id}>
+                  <ProjectRow
+                    menuOpen={projectMenuOpen === `project-${project.id}`}
+                    onMenu={() => openProjectMenu(`project-${project.id}`)}
+                    onPin={() => { setProjectMenuOpen(undefined); onProjectPinned(project.id, !project.pinned); }}
+                    onReveal={() => { setProjectMenuOpen(undefined); onRevealProject(project.id); }}
+                    onRename={() => { setProjectMenuOpen(undefined); onRenameProject(project.id); }}
+                    onNewTask={() => { setProjectMenuOpen(undefined); onNewTask(project.id); }}
+                    onArchive={() => { setProjectMenuOpen(undefined); onUnavailable("归档任务"); }}
+                    onRemove={() => { setProjectMenuOpen(undefined); onRemoveProject(project.id); }}
+                    onSelect={selectOrToggleProject}
+                    project={project}
+                    running={project.id === activeProjectId && hasRunningSession(sessions)}
+                    selected={project.id === activeProjectId}
+                    sessionsExpanded={project.id === activeProjectId && !collapsedProjectIds.has(project.id)}
+                  />
+                  {project.id === activeProjectId ? <ProjectSessions expanded={!collapsedProjectIds.has(project.id)} onSelectSession={onSelectSession} selectedSessionId={selectedSessionId} sessions={sessions} /> : null}
+                </div>
+              );
+            })}
+            {!projects.length ? <div className="empty-folder-row">暂无项目，点击 + 添加</div> : null}
+          </SidebarFolder>
+        </div>
 
-      <div className="sidebar-footer">
-        <button className="identity-row" type="button"><span className="identity-avatar"><Icon name="person" size={14} /></span><span>本地</span></button>
-        <button aria-label="设置" className="icon-button" onClick={onSettings} type="button"><Icon name="settings" /></button>
-        <button aria-label="帮助" className="icon-button" onClick={() => onUnavailable("帮助")} type="button"><Icon name="help" /></button>
-        <span className="version-label">v{version}</span>
+        <div className="sidebar-footer">
+          <button className="identity-row" type="button"><span className="identity-avatar"><Icon name="person" size={14} /></span><span>本地</span></button>
+          <button aria-label="设置" className="icon-button" onClick={onSettings} type="button"><Icon name="settings" /></button>
+          <button aria-label="帮助" className="icon-button" onClick={() => onUnavailable("帮助")} type="button"><Icon name="help" /></button>
+          <span className="version-label">v{version}</span>
+        </div>
+        <SidebarResizer onResizeEnd={onResizeEnd} onResizeStart={onResizeStart} onWidthChange={onWidthChange} width={width} />
       </div>
-      <SidebarResizer onWidthChange={onWidthChange} width={width} />
     </aside>
   );
 });
@@ -229,14 +257,33 @@ function SidebarFolder({ label, expanded, actions, onToggle, children }: { label
   );
 }
 
+function ProjectSessions({ sessions, selectedSessionId, expanded, onSelectSession }: { sessions: DesktopSessionSummary[]; selectedSessionId?: string; expanded: boolean; onSelectSession(sessionId: string): void }): React.JSX.Element | null {
+  if (!sessions.length) return null;
+  return (
+    <div aria-hidden={!expanded} aria-label="项目会话" className={`project-sessions t-resize${expanded ? " is-expanded" : ""}`} inert={!expanded}>
+      <div>
+        {sessions.map((session) => (
+          <div className={`session-row${session.id === selectedSessionId ? " is-selected" : ""}`} key={session.id}>
+            <button aria-current={session.id === selectedSessionId ? "page" : undefined} className="session-main" onClick={() => onSelectSession(session.id)} title={session.firstUserMessage || session.title} type="button">
+              <span className="row-label">{session.title}</span>
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 const ProjectRow = memo(function ProjectRow({
   project,
   selected,
+  sessionsExpanded,
   running,
   onSelect,
   menuOpen,
   onMenu,
   onRename,
+  onNewTask,
   onPin,
   onReveal,
   onArchive,
@@ -244,11 +291,13 @@ const ProjectRow = memo(function ProjectRow({
 }: {
   project: DesktopProject;
   selected: boolean;
+  sessionsExpanded: boolean;
   running: boolean;
   onSelect(projectId: string): void;
   menuOpen: boolean;
   onMenu(): void;
   onRename(): void;
+  onNewTask(): void;
   onPin(): void;
   onReveal(): void;
   onArchive(): void;
@@ -259,6 +308,7 @@ const ProjectRow = memo(function ProjectRow({
   return (
     <div className={`project-row-wrap${selected ? " is-active" : ""}`}>
       <button
+        aria-expanded={sessionsExpanded}
         className={`project-row${selected ? " is-active" : ""}`}
         onClick={() => onSelect(project.id)}
         title={project.path}
@@ -270,7 +320,7 @@ const ProjectRow = memo(function ProjectRow({
       </button>
       <div className={`project-row-actions${menuOpen ? " is-open" : ""}`}>
         <button ref={menuButtonRef} aria-label={`${project.name} 项目操作`} className="project-row-action" onClick={onMenu} type="button"><Icon name="more" size={14} /></button>
-        <button aria-label={`重命名项目 ${project.name}`} className="project-row-action" onClick={onRename} type="button"><Icon name="edit" size={14} /></button>
+        <button aria-label={`新建任务 ${project.name}`} className="project-row-action" onClick={onNewTask} title="新建任务" type="button"><Icon name="edit" size={14} /></button>
         {menuOpen ? <ProjectMenu anchorRef={menuButtonRef} onArchive={onArchive} onPin={onPin} onRemove={onRemove} onRename={onRename} onReveal={onReveal} project={project} /> : null}
       </div>
     </div>
@@ -358,14 +408,16 @@ function hasRunningSession(sessions: DesktopSessionSummary[]): boolean {
   return sessions.some((session) => session.status === "running" || session.status === "waiting_permission");
 }
 
-function SidebarResizer({ width, onWidthChange }: { width: number; onWidthChange(width: number): void }): React.JSX.Element {
+function SidebarResizer({ width, onWidthChange, onResizeStart, onResizeEnd }: { width: number; onWidthChange(width: number): void; onResizeStart(): void; onResizeEnd(): void }): React.JSX.Element {
   const startResize = (event: React.PointerEvent<HTMLDivElement>): void => {
+    onResizeStart();
     const startX = event.clientX;
     const startWidth = width;
     const move = (moveEvent: PointerEvent): void => onWidthChange(Math.min(300, Math.max(188, startWidth + moveEvent.clientX - startX)));
     const stop = (): void => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", stop);
+      onResizeEnd();
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop, { once: true });

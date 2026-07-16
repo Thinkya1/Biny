@@ -48,8 +48,8 @@ Electron Main
 - 会话：`createSession`、`openSession`、`renameSession`、`pinSession`、`duplicateSession`、`deleteSession`、`showSessionMenu`
 - Agent：`sendPrompt`、`cancelRun`、`compact`
 - 权限与模型：`resolvePermission`、`setPermissionMode`、`switchModel`
-- 文件与附件：`saveAttachment`、`resolveDroppedFile`、`openWorkspaceFile`
-- UI：`setSidebarWidth`、`onMenuAction`
+- 文件与附件：`saveAttachment`、`resolveDroppedFile`、`listWorkspaceDirectory`、`readWorkspaceFile`、`openWorkspaceFile`
+- UI：`setSidebarWidth`、`setFilePanelWidth`、`onMenuAction`
 - 事件：`onAgentEvent`
 
 `resolveDroppedFile` 只调用 Electron `webUtils.getPathForFile`，不授予 Renderer 通用文件系统权限。附件在 Main 中限制数量、大小和文件名，并写入当前项目的 `.agent/attachments/`。
