@@ -11,8 +11,10 @@ import type {
   DesktopProject,
   DesktopSessionDocument,
   DesktopSessionSummary,
+  DesktopWorkspaceDirectory,
   DesktopWorkspaceSnapshot
 } from "../../protocol.js";
+import { DEFAULT_FILE_PANEL_WIDTH } from "../../filePanelSizing.js";
 import {
   canNavigateBack,
   canNavigateForward,
@@ -23,8 +25,9 @@ import {
   type DesktopNavigationState,
   type DesktopNavigationTarget
 } from "./navigationHistory.js";
-import { buildSessionTimeline } from "./sessionTimeline.js";
+import { buildSessionTimeline, listChangedFiles, type TimelineTurn } from "./sessionTimeline.js";
 import { Composer } from "./components/Composer.js";
+import { NavigationControls } from "./components/NavigationControls.js";
 import { RenameOverlay, SearchOverlay, SettingsOverlay, Toast } from "./components/Overlays.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { Workspace } from "./components/Workspace.js";
@@ -45,7 +48,12 @@ export function App(): React.JSX.Element {
   const [loading, setLoading] = useState(true);
   const [sidebarVisible, setSidebarVisible] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(216);
+  const [sidebarResizing, setSidebarResizing] = useState(false);
+  const [filePanelWidth, setFilePanelWidth] = useState(DEFAULT_FILE_PANEL_WIDTH);
+  const [filePanelResizing, setFilePanelResizing] = useState(false);
   const [focusToken, setFocusToken] = useState(0);
+  const [composerDraft, setComposerDraft] = useState<{ value: string; token: number }>();
+  const [deletedUserMessages, setDeletedUserMessages] = useState<Set<string>>(() => new Set());
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [unavailableFeature, setUnavailableFeature] = useState<string>();
@@ -60,6 +68,7 @@ export function App(): React.JSX.Element {
   const eventFrameRef = useRef<number | undefined>(undefined);
   const refreshTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const menuActionRef = useRef<(action: DesktopMenuAction) => void>(() => undefined);
+  const draftTokenRef = useRef(0);
 
   useEffect(() => {
     selectedRef.current = selectedSessionId;
@@ -132,6 +141,7 @@ export function App(): React.JSX.Element {
       setVersion(bootstrap.version);
       setProjects(bootstrap.projects);
       setSidebarWidth(bootstrap.sidebarWidth);
+      setFilePanelWidth(bootstrap.filePanelWidth ?? DEFAULT_FILE_PANEL_WIDTH);
       if (bootstrap.workspace) {
         mergeWorkspaceProject(bootstrap.workspace);
         const nextSessionId = bootstrap.selectedSessionId ?? bootstrap.workspace.selectedSessionId;
@@ -254,9 +264,9 @@ export function App(): React.JSX.Element {
     }
   }, [adoptWorkspace, commitNavigation]);
 
-  const newTask = useCallback(async (): Promise<void> => {
+  const newTask = useCallback(async (targetProjectId = projectRef.current): Promise<void> => {
     setUnavailableFeature(undefined);
-    const projectId = projectRef.current;
+    const projectId = targetProjectId;
     if (!projectId) {
       await openProject();
       return;
@@ -328,6 +338,46 @@ export function App(): React.JSX.Element {
     if (receipt.queued) setToast("补充要求已排入当前会话");
   }, [commitNavigation, document, workspace?.sessions]);
 
+  const editUserMessage = useCallback((input: string): void => {
+    draftTokenRef.current += 1;
+    setComposerDraft({ value: input, token: draftTokenRef.current });
+    setFocusToken((value) => value + 1);
+  }, []);
+
+  const deleteUserMessage = useCallback((turnId: string): void => {
+    const scope = `${projectRef.current ?? "none"}:${selectedRef.current ?? "draft"}`;
+    const key = `${scope}:${turnId}`;
+    setDeletedUserMessages((current) => {
+      const next = new Set(current);
+      next.add(key);
+      return next;
+    });
+    setToast("已删除这条用户消息");
+  }, []);
+
+  const createBranch = useCallback(async (): Promise<void> => {
+    const projectId = projectRef.current;
+    const sessionId = selectedRef.current;
+    if (!projectId || !sessionId) {
+      setToast("当前草稿还没有可创建的分支");
+      return;
+    }
+    const previousNavigation = navigationRef.current;
+    try {
+      const snapshot = await window.biny.duplicateSession(projectId, sessionId);
+      await adoptWorkspace(snapshot);
+      if (snapshot.selectedSessionId) commitNavigation(pushNavigation(previousNavigation, { projectId, sessionId: snapshot.selectedSessionId }));
+      setToast("已创建会话分支");
+    } catch (error) {
+      setToast(errorMessage(error));
+    }
+  }, [adoptWorkspace, commitNavigation]);
+
+  const rollbackFiles = useCallback((turn: TimelineTurn): void => {
+    const files = listChangedFiles(turn);
+    setToast(files.length ? "当前消息的文件变更没有安全快照，暂不自动回滚" : "当前消息没有可回滚的文件");
+  }, []);
+
   const toggleProjectPinned = useCallback(async (projectId: string, pinned: boolean): Promise<void> => {
     try {
       mergeProjectSnapshot(await window.biny.setProjectPinned(projectId, pinned));
@@ -387,7 +437,29 @@ export function App(): React.JSX.Element {
     await window.biny.resolvePermission(projectId, requestId, result);
   }, []);
 
+  const readWorkspaceFile = useCallback(async (path: string) => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("当前没有打开项目。");
+    return await window.biny.readWorkspaceFile(projectId, path);
+  }, []);
+
+  const listWorkspaceDirectory = useCallback(async (path: string): Promise<DesktopWorkspaceDirectory> => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("当前没有打开项目。");
+    return await window.biny.listWorkspaceDirectory(projectId, path);
+  }, []);
+
+  const openWorkspaceFile = useCallback((path: string): void => {
+    const projectId = projectRef.current;
+    if (!projectId) return;
+    void window.biny.openWorkspaceFile(projectId, path).catch((error) => setToast(errorMessage(error)));
+  }, []);
+
   const turns = useMemo(() => document ? buildSessionTimeline(document.events, document.liveEvents) : [], [document]);
+  const messageScope = `${workspace?.project.id ?? "none"}:${document?.session.id ?? "draft"}`;
+  const visibleTurns = useMemo(() => turns
+    .map((turn) => deletedUserMessages.has(`${messageScope}:${turn.id}`) ? { ...turn, user: "" } : turn)
+    .filter((turn) => turn.user || turn.assistant || turn.tools.length || turn.error), [deletedUserMessages, messageScope, turns]);
   const clearToast = useCallback(() => setToast(undefined), []);
   const sessionSummary = workspace?.sessions.find((session) => session.id === selectedSessionId) ?? document?.session;
   const activeSessionId = workspace?.runtime?.activeRun?.sessionId ?? workspace?.runtime?.pendingPermission?.sessionId;
@@ -396,6 +468,7 @@ export function App(): React.JSX.Element {
   const composer = (
     <Composer
       activeElsewhere={activeElsewhere}
+      draftRequest={composerDraft}
       focusToken={focusToken}
       models={workspace?.models ?? []}
       onOpenProject={() => void openProject()}
@@ -416,11 +489,7 @@ export function App(): React.JSX.Element {
     <div className={`app-shell${sidebarVisible ? "" : " is-sidebar-hidden"}`}>
       <Sidebar
         activeProjectId={workspace?.project.id}
-        canGoBack={canNavigateBack(navigation)}
-        canGoForward={canNavigateForward(navigation)}
-        onNavigateBack={() => void navigateHistory(-1)}
-        onNavigateForward={() => void navigateHistory(1)}
-        onToggleSidebar={() => setSidebarVisible(false)}
+        onNewTask={(projectId) => void newTask(projectId)}
         onCreateEmptyProject={() => void createEmptyProject()}
         onOpenProject={() => void openProject()}
         onProjectPinned={(projectId, pinned) => void toggleProjectPinned(projectId, pinned)}
@@ -429,39 +498,69 @@ export function App(): React.JSX.Element {
         onRevealProject={(projectId) => { void window.biny.revealProject(projectId).catch((error) => setToast(errorMessage(error))); }}
         onSearch={() => setSearchOpen(true)}
         onSelectProject={(projectId) => void selectProject(projectId)}
+        onSelectSession={(sessionId) => { const projectId = projectRef.current; if (projectId) void navigateToSession(projectId, sessionId); }}
         onSettings={() => setSettingsOpen(true)}
         onUnavailable={(feature) => setUnavailableFeature(feature)}
+        onResizeEnd={() => setSidebarResizing(false)}
+        onResizeStart={() => setSidebarResizing(true)}
         onWidthChange={(width) => { setSidebarWidth(width); void window.biny.setSidebarWidth(width); }}
         projects={projects}
+        resizing={sidebarResizing}
+        selectedSessionId={selectedSessionId}
         sessions={workspace?.sessions ?? []}
         version={version}
         visible={sidebarVisible}
         width={sidebarWidth}
       />
       <Workspace
-        canGoBack={canNavigateBack(navigation)}
-        canGoForward={canNavigateForward(navigation)}
+        filePanelResizing={filePanelResizing}
+        filePanelWidth={filePanelWidth}
         loading={loading}
-        onNavigateBack={() => void navigateHistory(-1)}
-        onNavigateForward={() => void navigateHistory(1)}
-        onOpenFile={(path) => { const projectId = projectRef.current; if (projectId) void window.biny.openWorkspaceFile(projectId, path).catch((error) => setToast(errorMessage(error))); }}
+        onCreateBranch={() => { void createBranch(); }}
+        onDeleteUserMessage={deleteUserMessage}
+        onEditUserMessage={editUserMessage}
+        onFilePanelResizeEnd={(width) => {
+          setFilePanelResizing(false);
+          void window.biny.setFilePanelWidth(width);
+        }}
+        onFilePanelResizeStart={() => setFilePanelResizing(true)}
+        onFilePanelWidthChange={setFilePanelWidth}
+        onOpenFile={openWorkspaceFile}
         onOpenProject={() => void openProject()}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onListDirectory={listWorkspaceDirectory}
+        onOpenTerminal={() => {
+          const projectId = projectRef.current;
+          if (projectId) void window.biny.openProjectTerminal(projectId).catch((error) => setToast(errorMessage(error)));
+        }}
+        onPanelNotice={setToast}
+        onReadFile={readWorkspaceFile}
         onRefreshProject={() => { const projectId = projectRef.current; if (projectId) void window.biny.refreshProject(projectId).then(mergeWorkspaceProject).catch((error) => setToast(errorMessage(error))); }}
         onResolvePermission={resolvePermission}
+        onRollbackFiles={rollbackFiles}
         onRetry={(input) => void sendPrompt(input, "chat", []).catch((error) => setToast(errorMessage(error)))}
-        onToggleSidebar={() => setSidebarVisible(true)}
         project={workspace?.project}
         projectId={workspace?.project.id}
         runtimeError={workspace?.runtimeError}
         sessionId={selectedSessionId}
         sessionTitle={sessionSummary?.title}
-        sidebarVisible={sidebarVisible}
-        turns={turns}
+        turns={visibleTurns}
         unavailableFeature={unavailableFeature}
       >
         {composer}
       </Workspace>
+      <div
+        className={`app-navigation${sidebarResizing ? " is-resizing" : ""}`}
+        style={{ left: sidebarVisible ? Math.max(90, sidebarWidth - 93) : 90 }}
+      >
+        <NavigationControls
+          canGoBack={canNavigateBack(navigation)}
+          canGoForward={canNavigateForward(navigation)}
+          onBack={() => void navigateHistory(-1)}
+          onForward={() => void navigateHistory(1)}
+          onToggleSidebar={() => setSidebarVisible((visible) => !visible)}
+          sidebarVisible={sidebarVisible}
+        />
+      </div>
 
       <SearchOverlay
         onClose={() => setSearchOpen(false)}

@@ -32,8 +32,11 @@ export const desktopIpc = {
   compact: "desktop:agent:compact",
   saveAttachment: "desktop:attachment:save",
   resolveDroppedFile: "desktop:attachment:resolve-path",
+  listWorkspaceDirectory: "desktop:file:list-directory",
+  readWorkspaceFile: "desktop:file:read",
   openWorkspaceFile: "desktop:file:open",
   setSidebarWidth: "desktop:ui:sidebar-width",
+  setFilePanelWidth: "desktop:ui:file-panel-width",
   event: "desktop:agent:event",
   menuAction: "desktop:menu:action"
 } as const;
@@ -89,6 +92,7 @@ export interface DesktopBootstrap {
   selectedSessionId?: string;
   workspace?: DesktopWorkspaceSnapshot;
   sidebarWidth: number;
+  filePanelWidth: number;
 }
 
 export interface DesktopRunReceipt {
@@ -108,6 +112,25 @@ export interface DesktopAttachment {
   path: string;
   mimeType: string;
   size: number;
+}
+
+export interface DesktopWorkspaceFilePreview {
+  path: string;
+  content?: string;
+  bytes: number;
+  binary: boolean;
+  truncated: boolean;
+}
+
+export interface DesktopWorkspaceDirectoryEntry {
+  name: string;
+  path: string;
+  kind: "file" | "directory";
+}
+
+export interface DesktopWorkspaceDirectory {
+  path: string;
+  entries: DesktopWorkspaceDirectoryEntry[];
 }
 
 export interface DesktopModelConfigurationInput {
@@ -153,8 +176,11 @@ export interface DesktopApi {
   compact(projectId: string, hint?: string): Promise<string>;
   saveAttachment(projectId: string, name: string, mimeType: string, bytes: Uint8Array): Promise<DesktopAttachment>;
   resolveDroppedFile(file: File): string;
+  listWorkspaceDirectory(projectId: string, relativePath: string): Promise<DesktopWorkspaceDirectory>;
+  readWorkspaceFile(projectId: string, relativePath: string): Promise<DesktopWorkspaceFilePreview>;
   openWorkspaceFile(projectId: string, relativePath: string): Promise<void>;
   setSidebarWidth(width: number): Promise<void>;
+  setFilePanelWidth(width: number): Promise<void>;
   onAgentEvent(listener: (envelope: DesktopAgentEventEnvelope) => void): () => void;
   onMenuAction(listener: (action: DesktopMenuAction) => void): () => void;
 }

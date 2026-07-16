@@ -15,11 +15,15 @@ import type {
   DesktopProject,
   DesktopSessionDocument,
   DesktopSessionStatus,
-  DesktopSessionSummary
+  DesktopWorkspaceDirectory,
+  DesktopWorkspaceDirectoryEntry,
+  DesktopSessionSummary,
+  DesktopWorkspaceFilePreview
 } from "../../protocol.js";
 import { DesktopStateStore } from "./DesktopStateStore.js";
 
 const execFileAsync = promisify(execFile);
+const filePreviewLimit = 512 * 1024;
 
 export class DesktopProjectService {
   constructor(private readonly state: DesktopStateStore) {}
@@ -187,8 +191,68 @@ export class DesktopProjectService {
     };
   }
 
+  async listWorkspaceDirectory(project: DesktopProject, relativePath: string): Promise<DesktopWorkspaceDirectory> {
+    const directoryPath = this.workspaceDirectory(project, relativePath);
+    const stat = await fs.stat(directoryPath);
+    if (!stat.isDirectory()) throw new Error(`Path is not a directory: ${relativePath}`);
+    const dirEntries = await fs.readdir(directoryPath, { withFileTypes: true });
+    const entries: DesktopWorkspaceDirectoryEntry[] = dirEntries
+      .map((entry) => ({
+        name: entry.name,
+        path: path.relative(project.path, path.join(directoryPath, entry.name)).split(path.sep).join("/"),
+        kind: entry.isDirectory() ? "directory" : "file"
+      } satisfies DesktopWorkspaceDirectoryEntry))
+      .sort((left, right) => {
+        if (left.kind !== right.kind) return left.kind === "directory" ? -1 : 1;
+        return left.name.localeCompare(right.name);
+      });
+    return {
+      path: path.relative(project.path, directoryPath).split(path.sep).join("/") || ".",
+      entries
+    };
+  }
+
+  async readWorkspaceFile(project: DesktopProject, relativePath: string): Promise<DesktopWorkspaceFilePreview> {
+    const filePath = this.workspaceFile(project, relativePath);
+    const stat = await fs.stat(filePath);
+    if (!stat.isFile()) throw new Error(`Path is not a file: ${relativePath}`);
+    const previewBytes = Math.min(stat.size, filePreviewLimit);
+    const buffer = Buffer.alloc(previewBytes);
+    let bytesRead = 0;
+    if (previewBytes) {
+      const handle = await fs.open(filePath, "r");
+      try {
+        while (bytesRead < previewBytes) {
+          const result = await handle.read(buffer, bytesRead, previewBytes - bytesRead, bytesRead);
+          if (!result.bytesRead) break;
+          bytesRead += result.bytesRead;
+        }
+      } finally {
+        await handle.close();
+      }
+    }
+    const content = buffer.subarray(0, bytesRead);
+    const binary = content.includes(0);
+    return {
+      path: path.relative(project.path, filePath),
+      content: binary ? undefined : content.toString("utf8"),
+      bytes: stat.size,
+      binary,
+      truncated: stat.size > bytesRead
+    };
+  }
+
   workspaceFile(project: DesktopProject, relativePath: string): string {
     return resolveWorkspacePath(project.path, relativePath, ["node_modules", ".git"]);
+  }
+
+  workspaceDirectory(project: DesktopProject, relativePath: string): string {
+    const absolutePath = path.resolve(project.path, relativePath);
+    const workspaceRelativePath = path.relative(project.path, absolutePath);
+    if (workspaceRelativePath.startsWith("..") || path.isAbsolute(workspaceRelativePath)) {
+      throw new Error(`Path escapes workspace: ${relativePath}`);
+    }
+    return absolutePath;
   }
 
   requireProject(projectIdValue: string): DesktopProject {

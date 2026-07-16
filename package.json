@@ -35,6 +35,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "ai": "^7.0.22",
     "commander": "^13.1.0",
+    "highlight.js": "^11.11.1",
     "ink": "^7.1.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",

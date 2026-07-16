@@ -20,7 +20,8 @@ export function createDesktopWindow(
     show: false,
     backgroundColor: "#ffffff",
     title: "Biny",
-    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
+    titleBarStyle: "hidden",
+    titleBarOverlay: process.platform === "darwin" ? true : undefined,
     trafficLightPosition: process.platform === "darwin" ? { x: 14, y: 16 } : undefined,
     webPreferences: {
       preload: path.join(fileURLToPath(new URL(".", import.meta.url)), "../preload/index.cjs"),

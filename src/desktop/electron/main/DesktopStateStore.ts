@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { clampStoredFilePanelWidth, DEFAULT_FILE_PANEL_WIDTH } from "../../filePanelSizing.js";
 import type { DesktopProject } from "../../protocol.js";
 
 interface DesktopSessionMetadata {
@@ -21,6 +22,7 @@ interface PersistedDesktopState {
   selectedSessionIds: Record<string, string>;
   sessionMetadata: Record<string, DesktopSessionMetadata>;
   sidebarWidth: number;
+  filePanelWidth: number;
   windowBounds?: DesktopWindowBounds;
 }
 
@@ -31,6 +33,7 @@ const defaultState: PersistedDesktopState = {
   selectedSessionIds: {},
   sessionMetadata: {},
   sidebarWidth: 216,
+  filePanelWidth: DEFAULT_FILE_PANEL_WIDTH,
   windowBounds: undefined
 };
 
@@ -50,6 +53,7 @@ export class DesktopStateStore {
         selectedSessionIds: isRecord(raw.selectedSessionIds) ? stringRecord(raw.selectedSessionIds) : {},
         sessionMetadata: isRecord(raw.sessionMetadata) ? metadataRecord(raw.sessionMetadata) : {},
         sidebarWidth: typeof raw.sidebarWidth === "number" ? clampSidebarWidth(raw.sidebarWidth) : 216,
+        filePanelWidth: typeof raw.filePanelWidth === "number" ? clampStoredFilePanelWidth(raw.filePanelWidth) : DEFAULT_FILE_PANEL_WIDTH,
         windowBounds: validWindowBounds(raw.windowBounds) ? raw.windowBounds : undefined
       };
     } catch (error) {
@@ -157,6 +161,15 @@ export class DesktopStateStore {
 
   async setSidebarWidth(width: number): Promise<void> {
     this.state.sidebarWidth = clampSidebarWidth(width);
+    await this.save();
+  }
+
+  filePanelWidth(): number {
+    return this.state.filePanelWidth;
+  }
+
+  async setFilePanelWidth(width: number): Promise<void> {
+    this.state.filePanelWidth = clampStoredFilePanelWidth(width);
     await this.save();
   }
 

@@ -15,6 +15,7 @@ interface ComposerProps {
   running: boolean;
   activeElsewhere: boolean;
   focusToken: number;
+  draftRequest?: { value: string; token: number };
   onOpenProject(): void;
   onSend(input: string, mode: AgentRunMode, attachments: DesktopAttachment[]): Promise<void>;
   onStop(): Promise<void>;
@@ -41,6 +42,7 @@ export const Composer = memo(function Composer({
   running,
   activeElsewhere,
   focusToken,
+  draftRequest,
   onOpenProject,
   onSend,
   onStop,
@@ -64,6 +66,13 @@ export const Composer = memo(function Composer({
   }, [focusToken]);
 
   useEffect(() => {
+    if (!draftRequest) return;
+    setInput(draftRequest.value);
+    setError(undefined);
+    textareaRef.current?.focus();
+  }, [draftRequest]);
+
+  useEffect(() => {
     if (!menu) return;
     const close = (event: PointerEvent): void => {
       if (composerRef.current?.contains(event.target as Node)) return;
@@ -84,7 +93,7 @@ export const Composer = memo(function Composer({
     const textarea = textareaRef.current;
     if (!textarea) return;
     textarea.style.height = "0px";
-    textarea.style.height = `${String(Math.min(176, Math.max(54, textarea.scrollHeight)))}px`;
+    textarea.style.height = `${String(Math.min(176, Math.max(46, textarea.scrollHeight)))}px`;
   }, [input]);
 
   const submit = async (): Promise<void> => {

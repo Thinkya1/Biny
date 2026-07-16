@@ -94,6 +94,8 @@ export class DesktopAgentManager {
     attachments: DesktopAttachment[]
   ): Promise<DesktopRunReceipt> {
     const runtime = await this.ensureRuntime(projectId);
+    const snapshot = runtime.getSnapshot();
+    if (!snapshot.activeRun && !snapshot.queuedRuns.length) await runtime.refreshModelFromDisk();
     if (sessionId && runtime.getInfo().sessionId !== sessionId) {
       const snapshot = runtime.getSnapshot();
       if (snapshot.activeRun || snapshot.queuedRuns.length) {
@@ -150,12 +152,15 @@ export class DesktopAgentManager {
       apiKeyEnv: input.apiKeyEnv ?? existingProvider?.apiKeyEnv ?? profile.apiKeyEnv,
       timeoutMs: existingProvider?.timeoutMs
     };
+    const models = Object.fromEntries(Object.entries(current.models).filter(([alias, model]) => (
+      alias === input.alias || model.provider !== input.providerAlias || model.model !== input.model
+    )));
     const next = configSchema.parse({
       ...current,
       defaultModel: input.alias,
       providers: { ...current.providers, [input.providerAlias]: provider },
       models: {
-        ...current.models,
+        ...models,
         [input.alias]: {
           provider: input.providerAlias,
           model: input.model,

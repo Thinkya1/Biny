@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
 import type { TimelineCommand, TimelineTool } from "../sessionTimeline.js";
 import { Icon, type IconName } from "./Icon.js";
@@ -6,16 +6,22 @@ import { Icon, type IconName } from "./Icon.js";
 interface ToolActivityProps {
   projectId: string;
   tool: TimelineTool;
-  onOpenFile(path: string): void;
+  onPreviewFile(path: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
 }
 
-export const ToolActivity = memo(function ToolActivity({ projectId, tool, onOpenFile, onResolvePermission }: ToolActivityProps): React.JSX.Element {
-  const [expanded, setExpanded] = useState(tool.status === "running" || tool.status === "failed" || Boolean(tool.permission && !tool.permission.resolved));
+export const ToolActivity = memo(function ToolActivity({ projectId, tool, onPreviewFile, onResolvePermission }: ToolActivityProps): React.JSX.Element {
+  const permissionPending = Boolean(tool.permission && !tool.permission.resolved);
+  const [expanded, setExpanded] = useState(permissionPending);
   const [resolving, setResolving] = useState(false);
   const command = useMemo(() => commandDetails(tool), [tool]);
   const diff = useMemo(() => tool.diff ? analyzeDiff(tool.diff) : undefined, [tool.diff]);
   const summary = toolSummary(tool, command, diff);
+  const previewPath = changedFilePath(tool);
+
+  useEffect(() => {
+    if (permissionPending) setExpanded(true);
+  }, [permissionPending]);
 
   const resolve = async (result: PermissionResult): Promise<void> => {
     if (!tool.permission || resolving) return;
@@ -29,23 +35,37 @@ export const ToolActivity = memo(function ToolActivity({ projectId, tool, onOpen
 
   return (
     <article className={`tool-activity is-${tool.status}`} data-project-id={projectId}>
-      <button aria-expanded={expanded} className="tool-heading" onClick={() => setExpanded(!expanded)} type="button">
-        <span className="tool-icon"><Icon name={toolIcon(tool)} size={14} /></span>
-        <span className="tool-name">{toolLabel(tool.tool)}</span>
-        <span className="tool-summary">{summary}</span>
-        <ToolStatus status={tool.status} />
-        {tool.durationMs !== undefined ? <span className="tool-duration">{formatDuration(tool.durationMs)}</span> : null}
-        <span className={`tool-disclosure${expanded ? " is-expanded" : ""}`}><Icon name="chevron" size={13} /></span>
-      </button>
+      <div className="tool-heading-row">
+        <button aria-expanded={expanded} className="tool-heading" onClick={() => setExpanded(!expanded)} type="button">
+          <span className="tool-icon"><Icon name={toolIcon(tool)} size={14} /></span>
+          <span className="tool-name">{toolLabel(tool.tool)}</span>
+          <span className="tool-summary">{summary}</span>
+          <ToolStatus status={tool.status} />
+          {tool.durationMs !== undefined ? <span className="tool-duration">{formatDuration(tool.durationMs)}</span> : null}
+          <span className={`tool-disclosure${expanded ? " is-expanded" : ""}`}><Icon name="chevron" size={13} /></span>
+        </button>
+        {previewPath ? (
+          <button
+            aria-label={`在右侧预览 ${previewPath}`}
+            className="tool-file-preview"
+            disabled={tool.status !== "success"}
+            onClick={() => onPreviewFile(previewPath)}
+            title={tool.status === "success" ? "在右侧预览" : "文件写入完成后可预览"}
+            type="button"
+          >
+            <Icon name="panel-right" size={14} />
+          </button>
+        ) : null}
+      </div>
       {expanded ? (
         <div className="tool-details">
           {tool.permission ? (
             <PermissionCard disabled={resolving} permission={tool.permission} onResolve={resolve} />
           ) : null}
           {command ? <CommandLog command={command} running={tool.status === "running"} /> : null}
-          {diff && tool.diff ? <DiffView diff={tool.diff} info={diff} onOpenFile={onOpenFile} /> : null}
+          {diff && tool.diff ? <DiffView diff={tool.diff} info={diff} onPreviewFile={onPreviewFile} /> : null}
           {tool.path && !diff ? (
-            <button className="file-path-row" onClick={() => onOpenFile(tool.path ?? "")} type="button"><Icon name="file" size={13} /><span>{tool.path}</span></button>
+            <button className="file-path-row" onClick={() => onPreviewFile(tool.path ?? "")} title="在右侧预览" type="button"><Icon name="file" size={13} /><span>{tool.path}</span></button>
           ) : null}
           {!command && !diff ? <ToolPayload tool={tool} /> : null}
           {tool.error ? <pre className="tool-error-output">{tool.error}</pre> : null}
@@ -54,6 +74,12 @@ export const ToolActivity = memo(function ToolActivity({ projectId, tool, onOpen
     </article>
   );
 });
+
+function changedFilePath(tool: TimelineTool): string | undefined {
+  const operation = tool.display?.kind === "file_io" ? tool.display.operation : undefined;
+  if (tool.tool !== "write_file" && tool.tool !== "edit_file" && operation !== "write" && operation !== "edit") return undefined;
+  return tool.path ?? (tool.display?.kind === "file_io" ? tool.display.path : undefined);
+}
 
 function PermissionCard({
   permission,
@@ -122,7 +148,7 @@ interface DiffInfo {
   deletions: number;
 }
 
-function DiffView({ diff, info, onOpenFile }: { diff: string; info: DiffInfo; onOpenFile(path: string): void }): React.JSX.Element {
+function DiffView({ diff, info, onPreviewFile }: { diff: string; info: DiffInfo; onPreviewFile(path: string): void }): React.JSX.Element {
   const [showAll, setShowAll] = useState(false);
   const lines = numberedDiffLines(diff);
   const visibleLines = showAll ? lines : lines.slice(0, 260);
@@ -137,7 +163,7 @@ function DiffView({ diff, info, onOpenFile }: { diff: string; info: DiffInfo; on
       {info.files.length ? (
         <div className="diff-files">
           {info.files.map((file) => (
-            <button key={`${file.status}-${file.path}`} onClick={() => onOpenFile(file.path)} type="button"><span className={`diff-file-status is-${file.status}`}>{diffStatusLabel(file.status)}</span><span>{file.path}</span></button>
+            <button key={`${file.status}-${file.path}`} onClick={() => onPreviewFile(file.path)} title="在右侧预览" type="button"><span className={`diff-file-status is-${file.status}`}>{diffStatusLabel(file.status)}</span><span>{file.path}</span></button>
           ))}
         </div>
       ) : null}

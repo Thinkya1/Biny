@@ -7,6 +7,7 @@ export type IconName =
   | "arrow-right"
   | "arrow-up"
   | "branch"
+  | "brain"
   | "check"
   | "chevron"
   | "close"
@@ -17,15 +18,18 @@ export type IconName =
   | "external"
   | "file"
   | "folder"
+  | "folder-panel"
   | "help"
   | "home"
   | "menu"
   | "more"
   | "paperclip"
+  | "panel-right"
   | "pin"
   | "person"
   | "plug"
   | "pull-request"
+  | "refresh"
   | "search"
   | "sidebar"
   | "settings"
@@ -35,7 +39,9 @@ export type IconName =
   | "terminal"
   | "timer"
   | "trash"
-  | "warning";
+  | "warning"
+  | "wand"
+  | "wrench";
 
 interface IconProps extends SVGProps<SVGSVGElement> {
   name: IconName;
@@ -75,6 +81,7 @@ function pathFor(name: IconName): React.JSX.Element {
     case "arrow-right": return <path {...common} d="M5 12h14m-7-7 7 7-7 7" />;
     case "arrow-up": return <path {...common} d="m6 11 6-6 6 6M12 5v14" />;
     case "branch": return <><circle {...common} cx="7" cy="5" r="2" /><circle {...common} cx="17" cy="19" r="2" /><path {...common} d="M7 7v5c0 3.9 3.1 7 7 7h1M17 5v4c0 2.2-1.8 4-4 4H7" /></>;
+    case "brain": return <><path {...common} d="M9.5 5.2A3 3 0 0 0 6 7.8a3.2 3.2 0 0 0 .2 5.9A3 3 0 0 0 9 18.5c.8 1.2 2.2 2 3 2V5.1a3.5 3.5 0 0 0-2.5.1Z" /><path {...common} d="M14.5 5.2A3 3 0 0 1 18 7.8a3.2 3.2 0 0 1-.2 5.9 3 3 0 0 1-2.8 4.8c-.8 1.2-2.2 2-3 2V5.1a3.5 3.5 0 0 1 2.5.1ZM7 9.5h2M15 9.5h2M7.5 14h2M14.5 14h2" /></>;
     case "check": return <path {...common} d="m5 12 4.2 4.2L19 6.5" />;
     case "chevron": return <path {...common} d="m8 10 4 4 4-4" />;
     case "close": return <path {...common} d="m6 6 12 12M18 6 6 18" />;
@@ -85,15 +92,18 @@ function pathFor(name: IconName): React.JSX.Element {
     case "external": return <><path {...common} d="M14 5h5v5M19 5l-8 8" /><path {...common} d="M19 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5" /></>;
     case "file": return <path {...common} d="M7 3.5h6l4 4V20a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1Zm6 0v4h4" />;
     case "folder": return <path {...common} d="M3.5 7.5h6l2-2h9v13a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5v-11Z" />;
+    case "folder-panel": return <><path {...common} d="M7.5 5h4l2 2H19a1.5 1.5 0 0 1 1.5 1.5V16" /><path {...common} d="M3.5 9h6l2-2h7v11.5A1.5 1.5 0 0 1 17 20H5a1.5 1.5 0 0 1-1.5-1.5V9Z" /></>;
     case "help": return <><circle {...common} cx="12" cy="12" r="9" /><path {...common} d="M9.8 9a2.3 2.3 0 0 1 4.5.7c0 1.8-2.3 2-2.3 3.8M12 17.4h.01" /></>;
     case "home": return <path {...common} d="m4 10 8-6 8 6v9a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1v-9Z" />;
     case "menu": return <path {...common} d="M5 7h14M5 12h14M5 17h14" />;
     case "more": return <><circle cx="6" cy="12" fill="currentColor" r="1.2" /><circle cx="12" cy="12" fill="currentColor" r="1.2" /><circle cx="18" cy="12" fill="currentColor" r="1.2" /></>;
     case "paperclip": return <path {...common} d="m9 12.5 5.9-5.9a3 3 0 0 1 4.2 4.2l-7.4 7.4a5 5 0 0 1-7.1-7.1l7.2-7.2M7.5 14l6.4-6.4" />;
+    case "panel-right": return <><rect {...common} height="16" rx="2" width="19" x="2.5" y="4" /><path {...common} d="M16 4v16" /></>;
     case "pin": return <><path {...common} d="m15 4 5 5-3 1-3.5 3.5 2 2-1.5 1.5-3.5-3.5-4 4" /><path {...common} d="m5 19 4-4" /></>;
     case "person": return <><circle {...common} cx="12" cy="8" r="3.2" /><path {...common} d="M5.5 20c.6-4.1 2.8-6.2 6.5-6.2s5.9 2.1 6.5 6.2" /></>;
     case "plug": return <path {...common} d="M8 3v5M16 3v5M6 8h12v2a6 6 0 0 1-5 5.9V21h-2v-5.1A6 6 0 0 1 6 10V8Z" />;
     case "pull-request": return <><circle {...common} cx="7" cy="5" r="2" /><circle {...common} cx="7" cy="19" r="2" /><circle {...common} cx="17" cy="19" r="2" /><path {...common} d="M7 7v10M14 5h1a2 2 0 0 1 2 2v10M14 2l-3 3 3 3" /></>;
+    case "refresh": return <><path {...common} d="M20 11a8 8 0 1 0 1 4" /><path {...common} d="M20 5v6h-6" /></>;
     case "search": return <><circle {...common} cx="10.5" cy="10.5" r="6.5" /><path {...common} d="m15.5 15.5 4 4" /></>;
     case "sidebar": return <><rect {...common} height="16" rx="2" width="19" x="2.5" y="4" /><path {...common} d="M8 4v16" /></>;
     case "settings": return <><circle {...common} cx="12" cy="12" r="3" /><path {...common} d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z" /></>;
@@ -104,5 +114,7 @@ function pathFor(name: IconName): React.JSX.Element {
     case "timer": return <><circle {...common} cx="12" cy="13" r="8" /><path {...common} d="M9 2h6M12 5V2M12 13l3-3" /></>;
     case "trash": return <><path {...common} d="M5 7h14M10 4h4l1 3H9l1-3ZM8 7l.7 13h6.6L16 7M10 10v7M14 10v7" /></>;
     case "warning": return <><path {...common} d="M11 4.5 3.7 18a1 1 0 0 0 .9 1.5h14.8a1 1 0 0 0 .9-1.5L13 4.5a1.1 1.1 0 0 0-2 0Z" /><path {...common} d="M12 9v4M12 16.5h.01" /></>;
+    case "wand": return <><path {...common} d="m5 19 10.5-10.5M7 5h.01M17 4h.01M19 9h.01M5 12h.01M17 16h.01" /><path {...common} d="m15.5 3.5.7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7.7-2.3Z" /></>;
+    case "wrench": return <path {...common} d="M14.5 6.2a4.5 4.5 0 0 0-5.8 5.7l-5.1 5.2a1.8 1.8 0 0 0 2.5 2.5l5.2-5.1a4.5 4.5 0 0 0 5.7-5.8l-3 3-2.5-.7-.7-2.5 3-3Z" />;
   }
 }
