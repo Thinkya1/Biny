@@ -214,7 +214,7 @@ export class DesktopModelLoginService {
     });
     const response = await fetch(CODEX_TOKEN_ENDPOINT, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "biny-desktop/0.2.0" },
+      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "biny-desktop/0.2.1" },
       body: body.toString()
     });
     if (!response.ok) throw new Error(`Codex 授权码交换失败（HTTP ${String(response.status)}）：${await compactResponse(response)}`);
@@ -236,7 +236,7 @@ export class DesktopModelLoginService {
     const body = new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokens.refreshToken, client_id: CODEX_CLIENT_ID });
     const response = await fetch(CODEX_TOKEN_ENDPOINT, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "biny-desktop/0.2.0" },
+      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "biny-desktop/0.2.1" },
       body: body.toString()
     });
     if (!response.ok) throw new Error(`Codex 登录已过期（HTTP ${String(response.status)}），请重新登录。`);
