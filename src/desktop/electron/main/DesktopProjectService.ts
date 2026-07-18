@@ -7,7 +7,7 @@ import type { AgentConfigStore } from "../../../config/store.js";
 import { listModelChoices, type ModelChoice } from "../../../llm/ModelManager.js";
 import type { AgentHostEvent, InteractiveRuntimeSnapshot } from "../../../runtime/agentEvents.js";
 import { listSessionSummaries, readStoredSessionEvents } from "../../../session/events.js";
-import { deleteSessionFile, duplicateSessionFile, ensureAgentDirs } from "../../../session/store.js";
+import { createSessionFile, deleteSessionFile, duplicateSessionFile, ensureAgentDirs } from "../../../session/store.js";
 import { gitInspectionEnvironment } from "../../../tools/git/environment.js";
 import { resolveWorkspaceDirectory, resolveWorkspacePath, toWorkspaceRelative } from "../../../workspace/resolvePath.js";
 import type {
@@ -174,6 +174,20 @@ export class DesktopProjectService {
     const targetSessionId = createSessionId();
     const dataRoot = await this.storage.ensureProjectData(project);
     await duplicateSessionFile(dataRoot, sessionId, targetSessionId);
+    await this.state.copySessionMetadata(project.id, sessionId, targetSessionId);
+    return targetSessionId;
+  }
+
+  async forkSessionAtUserMessage(project: DesktopProject, sessionId: string, userMessageIndex: number): Promise<string> {
+    const dataRoot = await this.storage.ensureProjectData(project);
+    const events = await readStoredSessionEvents(dataRoot, sessionId).then((result) => result.events);
+    const userEventIndices = events.flatMap((event, index) => event.type === "user_message" ? [index] : []);
+    const targetEventIndex = userEventIndices[userMessageIndex];
+    if (targetEventIndex === undefined) throw new Error("要编辑的消息已不在当前会话中。");
+    const targetSessionId = createSessionId();
+    const prefix = events.slice(0, targetEventIndex);
+    const content = prefix.length ? `${prefix.map((event) => JSON.stringify(event)).join("\n")}\n` : "";
+    await createSessionFile(dataRoot, targetSessionId, Buffer.from(content, "utf8"));
     await this.state.copySessionMetadata(project.id, sessionId, targetSessionId);
     return targetSessionId;
   }

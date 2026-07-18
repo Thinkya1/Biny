@@ -125,6 +125,29 @@ export async function duplicateSessionFile(workspaceRoot: string, sourceSession:
   }
 }
 
+export async function createSessionFile(workspaceRoot: string, targetSessionId: string, bytes: Uint8Array): Promise<string> {
+  const location = await resolveSessionStorage(workspaceRoot);
+  const targetName = path.basename(sessionFilePath(location.workspace.path, targetSessionId));
+  let handle: FileHandle | undefined;
+  let identity: Pick<Stats, "dev" | "ino"> | undefined;
+  let completed = false;
+  try {
+    await assertSessionStorage(location);
+    handle = await fs.open(path.join(location.sessions.path, targetName), writeNewFlags(), 0o600);
+    const stat = await assertSessionBinding(location, targetName, handle);
+    identity = { dev: stat.dev, ino: stat.ino };
+    await handle.chmod(0o600);
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await assertSessionBinding(location, targetName, handle);
+    completed = true;
+    return path.join(location.sessions.path, targetName);
+  } finally {
+    await handle?.close().catch(() => undefined);
+    if (!completed && identity) await removeBoundSessionFile(location, targetName, identity);
+  }
+}
+
 export async function deleteSessionFile(
   workspaceRoot: string,
   session: string,

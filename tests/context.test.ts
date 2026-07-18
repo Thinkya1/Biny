@@ -9,6 +9,7 @@ import { ContextMemory, estimateMessageTokens } from "../src/agent/context/Conte
 import { LocalMemory, redactSecrets } from "../src/agent/context/LocalMemory.js";
 import { WorkspaceContext } from "../src/agent/context/WorkspaceContext.js";
 import { cloneModelMessages, messageReasoning, messageText } from "../src/agent/modelMessages.js";
+import { buildSystemPrompt } from "../src/agent/prompts.js";
 import type { AgentConfig } from "../src/config/schema.js";
 import { defaultConfig } from "../src/config/schema.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
@@ -133,6 +134,7 @@ function promptToModelMessages(prompt: unknown): ModelMessage[] {
 }
 
 async function main(): Promise<void> {
+  testConversationBoundaryPrompt();
   await testInstructionHierarchyAndCap();
   await testInstructionLoadingUsesExplicitPaths();
   await testRepoMapExactCandidate();
@@ -153,6 +155,13 @@ async function main(): Promise<void> {
   await testMemoryStorageBoundaries();
   await testCredentialAndSymlinkBoundaries();
   await testToolWriteMarksSnapshotAndRepoMapDirty();
+}
+
+function testConversationBoundaryPrompt(): void {
+  const prompt = buildSystemPrompt("qa");
+  assert.match(prompt, /messages, tool calls, file reads, command results, plans, and approvals before the latest user message are inherited history/);
+  assert.match(prompt, /Only the latest user message is the active task/);
+  assert.match(prompt, /Never say "I just read\.\.\."/);
 }
 
 async function testInstructionHierarchyAndCap(): Promise<void> {

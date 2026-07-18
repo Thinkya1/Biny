@@ -10,17 +10,31 @@ import { ToolActivity } from "./ToolActivity.js";
 
 interface MessageTimelineProps {
   projectId: string;
+  sessionId?: string;
   turns: TimelineTurn[];
   onPreviewFile(path: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
   onRetry(input: string): void;
-  onEditUserMessage(input: string): void;
+  onEditUserMessage(input: string, userMessageIndex: number): Promise<void>;
   onCreateBranch(): void;
   onRollbackFiles(turn: TimelineTurn): void;
   onDeleteUserMessage(turnId: string): void;
 }
 
-export const MessageTimeline = memo(function MessageTimeline({ projectId, turns, onPreviewFile, onResolvePermission, onRetry, onEditUserMessage, onCreateBranch, onRollbackFiles, onDeleteUserMessage }: MessageTimelineProps): React.JSX.Element {
+export const MessageTimeline = memo(function MessageTimeline({ projectId, sessionId, turns, onPreviewFile, onResolvePermission, onRetry, onEditUserMessage, onCreateBranch, onRollbackFiles, onDeleteUserMessage }: MessageTimelineProps): React.JSX.Element {
+  const [editing, setEditing] = useState<{ turnId: string; value: string; userMessageIndex: number }>();
+
+  const startEditing = (turn: TimelineTurn): void => {
+    if (turn.userMessageIndex === undefined) return;
+    setEditing({ turnId: turn.id, value: turn.user, userMessageIndex: turn.userMessageIndex });
+  };
+
+  const submitEditing = async (): Promise<void> => {
+    if (!editing || !sessionId) return;
+    await onEditUserMessage(editing.value, editing.userMessageIndex);
+    setEditing(undefined);
+  };
+
   return (
     <div className="message-timeline">
       {turns.map((turn) => (
@@ -28,7 +42,11 @@ export const MessageTimeline = memo(function MessageTimeline({ projectId, turns,
           key={turn.id}
           onCreateBranch={onCreateBranch}
           onDeleteUserMessage={onDeleteUserMessage}
-          onEditUserMessage={onEditUserMessage}
+          editing={editing?.turnId === turn.id ? editing : undefined}
+          onCancelEdit={() => setEditing(undefined)}
+          onChangeEdit={(value) => setEditing((current) => current?.turnId === turn.id ? { ...current, value } : current)}
+          onEditUserMessage={() => startEditing(turn)}
+          onSubmitEdit={submitEditing}
           onPreviewFile={onPreviewFile}
           onResolvePermission={onResolvePermission}
           onRollbackFiles={onRollbackFiles}
@@ -44,20 +62,28 @@ export const MessageTimeline = memo(function MessageTimeline({ projectId, turns,
 const Turn = memo(function Turn({
   projectId,
   turn,
+  editing,
   onPreviewFile,
   onResolvePermission,
   onRetry,
+  onCancelEdit,
+  onChangeEdit,
   onEditUserMessage,
+  onSubmitEdit,
   onCreateBranch,
   onRollbackFiles,
   onDeleteUserMessage
 }: {
   projectId: string;
   turn: TimelineTurn;
+  editing?: { value: string };
   onPreviewFile(path: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
   onRetry(input: string): void;
-  onEditUserMessage(input: string): void;
+  onCancelEdit(): void;
+  onChangeEdit(value: string): void;
+  onEditUserMessage(): void;
+  onSubmitEdit(): Promise<void>;
   onCreateBranch(): void;
   onRollbackFiles(turn: TimelineTurn): void;
   onDeleteUserMessage(turnId: string): void;
@@ -75,11 +101,15 @@ const Turn = memo(function Turn({
         <UserMessage
           content={turn.user}
           hasChangedFiles={listChangedFiles(turn).length > 0}
+          editing={editing}
           onCreateBranch={onCreateBranch}
           onDelete={() => onDeleteUserMessage(turn.id)}
-          onEdit={() => onEditUserMessage(turn.user)}
+          onCancelEdit={onCancelEdit}
+          onChangeEdit={onChangeEdit}
+          onEdit={onEditUserMessage}
           onRegenerate={() => onRetry(turn.user)}
           onRollbackFiles={() => onRollbackFiles(turn)}
+          onSubmitEdit={onSubmitEdit}
         />
       ) : null}
       <div className="agent-response">
@@ -130,19 +160,27 @@ const Turn = memo(function Turn({
 function UserMessage({
   content,
   hasChangedFiles,
+  editing,
   onCreateBranch,
   onDelete,
   onEdit,
+  onCancelEdit,
+  onChangeEdit,
   onRegenerate,
-  onRollbackFiles
+  onRollbackFiles,
+  onSubmitEdit
 }: {
   content: string;
   hasChangedFiles: boolean;
+  editing?: { value: string };
   onCreateBranch(): void;
   onDelete(): void;
   onEdit(): void;
+  onCancelEdit(): void;
+  onChangeEdit(value: string): void;
   onRegenerate(): void;
   onRollbackFiles(): void;
+  onSubmitEdit(): Promise<void>;
 }): React.JSX.Element {
   const [menuOpen, setMenuOpen] = useState(false);
   const actionsRef = useRef<HTMLDivElement>(null);
@@ -163,6 +201,19 @@ function UserMessage({
     };
   }, [menuOpen]);
 
+  if (editing) {
+    return (
+      <div className="user-message is-editing">
+        <InlineUserMessageEditor
+          value={editing.value}
+          onCancel={onCancelEdit}
+          onChange={onChangeEdit}
+          onSubmit={onSubmitEdit}
+        />
+      </div>
+    );
+  }
+
   const closeMenu = (): void => setMenuOpen(false);
   return (
     <div className="user-message">
@@ -182,6 +233,62 @@ function UserMessage({
             <button className="user-message-menu-item is-danger" onClick={() => { onDelete(); closeMenu(); }} role="menuitem" type="button"><Icon name="trash" size={14} /><span>删除消息</span></button>
           </div>
         ) : null}
+      </div>
+    </div>
+  );
+}
+
+function InlineUserMessageEditor({ value, onCancel, onChange, onSubmit }: {
+  value: string;
+  onCancel(): void;
+  onChange(value: string): void;
+  onSubmit(): Promise<void>;
+}): React.JSX.Element {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const composingRef = useRef(false);
+  const initialValueRef = useRef(value);
+
+  useEffect(() => {
+    textareaRef.current?.focus();
+    textareaRef.current?.setSelectionRange(initialValueRef.current.length, initialValueRef.current.length);
+  }, []);
+
+  const submit = async (): Promise<void> => {
+    if (busy || !value.trim()) return;
+    setBusy(true);
+    setError(undefined);
+    try {
+      await onSubmit();
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : String(submitError));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="user-message-editor">
+      <textarea
+        aria-label="编辑用户消息"
+        disabled={busy}
+        onChange={(event) => onChange(event.target.value)}
+        onCompositionEnd={() => { composingRef.current = false; }}
+        onCompositionStart={() => { composingRef.current = true; }}
+        onKeyDown={(event) => {
+          if (event.key !== "Enter" || event.shiftKey || composingRef.current || event.nativeEvent.isComposing) return;
+          event.preventDefault();
+          void submit();
+        }}
+        ref={textareaRef}
+        rows={1}
+        value={value}
+      />
+      {error ? <div className="user-message-editor-error"><Icon name="warning" size={12} /><span>{error}</span></div> : null}
+      <div className="user-message-editor-actions">
+        <button disabled={busy} onClick={onCancel} type="button">取消</button>
+        <button className="is-primary" disabled={busy || !value.trim()} onClick={() => void submit()} type="button">{busy ? "发送中…" : "发送"}</button>
       </div>
     </div>
   );

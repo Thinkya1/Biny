@@ -27,6 +27,7 @@ interface IpcContext {
 
 const idSchema = z.string().min(1).max(240);
 const promptSchema = z.string().min(1).max(1_000_000);
+const userMessageIndexSchema = z.number().int().nonnegative();
 const titleSchema = z.string().trim().min(1).max(120);
 const permissionModeSchema = z.enum(["ask", "read-only", "auto", "full-access"]);
 const thinkingSchema = z.enum(["off", "high", "max"]);
@@ -188,6 +189,17 @@ export function registerDesktopIpc(context: IpcContext): void {
     return await context.agents.sendPrompt(
       idSchema.parse(projectId),
       sessionId === undefined ? undefined : idSchema.parse(sessionId),
+      promptSchema.parse(input),
+      runModeSchema.parse(mode),
+      z.array(attachmentSchema).max(20).parse(attachments)
+    );
+  });
+
+  handle(desktopIpc.editPrompt, async (_event, projectId: unknown, sessionId: unknown, userMessageIndex: unknown, input: unknown, mode: unknown, attachments: unknown) => {
+    return await context.agents.editPrompt(
+      idSchema.parse(projectId),
+      idSchema.parse(sessionId),
+      userMessageIndexSchema.parse(userMessageIndex),
       promptSchema.parse(input),
       runModeSchema.parse(mode),
       z.array(attachmentSchema).max(20).parse(attachments)

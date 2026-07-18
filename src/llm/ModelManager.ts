@@ -5,6 +5,7 @@ import {
   type ReasoningEffort
 } from "../config/schema.js";
 import { createModelSettings, resolveModelConfig, type ModelSettings } from "./factory.js";
+import { providerProfile } from "./profiles.js";
 import type { LanguageModel } from "ai";
 
 export type ThinkingSelection = "off" | ReasoningEffort;
@@ -110,6 +111,22 @@ export function listModelChoices(config: AgentConfig): ModelChoice[] {
       defaultThinking: model.thinking?.defaultEffort ?? "off"
     }];
   });
+}
+
+export function listConfiguredModelChoices(config: AgentConfig): ModelChoice[] {
+  return listModelChoices(config).filter((model) => hasUsableModelConfiguration(config, model.alias));
+}
+
+export function hasUsableModelConfiguration(config: AgentConfig, alias = config.defaultModel): boolean {
+  const model = config.models[alias];
+  const provider = model ? config.providers[model.provider] : undefined;
+  if (!provider) return false;
+  const profile = providerProfile(provider.type);
+  const endpoint = provider.baseUrl ?? profile.baseUrl;
+  if (!endpoint) return false;
+  if (!profile.requiresApiKey) return true;
+  const envName = provider.apiKeyEnv ?? profile.apiKeyEnv;
+  return Boolean(provider.apiKey || (envName && process.env[envName]));
 }
 
 export function modelRuntimeInfo(config: AgentConfig): ModelRuntimeInfo {

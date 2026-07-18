@@ -51,7 +51,9 @@ interface SettingsOverlayProps {
   open: boolean;
   version: string;
   workspace?: DesktopWorkspaceSnapshot;
+  modelSetupRequired: boolean;
   onClose(): void;
+  onSkipModelSetup(): void;
   onPermissionMode(mode: PermissionMode): Promise<void>;
   onSwitchModel(alias: string, thinking: ThinkingSelection): Promise<void>;
   onSaveModelConfiguration(configuration: DesktopModelConfigurationInput): Promise<void>;
@@ -107,7 +109,9 @@ export function SettingsOverlay({
   open,
   version,
   workspace,
+  modelSetupRequired,
   onClose,
+  onSkipModelSetup,
   onPermissionMode,
   onSwitchModel,
   onSaveModelConfiguration,
@@ -130,6 +134,9 @@ export function SettingsOverlay({
     const timer = window.setTimeout(() => setMessage(undefined), 1_000);
     return () => window.clearTimeout(timer);
   }, [message]);
+  useEffect(() => {
+    if (modelSetupRequired) setTab("模型");
+  }, [modelSetupRequired]);
   if (!presence.present) return null;
   const runtime = workspace?.runtime;
   const execute = async (operation: () => Promise<void>, success: string): Promise<void> => {
@@ -141,17 +148,28 @@ export function SettingsOverlay({
       setMessage(error instanceof Error ? error.message : String(error));
     }
   };
+  const dismiss = modelSetupRequired ? () => undefined : onClose;
   return (
-    <ModalBackdrop onClose={onClose} variant="settings">
+    <ModalBackdrop onClose={dismiss} variant="settings">
       <section aria-label="Biny 设置" className={`t-modal settings-modal is-full-page ${presenceClass(presence.phase)}`} role="dialog">
         <aside className="settings-tabs">
-          <button aria-label="返回应用" className="settings-back-button" onClick={onClose} type="button">
-            <Icon name="arrow-left" size={16} />
-            <span>返回应用</span>
-          </button>
-          {settingsNav.map((item, index) => (
+          {modelSetupRequired ? (
+            <div className="settings-setup-notice">
+              <strong>先配置模型</strong>
+              <span>连接一个可用模型后才能开始任务。</span>
+              <button className="settings-setup-skip" onClick={onSkipModelSetup} type="button">
+                先看看，稍后配置
+              </button>
+            </div>
+          ) : (
+            <button aria-label="返回应用" className="settings-back-button" onClick={onClose} type="button">
+              <Icon name="arrow-left" size={16} />
+              <span>返回应用</span>
+            </button>
+          )}
+          {settingsNav.filter((item) => !modelSetupRequired || item.tab === "模型").map((item, index, visibleSettingsNav) => (
             <div key={item.tab}>
-              {item.group && (index === 0 || settingsNav[index - 1]?.group !== item.group) ? <div className="settings-nav-group">{item.group}</div> : null}
+              {item.group && (index === 0 || visibleSettingsNav[index - 1]?.group !== item.group) ? <div className="settings-nav-group">{item.group}</div> : null}
               <button aria-current={tab === item.tab ? "page" : undefined} className={tab === item.tab ? "is-selected" : ""} onClick={() => setTab(item.tab)} type="button">
                 <Icon name={item.icon} size={14} />
                 <span>{item.label}</span>
@@ -163,8 +181,8 @@ export function SettingsOverlay({
         <main className="settings-content">
           <header>
             <div className="settings-heading">
-              <h2>{tab}</h2>
-              <p>{settingsSubtitles[tab]}</p>
+              <h2>{modelSetupRequired ? "配置模型" : tab}</h2>
+              <p>{modelSetupRequired ? "开始使用前，请先连接一个可用模型。" : settingsSubtitles[tab]}</p>
             </div>
           </header>
           {tab === "通用" ? <SettingsGeneral workspace={workspace} /> : null}

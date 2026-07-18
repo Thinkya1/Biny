@@ -158,6 +158,17 @@ export class InteractiveAgentRuntime {
     for (const queued of [...this.queue]) this.cancelRun(queued.runId);
   }
 
+  async waitForIdle(): Promise<void> {
+    while (this.activeRun || this.queue.length || this.activeOperation) {
+      const completion = this.drainPromise ?? this.activeOperationCompletion;
+      if (completion) {
+        await completion;
+      } else {
+        await new Promise<void>((resolve) => queueMicrotask(resolve));
+      }
+    }
+  }
+
   cancelRun(runId: string): boolean {
     const active = this.activeRun;
     if (active?.runId === runId && this.abortController) {

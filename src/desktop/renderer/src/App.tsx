@@ -3,6 +3,7 @@ import type { AgentRunMode } from "../../../agent/AgentSession.js";
 import type { ModelRuntimeInfo, ThinkingSelection } from "../../../llm/ModelManager.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
 import type { AgentHostEvent } from "../../../runtime/agentEvents.js";
+import type { SessionEvent } from "../../../session/recorder.js";
 import type {
   DesktopAgentEventEnvelope,
   DesktopAttachment,
@@ -33,6 +34,8 @@ import { RenameOverlay, SearchOverlay, SettingsOverlay, Toast } from "./componen
 import { Sidebar } from "./components/Sidebar.js";
 import { Workspace } from "./components/Workspace.js";
 
+const desktopApiVersionMismatchMessage = "桌面端资源版本不一致，请完全退出 Biny 后重新启动。";
+
 interface RenameTarget {
   kind: "project" | "session";
   projectId: string;
@@ -53,7 +56,6 @@ export function App(): React.JSX.Element {
   const [filePanelWidth, setFilePanelWidth] = useState(DEFAULT_FILE_PANEL_WIDTH);
   const [filePanelResizing, setFilePanelResizing] = useState(false);
   const [focusToken, setFocusToken] = useState(0);
-  const [composerDraft, setComposerDraft] = useState<{ value: string; token: number }>();
   const [deletedUserMessages, setDeletedUserMessages] = useState<Set<string>>(() => new Set());
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -69,12 +71,23 @@ export function App(): React.JSX.Element {
   const eventFrameRef = useRef<number | undefined>(undefined);
   const refreshTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const menuActionRef = useRef<(action: DesktopMenuAction) => void>(() => undefined);
-  const draftTokenRef = useRef(0);
+  const modelSetupWasRequiredRef = useRef(false);
 
   useEffect(() => {
     selectedRef.current = selectedSessionId;
     projectRef.current = workspace?.project.id;
   }, [selectedSessionId, workspace?.project.id]);
+
+  useEffect(() => {
+    const required = Boolean(workspace?.requiresModelConfiguration);
+    if (required) {
+      modelSetupWasRequiredRef.current = true;
+      setSettingsOpen(true);
+    } else if (modelSetupWasRequiredRef.current) {
+      modelSetupWasRequiredRef.current = false;
+      setSettingsOpen(false);
+    }
+  }, [workspace?.requiresModelConfiguration]);
 
   const commitNavigation = useCallback((next: DesktopNavigationState): void => {
     navigationRef.current = next;
@@ -339,11 +352,46 @@ export function App(): React.JSX.Element {
     if (receipt.queued) setToast("补充要求已排入当前会话");
   }, [commitNavigation, document, workspace?.sessions]);
 
-  const editUserMessage = useCallback((input: string): void => {
-    draftTokenRef.current += 1;
-    setComposerDraft({ value: input, token: draftTokenRef.current });
-    setFocusToken((value) => value + 1);
-  }, []);
+  const editPrompt = useCallback(async (
+    input: string,
+    mode: AgentRunMode,
+    attachments: DesktopAttachment[],
+    sessionId: string,
+    userMessageIndex: number
+  ): Promise<void> => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    if (selectedRef.current !== sessionId) throw new Error("请回到原消息所在的会话后再提交编辑。");
+    const previousNavigation = navigationRef.current;
+    const previousDocument = document;
+    const edit = window.biny.editPrompt;
+    if (typeof edit !== "function") throw new Error(desktopApiVersionMismatchMessage);
+    const receipt = await edit(projectId, sessionId, userMessageIndex, input, mode, attachments);
+    setSelectedSessionId(receipt.sessionId);
+    if (receipt.sessionId !== sessionId) {
+      const target: DesktopNavigationTarget = { projectId, sessionId: receipt.sessionId };
+      const currentTarget = previousNavigation.entries[previousNavigation.index];
+      commitNavigation(currentTarget?.projectId === projectId && currentTarget.sessionId === undefined
+        ? replaceNavigation(previousNavigation, target)
+        : pushNavigation(previousNavigation, target));
+    }
+    const sourceSummary = workspace?.sessions.find((session) => session.id === sessionId) ?? previousDocument?.session;
+    const summary = sourceSummary
+      ? { ...sourceSummary, id: receipt.sessionId, fileName: `${receipt.sessionId}.jsonl`, status: "running" as const, updatedAt: new Date().toISOString() }
+      : syntheticSession(projectId, receipt.sessionId, input);
+    const prefixEvents = previousDocument?.session.id === sessionId
+      ? eventsBeforeUserMessage(previousDocument.events, userMessageIndex)
+      : [];
+    setDocument({ session: summary, events: prefixEvents, liveEvents: [] });
+  }, [commitNavigation, document, workspace?.sessions]);
+
+  const editUserMessage = useCallback(async (input: string, userMessageIndex: number): Promise<void> => {
+    const sessionId = selectedRef.current;
+    if (!sessionId) {
+      throw new Error("当前消息还没有可编辑的会话。");
+    }
+    await editPrompt(input, "chat", [], sessionId, userMessageIndex);
+  }, [editPrompt]);
 
   const deleteUserMessage = useCallback((turnId: string): void => {
     const scope = `${projectRef.current ?? "none"}:${selectedRef.current ?? "draft"}`;
@@ -434,19 +482,29 @@ export function App(): React.JSX.Element {
   const startModelLogin = useCallback(async (provider: DesktopModelLoginProvider) => {
     const projectId = projectRef.current;
     if (!projectId) throw new Error("请先打开一个项目。");
-    return await window.biny.startModelLogin(projectId, provider);
+    const startLogin = window.biny.startModelLogin;
+    if (typeof startLogin !== "function") {
+      throw new Error(desktopApiVersionMismatchMessage);
+    }
+    return await startLogin(projectId, provider);
   }, []);
 
   const completeModelLogin = useCallback(async (provider: DesktopModelLoginProvider, authRequestId: string, pastedAuthorization?: string): Promise<void> => {
     const projectId = projectRef.current;
     if (!projectId) throw new Error("请先打开一个项目。");
-    mergeWorkspaceProject(await window.biny.completeModelLogin(projectId, provider, authRequestId, pastedAuthorization));
+    const completeLogin = window.biny.completeModelLogin;
+    if (typeof completeLogin !== "function") {
+      throw new Error(desktopApiVersionMismatchMessage);
+    }
+    mergeWorkspaceProject(await completeLogin(projectId, provider, authRequestId, pastedAuthorization));
   }, [mergeWorkspaceProject]);
 
   const cancelModelLogin = useCallback(async (provider: DesktopModelLoginProvider, authRequestId: string): Promise<void> => {
     const projectId = projectRef.current;
     if (!projectId) return;
-    await window.biny.cancelModelLogin(projectId, provider, authRequestId);
+    const cancelLogin = window.biny.cancelModelLogin;
+    if (typeof cancelLogin !== "function") return;
+    await cancelLogin(projectId, provider, authRequestId);
   }, []);
 
   const setPermissionMode = useCallback(async (mode: PermissionMode): Promise<void> => {
@@ -499,8 +557,8 @@ export function App(): React.JSX.Element {
   const composer = (
     <Composer
       activeElsewhere={activeElsewhere}
-      draftRequest={composerDraft}
       focusToken={focusToken}
+      modelSetupRequired={Boolean(workspace?.requiresModelConfiguration)}
       models={workspace?.models ?? []}
       onOpenProject={() => void openProject()}
       onPermissionMode={setPermissionMode}
@@ -601,7 +659,9 @@ export function App(): React.JSX.Element {
         sessions={workspace?.sessions ?? []}
       />
       <SettingsOverlay
+        modelSetupRequired={Boolean(workspace?.requiresModelConfiguration)}
         onClose={() => setSettingsOpen(false)}
+        onSkipModelSetup={() => setSettingsOpen(false)}
         onCompact={async () => { const projectId = projectRef.current; if (projectId) await window.biny.compact(projectId); }}
         onOpenExternal={async (url) => await window.biny.openExternal(url)}
         onOpenTerminal={async () => { const projectId = projectRef.current; if (projectId) await window.biny.openProjectTerminal(projectId); }}
@@ -745,6 +805,16 @@ function mergeProject(projects: DesktopProject[], next: DesktopProject): Desktop
 
 function titleFromInput(input: string): string {
   return input.replace(/\s+/g, " ").trim().slice(0, 64) || "新任务";
+}
+
+function eventsBeforeUserMessage(events: SessionEvent[], userMessageIndex: number): SessionEvent[] {
+  let seen = 0;
+  for (const [index, event] of events.entries()) {
+    if (event.type !== "user_message") continue;
+    if (seen === userMessageIndex) return events.slice(0, index);
+    seen += 1;
+  }
+  return events;
 }
 
 function errorMessage(error: unknown): string {

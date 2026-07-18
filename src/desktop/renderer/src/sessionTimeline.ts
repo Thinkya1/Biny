@@ -77,6 +77,7 @@ function executionToolLabel(tool: string): string {
 export interface TimelineTurn {
   id: string;
   user: string;
+  userMessageIndex?: number;
   assistant: string;
   reasoning: string;
   reasoningStatus?: string;
@@ -100,17 +101,24 @@ export interface TimelineChangedFile {
 
 export function buildSessionTimeline(events: SessionEvent[], liveEvents: AgentHostEvent[]): TimelineTurn[] {
   const history = historicalPrefix(events, liveEvents);
-  return [...buildHistoricalTurns(history), ...buildLiveTurns(liveEvents)].filter((turn) => turn.user || turn.assistant || turn.tools.length || turn.error);
+  const historicalTurns = buildHistoricalTurns(history);
+  const historicalUserMessages = history.filter((event) => event.type === "user_message").length;
+  return [...historicalTurns, ...buildLiveTurns(liveEvents, historicalUserMessages)].filter((turn) => turn.user || turn.assistant || turn.tools.length || turn.error);
 }
 
 function historicalPrefix(events: SessionEvent[], liveEvents: AgentHostEvent[]): SessionEvent[] {
   const firstLiveUser = liveEvents.find((event) => event.type === "message.user");
   if (!firstLiveUser || firstLiveUser.type !== "message.user") return events;
+  const liveTimestamp = Date.parse(firstLiveUser.timestamp);
+  if (Number.isNaN(liveTimestamp)) return events;
   let matchingIndex = -1;
   for (let index = 0; index < events.length; index += 1) {
     const event = events[index];
     if (event?.type !== "user_message" || event.content !== firstLiveUser.content) continue;
-    if (!event.time || Date.parse(event.time) <= Date.parse(firstLiveUser.timestamp) + 5_000) matchingIndex = index;
+    const eventTimestamp = event.time ? Date.parse(event.time) : Number.NaN;
+    // The live event is emitted before AgentSession records the user message. An
+    // older identical prompt must therefore stay in the historical prefix.
+    if (!Number.isNaN(eventTimestamp) && eventTimestamp >= liveTimestamp) matchingIndex = index;
   }
   return matchingIndex >= 0 ? events.slice(0, matchingIndex) : events;
 }
@@ -119,6 +127,7 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
   const turns: TimelineTurn[] = [];
   let current: TimelineTurn | undefined;
   let anonymousIndex = 0;
+  let userMessageIndex = 0;
   const ensureTurn = (timestamp?: string): TimelineTurn => {
     if (current) return current;
     anonymousIndex += 1;
@@ -132,13 +141,15 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
       anonymousIndex += 1;
       current = emptyTurn(`history-${String(anonymousIndex)}`, event.time);
       current.user = event.content;
+      current.userMessageIndex = userMessageIndex;
+      userMessageIndex += 1;
       current.skills = skillNames(event.skills);
       turns.push(current);
       continue;
     }
     if (event.type === "assistant_message") {
       const turn = ensureTurn(event.time);
-      turn.assistant = event.content;
+      turn.assistant = event.content || turn.assistant;
       turn.reasoning = appendReasoning(turn.reasoning, event.reasoningContent);
       turn.durationMs = elapsedMs(turn.timestamp, event.time) ?? turn.durationMs;
       turn.timestamp = event.time ?? turn.timestamp;
@@ -196,10 +207,11 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
   return turns;
 }
 
-function buildLiveTurns(events: AgentHostEvent[]): TimelineTurn[] {
+function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: number): TimelineTurn[] {
   const turns = new Map<string, TimelineTurn>();
   const order: string[] = [];
   const toolMaps = new Map<string, Map<string, TimelineTool>>();
+  let userMessageIndex = initialUserMessageIndex;
   const turnFor = (event: AgentHostEvent): TimelineTurn => {
     const current = turns.get(event.runId);
     if (current) return current;
@@ -232,6 +244,8 @@ function buildLiveTurns(events: AgentHostEvent[]): TimelineTurn[] {
     const turn = turnFor(event);
     if (event.type === "message.user") {
       turn.user = event.content;
+      turn.userMessageIndex = userMessageIndex;
+      userMessageIndex += 1;
       turn.status = "queued";
     } else if (event.type === "run.started") {
       turn.status = "running";

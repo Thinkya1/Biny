@@ -35,7 +35,7 @@ import { workspaceFileMarker } from "../src/desktop/renderer/src/workspaceFileMa
 import { listModelChoices, ModelManager } from "../src/llm/ModelManager.js";
 import type { SessionEvent } from "../src/session/recorder.js";
 import { SessionRecorder } from "../src/session/recorder.js";
-import { listSessionSummaries } from "../src/session/events.js";
+import { listSessionSummaries, readStoredSessionEvents } from "../src/session/events.js";
 import { ensureAgentDirs, resolveSessionFile, sessionFilePath } from "../src/session/store.js";
 
 const execFileAsync = promisify(execFile);
@@ -47,6 +47,7 @@ await testInteractiveRuntimeStrongConfirmation();
 await testPermissionRequiredToolResultIsFailed();
 await testInteractiveRuntimeAbort();
 await testDraftSessionsDoNotReachTheSessionList();
+await testDesktopMessageEditFork();
 await testWorkspaceFilePreview();
 await testWorkspaceDirectoryListing();
 await testDesktopGitInspectionDisablesHelpers();
@@ -55,12 +56,15 @@ testWorkspaceFileMarkers();
 await testFilePanelSizing();
 await testDesktopModelConfiguration();
 await testDesktopCredentialsAreSeparated();
+await testDesktopRequiresModelConfiguration();
 await testLegacyDesktopDataMigration();
 testModelChoicesDeduplicateEquivalentAliases();
 testHistoricalAbortProjection();
 testHistoricalUsageProjection();
 testHistoricalToolProjection();
 testHistoricalReasoningAndSkillProjection();
+testHistoricalPrefixKeepsUnpersistedDuplicatePrompt();
+testHistoricalEmptyAssistantDoesNotEraseReply();
 testChangedFileProjection();
 testLiveTimelineProjection();
 testLiveReasoningAndSkillProjection();
@@ -257,6 +261,31 @@ async function testDraftSessionsDoNotReachTheSessionList(): Promise<void> {
     assert.deepEqual((await listSessionSummaries(workspaceRoot)).map((session) => session.fileName), ["draft.jsonl"]);
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testDesktopMessageEditFork(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-edit-fork-workspace-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-edit-fork-data-"));
+  try {
+    const { projects } = await createDesktopTestServices(desktopRoot);
+    const project = await projects.createProject(workspaceRoot);
+    const dataRoot = await projects.dataRoot(project);
+    await ensureAgentDirs(dataRoot);
+    const source = new SessionRecorder(dataRoot, "source-session");
+    source.record({ type: "user_message", content: "第一条" });
+    source.record({ type: "assistant_message", content: "第一条回复" });
+    source.record({ type: "user_message", content: "旧的第二条" });
+    source.record({ type: "assistant_message", content: "旧的第二条回复" });
+    await source.close();
+
+    const forkedSessionId = await projects.forkSessionAtUserMessage(project, "source-session", 1);
+    const forked = await readStoredSessionEvents(dataRoot, forkedSessionId);
+    assert.deepEqual(forked.events.map((event) => event.type), ["user_message", "assistant_message"]);
+    assert.equal(forked.events[0]?.type === "user_message" ? forked.events[0].content : undefined, "第一条");
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
   }
 }
 
@@ -467,6 +496,35 @@ async function testDesktopCredentialsAreSeparated(): Promise<void> {
   }
 }
 
+async function testDesktopRequiresModelConfiguration(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-model-setup-workspace-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-model-setup-data-"));
+  try {
+    const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
+    const project = await projects.createProject(workspaceRoot);
+    const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
+    const unconfigured = structuredClone(defaultConfig);
+    unconfigured.defaultModel = "setup-model";
+    unconfigured.providers = { setup: { type: "openai-compatible", baseUrl: "https://example.com/v1" } };
+    unconfigured.models = { "setup-model": { provider: "setup", model: "setup-model", supportsTools: true } };
+    unconfigured.thinking = { enabled: false, effort: "high" };
+    await configStore.save(unconfigured);
+    const initial = await agents.workspaceSnapshot(project.id);
+    assert.equal(initial.requiresModelConfiguration, true);
+    assert.equal(initial.models.length, 0);
+
+    const configured = structuredClone(unconfigured);
+    configured.providers.setup!.apiKey = "desktop-test-key";
+    await configStore.save(configured);
+    const ready = await agents.workspaceSnapshot(project.id);
+    assert.equal(ready.requiresModelConfiguration, false);
+    assert.equal(ready.models[0]?.alias, configured.defaultModel);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
+  }
+}
+
 async function testLegacyDesktopDataMigration(): Promise<void> {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "biny-legacy-project-"));
   const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-data-"));
@@ -494,8 +552,41 @@ async function testLegacyDesktopDataMigration(): Promise<void> {
       encrypt: (value) => value,
       decrypt: (value) => value
     });
+    const stateProject: DesktopProject = { ...project, id: "state-project", name: "State Project" };
+    const legacyStatePath = path.join(desktopRoot, "legacy-desktop-state.json");
+    const destinationStatePath = path.join(desktopRoot, "desktop-state.json");
+    await writeFile(legacyStatePath, JSON.stringify({
+      version: 1,
+      projects: [project],
+      activeProjectId: project.id,
+      selectedSessionIds: { [project.id]: "legacy-session" },
+      sessionMetadata: { [`${project.id}:legacy-session`]: { title: "Legacy title" } }
+    }));
+    await writeFile(destinationStatePath, JSON.stringify({
+      version: 1,
+      projects: [stateProject],
+      activeProjectId: stateProject.id,
+      selectedSessionIds: { [stateProject.id]: "state-session" },
+      sessionMetadata: { [`${stateProject.id}:state-session`]: { pinned: true } }
+    }));
+    await storage.migrateLegacyState(legacyStatePath, destinationStatePath);
+    const migratedState = JSON.parse(await readFile(destinationStatePath, "utf8")) as {
+      projects: DesktopProject[];
+      activeProjectId?: string;
+      selectedSessionIds: Record<string, string>;
+      sessionMetadata: Record<string, { title?: string; pinned?: boolean }>;
+    };
+    assert.deepEqual(migratedState.projects.map((candidate) => candidate.id).sort(), [project.id, stateProject.id].sort());
+    assert.equal(migratedState.activeProjectId, stateProject.id);
+    assert.equal(migratedState.selectedSessionIds[project.id], "legacy-session");
+    assert.equal(migratedState.selectedSessionIds[stateProject.id], "state-session");
+    assert.equal(migratedState.sessionMetadata[`${project.id}:legacy-session`]?.title, "Legacy title");
+    assert.equal(migratedState.sessionMetadata[`${stateProject.id}:state-session`]?.pinned, true);
+
     await storage.migrateLegacyConfig([project], configStore);
-    const projectDataRoot = await storage.ensureProjectData(project);
+    const projectDataRoot = storage.projectRoot(project);
+    await mkdir(path.join(projectDataRoot, ".agent"), { recursive: true });
+    await storage.ensureProjectData(project);
 
     assert.equal((await configStore.load()).defaultModel, "deepseek-v4-pro");
     assert.equal(await readFile(sessionFilePath(projectDataRoot, "legacy-session"), "utf8"), await readFile(sessionFilePath(projectRoot, "legacy-session"), "utf8"));
@@ -577,6 +668,27 @@ function testHistoricalReasoningAndSkillProjection(): void {
   assert.deepEqual(timeline[0]?.skills, ["programmatic-tools"]);
   assert.equal(timeline[0]?.reasoning, "先确认当前工作目录。\n\n然后整理结果。");
   assert.equal(timeline[0]?.durationMs, 2_512);
+}
+
+function testHistoricalPrefixKeepsUnpersistedDuplicatePrompt(): void {
+  const liveTimestamp = "2026-01-01T00:00:10.000Z";
+  const timeline = buildSessionTimeline([
+    { type: "user_message", content: "同一个问题", time: "2026-01-01T00:00:00.000Z" },
+    { type: "assistant_message", content: "历史回复", time: "2026-01-01T00:00:01.000Z" }
+  ], [
+    { sessionId: "session", runId: "run", timestamp: liveTimestamp, type: "message.user", messageId: "message", content: "同一个问题" }
+  ]);
+  assert.deepEqual(timeline.map((turn) => turn.user), ["同一个问题", "同一个问题"]);
+  assert.equal(timeline[0]?.assistant, "历史回复");
+}
+
+function testHistoricalEmptyAssistantDoesNotEraseReply(): void {
+  const timeline = buildSessionTimeline([
+    { type: "user_message", content: "完成任务" },
+    { type: "assistant_message", content: "任务已完成" },
+    { type: "assistant_message", content: "", relatedUsage: [] }
+  ], []);
+  assert.equal(timeline[0]?.assistant, "任务已完成");
 }
 
 function testChangedFileProjection(): void {

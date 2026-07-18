@@ -21,6 +21,7 @@ const api: DesktopApi = {
   deleteSession: async (projectId, sessionId) => await ipcRenderer.invoke(desktopIpc.deleteSession, projectId, sessionId),
   showSessionMenu: async (projectId, sessionId, pinned) => await ipcRenderer.invoke(desktopIpc.sessionMenu, projectId, sessionId, pinned),
   sendPrompt: async (projectId, sessionId, input, mode, attachments) => await ipcRenderer.invoke(desktopIpc.sendPrompt, projectId, sessionId, input, mode, attachments),
+  editPrompt: async (projectId, sessionId, userMessageIndex, input, mode, attachments) => await ipcRenderer.invoke(desktopIpc.editPrompt, projectId, sessionId, userMessageIndex, input, mode, attachments),
   cancelRun: async (projectId) => await ipcRenderer.invoke(desktopIpc.cancelRun, projectId),
   resolvePermission: async (projectId, requestId, result) => await ipcRenderer.invoke(desktopIpc.resolvePermission, projectId, requestId, result),
   setPermissionMode: async (projectId, mode) => await ipcRenderer.invoke(desktopIpc.setPermissionMode, projectId, mode),

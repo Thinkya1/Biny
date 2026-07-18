@@ -24,6 +24,7 @@ export const desktopIpc = {
   deleteSession: "desktop:session:delete",
   sessionMenu: "desktop:session:menu",
   sendPrompt: "desktop:agent:send",
+  editPrompt: "desktop:agent:edit",
   cancelRun: "desktop:agent:cancel",
   resolvePermission: "desktop:permission:resolve",
   setPermissionMode: "desktop:permission:mode",
@@ -87,6 +88,7 @@ export interface DesktopWorkspaceSnapshot {
   selectedSessionId?: string;
   runtime?: InteractiveRuntimeSnapshot;
   runtimeError?: string;
+  requiresModelConfiguration: boolean;
   models: ModelChoice[];
 }
 
@@ -189,6 +191,7 @@ export interface DesktopApi {
   deleteSession(projectId: string, sessionId: string): Promise<DesktopWorkspaceSnapshot>;
   showSessionMenu(projectId: string, sessionId: string, pinned: boolean): Promise<DesktopSessionMenuAction | undefined>;
   sendPrompt(projectId: string, sessionId: string | undefined, input: string, mode: AgentRunMode, attachments: DesktopAttachment[]): Promise<DesktopRunReceipt>;
+  editPrompt(projectId: string, sessionId: string, userMessageIndex: number, input: string, mode: AgentRunMode, attachments: DesktopAttachment[]): Promise<DesktopRunReceipt>;
   cancelRun(projectId: string): Promise<void>;
   resolvePermission(projectId: string, requestId: string, result: PermissionResult): Promise<void>;
   setPermissionMode(projectId: string, mode: PermissionMode): Promise<DesktopWorkspaceSnapshot>;

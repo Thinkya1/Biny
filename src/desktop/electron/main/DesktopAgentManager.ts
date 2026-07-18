@@ -4,7 +4,7 @@ import { generateText } from "ai";
 import { configSchema, type AgentConfig } from "../../../config/schema.js";
 import type { AgentConfigStore } from "../../../config/store.js";
 import { createModelSettings } from "../../../llm/factory.js";
-import type { ModelRuntimeInfo, ThinkingSelection } from "../../../llm/ModelManager.js";
+import { hasUsableModelConfiguration, listConfiguredModelChoices, type ModelRuntimeInfo, type ThinkingSelection } from "../../../llm/ModelManager.js";
 import { providerProfile } from "../../../llm/profiles.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
 import { createInteractiveAgentRuntime, type InteractiveAgentRuntime } from "../../../runtime/InteractiveAgentRuntime.js";
@@ -53,16 +53,18 @@ export class DesktopAgentManager {
     const project = await this.projects.inspectProject(storedProject);
     await this.state.upsertProject({ ...project, lastOpenedAt: new Date().toISOString() });
     const runtime = this.runtimes.get(projectId)?.runtime;
-    const [models, sessions] = await Promise.all([
-      this.projects.listModels(project).catch(() => []),
+    const [config, sessions] = await Promise.all([
+      this.configStore.load().catch(() => undefined),
       this.projects.listSessions(project, runtime?.getSnapshot(), this.projectEvents(projectId))
     ]);
+    const models = config ? listConfiguredModelChoices(config) : [];
     return {
       project,
       sessions,
       selectedSessionId: this.state.selectedSessionId(projectId),
       runtime: runtime?.getSnapshot(),
       runtimeError: this.runtimeErrors.get(projectId),
+      requiresModelConfiguration: !config || !hasUsableModelConfiguration(config),
       models
     };
   }
@@ -106,6 +108,7 @@ export class DesktopAgentManager {
     mode: AgentRunMode,
     attachments: DesktopAttachment[]
   ): Promise<DesktopRunReceipt> {
+    await this.requireConfiguredModel();
     await this.refreshOAuthCredentials(projectId);
     const runtime = await this.ensureRuntime(projectId);
     const snapshot = runtime.getSnapshot();
@@ -121,6 +124,48 @@ export class DesktopAgentManager {
     const prompt = withAttachmentReferences(input, attachments);
     const submitted = runtime.submitPrompt(prompt, mode);
     await this.state.setSelectedSession(projectId, info.sessionId);
+    void submitted.completion.catch(() => undefined);
+    return {
+      sessionId: info.sessionId,
+      runId: submitted.runId,
+      messageId: submitted.messageId,
+      queued: submitted.queued
+    };
+  }
+
+  async editPrompt(
+    projectId: string,
+    sessionId: string,
+    userMessageIndex: number,
+    input: string,
+    mode: AgentRunMode,
+    attachments: DesktopAttachment[]
+  ): Promise<DesktopRunReceipt> {
+    await this.requireConfiguredModel();
+    await this.refreshOAuthCredentials(projectId);
+    const runtime = await this.ensureRuntime(projectId);
+    if (runtime.getInfo().sessionId !== sessionId) {
+      const snapshot = runtime.getSnapshot();
+      if (snapshot.activeRun || snapshot.queuedRuns.length) {
+        throw new Error("当前项目仍有其他会话正在运行，请先停止后再编辑消息。");
+      }
+      await runtime.resumeSession(sessionId);
+    }
+    const snapshot = runtime.getSnapshot();
+    if (snapshot.activeRun || snapshot.queuedRuns.length) {
+      runtime.cancelCurrentRun();
+      await runtime.waitForIdle();
+    }
+    await this.disposeRuntime(projectId);
+    const project = this.projects.requireProject(projectId);
+    const targetSessionId = await this.projects.forkSessionAtUserMessage(project, sessionId, userMessageIndex);
+    await this.state.setSelectedSession(projectId, targetSessionId);
+    this.runtimeErrors.delete(projectId);
+
+    const nextRuntime = await this.ensureRuntime(projectId);
+    const info = nextRuntime.getInfo();
+    const prompt = withAttachmentReferences(input, attachments);
+    const submitted = nextRuntime.submitPrompt(prompt, mode);
     void submitted.completion.catch(() => undefined);
     return {
       sessionId: info.sessionId,
@@ -368,6 +413,14 @@ export class DesktopAgentManager {
     await Promise.all(managedRuntimes.map(async ({ runtime }) => await runtime.close()));
   }
 
+  private async disposeRuntime(projectId: string): Promise<void> {
+    const managed = this.runtimes.get(projectId);
+    if (!managed) return;
+    managed.unsubscribe();
+    await managed.runtime.close();
+    this.runtimes.delete(projectId);
+  }
+
   private async ensureRuntime(projectId: string): Promise<InteractiveAgentRuntime> {
     if (this.closing) throw new Error("Desktop runtime is shutting down.");
     const current = this.runtimes.get(projectId)?.runtime;
@@ -418,6 +471,13 @@ export class DesktopAgentManager {
     });
     this.runtimes.set(projectId, { runtime, unsubscribe });
     return runtime;
+  }
+
+  private async requireConfiguredModel(): Promise<void> {
+    const config = await this.configStore.load();
+    if (!hasUsableModelConfiguration(config)) {
+      throw new Error("请先在设置的“模型”中配置一个可用模型，再开始任务。");
+    }
   }
 
   private buildConfigWithAuthenticatedLogin(current: AgentConfig, authenticated: AuthenticatedModelLogin): AgentConfig {

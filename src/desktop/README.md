@@ -16,7 +16,7 @@ pnpm desktop:pack  # release/mac-arm64/Biny.app
 pnpm desktop:dist  # release/Biny-<version>-<arch>.dmg/.zip
 ```
 
-`desktop:dist` 只构建本地安装包，不会发布。推送匹配版本号的 tag（例如 `v0.2.2`）会触发 GitHub Actions，为 Apple 芯片和 Intel Mac 分别构建 DMG/ZIP 并上传到对应 GitHub Release。安装包包含 Electron 运行时，用户不需要安装 Node.js 或 pnpm。
+`desktop:dist` 只构建本地安装包，不会发布。日常发布时，在 GitHub Actions 的 `Prepare release` 工作流中输入版本号（例如 `0.2.2`），工作流会自动更新 `package.json`、提交版本变更并推送 `v0.2.2` tag；随后 tag 会触发发布工作流，为 Apple 芯片和 Intel Mac 分别构建 DMG/ZIP 并上传到对应 GitHub Release。安装包包含 Electron 运行时，用户不需要安装 Node.js 或 pnpm。需要重跑已有版本时，仍可直接运行 `Release macOS app` 并输入已有 tag。
 
 当前产物未签名。公开分发前可在 `electron-builder.yml` 和 GitHub Actions secrets 中配置 Apple Developer 签名、hardened runtime 与 notarization。
 
@@ -67,7 +67,8 @@ Electron Main
 - `desktop-state.json`：项目列表、窗口尺寸、面板宽度和会话 UI 元数据。
 - `projects/<project-id>/.agent/`：该项目的 session、附件、记忆、日志与 telemetry。
 
-首次启动新版桌面端时，旧的 `desktop-state.json`、项目 `agent.config.json` 和 `.agent/` 数据会复制到用户数据目录；旧文件保留，以免迁移意外造成数据丢失。CLI/TUI 继续使用项目级配置与 session，和桌面端的数据相互隔离。
+首次打开没有可用默认模型的项目时，桌面端会先进入模型配置页；只有默认模型具备有效凭据和服务地址后，才能开始任务。
+首次启动新版桌面端时，旧的 `desktop-state.json`、项目 `agent.config.json` 和 `.agent/` 数据会迁移到用户数据目录；已有目标数据会与旧数据合并，目标中的新文件优先，旧文件保留，以免迁移意外造成数据丢失。CLI/TUI 继续使用项目级配置与 session，和桌面端的数据相互隔离。
 
 ## Agent 事件协议
 

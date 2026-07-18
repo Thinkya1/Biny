@@ -22,9 +22,34 @@ export class DesktopUserDataStore {
   }
 
   async migrateLegacyState(legacyPath: string, destinationPath: string): Promise<void> {
-    if (await exists(destinationPath) || !await exists(legacyPath)) return;
+    if (!await exists(legacyPath)) return;
     await fs.mkdir(path.dirname(destinationPath), { recursive: true, mode: 0o700 });
-    await fs.copyFile(legacyPath, destinationPath);
+    if (!await exists(destinationPath)) {
+      await fs.copyFile(legacyPath, destinationPath);
+      return;
+    }
+
+    const legacyState = await readJsonRecord(legacyPath);
+    const destinationState = await readJsonRecord(destinationPath);
+    if (!legacyState || !destinationState) return;
+
+    const mergedState: Record<string, unknown> = {
+      ...legacyState,
+      ...destinationState,
+      projects: mergeProjects(legacyState.projects, destinationState.projects),
+      selectedSessionIds: {
+        ...recordValue(legacyState.selectedSessionIds),
+        ...recordValue(destinationState.selectedSessionIds)
+      },
+      sessionMetadata: {
+        ...recordValue(legacyState.sessionMetadata),
+        ...recordValue(destinationState.sessionMetadata)
+      }
+    };
+    if (destinationState.activeProjectId === undefined && legacyState.activeProjectId !== undefined) {
+      mergedState.activeProjectId = legacyState.activeProjectId;
+    }
+    await fs.writeFile(destinationPath, `${JSON.stringify(mergedState, null, 2)}\n`, "utf8");
   }
 
   async migrateLegacyConfig(projects: DesktopProject[], configStore: DesktopConfigStore): Promise<void> {
@@ -40,11 +65,10 @@ export class DesktopUserDataStore {
   async ensureProjectData(project: DesktopProject): Promise<string> {
     const targetRoot = this.projectRoot(project);
     const targetAgentDirectory = agentDir(targetRoot);
-    if (await exists(targetAgentDirectory)) return targetRoot;
     await fs.mkdir(targetRoot, { recursive: true, mode: 0o700 });
     const legacyAgentDirectory = agentDir(project.path);
-    if (await exists(legacyAgentDirectory)) {
-      await fs.cp(legacyAgentDirectory, targetAgentDirectory, { recursive: true, force: false, errorOnExist: false });
+    if (await exists(legacyAgentDirectory) && path.resolve(legacyAgentDirectory) !== path.resolve(targetAgentDirectory)) {
+      await mergeDirectory(legacyAgentDirectory, targetAgentDirectory);
     }
     return targetRoot;
   }
@@ -62,4 +86,54 @@ async function exists(filePath: string): Promise<boolean> {
     if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return false;
     throw error;
   }
+}
+
+async function mergeDirectory(source: string, destination: string): Promise<void> {
+  await fs.mkdir(destination, { recursive: true, mode: 0o700 });
+  for (const entry of await fs.readdir(source, { withFileTypes: true })) {
+    const sourcePath = path.join(source, entry.name);
+    const destinationPath = path.join(destination, entry.name);
+    if (entry.isDirectory()) {
+      await mergeDirectory(sourcePath, destinationPath);
+    } else if (entry.isFile() && !await exists(destinationPath)) {
+      await fs.copyFile(sourcePath, destinationPath);
+    }
+  }
+}
+
+async function readJsonRecord(filePath: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    const value: unknown = JSON.parse(await fs.readFile(filePath, "utf8"));
+    return isRecord(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function mergeProjects(legacy: unknown, destination: unknown): unknown[] {
+  const projects = new Map<string, unknown>();
+  for (const project of Array.isArray(legacy) ? legacy : []) {
+    const key = projectKey(project);
+    if (key) projects.set(key, project);
+  }
+  for (const project of Array.isArray(destination) ? destination : []) {
+    const key = projectKey(project);
+    if (key) projects.set(key, project);
+  }
+  return [...projects.values()];
+}
+
+function projectKey(project: unknown): string | undefined {
+  if (!isRecord(project)) return undefined;
+  if (typeof project.id === "string") return `id:${project.id}`;
+  if (typeof project.path === "string") return `path:${project.path}`;
+  return undefined;
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

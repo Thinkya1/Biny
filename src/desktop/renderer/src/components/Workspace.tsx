@@ -38,7 +38,7 @@ interface WorkspaceProps {
   onPanelNotice(message: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
   onRetry(input: string): void;
-  onEditUserMessage(input: string): void;
+  onEditUserMessage(input: string, userMessageIndex: number): Promise<void>;
   onCreateBranch(): void;
   onRollbackFiles(turn: TimelineTurn): void;
   onDeleteUserMessage(turnId: string): void;
@@ -267,9 +267,10 @@ export function Workspace({
               onPreviewFile={previewFile}
               onResolvePermission={onResolvePermission}
               onRollbackFiles={onRollbackFiles}
-              onRetry={onRetry}
-              projectId={projectId}
-              turns={turns}
+            onRetry={onRetry}
+            projectId={projectId}
+            sessionId={sessionId}
+            turns={turns}
             />
           ) : <EmptyState onOpenProject={onOpenProject} project={project} />}
           {!unavailableFeature ? <div className="composer-spacer" /> : null}
