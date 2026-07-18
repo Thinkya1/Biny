@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import type { AgentRunOptions, AgentSessionInfo } from "../src/agent/AgentSession.js";
 import type { AgentSessionEvent } from "../src/agent/types.js";
 import type { ContextStatus } from "../src/agent/context/types.js";
@@ -26,20 +28,28 @@ import {
   pushNavigation,
   replaceNavigation
 } from "../src/desktop/renderer/src/navigationHistory.js";
-import { buildSessionTimeline, listChangedFiles, listTimelineFiles } from "../src/desktop/renderer/src/sessionTimeline.js";
+import { activeTimelineTool, buildSessionTimeline, listChangedFiles, listTimelineFiles, timelineToolEntries } from "../src/desktop/renderer/src/sessionTimeline.js";
+import type { TimelineTool } from "../src/desktop/renderer/src/sessionTimeline.js";
 import { highlightWorkspaceFile } from "../src/desktop/renderer/src/syntaxHighlight.js";
 import { workspaceFileMarker } from "../src/desktop/renderer/src/workspaceFileMarker.js";
 import { listModelChoices, ModelManager } from "../src/llm/ModelManager.js";
 import type { SessionEvent } from "../src/session/recorder.js";
 import { SessionRecorder } from "../src/session/recorder.js";
 import { listSessionSummaries } from "../src/session/events.js";
-import { ensureAgentDirs, sessionFilePath } from "../src/session/store.js";
+import { ensureAgentDirs, resolveSessionFile, sessionFilePath } from "../src/session/store.js";
+
+const execFileAsync = promisify(execFile);
 
 await testInteractiveRuntimeProtocol();
+await testInteractiveRuntimeRedactsToolEvents();
+await testInteractiveRuntimeRedactsRunText();
+await testInteractiveRuntimeStrongConfirmation();
+await testPermissionRequiredToolResultIsFailed();
 await testInteractiveRuntimeAbort();
 await testDraftSessionsDoNotReachTheSessionList();
 await testWorkspaceFilePreview();
 await testWorkspaceDirectoryListing();
+await testDesktopGitInspectionDisablesHelpers();
 testWorkspaceSyntaxHighlighting();
 testWorkspaceFileMarkers();
 await testFilePanelSizing();
@@ -55,6 +65,7 @@ testChangedFileProjection();
 testLiveTimelineProjection();
 testLiveReasoningAndSkillProjection();
 testDesktopNavigationHistory();
+testPendingPermissionToolSelection();
 
 async function testInteractiveRuntimeProtocol(): Promise<void> {
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
@@ -94,6 +105,122 @@ async function testInteractiveRuntimeProtocol(): Promise<void> {
   await runtime.close();
 }
 
+async function testInteractiveRuntimeRedactsToolEvents(): Promise<void> {
+  const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
+  const events: AgentHostEvent[] = [];
+  runtime.subscribe((event) => {
+    events.push(event);
+    if (event.type === "permission.requested") {
+      runtime.answerPermission(event.requestId, { approved: true, scope: "once" });
+    }
+  });
+
+  await runtime.submitPrompt("secret").completion;
+  const serialized = JSON.stringify(events);
+  assert.equal(serialized.includes("opaque-live-tool-secret"), false);
+  assert.match(serialized, /\[redacted\]/);
+  const started = events.find((event): event is Extract<AgentHostEvent, { type: "tool.started" }> => event.type === "tool.started");
+  const completed = events.find((event): event is Extract<AgentHostEvent, { type: "tool.completed" }> => event.type === "tool.completed");
+  assert.equal((started?.args as { apiKey?: string } | undefined)?.apiKey, "[redacted]");
+  assert.equal((completed?.result as { safe?: string } | undefined)?.safe, "visible");
+  await runtime.close();
+}
+
+async function testInteractiveRuntimeRedactsRunText(): Promise<void> {
+  for (const input of ["secret-event-error", "secret-thrown-error"]) {
+    const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
+    const events: AgentHostEvent[] = [];
+    runtime.subscribe((event) => events.push(event));
+    const outcome = await runtime.submitPrompt(input).completion;
+    const serialized = JSON.stringify({ events, outcome });
+    assert.equal(serialized.includes("opaque-live-run-secret"), false);
+    assert.match(serialized, /\[redacted\]/);
+    assert.equal(events.some((event) => event.type === "run.failed"), true);
+    await runtime.close();
+  }
+
+  const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
+  const events: AgentHostEvent[] = [];
+  runtime.subscribe((event) => events.push(event));
+  await assert.rejects(runtime.runSubagentTask("secret-subagent-failure"), /\[redacted\]/);
+  assert.equal(JSON.stringify(events).includes("opaque-live-run-secret"), false);
+  await runtime.close();
+}
+
+async function testInteractiveRuntimeStrongConfirmation(): Promise<void> {
+  const runtime = new InteractiveAgentRuntime(fakeCommandRuntime(true));
+  let resolvePermission!: (event: Extract<AgentHostEvent, { type: "permission.requested" }>) => void;
+  const permissionRequested = new Promise<Extract<AgentHostEvent, { type: "permission.requested" }>>((resolve) => {
+    resolvePermission = resolve;
+  });
+  runtime.subscribe((event) => {
+    if (event.type === "permission.requested") resolvePermission(event);
+  });
+
+  const submitted = runtime.submitPrompt("modify critical file");
+  const permission = await permissionRequested;
+  assert.equal(permission.request.requireFullYes, true);
+  assert.throws(
+    () => runtime.answerPermission(permission.requestId, { approved: true, scope: "once" }),
+    /requires the full word yes/u
+  );
+  assert.equal(runtime.getSnapshot().pendingPermission?.requestId, permission.requestId);
+  assert.throws(
+    () => runtime.answerPermission(permission.requestId, { approved: true, scope: "once", confirmation: "y" }),
+    /requires the full word yes/u
+  );
+  runtime.answerPermission(permission.requestId, { approved: true, scope: "once", confirmation: " YES " });
+  assert.equal((await submitted.completion).status, "completed");
+  await runtime.close();
+}
+
+async function testPermissionRequiredToolResultIsFailed(): Promise<void> {
+  const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
+  const events: AgentHostEvent[] = [];
+  runtime.subscribe((event) => {
+    events.push(event);
+    if (event.type === "permission.requested") {
+      runtime.answerPermission(event.requestId, { approved: true, scope: "once" });
+    }
+  });
+
+  await runtime.submitPrompt("stale").completion;
+  assert.equal(events.some((event) => event.type === "tool.failed" && /target changed/i.test(event.error)), true);
+  assert.equal(events.some((event) => event.type === "tool.completed" || event.type === "file.changed"), false);
+  await runtime.close();
+}
+
+function testPendingPermissionToolSelection(): void {
+  const tools: TimelineTool[] = [
+    { id: "write-1", tool: "write_file", args: {}, status: "success", updates: [] },
+    {
+      id: "write-2",
+      tool: "write_file",
+      args: {},
+      status: "running",
+      updates: [],
+      permission: {
+        requestId: "permission-2",
+        resolved: false,
+        request: {
+          toolCallId: "write-2",
+          tool: "write_file",
+          title: "Allow write",
+          details: "Write another file",
+          requireFullYes: true,
+          actionType: "write",
+          riskLevel: "critical"
+        }
+      }
+    }
+  ];
+  assert.equal(activeTimelineTool(tools)?.id, "write-2");
+  assert.deepEqual(timelineToolEntries(tools).map((entry) => [entry.key, entry.label]), [
+    ["write-1", "write_file 1"],
+    ["write-2", "write_file 2 · 待授权"]
+  ]);
+}
+
 async function testInteractiveRuntimeAbort(): Promise<void> {
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
   const events: AgentHostEvent[] = [];
@@ -116,14 +243,17 @@ async function testDraftSessionsDoNotReachTheSessionList(): Promise<void> {
   try {
     await ensureAgentDirs(workspaceRoot);
     const draft = new SessionRecorder(workspaceRoot, "draft");
-    await assert.rejects(access(draft.filePath));
+    await access(draft.filePath);
+    await assert.rejects(resolveSessionFile(workspaceRoot, "latest"), /No sessions found/);
     await draft.close();
+    await assert.rejects(access(draft.filePath));
     await writeFile(sessionFilePath(workspaceRoot, "legacy-empty"), "");
     await writeFile(sessionFilePath(workspaceRoot, "legacy-error"), `${JSON.stringify({ type: "error", message: "No model available" })}\n`);
     assert.deepEqual(await listSessionSummaries(workspaceRoot), []);
 
-    draft.record({ type: "user_message", content: "Create a project" });
-    await draft.close();
+    const activeDraft = new SessionRecorder(workspaceRoot, "draft");
+    activeDraft.record({ type: "user_message", content: "Create a project" });
+    await activeDraft.close();
     assert.deepEqual((await listSessionSummaries(workspaceRoot)).map((session) => session.fileName), ["draft.jsonl"]);
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
@@ -162,6 +292,7 @@ async function testWorkspaceFilePreview(): Promise<void> {
 async function testWorkspaceDirectoryListing(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-directory-listing-"));
   const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-data-"));
+  const outsideRoot = await mkdtemp(path.join(os.tmpdir(), "biny-directory-outside-"));
   try {
     const { projects } = await createDesktopTestServices(desktopRoot);
     const project = await projects.createProject(workspaceRoot);
@@ -178,6 +309,34 @@ async function testWorkspaceDirectoryListing(): Promise<void> {
     const nested = await projects.listWorkspaceDirectory(project, "src");
     assert.deepEqual(nested.entries.map((entry) => entry.path), ["src/index.ts"]);
     await assert.rejects(projects.listWorkspaceDirectory(project, "../outside"), /Path escapes workspace/);
+    await assert.rejects(projects.listWorkspaceDirectory(project, ".git"), /ignored by workspace policy/);
+    await symlink(outsideRoot, path.join(workspaceRoot, "outside-link"), "dir");
+    await assert.rejects(projects.listWorkspaceDirectory(project, "outside-link"), /symbolic link/);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
+    await rm(outsideRoot, { recursive: true, force: true });
+  }
+}
+
+async function testDesktopGitInspectionDisablesHelpers(): Promise<void> {
+  if (process.platform === "win32") return;
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-git-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-git-data-"));
+  const sentinel = path.join(workspaceRoot, "fsmonitor-ran.txt");
+  const helper = path.join(workspaceRoot, "fsmonitor-helper.mjs");
+  try {
+    await writeFile(helper, [
+      "#!/usr/bin/env node",
+      "import { writeFileSync } from 'node:fs';",
+      `writeFileSync(${JSON.stringify(sentinel)}, 'unexpected');`
+    ].join("\n"), "utf8");
+    await chmod(helper, 0o755);
+    await execFileAsync("git", ["init", "--quiet"], { cwd: workspaceRoot });
+    await execFileAsync("git", ["config", "core.fsmonitor", helper], { cwd: workspaceRoot });
+    const { projects } = await createDesktopTestServices(desktopRoot);
+    await projects.createProject(workspaceRoot);
+    await assert.rejects(access(sentinel));
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
     await rm(desktopRoot, { recursive: true, force: true });
@@ -459,6 +618,14 @@ function testLiveTimelineProjection(): void {
   assert.equal(timeline[0]?.assistant, "done");
   assert.equal(timeline[0]?.tools[0]?.diff?.includes("a.ts"), true);
   assert.equal(timeline[0]?.status, "completed");
+
+  const failedCommand = buildSessionTimeline([], [
+    { ...base, runId: "failed-command", type: "message.user", messageId: "command-message", content: "run" },
+    { ...base, runId: "failed-command", type: "tool.started", toolCallId: "command", tool: "run_command", args: { command: "false" } },
+    { ...base, runId: "failed-command", type: "tool.completed", toolCallId: "command", tool: "run_command", result: { exitCode: 1 }, durationMs: 8 },
+    { ...base, runId: "failed-command", type: "command.completed", toolCallId: "command", command: "false", exitCode: 1, durationMs: 8 }
+  ]);
+  assert.equal(failedCommand[0]?.tools[0]?.status, "failed");
 }
 
 function testLiveReasoningAndSkillProjection(): void {
@@ -507,7 +674,7 @@ function testDesktopNavigationHistory(): void {
   assert.deepEqual(moveNavigation(state, 1).target, undefined);
 }
 
-function fakeCommandRuntime(): CommandRuntime {
+function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
   const info: AgentSessionInfo = {
     workspaceRoot: "/tmp/project",
     sessionId: "session-1",
@@ -539,7 +706,7 @@ function fakeCommandRuntime(): CommandRuntime {
     tool: "write_file",
     title: "Allow write",
     details: "Write a file",
-    requireFullYes: false,
+    requireFullYes,
     actionType: "write",
     riskLevel: "medium"
   };
@@ -557,12 +724,51 @@ function fakeCommandRuntime(): CommandRuntime {
         }
         throw new Error("aborted");
       }
-      yield { type: "tool-started", toolCallId: "tool-1", tool: "write_file", args: { path: "a.ts" }, display: { kind: "file_io", operation: "write", path: "a.ts" } };
+      if (input === "secret-event-error") {
+        yield { type: "error", message: "provider token=opaque-live-run-secret" };
+        return;
+      }
+      if (input === "secret-thrown-error") throw new Error("provider password=opaque-live-run-secret");
+      const secretProbe = input === "secret";
+      if (secretProbe) {
+        yield {
+          type: "sdk",
+          part: { type: "reasoning-delta", id: "reasoning", text: "token=opaque-live-tool-secret" } as AgentSessionEvent & never
+        };
+      }
+      yield {
+        type: "tool-started",
+        toolCallId: "tool-1",
+        tool: "write_file",
+        args: {
+          path: "a.ts",
+          apiKey: secretProbe ? "opaque-live-tool-secret" : undefined,
+          webhookSecret: secretProbe ? "opaque-live-tool-secret" : undefined
+        },
+        display: {
+          kind: "file_io",
+          operation: "write",
+          path: "a.ts",
+          content: secretProbe ? "apiKey=opaque-live-tool-secret" : undefined
+        }
+      };
       const result = await options.confirmPermission?.(request as Parameters<NonNullable<AgentRunOptions["confirmPermission"]>>[0]);
       yield { type: "permission-result", toolCallId: "tool-1", request: request as Parameters<NonNullable<AgentRunOptions["confirmPermission"]>>[0], result: result ?? { approved: false } };
-      yield { type: "sdk", part: { type: "tool-result", toolCallId: "tool-1", toolName: "write_file", output: { path: "a.ts" } } as AgentSessionEvent & never };
-      yield { type: "sdk", part: { type: "text-delta", id: "text", text: "done" } as AgentSessionEvent & never };
-      yield { type: "done", content: "done" };
+      const output = input === "stale"
+        ? { status: "permission_required", approved: false, reason: "The target changed after approval." }
+        : secretProbe
+          ? { path: "a.ts", token: "opaque-live-tool-secret", diffPreview: "+ apiKey=opaque-live-tool-secret", safe: "visible" }
+          : { path: "a.ts" };
+      yield { type: "sdk", part: { type: "tool-result", toolCallId: "tool-1", toolName: "write_file", output } as AgentSessionEvent & never };
+      yield {
+        type: "sdk",
+        part: {
+          type: "text-delta",
+          id: "text",
+          text: secretProbe ? "password=opaque-live-tool-secret" : "done"
+        } as AgentSessionEvent & never
+      };
+      yield { type: "done", content: secretProbe ? "Authorization: Bearer opaque-live-tool-secret" : "done" };
     },
     contextStatus: async () => context,
     recordError: () => undefined,
@@ -570,6 +776,13 @@ function fakeCommandRuntime(): CommandRuntime {
   };
   return {
     agent,
+    getSubagentInfo: () => ({ modelAlias: "test", provider: "test", modelLabel: "test/model", reasoningLabel: "Off", thinking: "off" as const }),
+    runSubagentTask: async (task: string) => {
+      if (task === "secret-subagent-failure") throw new Error("subagent apiKey=opaque-live-run-secret");
+      return `subagent:${task}`;
+    },
+    setSubagentParentRunId: () => undefined,
+    cancelSubagentTasks: () => undefined,
     close: async () => undefined
   } as unknown as CommandRuntime;
 }

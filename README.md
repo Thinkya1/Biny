@@ -13,8 +13,8 @@
 
 - **本地优先**：项目文件留在你的电脑上，模型由你自行选择和配置。
 - **模型不设限**：支持 DeepSeek、OpenAI、Anthropic、Gemini、Kimi、Qwen、Ollama 及 OpenAI-compatible 服务。
-- **执行可控**：读取、写入、编辑和命令执行都经过权限确认；高风险操作不会静默执行。
-- **会话可恢复**：消息、工具调用和运行状态保存在本机，任务可以继续而不必从头描述。
+- **执行可控**：读取、写入、编辑和命令执行都经过统一权限策略；需要审批的高风险操作必须完整输入 `yes`，不会因空 Enter 或误按单键执行。
+- **会话可恢复**：消息、工具调用和运行状态保存在本机；崩溃留下的截断末行和悬空工具调用可在恢复时安全收束。
 
 ## 使用方式
 
@@ -28,9 +28,59 @@
 ### Agent
 
 - 使用文件、搜索、Git、Shell 和联网搜索工具完成任务；
-- 支持工具调用、流式输出、推理档位和用量统计；
+- 支持有并发上限、公平冲突排序和取消传播的工具调用，以及流式输出、推理档位和用量统计；
 - 支持 Plan 模式：先生成计划，不执行会产生副作用的操作；
-- 支持 Workspace Skill、Plugin、MCP stdio server 和受限只读 Subagent。
+- 支持 Workspace Skill、Plugin、MCP stdio server 和受限只读 Subagent；子 Agent 默认仅能使用显式允许的本地读取、搜索和 Git 检查工具；`maxCostUsd` 是在每个模型 step 结束后按 provider usage 检查的软阈值，当前 step 可能使总成本超过阈值（启用时需配置输入、输出、缓存读和缓存写价格）。
+- 内置工具遵守取消信号；Plugin、MCP 等外部工具采用 best-effort 取消。若外部工具在有界 drain 后仍未结束，当前调用会明确标记为已隔离，AgentSession 会拒绝新的执行操作，直到迟到的外部调用真正 settle，避免副作用重叠。
+- 文件读取、编辑和权限 Diff 单文件上限为 1 MiB；搜索只扫描每个文件的前 1 MiB，并在结果中标记截断文件。写入与编辑使用同目录事务式替换，且把真正执行绑定到已审批的文件快照；新文件的父目录必须已存在，提交窗口检测到外部写入时会保留或恢复外部版本，而不是静默覆盖。
+- CLI 的 `run`、`plan`、`chat` 及其中的长操作会把第一次 Ctrl+C 传递为协作式取消，并在操作结束后清理信号监听。
+
+Workspace Skill 默认从 `.agent/skills` 加载。Plugin 会以当前进程权限执行本地 JavaScript，能够直接访问文件系统和环境变量，且没有沙箱，因此默认不自动加载；只有写入 `extensions.plugins` 的工作区内路径才会启用，并必须视为完全受信任代码。Skill、Plugin 与 MCP `cwd` 都拒绝越出工作区的路径和符号链接；传给 Plugin 的配置副本会移除 provider key、OAuth refresh token 与 MCP 环境变量，这只用于避免上下文意外泄漏，不构成安全隔离。
+
+下面是开启 Subagent 成本软阈值的最小配置片段；将它合并进 `agent.config.json`，价格单位均为每百万 token 的美元价格：
+
+```json
+{
+  "agent": {
+    "maxSteps": 8,
+    "maxConcurrentTools": 4,
+    "maxQueuedToolCalls": 64
+  },
+  "models": {
+    "reviewer": {
+      "provider": "deepseek",
+      "model": "deepseek-chat",
+      "pricing": {
+        "inputPerMillionTokens": 0.27,
+        "outputPerMillionTokens": 1.1,
+        "cacheReadPerMillionTokens": 0.07,
+        "cacheWritePerMillionTokens": 0.27
+      }
+    }
+  },
+  "extensions": {
+    "subagent": {
+      "model": "reviewer",
+      "maxSteps": 4,
+      "maxOutputTokens": 4000,
+      "maxConcurrentSubagents": 2,
+      "maxPendingSubagents": 16,
+      "timeoutMs": 120000,
+      "maxCostUsd": 0.02,
+      "allowedTools": [
+        "read_file",
+        "list_files",
+        "search_files",
+        "grep_search",
+        "git_status",
+        "git_diff"
+      ]
+    }
+  }
+}
+```
+
+旧配置会自动补齐上述默认值。Subagent 默认最多并行 2 个、等待队列最多 16 个。CLI 中 `/subagent <task>` 会前台等待结果；`/subagent start <task>` 会立即返回 task ID 并在后台执行，因此可以继续用 `/subagent status` 查看任务历史，或用 `/subagent cancel <task-id>` 取消仍在等待或运行的任务。`agent.maxConcurrentTools` 控制并行进入工具管线的调用数，`agent.maxQueuedToolCalls` 限制从 schema/扩展解析、权限等待到实际执行的整条管线队列；队列满时调用会收到明确错误，资源冲突的工具按公平顺序等待。`/status` 会显示这些调度上限。Agent/Subagent 调度配置在 runtime 创建时读取，修改后需重启 CLI/TUI，或在 Desktop 中重新打开对应项目 runtime。
 
 ### Desktop
 
@@ -82,7 +132,7 @@ biny run "总结当前项目并指出最重要的风险"
   projects/<project-id>/  会话、附件、记忆和运行记录
 ```
 
-升级后，旧版桌面端的配置和会话会自动复制到新位置，原文件会保留。CLI/TUI 仍使用当前工作区中的 `agent.config.json` 和 `.agent/`；它们与桌面端数据相互隔离。
+升级后，旧版桌面端的配置和会话会自动复制到新位置，原文件会保留。CLI/TUI 仍使用当前工作区中的 `agent.config.json` 和 `.agent/`；它们与桌面端数据相互隔离。CLI/TUI 建议只在配置中填写 `apiKeyEnv`，把真实 key 放进环境变量；`biny doctor` 会提示 inline key 风险，但不会输出 key 内容。配置文件按 `0600` 保存并采用原子替换，符号链接或硬链接配置会被拒绝。
 
 ## 当前边界
 

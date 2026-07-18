@@ -4,9 +4,11 @@
  * 每个 CLI/TUI 入口最终都会通过这里创建一个 AgentSession。这里是 composition
  * root，只装配配置、provider、工具和权限，不向宿主泄露可变 conversation 或 recorder。
  */
+import { randomUUID } from "node:crypto";
 import { createFileConfigStore, type AgentConfigStore } from "../config/store.js";
+import type { AgentConfig } from "../config/schema.js";
 import { AgentSession } from "../agent/AgentSession.js";
-import { ModelManager } from "../llm/ModelManager.js";
+import { ModelManager, modelRuntimeInfo, type ModelRuntimeInfo } from "../llm/ModelManager.js";
 import { SessionRecorder } from "../session/recorder.js";
 import { ensureAgentDirs } from "../session/store.js";
 import { createToolRegistry } from "../tools/registry.js";
@@ -14,14 +16,28 @@ import { PermissionManager } from "../permission/PermissionManager.js";
 import { loadSkills } from "../extensions/skills.js";
 import { loadPlugins } from "../extensions/plugins.js";
 import { McpToolHost } from "../extensions/mcp.js";
-import { createSubagentTool, runSubagentTask, type SubagentOptions } from "../extensions/subagent.js";
+import { createSubagentTool, runSubagentTask as executeSubagentTask, type SubagentOptions } from "../extensions/subagent.js";
 import { createToolCounts, formatExtensionReport, type ExtensionSection, type ExtensionStatus } from "../extensions/report.js";
+import { createModelSettings, type ModelSettings } from "../llm/factory.js";
+import {
+  SubagentTaskManager,
+  type SubagentTaskRunOptions,
+  type SubagentTaskSnapshot,
+  type SubmittedSubagentTask
+} from "./SubagentTaskManager.js";
 
 export interface CommandRuntime {
   workspaceRoot: string;
   agent: AgentSession;
   extensionReport(section?: ExtensionSection): string;
-  runSubagentTask(task: string): Promise<string>;
+  getSubagentInfo(): ModelRuntimeInfo;
+  startSubagentTask(task: string, options?: SubagentTaskRunOptions): SubmittedSubagentTask;
+  runSubagentTask(task: string, options?: SubagentTaskRunOptions): Promise<string>;
+  listSubagentTasks(): SubagentTaskSnapshot[];
+  cancelSubagentTask(taskId: string, reason?: string): boolean;
+  subscribeSubagentTasks(listener: (task: SubagentTaskSnapshot) => void): () => void;
+  setSubagentParentRunId(parentRunId?: string): void;
+  cancelSubagentTasks(parentRunId: string, reason?: string): void;
   close(): Promise<void>;
 }
 
@@ -43,21 +59,28 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   const permissionManager = new PermissionManager({ ...config.permission, source: "agent.config.json" });
   const skills = await loadSkills(workspaceRoot, config.extensions.skills);
   const mcpHost = new McpToolHost();
+  let agent: AgentSession | undefined;
+  let subagentParentRunId: string | undefined;
   const subagentOptions: SubagentOptions = {
     workspaceRoot,
     config,
-    getModel: () => modelManager.getModel(),
-    getModelSettings: () => modelManager.getModelSettings(),
+    getModelSettings: () => subagentModelSettings(config, modelManager),
+    getParentRunId: () => subagentParentRunId,
     toolRegistry,
-    onUsage: async (usage, operation) => agent?.observeModelUsage(usage, operation)
+    onUsage: async (usage, operation, modelAlias) => agent?.observeModelUsage(usage, operation, modelAlias)
   };
-  let agent: AgentSession | undefined;
+  const subagentTaskManager = new SubagentTaskManager({
+    maxConcurrentSubagents: config.extensions.subagent.maxConcurrentSubagents,
+    maxPendingSubagents: config.extensions.subagent.maxPendingSubagents,
+    timeoutMs: config.extensions.subagent.timeoutMs,
+    execute: async (task, context) => await executeSubagentTask(subagentOptions, task, context.signal)
+  });
   let loadedPlugins: string[] = [];
   try {
     await mcpHost.connectConfiguredServers(workspaceRoot, config, toolRegistry);
     loadedPlugins = await loadPlugins(workspaceRoot, config.extensions.plugins, config, toolRegistry);
     if (config.extensions.subagent.enabled) {
-      toolRegistry.registerSubagentTool(createSubagentTool(subagentOptions));
+      toolRegistry.registerSubagentTool(createSubagentTool(subagentOptions, subagentTaskManager));
     }
     agent = new AgentSession({
       workspaceRoot,
@@ -74,6 +97,7 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     });
     await agent.initialize();
   } catch (error) {
+    await subagentTaskManager.close();
     await mcpHost.close();
     await recorder.close();
     throw error;
@@ -85,19 +109,71 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     skills: [...skills.paths],
     plugins: [...loadedPlugins],
     subagent: { ...config.extensions.subagent },
+    toolScheduling: {
+      maxConcurrentTools: config.agent.maxConcurrentTools,
+      maxQueuedToolCalls: config.agent.maxQueuedToolCalls
+    },
     toolCounts: createToolCounts(toolRegistry.listEntries())
+  };
+
+  const startSubagentTask = (task: string, taskOptions?: SubagentTaskRunOptions): SubmittedSubagentTask => {
+    if (!config.extensions.subagent.enabled) throw new Error("Subagent extension is disabled in agent.config.json.");
+    const taskId = taskOptions?.taskId ?? randomUUID();
+    agent.recordHostedUserMessage(task);
+    const sequence = agent.recordHostedToolCall("delegate_task", { task }, taskId);
+    let submitted: SubmittedSubagentTask;
+    try {
+      taskOptions?.signal?.throwIfAborted();
+      submitted = subagentTaskManager.submit(task, {
+        taskId,
+        parentRunId: taskOptions?.parentRunId,
+        signal: taskOptions?.signal,
+        timeoutMs: taskOptions?.timeoutMs
+      });
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      agent.recordHostedToolResult("delegate_task", { error: failure.message }, taskId, sequence);
+      throw failure;
+    }
+
+    const completion = submitted.completion.then(
+      (result) => {
+        agent.recordHostedToolResult("delegate_task", result, taskId, sequence);
+        agent.recordHostedAssistantMessage(result);
+        return result;
+      },
+      (error: unknown) => {
+        const failure = error instanceof Error ? error : new Error(String(error));
+        agent.recordHostedToolResult("delegate_task", { error: failure.message }, taskId, sequence);
+        throw failure;
+      }
+    );
+    // Background CLI starts intentionally do not await completion. Attaching a
+    // rejection observer keeps cancellation/failure from becoming unhandled;
+    // foreground callers can still await the original completion promise.
+    void completion.catch(() => undefined);
+    return { ...submitted, completion };
   };
 
   const runtime: CommandRuntime = {
     workspaceRoot,
     agent,
     extensionReport: (section?: ExtensionSection): string => formatExtensionReport(extensionStatus, section),
-    runSubagentTask: async (task: string): Promise<string> => {
-      if (!config.extensions.subagent.enabled) throw new Error("Subagent extension is disabled in agent.config.json.");
-      return await runSubagentTask(subagentOptions, task);
+    getSubagentInfo: (): ModelRuntimeInfo => subagentRuntimeInfo(config),
+    startSubagentTask,
+    runSubagentTask: async (task: string, taskOptions?: SubagentTaskRunOptions): Promise<string> => await startSubagentTask(task, taskOptions).completion,
+    listSubagentTasks: (): SubagentTaskSnapshot[] => subagentTaskManager.listSnapshots(),
+    cancelSubagentTask: (taskId: string, reason?: string): boolean => subagentTaskManager.cancelTask(taskId, reason),
+    subscribeSubagentTasks: (listener: (task: SubagentTaskSnapshot) => void): (() => void) => subagentTaskManager.subscribe(listener),
+    setSubagentParentRunId: (parentRunId?: string): void => {
+      subagentParentRunId = parentRunId;
+    },
+    cancelSubagentTasks: (parentRunId: string, reason?: string): void => {
+      subagentTaskManager.cancelParent(parentRunId, reason);
     },
     close: async () => {
       try {
+        await subagentTaskManager.close();
         await agent.close();
       } finally {
         await mcpHost.close();
@@ -105,6 +181,37 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     }
   };
   return runtime;
+}
+
+function subagentModelSettings(config: AgentConfig, modelManager: ModelManager): ModelSettings {
+  const alias = config.extensions.subagent.model;
+  if (!alias) return modelManager.getModelSettings();
+  const model = config.models[alias];
+  if (!model) throw new Error(`Unknown subagent model alias: ${alias}`);
+  const modelConfig = {
+    ...config,
+    defaultModel: alias,
+    thinking: model.thinking
+      ? { enabled: true, effort: model.thinking.defaultEffort }
+      : { enabled: false, effort: "high" as const }
+  };
+  return createModelSettings(modelConfig, alias);
+}
+
+function subagentRuntimeInfo(config: AgentConfig): ModelRuntimeInfo {
+  const alias = config.extensions.subagent.model;
+  if (!alias) return modelRuntimeInfo(config);
+  const model = config.models[alias];
+  if (!model) throw new Error(`Unknown subagent model alias: ${alias}`);
+  const thinking = model.thinking?.defaultEffort ?? "off";
+  return modelRuntimeInfo({
+    ...config,
+    defaultModel: alias,
+    thinking: {
+      enabled: thinking !== "off",
+      effort: thinking === "off" ? config.thinking.effort : thinking
+    }
+  });
 }
 
 export async function withCommandRuntime(workspaceRoot: string, fn: (runtime: CommandRuntime) => Promise<void>): Promise<void> {

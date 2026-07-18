@@ -7,7 +7,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
-import { CONFIG_FILE } from "../../config/loader.js";
+import { CONFIG_FILE, loadConfig } from "../../config/loader.js";
 import { pathExists } from "../../utils/fs.js";
 
 const execFileAsync = promisify(execFile);
@@ -19,11 +19,23 @@ export async function doctorCommand(workspaceRoot: string): Promise<void> {
     ["pnpm", await commandVersion("pnpm", ["--version"])],
     ["git", await commandVersion("git", ["--version"])],
     [CONFIG_FILE, (await pathExists(path.join(workspaceRoot, CONFIG_FILE))) ? "found" : "missing"],
+    ["credentials", await credentialStatus(workspaceRoot)],
     [".agent", (await pathExists(path.join(workspaceRoot, ".agent"))) ? "found" : "missing"]
   ];
 
   for (const [name, result] of checks) {
     console.log(`${name}: ${result}`);
+  }
+}
+
+async function credentialStatus(workspaceRoot: string): Promise<string> {
+  try {
+    const config = await loadConfig(workspaceRoot);
+    return Object.values(config.providers).some((provider) => Boolean(provider.apiKey))
+      ? `warning: inline API key found in ${CONFIG_FILE}; use apiKeyEnv and rotate the key`
+      : "no inline API keys";
+  } catch (error) {
+    return `unable to inspect configuration: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 

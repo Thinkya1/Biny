@@ -10,6 +10,7 @@ import type { PermissionMode } from "../permission/PermissionManager.js";
 import { parseThinkingSelection, type ModelChoice, type ThinkingSelection } from "../llm/ModelManager.js";
 import type { SessionSummary } from "../session/events.js";
 import { formatPermissionModeChanged } from "../permission/commands.js";
+import { formatSubagentTaskReport } from "../runtime/subagentTaskReport.js";
 import { createInitialTuiState, tuiReducer } from "./state.js";
 import { Header } from "./components/Header.js";
 import { Welcome } from "./components/Welcome.js";
@@ -24,7 +25,7 @@ import { HelpDialog } from "./components/HelpDialog.js";
 import { ModelPicker } from "./components/ModelPicker.js";
 import { createTuiRuntime, type TuiRuntime } from "./runtime/createTuiRuntime.js";
 import type { PermissionChoice } from "./types.js";
-import { TUI_SLASH_COMMANDS } from "./slashCommands.js";
+import { isConcurrentTuiSlashCommand, TUI_SLASH_COMMANDS } from "./slashCommands.js";
 import { sessionEventsToTranscript } from "./sessionTranscript.js";
 import { appendInputHistory, loadInputHistory } from "./inputHistory.js";
 import { latestExpandableTranscript, type ExpandableTranscript } from "./transcriptViewer.js";
@@ -158,7 +159,8 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
   const sendPrompt = (value: string): void => {
     // 输入提交后按 slash、plan mode、chat mode 三条路径分发。
     setPreviewMode(undefined);
-    if (state.status === "thinking" || state.status === "running") {
+    const busy = state.status === "thinking" || state.status === "running";
+    if (busy && !isConcurrentTuiSlashCommand(value)) {
       dispatch({ type: "system.message", content: "当前暂不支持 Ctrl-S 注入；请等待当前轮次结束，或按 Esc / Ctrl+C 中断。" });
       return;
     }
@@ -397,9 +399,27 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
     }
 
     if (command === "/subagent") {
+      const action = args[0]?.toLowerCase();
+      if (action === "status") {
+        setTranscriptViewer({ title: "Subagent tasks", content: formatSubagentTaskReport(runtime.listSubagentTasks()) });
+        return;
+      }
+      if (action === "cancel") {
+        const taskId = args[1]?.trim();
+        if (!taskId) {
+          setTranscriptViewer({ title: "Subagent", content: "Usage: /subagent cancel <task-id>" });
+          return;
+        }
+        const cancelled = runtime.cancelSubagentTask(taskId, "Cancelled from the TUI.");
+        setTranscriptViewer({
+          title: "Subagent",
+          content: cancelled ? `Cancelled subagent task ${taskId}.` : `No active subagent task found for ${taskId}.`
+        });
+        return;
+      }
       const task = args.join(" ").trim();
       if (!task) {
-        setTranscriptViewer({ title: "Subagent", content: "Usage: /subagent <read-only task>" });
+        setTranscriptViewer({ title: "Subagent", content: "Usage: /subagent <read-only task> | status | cancel <task-id>" });
         return;
       }
       const output = await runtime.runSubagentTask(task);

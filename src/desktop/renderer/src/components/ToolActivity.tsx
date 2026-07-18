@@ -1,4 +1,5 @@
 import { memo, useEffect, useMemo, useState } from "react";
+import { isFullYesConfirmation } from "../../../../permission/confirmation.js";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
 import type { TimelineCommand, TimelineTool } from "../sessionTimeline.js";
 import { CopyButton } from "./CopyButton.js";
@@ -98,6 +99,10 @@ function PermissionCard({
 }): React.JSX.Element {
   const request = permission.request;
   const alwaysScope = request.command ? "command" : request.targetPath ? "path" : "tool";
+  const [confirmationState, setConfirmationState] = useState({ requestId: permission.requestId, value: "" });
+  const confirmation = confirmationState.requestId === permission.requestId ? confirmationState.value : "";
+  const fullYesProvided = isFullYesConfirmation(confirmation);
+
   if (permission.resolved) {
     return (
       <div className={`permission-card is-resolved${permission.approved ? " is-approved" : " is-denied"}`}>
@@ -114,10 +119,24 @@ function PermissionCard({
       {request.targetPath ? <div className="permission-target"><Icon name="file" size={13} /><span>{request.targetPath}</span></div> : null}
       {request.preview && !request.command ? <pre className="permission-preview"><code>{request.preview}</code></pre> : null}
       {request.reason ? <p className="permission-reason">{request.reason}</p> : null}
+      {request.requireFullYes ? (
+        <label className="permission-confirmation">
+          <span>高风险操作：输入完整的 <strong>yes</strong> 后才能允许</span>
+          <input
+            autoCapitalize="none"
+            autoComplete="off"
+            disabled={disabled}
+            onChange={(event) => setConfirmationState({ requestId: permission.requestId, value: event.target.value.slice(0, 16) })}
+            spellCheck={false}
+            type="text"
+            value={confirmation}
+          />
+        </label>
+      ) : null}
       <div className="permission-actions">
         <button disabled={disabled} onClick={() => void onResolve({ approved: false, scope: "once", message: "Denied in Biny desktop." })} type="button">拒绝</button>
-        <button disabled={disabled} onClick={() => void onResolve({ approved: true, scope: alwaysScope })} type="button">始终允许同类操作</button>
-        <button className="is-primary" disabled={disabled} onClick={() => void onResolve({ approved: true, scope: "once" })} type="button">允许一次</button>
+        <button disabled={disabled || (request.requireFullYes && !fullYesProvided)} onClick={() => void onResolve({ approved: true, scope: alwaysScope, confirmation: request.requireFullYes ? confirmation : undefined })} type="button">始终允许同类操作</button>
+        <button className="is-primary" disabled={disabled || (request.requireFullYes && !fullYesProvided)} onClick={() => void onResolve({ approved: true, scope: "once", confirmation: request.requireFullYes ? confirmation : undefined })} type="button">允许一次</button>
       </div>
     </section>
   );

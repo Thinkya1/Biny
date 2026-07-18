@@ -30,6 +30,8 @@ export interface PermissionRequestContext {
   reason?: string;
   diffPreview?: string;
   changeSummary?: string;
+  /** Opaque exact-call fingerprint used for command-scoped grants. */
+  approvalRule?: string;
   sessionId: string;
   projectRoot: string;
 }
@@ -56,7 +58,10 @@ export interface PermissionApplyResult {
   message?: string;
 }
 
-export type PermissionResult = PermissionApplyResult;
+/** UI transport response. `confirmation` is validated before grants are applied. */
+export interface PermissionResult extends PermissionApplyResult {
+  confirmation?: string;
+}
 
 export interface DeniedOperation {
   toolName: string;
@@ -156,7 +161,7 @@ export class PermissionManager {
   }
 
   applyResult(request: PermissionRequestContext, result: PermissionApplyResult): void {
-    if (result.nextMode) this.mode = result.nextMode;
+    if (result.approved && result.nextMode) this.mode = result.nextMode;
 
     if (!result.approved) {
       this.deniedOperations.push({
@@ -188,6 +193,14 @@ export class PermissionManager {
     if (result.scope === "session") {
       this.sessionAllowedActions.add(actionKey(request));
     }
+  }
+
+  revokeResult(request: PermissionRequestContext, result: PermissionApplyResult | undefined): void {
+    if (!result?.approved) return;
+    if (result.scope === "tool") this.sessionAllowedTools.delete(request.toolName);
+    else if (result.scope === "path" && request.targetPath) this.sessionAllowedPaths.delete(normalizeRulePath(request.targetPath));
+    else if (result.scope === "command") this.sessionAllowedCommands.delete(requestKey(request));
+    else if (result.scope === "session") this.sessionAllowedActions.delete(actionKey(request));
   }
 
   setMode(mode: PermissionMode): void {
@@ -238,6 +251,9 @@ function isAllowedBySession(
 }
 
 function requestKey(request: PermissionRequestContext): string {
+  if (request.approvalRule) {
+    return JSON.stringify([request.toolName, request.actionType, request.approvalRule]);
+  }
   return JSON.stringify([
     request.toolName,
     request.actionType,

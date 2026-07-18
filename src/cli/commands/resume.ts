@@ -5,15 +5,14 @@
  * assistant 消息、工具调用、工具结果和错误，帮助用户在普通终端里回看 session。
  */
 import path from "node:path";
-import { ensureAgentDirs, resolveSessionFile } from "../../session/store.js";
-import { readSessionEvents } from "../../session/events.js";
+import { readStoredSessionEvents } from "../../session/events.js";
+import { ensureAgentDirs } from "../../session/store.js";
 import type { SessionEvent } from "../../session/recorder.js";
 
 export async function resumeCommand(workspaceRoot: string, session: string | undefined): Promise<void> {
   // resume 支持 latest、session id 前缀或 jsonl 文件路径，解析逻辑集中在 store。
   await ensureAgentDirs(workspaceRoot);
-  const filePath = await resolveSessionFile(workspaceRoot, session);
-  const events = await readSessionEvents(filePath);
+  const { filePath, events } = await readStoredSessionEvents(workspaceRoot, session);
 
   console.log(`Session: ${path.relative(workspaceRoot, filePath)}`);
   for (const event of events) {

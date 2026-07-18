@@ -5,6 +5,7 @@ import type { SessionUsage } from "../session/metadata.js";
 import type { ToolInputDisplay, ToolUpdate } from "../tools/types.js";
 
 export type AgentRunStatus = "queued" | "thinking" | "running" | "waiting_permission" | "completed" | "aborted" | "failed";
+export type RuntimeOperation = "resume" | "compact" | "switch_model" | "refresh_model" | "subagent";
 
 export interface AgentEventBase {
   sessionId: string;
@@ -93,6 +94,7 @@ export interface ActiveRunSnapshot {
 export interface InteractiveRuntimeSnapshot {
   info: AgentSessionInfo;
   permissionMode: PermissionMode;
+  activeOperation?: RuntimeOperation;
   activeRun?: ActiveRunSnapshot;
   pendingPermission?: PendingPermissionSnapshot;
   queuedRuns: Array<Pick<ActiveRunSnapshot, "runId" | "messageId" | "input" | "mode">>;

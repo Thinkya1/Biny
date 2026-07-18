@@ -6,8 +6,31 @@
  */
 import { ToolAccesses, type ToolAccessList } from "./access.js";
 
+export const defaultMaxToolConcurrency = 4;
+export const defaultMaxQueuedToolCalls = 64;
+
+export interface ToolSchedulerOptions {
+  maxConcurrency: number;
+  maxQueuedTasks: number;
+}
+
+export interface ToolSchedulerSnapshot {
+  maxConcurrency: number;
+  maxQueuedTasks: number;
+  active: number;
+  queued: number;
+}
+
+export class ToolSchedulerQueueFullError extends Error {
+  constructor(readonly maxQueuedTasks: number) {
+    super(`Tool scheduler queue is full (maximum ${String(maxQueuedTasks)} queued calls).`);
+    this.name = "ToolSchedulerQueueFullError";
+  }
+}
+
 export interface ToolSchedulerTask<TResult> {
   accesses: ToolAccessList;
+  signal?: AbortSignal;
   start(): Promise<TResult>;
 }
 
@@ -16,6 +39,7 @@ interface QueuedTask<TResult> {
   resolve(result: TResult): void;
   reject(error: unknown): void;
   started: boolean;
+  removeAbortListener(): void;
 }
 
 interface ActiveTask<TResult> {
@@ -25,34 +49,137 @@ interface ActiveTask<TResult> {
 export class ToolScheduler<TResult> {
   private readonly queue: Array<QueuedTask<TResult>> = [];
   private readonly active: Array<ActiveTask<TResult>> = [];
+  private readonly maxConcurrency: number;
+  private readonly maxQueuedTasks: number;
+  private pumping = false;
+
+  constructor(options: number | ToolSchedulerOptions = defaultMaxToolConcurrency, maxQueuedTasks = defaultMaxQueuedToolCalls) {
+    const maxConcurrency = typeof options === "number" ? options : options.maxConcurrency;
+    const queueLimit = typeof options === "number" ? maxQueuedTasks : options.maxQueuedTasks;
+    if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1) {
+      throw new RangeError("ToolScheduler maxConcurrency must be a positive integer.");
+    }
+    if (!Number.isInteger(queueLimit) || queueLimit < 1) {
+      throw new RangeError("ToolScheduler maxQueuedTasks must be a positive integer.");
+    }
+    this.maxConcurrency = maxConcurrency;
+    this.maxQueuedTasks = queueLimit;
+  }
+
+  getSnapshot(): ToolSchedulerSnapshot {
+    return {
+      maxConcurrency: this.maxConcurrency,
+      maxQueuedTasks: this.maxQueuedTasks,
+      active: this.active.length,
+      queued: this.queue.reduce((count, item) => count + (item.started ? 0 : 1), 0)
+    };
+  }
 
   schedule(task: ToolSchedulerTask<TResult>): Promise<TResult> {
     return new Promise<TResult>((resolve, reject) => {
-      this.queue.push({ task, resolve, reject, started: false });
+      if (task.signal?.aborted) {
+        reject(abortReason(task.signal));
+        return;
+      }
+
+      const queueIndex = this.queue.length;
+      const canStartImmediately = this.active.length < this.maxConcurrency && !this.isBlocked(task, queueIndex);
+      if (!canStartImmediately && this.getSnapshot().queued >= this.maxQueuedTasks) {
+        reject(new ToolSchedulerQueueFullError(this.maxQueuedTasks));
+        return;
+      }
+
+      const item: QueuedTask<TResult> = {
+        task,
+        resolve,
+        reject,
+        started: false,
+        removeAbortListener: () => undefined
+      };
+      const onAbort = () => {
+        if (item.started) return;
+        const index = this.queue.indexOf(item);
+        if (index === -1) return;
+        this.queue.splice(index, 1);
+        item.removeAbortListener();
+        item.reject(abortReason(task.signal));
+        this.pump();
+      };
+      task.signal?.addEventListener("abort", onAbort, { once: true });
+      item.removeAbortListener = () => task.signal?.removeEventListener("abort", onAbort);
+      this.queue.push(item);
       this.pump();
     });
   }
 
   private pump(): void {
-    for (const item of this.queue) {
-      if (item.started || this.isBlocked(item.task)) continue;
-      item.started = true;
-      const activeItem: ActiveTask<TResult> = { task: item.task };
-      this.active.push(activeItem);
-      void item.task.start()
-        .then((result) => item.resolve(result))
-        .catch((error: unknown) => item.reject(error))
-        .finally(() => {
-          const index = this.active.indexOf(activeItem);
-          if (index !== -1) this.active.splice(index, 1);
-          const queueIndex = this.queue.indexOf(item);
-          if (queueIndex !== -1) this.queue.splice(queueIndex, 1);
-          this.pump();
-        });
+    if (this.pumping) return;
+    this.pumping = true;
+    try {
+      while (this.active.length < this.maxConcurrency) {
+        const index = this.nextRunnableIndex();
+        if (index === -1) return;
+        const item = this.queue[index];
+        if (!item) return;
+        this.start(item);
+      }
+    } finally {
+      this.pumping = false;
     }
   }
 
-  private isBlocked(task: ToolSchedulerTask<TResult>): boolean {
-    return this.active.some((active) => ToolAccesses.conflict(task.accesses, active.task.accesses));
+  private nextRunnableIndex(): number {
+    for (let index = 0; index < this.queue.length; index += 1) {
+      const item = this.queue[index];
+      if (!item || item.started || this.isBlocked(item.task, index)) continue;
+      return index;
+    }
+    return -1;
   }
+
+  private start(item: QueuedTask<TResult>): void {
+    item.started = true;
+    item.removeAbortListener();
+    const activeItem: ActiveTask<TResult> = { task: item.task };
+    this.active.push(activeItem);
+
+    let result: Promise<TResult>;
+    try {
+      if (item.task.signal?.aborted) throw abortReason(item.task.signal);
+      result = item.task.start();
+    } catch (error) {
+      this.finish(item, activeItem, () => item.reject(error));
+      return;
+    }
+
+    void result
+      .then((value) => item.resolve(value), (error: unknown) => item.reject(error))
+      .finally(() => this.finish(item, activeItem));
+  }
+
+  private finish(item: QueuedTask<TResult>, activeItem: ActiveTask<TResult>, settle?: () => void): void {
+    const activeIndex = this.active.indexOf(activeItem);
+    if (activeIndex !== -1) this.active.splice(activeIndex, 1);
+    const queueIndex = this.queue.indexOf(item);
+    if (queueIndex !== -1) this.queue.splice(queueIndex, 1);
+    settle?.();
+    this.pump();
+  }
+
+  private isBlocked(task: ToolSchedulerTask<TResult>, queueIndex: number): boolean {
+    if (this.active.some((active) => ToolAccesses.conflict(task.accesses, active.task.accesses))) return true;
+
+    // A later reader must not repeatedly pass a writer that is already waiting for
+    // the same resource. More generally, conflicting tasks preserve queue order.
+    for (let index = 0; index < queueIndex; index += 1) {
+      const earlier = this.queue[index];
+      if (earlier && !earlier.started && ToolAccesses.conflict(task.accesses, earlier.task.accesses)) return true;
+    }
+    return false;
+  }
+}
+
+function abortReason(signal: AbortSignal | undefined): unknown {
+  if (signal?.reason !== undefined) return signal.reason;
+  return new DOMException("The operation was aborted.", "AbortError");
 }

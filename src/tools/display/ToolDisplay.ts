@@ -4,11 +4,12 @@
  * 这里只负责把工具调用参数转换成权限确认所需的标题、摘要和 diff。它不执行工具、不记录 session，
  * 也不决定是否允许调用，保证 UI 展示格式不会影响工具协议。
  */
-import { promises as fs } from "node:fs";
 import { analyzePermissionRequest, commandSafetyWarnings } from "../../permission/policy.js";
 import type { PermissionPrompt, PermissionRequestContext } from "../../permission/PermissionManager.js";
 import { createUnifiedDiff } from "../../utils/diff.js";
+import { redactSecrets, redactSensitiveValue } from "../../utils/secrets.js";
 import { resolveWorkspacePath } from "../../workspace/resolvePath.js";
+import { maxEditFileBytes, readBoundedUtf8File } from "../file/safeFileIo.js";
 export interface ToolCallInput {
   id: string;
   name: string;
@@ -47,17 +48,21 @@ export async function createToolPermissionRequest(
   });
   const rule = toolDisplayRules[call.name] ?? defaultDisplayRule;
   const summary = await rule.summarize(call.args, context);
+  const diff = summary.diff === undefined ? undefined : redactSecrets(summary.diff);
+  const preview = summary.preview === undefined ? undefined : redactSecrets(summary.preview);
   return {
     ...requestContext,
+    command: requestContext.command === undefined ? undefined : redactSecrets(requestContext.command),
+    reason: requestContext.reason === undefined ? undefined : redactSecrets(requestContext.reason),
     toolCallId: call.id,
     tool: call.name,
     title: rule.title,
-    details: summary.details,
-    requireFullYes: summary.requireFullYes ?? false,
-    diff: summary.diff,
-    preview: summary.preview,
-    diffPreview: summary.diff,
-    changeSummary: summary.changeSummary
+    details: redactSecrets(summary.details),
+    requireFullYes: summary.requireFullYes ?? requestContext.riskLevel === "critical",
+    diff,
+    preview,
+    diffPreview: diff,
+    changeSummary: summary.changeSummary === undefined ? undefined : redactSecrets(summary.changeSummary)
   };
 }
 
@@ -115,14 +120,14 @@ export const toolDisplayRules: Record<string, ToolDisplayRule> = {
 const defaultDisplayRule: ToolDisplayRule = {
   title: "Tool permission request",
   async summarize(args) {
-    return { details: JSON.stringify(args, null, 2) };
+    return { details: JSON.stringify(redactSensitiveValue(args), null, 2) };
   }
 };
 
 async function readExistingFileForDiff(filePath: string, context: ToolDisplayContext): Promise<string> {
   const absolutePath = resolveWorkspacePath(context.workspaceRoot, filePath, context.ignore);
   try {
-    return await fs.readFile(absolutePath, "utf8");
+    return (await readBoundedUtf8File(absolutePath, maxEditFileBytes, "reject")).content;
   } catch (error) {
     if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return "";
     throw error;

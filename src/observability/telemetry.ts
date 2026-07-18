@@ -1,8 +1,9 @@
-import { promises as fs } from "node:fs";
+import { constants, promises as fs } from "node:fs";
 import path from "node:path";
 import type { Telemetry, TelemetryOptions } from "ai";
 import type { AgentConfig } from "../config/schema.js";
 import { agentDir } from "../session/store.js";
+import { redactSecrets } from "../utils/secrets.js";
 
 export function createSdkTelemetry(config: AgentConfig, workspaceRoot: string, functionId: string): TelemetryOptions {
   return {
@@ -17,10 +18,12 @@ export function createSdkTelemetry(config: AgentConfig, workspaceRoot: string, f
 export function createLocalTelemetry(filePath: string): Telemetry {
   let writeTail: Promise<void> = Promise.resolve();
   const append = (event: Record<string, unknown>): Promise<void> => {
-    writeTail = writeTail.then(async () => {
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.appendFile(filePath, `${JSON.stringify({ ...event, time: new Date().toISOString() })}\n`, "utf8");
-    });
+    // Telemetry is diagnostic only: an unsafe or unavailable sink is disabled
+    // without breaking the agent operation that produced the event.
+    writeTail = writeTail
+      .catch(() => undefined)
+      .then(async () => await appendSecureTelemetry(filePath, `${JSON.stringify({ ...event, time: new Date().toISOString() })}\n`))
+      .catch(() => undefined);
     return writeTail;
   };
 
@@ -57,6 +60,49 @@ export function createLocalTelemetry(filePath: string): Telemetry {
   };
 }
 
+async function appendSecureTelemetry(requestedPath: string, line: string): Promise<void> {
+  const requestedDirectory = path.dirname(path.resolve(requestedPath));
+  const directoryStat = await fs.lstat(requestedDirectory);
+  if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) throw new Error("Telemetry directory must be a real directory.");
+  const directory = await fs.realpath(requestedDirectory);
+  const filePath = path.join(directory, path.basename(requestedPath));
+  let existing;
+  try {
+    existing = await fs.lstat(filePath);
+  } catch (error) {
+    if (!isNotFound(error)) throw error;
+  }
+  if (existing && (existing.isSymbolicLink() || !existing.isFile() || existing.nlink !== 1)) {
+    throw new Error("Telemetry file must be a single-link regular file.");
+  }
+
+  const handle = await fs.open(
+    filePath,
+    constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | noFollowFlag(),
+    0o600
+  );
+  try {
+    const descriptorStat = await handle.stat();
+    const pathStat = await fs.lstat(filePath);
+    if (
+      !descriptorStat.isFile()
+      || descriptorStat.nlink !== 1
+      || pathStat.isSymbolicLink()
+      || !pathStat.isFile()
+      || pathStat.nlink !== 1
+      || pathStat.dev !== descriptorStat.dev
+      || pathStat.ino !== descriptorStat.ino
+      || await fs.realpath(requestedDirectory) !== directory
+    ) {
+      throw new Error("Telemetry storage changed during append.");
+    }
+    await handle.chmod(0o600);
+    await handle.writeFile(line, "utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
 function sanitizeUsage(value: unknown): Record<string, unknown> | undefined {
   if (!isRecord(value)) return undefined;
   const inputTokenDetails = isRecord(value.inputTokenDetails) ? value.inputTokenDetails : {};
@@ -82,7 +128,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function safePayload(value: unknown): string | undefined {
   if (value === undefined) return undefined;
   try {
-    return redactTelemetrySecrets(JSON.stringify(value).slice(0, 8_000));
+    return redactSecrets(JSON.stringify(value).slice(0, 8_000));
   } catch {
     return "[unserializable]";
   }
@@ -92,8 +138,10 @@ function valueFrom(value: unknown, key: string): unknown {
   return isRecord(value) ? value[key] : undefined;
 }
 
-function redactTelemetrySecrets(value: string): string {
-  return value
-    .replace(/\b(?:sk|rk|pk|ghp|github_pat|AIza|AKIA)[-_A-Za-z0-9]{8,}\b/g, "[redacted]")
-    .replace(/(api[_-]?key|access[_-]?token|token|secret|password)(\\?"?\s*[:=]\\?"?)([^,\s}]+)/gi, "$1$2[redacted]");
+function noFollowFlag(): number {
+  return typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+}
+
+function isNotFound(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }

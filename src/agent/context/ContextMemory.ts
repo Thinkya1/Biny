@@ -10,6 +10,8 @@ import type { SessionContextState } from "../../session/metadata.js";
 
 const retainedHistoryTokens = 5_000;
 const summaryTokens = 2_800;
+const memoryShutdownDrainMs = 2_000;
+const memoryAbortDrainMs = 500;
 
 /**
  * Stateful model context for one agent session. It owns conversation history,
@@ -17,7 +19,9 @@ const summaryTokens = 2_800;
  */
 export class ContextMemory {
   private readonly history: ModelMessage[] = [];
-  private readonly pendingMemoryWrites = new Set<Promise<void>>();
+  private memoryTail: Promise<void> = Promise.resolve();
+  private readonly memoryControllers = new Set<AbortController>();
+  private memoryClosed = false;
   private summary: string | undefined;
   private compactedMessages = 0;
   private lastCompactedAt: string | undefined;
@@ -40,11 +44,16 @@ export class ContextMemory {
     await this.workspace.initialize();
   }
 
-  async prepareTurn(input: string, systemPrompt: string): Promise<ModelMessage[]> {
-    await this.initialize();
-    const compaction = await this.compactIfNeeded();
-    const workspace = await this.workspace.prepareTurn(input);
-    const memoryMatches = await this.findRelevantMemory(input, [...workspace.explicitPaths, ...workspace.recentActivity.paths]);
+  async prepareTurn(input: string, systemPrompt: string, signal?: AbortSignal): Promise<ModelMessage[]> {
+    signal?.throwIfAborted();
+    await this.flush(signal);
+    signal?.throwIfAborted();
+    await this.workspace.initialize(signal);
+    signal?.throwIfAborted();
+    const compaction = await this.compactIfNeeded(signal);
+    const workspace = await this.workspace.prepareTurn(input, signal);
+    const memoryMatches = await this.findRelevantMemory(input, [...workspace.explicitPaths, ...workspace.recentActivity.paths], signal);
+    signal?.throwIfAborted();
     this.memoryTopics = [...new Set(memoryMatches.map((match) => match.topic))];
     const assembly = assembleContext(
       systemPrompt,
@@ -101,8 +110,10 @@ export class ContextMemory {
     this.workspace.observeToolResult(tool, args, result);
   }
 
-  async compact(hint?: string): Promise<CompactionResult> {
-    await this.initialize();
+  async compact(hint?: string, signal?: AbortSignal): Promise<CompactionResult> {
+    signal?.throwIfAborted();
+    await this.workspace.initialize(signal);
+    signal?.throwIfAborted();
     if (!this.history.length) return { compacted: false, compactedMessageCount: 0, summary: this.summary };
 
     let retained = takeRecentMessages(this.history, retainedHistoryTokens);
@@ -112,7 +123,8 @@ export class ContextMemory {
       retained = [];
     }
 
-    this.summary = mergeSummaries(this.summary, await this.createSummary(compacted, hint));
+    this.summary = mergeSummaries(this.summary, await this.createSummary(compacted, hint, signal));
+    signal?.throwIfAborted();
     this.compactedMessages += compacted.length;
     this.lastCompactedAt = new Date().toISOString();
     this.replaceHistory(retained);
@@ -133,16 +145,27 @@ export class ContextMemory {
   }
 
   queueSuccessfulTask(task: string, answer: string): void {
-    if (!this.localMemory) return;
-    const pending = this.localMemory.rememberSuccessfulTask(task, answer).catch(() => {
+    if (!this.localMemory || this.memoryClosed) return;
+    const controller = new AbortController();
+    this.memoryControllers.add(controller);
+    const pending = this.memoryTail.then(async () => {
+      await this.localMemory?.rememberSuccessfulTask(task, answer, controller.signal);
+    }).catch(() => {
       // Persistent memory is best effort and must not turn a successful turn into an error.
-    });
-    this.pendingMemoryWrites.add(pending);
-    void pending.finally(() => this.pendingMemoryWrites.delete(pending));
+    }).finally(() => this.memoryControllers.delete(controller));
+    this.memoryTail = pending;
   }
 
-  async flush(): Promise<void> {
-    await Promise.all([...this.pendingMemoryWrites]);
+  async flush(signal?: AbortSignal): Promise<void> {
+    await waitForAbort(this.memoryTail, signal);
+  }
+
+  async shutdownMemory(drainMs = memoryShutdownDrainMs): Promise<void> {
+    this.memoryClosed = true;
+    const pending = this.memoryTail;
+    if (await settlesWithin(pending, drainMs)) return;
+    for (const controller of this.memoryControllers) controller.abort(new Error("Local memory shutdown interrupted the pending write."));
+    await settlesWithin(pending, memoryAbortDrainMs);
   }
 
   async status(): Promise<ContextStatus> {
@@ -189,14 +212,15 @@ export class ContextMemory {
     return `Compacted ${String(result.compactedMessageCount)} messages. The next turn will use the handoff summary and recent history.`;
   }
 
-  private async compactIfNeeded(): Promise<CompactionResult> {
+  private async compactIfNeeded(signal?: AbortSignal): Promise<CompactionResult> {
+    signal?.throwIfAborted();
     if (estimateMessageTokens(this.history) <= Math.floor(this.maxTokens * 0.45)) {
       return { compacted: false, compactedMessageCount: 0, summary: this.summary };
     }
-    return await this.compact();
+    return await this.compact(undefined, signal);
   }
 
-  private async createSummary(messages: ModelMessage[], hint?: string): Promise<string> {
+  private async createSummary(messages: ModelMessage[], hint?: string, signal?: AbortSignal): Promise<string> {
     const transcript = messages.map((message) => {
       const label = message.role === "tool" ? `tool ${messageToolName(message)}` : message.role;
       return `${label}: ${truncateTextToTokens(messageText(message), 700)}`;
@@ -214,6 +238,7 @@ export class ContextMemory {
       const result = await generateText({
         model: this.getModel(),
         allowSystemInMessages: true,
+        abortSignal: signal,
         maxRetries: 0,
         output: Output.object({
           schema: summarySchema,
@@ -230,16 +255,18 @@ export class ContextMemory {
       const summary = formatStructuredSummary(await result.output);
       if (summary) return truncateTextToTokens(redactSecrets(summary), summaryTokens);
     } catch {
+      signal?.throwIfAborted();
       // A compaction failure must not block the active coding task.
     }
     return deterministicSummary(messages);
   }
 
-  private async findRelevantMemory(input: string, paths: string[]): Promise<MemoryMatch[]> {
+  private async findRelevantMemory(input: string, paths: string[], signal?: AbortSignal): Promise<MemoryMatch[]> {
     if (!this.localMemory) return [];
     try {
-      return await this.localMemory.findRelevant(input, paths);
+      return await this.localMemory.findRelevant(input, paths, 3, signal);
     } catch {
+      signal?.throwIfAborted();
       return [];
     }
   }
@@ -261,6 +288,37 @@ export class ContextMemory {
       source: "estimated",
       measuredAt: undefined
     };
+  }
+}
+
+async function waitForAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return await promise;
+  signal.throwIfAborted();
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}
+
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true, () => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

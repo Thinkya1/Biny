@@ -356,6 +356,9 @@ button.summary-popover-item:hover { color: var(--text); }
 .permission-card p { margin: 8px 0; color: var(--text-secondary); font-size: 11.5px; }
 .permission-preview { max-height: 150px; margin: 9px 0; overflow: auto; padding: 9px 10px; border-radius: 6px; background: var(--code); font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
 .permission-target { display: flex; align-items: center; gap: 7px; padding: 5px 0; color: var(--text-secondary); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.permission-confirmation { display: grid; gap: 6px; margin-top: 10px; color: var(--text-secondary); font-size: 11.5px; }
+.permission-confirmation input { min-height: 30px; padding: 0 9px; border: 1px solid var(--amber); border-radius: 7px; color: var(--text-primary); background: var(--surface); font: inherit; }
+.permission-confirmation input:focus { outline: 2px solid color-mix(in srgb, var(--amber) 32%, transparent); outline-offset: 1px; }
 .permission-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 12px; }
 .permission-actions button, .run-error-actions button, .settings-button-row > button, .connect-dialog-actions button, .rename-modal button { min-height: 28px; padding: 0 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); font-size: 11px; }
 .permission-actions button:hover, .run-error-actions button:hover, .settings-button-row > button:hover, .connect-dialog-actions button:hover, .rename-modal button:hover { background: var(--surface-hover); }

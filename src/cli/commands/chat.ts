@@ -8,6 +8,7 @@ import { stdin as input, stdout as output } from "node:process";
 import type { CommandRuntime } from "../../runtime/CommandRuntime.js";
 import { withCommandRuntime } from "../../runtime/CommandRuntime.js";
 import { readInteractiveLine } from "../prompt/interactivePrompt.js";
+import { withCliAbortSignal } from "../sigint.js";
 import { CHAT_SLASH_COMMANDS, completeChatSlashCommand, executeChatSlashCommand } from "./chatSlash.js";
 
 export interface ChatCommandOptions {
@@ -55,15 +56,14 @@ async function runChatLoop(runtime: CommandRuntime): Promise<void> {
 async function handleInputLine(runtime: CommandRuntime, line: string): Promise<boolean> {
   const text = line.trim();
   if (!text) return true;
-  if (text.startsWith("/")) {
-    try {
-      return await executeChatSlashCommand(runtime, text);
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
+  try {
+    return await withCliAbortSignal(async (signal) => {
+      if (text.startsWith("/")) return await executeChatSlashCommand(runtime, text, signal);
+      console.log(await runtime.agent.runTask(text, { abortSignal: signal }));
       return true;
-    }
+    });
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    return true;
   }
-
-  console.log(await runtime.agent.runTask(text));
-  return true;
 }

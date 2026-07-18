@@ -6,6 +6,7 @@
  */
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { isFullYesConfirmation, permissionResultFromAnswer } from "./confirmation.js";
 import type { PermissionPrompt, PermissionResult } from "./PermissionManager.js";
 
 export interface ConfirmOptions {
@@ -18,9 +19,10 @@ export async function confirmAction(title: string, details: string, options: Con
   output.write(`\n${title}\n${details}\nAllow? ${options.requireFullYes ? "type yes to confirm" : "yes/no"}\n`);
   const rl = createInterface({ input, output });
   try {
-    const answer = (await rl.question("> ")).trim().toLowerCase();
-    if (options.requireFullYes) return answer === "yes";
-    return answer === "y" || answer === "yes";
+    const answer = await rl.question("> ");
+    if (options.requireFullYes) return isFullYesConfirmation(answer);
+    const normalized = answer.trim().toLowerCase();
+    return normalized === "y" || normalized === "yes";
   } finally {
     rl.close();
   }
@@ -36,20 +38,22 @@ export async function confirmPermissionRequest(request: PermissionPrompt): Promi
   if (request.reason) output.write(`Reason: ${request.reason}\n`);
   if (request.changeSummary) output.write(`Summary: ${request.changeSummary}\n`);
   output.write(`${request.details}\n`);
-  output.write([
+  output.write((request.requireFullYes ? [
+    "Choose (full confirmation required):",
+    "  yes          Execute once",
+    "  yes command  Execute and do not ask again for this command",
+    "  n / Enter    Do not execute"
+  ] : [
     "Choose:",
     "  y / Enter  Execute",
     "  n          Do not execute",
     "  c          Do not ask again for this command"
-  ].join("\n"));
+  ]).join("\n"));
   output.write("\n");
 
   const rl = createInterface({ input, output });
   try {
-    const answer = (await rl.question("> ")).trim().toLowerCase();
-    if (answer === "" || answer === "y" || answer === "yes") return { approved: true, scope: "once" };
-    if (answer === "c") return { approved: true, scope: "command" };
-    return { approved: false, scope: "once", message: "Denied by user." };
+    return permissionResultFromAnswer(await rl.question("> "), request.requireFullYes);
   } finally {
     rl.close();
   }

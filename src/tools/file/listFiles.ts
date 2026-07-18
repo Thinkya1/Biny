@@ -40,8 +40,8 @@ export function createListFilesTool(context: ToolContext): Tool<ListFilesArgs, L
         display: { kind: "file_io", operation: "list", path: ".", detail: `limit ${String(args.limit ?? 200)}` },
         description: "List workspace files",
         approvalRule: "list_files",
-        async execute() {
-          const files = await scanWorkspaceFiles(context.workspaceRoot, context.ignore, args.limit ?? 200);
+        async execute({ signal }) {
+          const files = await scanWorkspaceFiles(context.workspaceRoot, context.ignore, args.limit ?? 200, signal);
           return { files };
         }
       };

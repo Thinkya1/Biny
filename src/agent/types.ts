@@ -32,7 +32,7 @@ export type AgentSessionEvent =
   | { type: "tool-progress"; toolCallId: string; tool: string; update: ToolUpdate }
   | { type: "permission-requested"; toolCallId: string; request: AgentPermissionRequest }
   | { type: "permission-result"; toolCallId: string; request: AgentPermissionRequest; result: AgentPermissionResult }
-  | { type: "error"; message: string; recorded?: boolean }
+  | { type: "error"; message: string; recorded?: boolean; fatal?: boolean }
   | { type: "done"; content: string; usage?: SessionUsage };
 
 export interface AgentRuntimeContext {
@@ -46,6 +46,7 @@ export interface AgentRuntimeContext {
   toolRegistry: ToolRegistry;
   permissionManager?: PermissionManager;
   confirmPermission?: (request: AgentPermissionRequest) => Promise<AgentPermissionResult>;
+  quarantineExternalTool?: (tool: string, toolCallId: string, settlement: Promise<unknown>) => void;
   abortSignal?: AbortSignal;
 }
 

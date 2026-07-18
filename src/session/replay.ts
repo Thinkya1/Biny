@@ -1,5 +1,5 @@
 import type { ModelMessage } from "ai";
-import { readSessionEvents } from "./events.js";
+import { readSessionEvents, readStoredSessionEvents } from "./events.js";
 import type { SessionContextState, SessionContextUsage, SessionEvent, SessionUsage } from "./recorder.js";
 
 export interface SessionReplay {
@@ -8,17 +8,55 @@ export interface SessionReplay {
   contextUsage?: SessionContextUsage;
   contextState?: SessionContextState;
   usage: SessionUsage[];
+  recoveredToolResults: Array<Extract<SessionEvent, { type: "tool_result" }>>;
 }
 
 export async function replaySession(filePath: string): Promise<SessionReplay> {
-  const events = await readSessionEvents(filePath);
+  return replaySessionEvents(await readSessionEvents(filePath));
+}
+
+export async function replayStoredSession(workspaceRoot: string, session: string | undefined): Promise<SessionReplay> {
+  return replaySessionEvents((await readStoredSessionEvents(workspaceRoot, session)).events);
+}
+
+export function replaySessionEvents(recordedEvents: SessionEvent[]): SessionReplay {
+  const recoveredToolResults = interruptedToolResults(recordedEvents);
+  const events = [...recordedEvents, ...recoveredToolResults];
   return {
     events,
     messages: sessionEventsToConversation(events),
     contextUsage: latestContextUsage(events),
     contextState: latestContextState(events),
-    usage: sessionUsage(events)
+    usage: sessionUsage(events),
+    recoveredToolResults
   };
+}
+
+function interruptedToolResults(events: SessionEvent[]): Array<Extract<SessionEvent, { type: "tool_result" }>> {
+  const openCalls: Array<Extract<SessionEvent, { type: "tool_call" }>> = [];
+  for (const event of events) {
+    if (event.type === "user_message" || event.type === "assistant_message") {
+      openCalls.splice(0, openCalls.length);
+      continue;
+    }
+    if (event.type === "tool_call") {
+      openCalls.push(event);
+      continue;
+    }
+    if (event.type !== "tool_result") continue;
+    const index = event.toolCallId
+      ? openCalls.findIndex((call) => call.toolCallId === event.toolCallId)
+      : openCalls.findIndex((call) => call.tool === event.tool);
+    if (index !== -1) openCalls.splice(index, 1);
+  }
+  return openCalls.map((call) => ({
+    type: "tool_result",
+    tool: call.tool,
+    toolCallId: call.toolCallId,
+    sequence: call.sequence,
+    auditOnly: call.auditOnly,
+    result: { error: "Tool call was interrupted before completion.", interrupted: true }
+  }));
 }
 
 function latestContextUsage(events: SessionEvent[]): SessionContextUsage | undefined {
@@ -41,9 +79,10 @@ function latestContextState(events: SessionEvent[]): SessionContextState | undef
 
 function sessionUsage(events: SessionEvent[]): SessionUsage[] {
   return events.flatMap((event) => {
-    if (event.type === "assistant_message" && event.usage !== undefined) return [event.usage];
-    if (event.type === "user_message" && event.preparationUsage !== undefined) return event.preparationUsage;
-    return [];
+    const usage = event.type === "assistant_message" && event.usage !== undefined ? [event.usage] : [];
+    const preparationUsage = event.type === "user_message" && event.preparationUsage !== undefined ? event.preparationUsage : [];
+    const relatedUsage = "relatedUsage" in event && event.relatedUsage !== undefined ? event.relatedUsage : [];
+    return [...usage, ...preparationUsage, ...relatedUsage];
   });
 }
 
@@ -77,6 +116,13 @@ export function sessionEventsToConversation(events: SessionEvent[]): ModelMessag
   };
 
   for (const [index, event] of events.entries()) {
+    if (
+      (event.type === "user_message"
+        || event.type === "assistant_message"
+        || event.type === "tool_call"
+        || event.type === "tool_result")
+      && event.auditOnly
+    ) continue;
     if (event.type === "user_message") {
       flushPendingCalls();
       resetPendingCalls();

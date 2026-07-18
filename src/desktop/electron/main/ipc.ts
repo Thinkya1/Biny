@@ -49,7 +49,8 @@ const permissionResultSchema = z.object({
   approved: z.boolean(),
   scope: z.enum(["once", "command", "session", "tool", "path"]).optional(),
   nextMode: permissionModeSchema.optional(),
-  message: z.string().max(500).optional()
+  message: z.string().max(500).optional(),
+  confirmation: z.string().max(16).optional()
 });
 const attachmentSchema = z.object({
   name: z.string().max(240),

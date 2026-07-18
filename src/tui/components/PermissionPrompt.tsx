@@ -7,7 +7,14 @@
 import React, { useEffect, useState } from "react";
 import { Text, useInput } from "ink";
 import { TUI_KEYS } from "../keymap.js";
-import { movePermissionSelection, permissionChoiceAt, permissionOptions } from "../permissionOptions.js";
+import {
+  appendPermissionConfirmation,
+  confirmedPermissionChoice,
+  createPermissionPromptInteractionState,
+  movePermissionSelection,
+  permissionOptions,
+  permissionPromptStateForRequest
+} from "../permissionOptions.js";
 import { tuiColors } from "../theme/index.js";
 import type { PermissionChoice, TuiPermissionRequest } from "../types.js";
 import { DialogFrame } from "./DialogFrame.js";
@@ -21,35 +28,60 @@ export interface PermissionPromptProps {
 }
 
 export function PermissionPrompt({ request, detailsExpanded, onAnswer, onToggleDetails }: PermissionPromptProps): React.ReactElement | null {
-  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [interaction, setInteraction] = useState(() => createPermissionPromptInteractionState(request));
+  const activeInteraction = permissionPromptStateForRequest(interaction, request);
 
   useEffect(() => {
-    setSelectedIndex(0);
+    setInteraction(createPermissionPromptInteractionState(request));
   }, [request]);
 
   useInput((input, key) => {
     // 权限框激活时只处理确认相关快捷键，其他输入仍由外层忽略。
     if (!request) return;
-    if ((key.ctrl && input.toLowerCase() === "e") || (key.ctrl && input.toLowerCase() === "o")) onToggleDetails();
+    if ((key.ctrl && input.toLowerCase() === "e") || (key.ctrl && input.toLowerCase() === "o")) {
+      onToggleDetails();
+      return;
+    }
     if (key.upArrow) {
-      setSelectedIndex((current) => movePermissionSelection(current, -1));
+      moveSelection(-1);
       return;
     }
     if (key.downArrow) {
-      setSelectedIndex((current) => movePermissionSelection(current, 1));
+      moveSelection(1);
       return;
     }
     if (key.return) {
-      onAnswer(permissionChoiceAt(selectedIndex));
+      const choice = confirmedPermissionChoice(
+        activeInteraction.selectedIndex,
+        request.requireFullYes,
+        activeInteraction.confirmation
+      );
+      if (choice) onAnswer(choice);
+      else updateInteraction({ confirmationAttempted: true });
       return;
     }
-    if (input.toLowerCase() === TUI_KEYS.approve) {
+    if (!request.requireFullYes && input.toLowerCase() === TUI_KEYS.approve) {
       onAnswer("approve_once");
       return;
     }
     if (input.toLowerCase() === TUI_KEYS.reject) {
       onAnswer("reject");
+      return;
     }
+    if (!request.requireFullYes || key.ctrl || key.meta) return;
+    if (key.backspace || key.delete) {
+      updateInteraction({
+        confirmation: activeInteraction.confirmation.slice(0, -1),
+        confirmationAttempted: false
+      });
+      return;
+    }
+    const nextInput = input.replaceAll("\r", "").replaceAll("\n", "");
+    if (!nextInput) return;
+    updateInteraction({
+      confirmation: appendPermissionConfirmation(activeInteraction.confirmation, nextInput),
+      confirmationAttempted: false
+    });
   }, { isActive: request !== undefined });
 
   if (!request) return null;
@@ -62,21 +94,34 @@ export function PermissionPrompt({ request, detailsExpanded, onAnswer, onToggleD
     <DialogFrame
       title={<Text color={tuiColors.warning}>{request.title}</Text>}
       subtitle={`Tool: ${request.tool} · Action: ${request.actionType} · Risk: ${request.riskLevel}`}
-      hint="↑↓ navigate · Enter select · y execute · n deny · Ctrl+E/Ctrl+O details"
-      footer={request.requireFullYes ? "Critical action: review details before accepting." : "Press enter to select"}
+      hint={request.requireFullYes
+        ? "↑↓ navigate · Enter confirm · N deny · Ctrl+E/Ctrl+O details"
+        : "↑↓ navigate · Enter select · Y execute · N deny · Ctrl+E/Ctrl+O details"}
+      footer={request.requireFullYes
+        ? "Approval requires the full word yes. Empty Enter or y will not execute."
+        : "Press Enter to select"}
     >
       <Text> </Text>
       {request.targetPath ? <Text>Target: {request.targetPath}</Text> : null}
       {request.command ? <Text>Command: {request.command}</Text> : null}
       {request.reason ? <Text>Reason: {request.reason}</Text> : null}
       {request.changeSummary ? <Text>Summary: {request.changeSummary}</Text> : null}
-      {request.requireFullYes ? <Text color={tuiColors.error}>Critical or sensitive operation: review before accepting.</Text> : null}
+      {request.requireFullYes ? (
+        <>
+          <Text color={tuiColors.error}>Critical or sensitive operation: review before accepting.</Text>
+          <Text color={tuiColors.warning} bold>Type yes, then press Enter, to approve the selected action.</Text>
+          <Text>
+            Confirmation: <Text color={tuiColors.warning}>{activeInteraction.confirmation}</Text><Text color={tuiColors.warning}>█</Text>
+          </Text>
+          {activeInteraction.confirmationAttempted ? <Text color={tuiColors.error}>Confirmation must be the full word yes.</Text> : null}
+        </>
+      ) : null}
       {lines.map((line, index) => (
         <MarkdownText key={`${request.tool}-${String(index)}`} line={line} />
       ))}
       <Text> </Text>
       {permissionOptions.map((option, index) => {
-        const selected = index === selectedIndex;
+        const selected = index === activeInteraction.selectedIndex;
         const color = option.dangerous ? tuiColors.error : selected ? tuiColors.warning : undefined;
         return (
           <Text key={option.choice} color={color} bold={selected} wrap="truncate-end">
@@ -88,4 +133,25 @@ export function PermissionPrompt({ request, detailsExpanded, onAnswer, onToggleD
       })}
     </DialogFrame>
   );
+
+  function moveSelection(direction: -1 | 1): void {
+    setInteraction((current) => {
+      const active = permissionPromptStateForRequest(current, request);
+      return {
+        ...active,
+        selectedIndex: movePermissionSelection(active.selectedIndex, direction),
+        confirmation: "",
+        confirmationAttempted: false
+      };
+    });
+  }
+
+  function updateInteraction(update: Partial<PermissionPromptInteractionUpdate>): void {
+    setInteraction((current) => ({ ...permissionPromptStateForRequest(current, request), ...update }));
+  }
 }
+
+type PermissionPromptInteractionUpdate = Pick<
+  ReturnType<typeof createPermissionPromptInteractionState>,
+  "confirmation" | "confirmationAttempted"
+>;

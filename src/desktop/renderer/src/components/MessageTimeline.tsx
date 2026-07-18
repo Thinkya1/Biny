@@ -3,7 +3,7 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
 import { copyToClipboard } from "../copyToClipboard.js";
-import { listChangedFiles, type TimelineTool, type TimelineTurn } from "../sessionTimeline.js";
+import { activeTimelineTool, listChangedFiles, timelineToolEntries, type TimelineToolEntry, type TimelineTurn } from "../sessionTimeline.js";
 import { CopyButton } from "./CopyButton.js";
 import { Icon } from "./Icon.js";
 import { ToolActivity } from "./ToolActivity.js";
@@ -67,7 +67,7 @@ const Turn = memo(function Turn({
   const [selectedToolId, setSelectedToolId] = useState<string>();
   const summary = useMemo(() => turnSummary(turn), [turn]);
   const running = turn.status === "running" || turn.status === "waiting_permission" || turn.status === "queued";
-  const activeTool = turn.tools.find((tool) => tool.id === selectedToolId);
+  const activeTool = activeTimelineTool(turn.tools, selectedToolId);
   const hasReasoning = Boolean(turn.reasoningStatus || turn.reasoning || turn.durationMs !== undefined);
   return (
     <article className={`timeline-turn is-${turn.status}`}>
@@ -214,7 +214,7 @@ function ExecutionSummary({
   onToggleReasoning(): void;
   onSelectTool(toolId: string): void;
 }): React.JSX.Element {
-  const toolEntries = useMemo(() => uniqueToolEntries(turn.tools), [turn.tools]);
+  const toolEntries = useMemo(() => timelineToolEntries(turn.tools), [turn.tools]);
   const [openMenu, setOpenMenu] = useState<"tools" | "skills">();
   return (
     <div className="execution-summary">
@@ -244,7 +244,7 @@ function SummaryMenu({
   icon: "wand" | "wrench";
   label: string;
   title: string;
-  items: SummaryItem[];
+  items: TimelineToolEntry[];
   onSelect?: (toolId: string) => void;
   open: boolean;
   onToggle(): void;
@@ -271,26 +271,6 @@ function SummaryMenu({
       ) : null}
     </div>
   );
-}
-
-interface SummaryItem {
-  key: string;
-  label: string;
-  toolId?: string;
-}
-
-function uniqueToolEntries(tools: TimelineTool[]): SummaryItem[] {
-  const entries = new Map<string, SummaryItem>();
-  for (const tool of tools) {
-    if (!entries.has(tool.tool)) entries.set(tool.tool, { key: tool.tool, label: executionToolLabel(tool.tool), toolId: tool.id });
-  }
-  return [...entries.values()];
-}
-
-function executionToolLabel(tool: string): string {
-  if (tool === "run_command") return "Bash";
-  if (tool === "invoke_skill" || tool === "skill_call") return "技能调用";
-  return tool;
 }
 
 function ReasoningDetail({ content, status }: { content: string; status?: string }): React.JSX.Element {

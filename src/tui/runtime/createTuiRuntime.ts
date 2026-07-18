@@ -7,8 +7,9 @@ import type { AgentRunMode, AgentSessionInfo, ResumedAgentSession } from "../../
 import type { ContextStatus } from "../../agent/context/types.js";
 import type { ExtensionSection } from "../../extensions/report.js";
 import type { ModelChoice, ModelRuntimeInfo, ThinkingSelection } from "../../llm/ModelManager.js";
-import type { PermissionMode } from "../../permission/PermissionManager.js";
+import type { PermissionMode, PermissionResult } from "../../permission/PermissionManager.js";
 import { createInteractiveAgentRuntime } from "../../runtime/InteractiveAgentRuntime.js";
+import type { SubagentTaskSnapshot } from "../../runtime/SubagentTaskManager.js";
 import type { RuntimeEventSink } from "../../runtime/events.js";
 import type { SessionSummary } from "../../session/events.js";
 import type { PermissionChoice } from "../types.js";
@@ -28,6 +29,8 @@ export interface TuiRuntime {
   listSessions(): Promise<SessionSummary[]>;
   extensionReport(section?: ExtensionSection): string;
   runSubagentTask(task: string): Promise<string>;
+  listSubagentTasks(): SubagentTaskSnapshot[];
+  cancelSubagentTask(taskId: string, reason?: string): boolean;
   contextReport(): Promise<string>;
   usageReport(): string;
   contextStatus(): Promise<ContextStatus>;
@@ -108,6 +111,12 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
     async runSubagentTask(task: string): Promise<string> {
       return await host.runSubagentTask(task);
     },
+    listSubagentTasks(): SubagentTaskSnapshot[] {
+      return host.listSubagentTasks();
+    },
+    cancelSubagentTask(taskId: string, reason?: string): boolean {
+      return host.cancelSubagentTask(taskId, reason);
+    },
     async contextReport(): Promise<string> {
       return await host.contextReport();
     },
@@ -126,7 +135,7 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
     answerPermission(choice: PermissionChoice): void {
       const pending = host.getSnapshot().pendingPermission;
       if (!pending) return;
-      host.answerPermission(pending.requestId, permissionChoiceToResult(choice));
+      host.answerPermission(pending.requestId, permissionChoiceToResult(choice, pending.request.requireFullYes));
     },
     subscribe(listener: RuntimeEventSink): () => void {
       return bridge.subscribe(listener);
@@ -141,8 +150,8 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
   };
 }
 
-function permissionChoiceToResult(choice: PermissionChoice) {
-  if (choice === "approve_once") return { approved: true as const, scope: "once" as const };
-  if (choice === "approve_command") return { approved: true as const, scope: "command" as const };
-  return { approved: false as const, scope: "once" as const, message: "Denied by user." };
+export function permissionChoiceToResult(choice: PermissionChoice, requireFullYes: boolean): PermissionResult {
+  if (choice === "approve_once") return { approved: true, scope: "once", confirmation: requireFullYes ? "yes" : undefined };
+  if (choice === "approve_command") return { approved: true, scope: "command", confirmation: requireFullYes ? "yes" : undefined };
+  return { approved: false, scope: "once", message: "Denied by user.", confirmation: undefined };
 }

@@ -4,12 +4,11 @@
  * `read_file` 读取工作区内通过路径校验的 UTF-8 文本文件；桌面端还可读取由应用保存的
  * `@attachments/` 虚拟路径，但不能借此访问任意用户目录。
  */
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import { z } from "zod";
 import { resolveWorkspacePath } from "../../workspace/resolvePath.js";
 import { ToolAccesses } from "../access.js";
 import type { Tool, ToolContext } from "../types.js";
+import { maxReadFileBytes, readBoundedUtf8File } from "./safeFileIo.js";
 
 export interface ReadFileArgs {
   // 工具层只接受相对路径；resolveWorkspacePath 会拒绝 ../ 和被忽略的目录。
@@ -25,7 +24,7 @@ export function createReadFileTool(context: ToolContext): Tool<ReadFileArgs, Rea
   // read_file 是最小只读工具：解析路径、读 utf8、按原路径返回内容。
   return {
     name: "read_file",
-    description: "Read a file inside the workspace or a supplied attachment.",
+    description: `Read a UTF-8 file inside the workspace or a supplied attachment, up to ${String(maxReadFileBytes)} bytes. Larger files are rejected; use search_files or grep_search to inspect their bounded prefix.`,
     parameters: {
       type: "object",
       properties: {
@@ -38,15 +37,18 @@ export function createReadFileTool(context: ToolContext): Tool<ReadFileArgs, Rea
     capability: "filesystem.read",
     risk: "read",
     resolveExecution(args) {
+      const absolutePath = resolveReadablePath(context, args.path);
       return {
-        accesses: ToolAccesses.readFile(resolveReadablePath(context, args.path)),
+        accesses: ToolAccesses.readFile(absolutePath),
         display: { kind: "file_io", operation: "read", path: args.path },
         description: `Read ${args.path}`,
         approvalRule: `read_file(${args.path})`,
-        async execute() {
-          const absolutePath = resolveReadablePath(context, args.path);
-          const content = await fs.readFile(absolutePath, "utf8");
-          return { path: args.path, content };
+        async execute({ signal }) {
+          signal?.throwIfAborted();
+          const currentPath = resolveReadablePath(context, args.path);
+          if (currentPath !== absolutePath) throw new Error("The read target changed after the tool call was prepared.");
+          const result = await readBoundedUtf8File(absolutePath, maxReadFileBytes, "reject", signal);
+          return { path: args.path, content: result.content };
         }
       };
     }
@@ -60,10 +62,5 @@ function resolveReadablePath(context: ToolContext, requestedPath: string): strin
   }
   if (!context.attachmentRoot) throw new Error("No attachments are available for this session.");
   const relativePath = requestedPath.slice(attachmentPrefix.length);
-  const absolutePath = path.resolve(context.attachmentRoot, relativePath);
-  const relativeToRoot = path.relative(context.attachmentRoot, absolutePath);
-  if (!relativePath || relativeToRoot.startsWith(`..${path.sep}`) || relativeToRoot === ".." || path.isAbsolute(relativeToRoot)) {
-    throw new Error(`Attachment path escapes its storage directory: ${requestedPath}`);
-  }
-  return absolutePath;
+  return resolveWorkspacePath(context.attachmentRoot, relativePath, []);
 }

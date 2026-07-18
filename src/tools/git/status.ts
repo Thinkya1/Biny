@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { z } from "zod";
 import { ToolAccesses } from "../access.js";
 import type { Tool, ToolContext } from "../types.js";
+import { gitInspectionEnvironment } from "./environment.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -31,9 +32,17 @@ export function createGitStatusTool(context: ToolContext): Tool<Record<string, n
         display: { kind: "file_io", operation: "git", path: ".", detail: "git status --short" },
         description: "Run git status --short",
         approvalRule: "git_status",
-        async execute() {
+        async execute({ signal }) {
           try {
-            const result = await execFileAsync("git", ["status", "--short"], { cwd: context.workspaceRoot });
+            const result = await execFileAsync("git", [
+              "--no-pager",
+              "--no-optional-locks",
+              "-c",
+              "core.fsmonitor=false",
+              "status",
+              "--short",
+              "--ignore-submodules=all"
+            ], { cwd: context.workspaceRoot, env: gitInspectionEnvironment(), timeout: 30_000, signal });
             return { output: result.stdout };
           } catch (error) {
             return { output: error instanceof Error ? error.message : String(error) };

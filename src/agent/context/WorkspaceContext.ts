@@ -3,6 +3,7 @@ import path from "node:path";
 import type { ModelMessage } from "ai";
 import { messageText } from "../modelMessages.js";
 import { collectProjectContext } from "../../project/ProjectContext.js";
+import { resolveWorkspaceDirectory, resolveWorkspacePath, toWorkspaceRelative } from "../../workspace/resolvePath.js";
 import { scanWorkspaceFiles } from "../../workspace/scanner.js";
 import type { LoadedInstruction, ProjectSnapshot, RecentWorkspaceActivity, RepoMapEntry, RepoMapRole, WorkspaceTurnData } from "./types.js";
 
@@ -24,6 +25,7 @@ export interface WorkspaceContextStatus {
 }
 
 export class WorkspaceContext {
+  private readonly canonicalWorkspaceRoot: string;
   private readonly loadedInstructions: LoadedInstruction[] = [];
   private readonly visitedInstructionDirectories = new Set<string>();
   private readonly activePaths: string[] = [];
@@ -40,26 +42,32 @@ export class WorkspaceContext {
     private readonly workspaceRoot: string,
     private readonly ignore: string[],
     private readonly instructionMaxBytes: number
-  ) {}
+  ) {
+    this.canonicalWorkspaceRoot = resolveWorkspaceDirectory(workspaceRoot, ".", []);
+  }
 
-  async initialize(): Promise<void> {
+  async initialize(signal?: AbortSignal): Promise<void> {
     if (this.initialized) return;
+    signal?.throwIfAborted();
     await Promise.all([
-      this.loadInstructionDirectory(this.workspaceRoot),
-      this.refreshSnapshot(),
-      this.refreshRepoMap()
+      this.loadInstructionDirectory(this.workspaceRoot, signal),
+      this.refreshSnapshot(signal),
+      this.refreshRepoMap(signal)
     ]);
+    signal?.throwIfAborted();
     this.initialized = true;
   }
 
-  async prepareTurn(input: string): Promise<WorkspaceTurnData> {
-    await this.initialize();
+  async prepareTurn(input: string, signal?: AbortSignal): Promise<WorkspaceTurnData> {
+    await this.initialize(signal);
+    signal?.throwIfAborted();
     const explicitPaths = extractPathReferences(input);
-    await this.loadInstructionsForPaths(this.activePaths);
+    await this.loadInstructionsForPaths([...explicitPaths, ...this.activePaths], signal);
     const [snapshot, repoMapCandidates] = await Promise.all([
-      this.refreshSnapshot(),
-      this.findRepoMapCandidates(input)
+      this.refreshSnapshot(signal),
+      this.findRepoMapCandidates(input, signal)
     ]);
+    signal?.throwIfAborted();
     return {
       instructions: this.loadedInstructions.map((instruction) => ({ ...instruction })),
       snapshot,
@@ -101,9 +109,11 @@ export class WorkspaceContext {
     };
   }
 
-  private async refreshSnapshot(): Promise<ProjectSnapshot> {
+  private async refreshSnapshot(signal?: AbortSignal): Promise<ProjectSnapshot> {
+    signal?.throwIfAborted();
     if (!this.snapshot || this.snapshotDirty) {
-      const context = await collectProjectContext(this.workspaceRoot, this.ignore);
+      const context = await collectProjectContext(this.workspaceRoot, this.ignore, signal);
+      signal?.throwIfAborted();
       this.snapshot = {
         context,
         refreshedAt: new Date().toISOString(),
@@ -114,16 +124,20 @@ export class WorkspaceContext {
     return this.snapshot;
   }
 
-  private async refreshRepoMap(): Promise<void> {
+  private async refreshRepoMap(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     if (!this.repoMapDirty) return;
-    const files = (await scanWorkspaceFiles(this.workspaceRoot, this.ignore, maxRepoFiles)).sort((left, right) => left.localeCompare(right));
-    this.repoEntries = await Promise.all(files.map(async (filePath) => await buildRepoMapEntry(this.workspaceRoot, filePath)));
+    const files = (await scanWorkspaceFiles(this.workspaceRoot, this.ignore, maxRepoFiles, signal)).sort((left, right) => left.localeCompare(right));
+    const entries = await Promise.all(files.map(async (filePath) => await buildRepoMapEntry(this.workspaceRoot, this.ignore, filePath, signal)));
+    signal?.throwIfAborted();
+    this.repoEntries = entries;
     this.repoMapRefreshedAt = new Date().toISOString();
     this.repoMapDirty = false;
   }
 
-  private async findRepoMapCandidates(query: string): Promise<RepoMapEntry[]> {
-    await this.refreshRepoMap();
+  private async findRepoMapCandidates(query: string, signal?: AbortSignal): Promise<RepoMapEntry[]> {
+    await this.refreshRepoMap(signal);
+    signal?.throwIfAborted();
     const active = new Set(this.activePaths);
     const terms = tokenize(query);
     return this.repoEntries
@@ -134,46 +148,64 @@ export class WorkspaceContext {
       .map((item) => item.entry);
   }
 
-  private async loadInstructionsForPaths(filePaths: string[]): Promise<void> {
+  private async loadInstructionsForPaths(filePaths: string[], signal?: AbortSignal): Promise<void> {
     const directories = new Set<string>();
     for (const filePath of filePaths) {
+      signal?.throwIfAborted();
       const absolutePath = this.toWorkspacePath(filePath);
       if (!absolutePath) continue;
       let currentDirectory = path.dirname(absolutePath);
       const chain: string[] = [];
-      while (isInsideWorkspace(this.workspaceRoot, currentDirectory)) {
+      while (isInsideWorkspace(this.canonicalWorkspaceRoot, currentDirectory)) {
         chain.unshift(currentDirectory);
-        if (currentDirectory === this.workspaceRoot) break;
+        if (currentDirectory === this.canonicalWorkspaceRoot) break;
         currentDirectory = path.dirname(currentDirectory);
       }
       for (const directory of chain) directories.add(directory);
     }
     for (const directory of [...directories].sort((left, right) => left.localeCompare(right))) {
-      await this.loadInstructionDirectory(directory);
+      await this.loadInstructionDirectory(directory, signal);
     }
   }
 
-  private async loadInstructionDirectory(directory: string): Promise<void> {
-    if (this.visitedInstructionDirectories.has(directory) || this.instructionBytes >= this.instructionMaxBytes) return;
-    this.visitedInstructionDirectories.add(directory);
-    const filePath = await findInstructionFile(directory);
-    if (!filePath) return;
+  private async loadInstructionDirectory(directory: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    const canonicalDirectory = this.toWorkspaceDirectory(directory);
+    if (!canonicalDirectory || this.visitedInstructionDirectories.has(canonicalDirectory) || this.instructionBytes >= this.instructionMaxBytes) return;
+    const filePath = await findInstructionFile(this.workspaceRoot, canonicalDirectory, this.ignore, signal);
+    if (!filePath) {
+      this.visitedInstructionDirectories.add(canonicalDirectory);
+      return;
+    }
 
-    const content = await fs.readFile(filePath, "utf8");
+    const content = await fs.readFile(filePath, { encoding: "utf8", signal });
+    signal?.throwIfAborted();
     const selectedContent = truncateUtf8(content, this.instructionMaxBytes - this.instructionBytes);
     const bytes = Buffer.byteLength(selectedContent, "utf8");
     if (!selectedContent || !bytes) return;
     this.loadedInstructions.push({
-      path: path.relative(this.workspaceRoot, filePath) || path.basename(filePath),
+      path: toWorkspaceRelative(this.workspaceRoot, filePath),
       content: selectedContent,
       bytes
     });
     this.instructionBytes += bytes;
+    this.visitedInstructionDirectories.add(canonicalDirectory);
   }
 
   private toWorkspacePath(filePath: string): string | undefined {
-    const absolutePath = path.resolve(this.workspaceRoot, filePath);
-    return isInsideWorkspace(this.workspaceRoot, absolutePath) ? absolutePath : undefined;
+    try {
+      return resolveWorkspacePath(this.workspaceRoot, filePath, this.ignore);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private toWorkspaceDirectory(directory: string): string | undefined {
+    try {
+      return resolveWorkspaceDirectory(this.workspaceRoot, toWorkspaceRelative(this.workspaceRoot, directory), this.ignore);
+    } catch {
+      return undefined;
+    }
   }
 
   private recentActivity(): RecentWorkspaceActivity {
@@ -198,13 +230,16 @@ export function extractPathReferences(value: string): string[] {
   return [...new Set(value.match(/[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json|md|yml|yaml|css|html)/g) ?? [])].slice(0, 24);
 }
 
-async function buildRepoMapEntry(workspaceRoot: string, filePath: string): Promise<RepoMapEntry> {
+async function buildRepoMapEntry(workspaceRoot: string, ignore: string[], filePath: string, signal?: AbortSignal): Promise<RepoMapEntry> {
+  signal?.throwIfAborted();
   const role = classifyRepoRole(filePath);
   if (!codeExtensions.has(path.extname(filePath).toLowerCase())) {
     return { path: filePath, role, symbols: [], imports: [], exports: [] };
   }
   try {
-    const content = (await fs.readFile(path.join(workspaceRoot, filePath), "utf8")).slice(0, maxSourceChars);
+    const resolvedPath = resolveWorkspacePath(workspaceRoot, filePath, ignore);
+    const content = (await fs.readFile(resolvedPath, { encoding: "utf8", signal })).slice(0, maxSourceChars);
+    signal?.throwIfAborted();
     return {
       path: filePath,
       role,
@@ -213,6 +248,7 @@ async function buildRepoMapEntry(workspaceRoot: string, filePath: string): Promi
       exports: extractExports(content)
     };
   } catch {
+    signal?.throwIfAborted();
     return { path: filePath, role, symbols: [], imports: [], exports: [] };
   }
 }
@@ -290,9 +326,16 @@ function isFailure(value: unknown): boolean {
   return isRecord(value) && (typeof value.error === "string" || value.status === "denied");
 }
 
-async function findInstructionFile(directory: string): Promise<string | undefined> {
+async function findInstructionFile(workspaceRoot: string, directory: string, ignore: string[], signal?: AbortSignal): Promise<string | undefined> {
+  const relativeDirectory = toWorkspaceRelative(workspaceRoot, directory);
   for (const fileName of instructionFileNames) {
-    const filePath = path.join(directory, fileName);
+    signal?.throwIfAborted();
+    let filePath: string;
+    try {
+      filePath = resolveWorkspacePath(workspaceRoot, path.join(relativeDirectory, fileName), ignore);
+    } catch {
+      continue;
+    }
     try {
       if ((await fs.stat(filePath)).isFile()) return filePath;
     } catch (error) {

@@ -10,7 +10,14 @@ export class AgentEventBus<TEvent = RuntimeEvent> {
   private readonly listeners = new Set<(event: TEvent) => void>();
 
   emit(event: TEvent): void {
-    for (const listener of [...this.listeners]) listener(event);
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(event);
+      } catch {
+        // A renderer or host listener must not interrupt the agent lifecycle.
+        this.listeners.delete(listener);
+      }
+    }
   }
 
   subscribe(listener: TEvent extends RuntimeEvent ? RuntimeEventSink : (event: TEvent) => void): () => void {

@@ -6,6 +6,12 @@
  */
 import { z } from "zod";
 
+const agentSchema = z.object({
+  maxSteps: z.number().int().min(1).max(32).default(8),
+  maxConcurrentTools: z.number().int().min(1).max(32).default(4),
+  maxQueuedToolCalls: z.number().int().min(1).max(1_024).default(64)
+}).default({ maxSteps: 8, maxConcurrentTools: 4, maxQueuedToolCalls: 64 });
+
 const permissionSchema = z.object({
   mode: z.enum(["safe", "ask", "read-only", "auto", "full-access"]).default("ask"),
   allowTools: z.array(z.string()).default(["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search"]),
@@ -112,20 +118,57 @@ const mcpServerSchema = z.object({
   enabled: z.boolean().default(true)
 });
 
+export const defaultSubagentAllowedTools = [
+  "read_file",
+  "list_files",
+  "search_files",
+  "grep_search",
+  "git_status",
+  "git_diff"
+] as const;
+
+const subagentToolNameSchema = z.enum(defaultSubagentAllowedTools);
+
 const extensionsSchema = z.object({
   mcp: z.record(mcpServerSchema).default({}),
-  skills: z.array(z.string()).default([".agent/skills"]),
-  plugins: z.array(z.string()).default([".agent/plugins"]),
+  skills: z.array(z.string().trim().min(1)).max(32).default([".agent/skills"]),
+  plugins: z.array(z.string().trim().min(1)).max(32).default([]),
   subagent: z.object({
     enabled: z.boolean().default(true),
     maxSteps: z.number().int().min(1).max(12).default(4),
-    maxOutputTokens: z.number().int().min(256).max(32_768).default(4_000)
-  }).default({ enabled: true, maxSteps: 4, maxOutputTokens: 4_000 })
+    maxOutputTokens: z.number().int().min(256).max(32_768).default(4_000),
+    maxConcurrentSubagents: z.number().int().min(1).max(8).default(2),
+    maxPendingSubagents: z.number().int().min(0).max(128).default(16),
+    timeoutMs: z.number().int().min(1_000).max(600_000).default(120_000),
+    model: z.string().min(1).optional(),
+    maxCostUsd: z.number().positive().max(100).optional(),
+    allowedTools: z.array(subagentToolNameSchema).min(1).default([...defaultSubagentAllowedTools])
+  }).default({
+    enabled: true,
+    maxSteps: 4,
+    maxOutputTokens: 4_000,
+    maxConcurrentSubagents: 2,
+    maxPendingSubagents: 16,
+    timeoutMs: 120_000,
+    model: undefined,
+    maxCostUsd: undefined,
+    allowedTools: [...defaultSubagentAllowedTools]
+  })
 }).default({
   mcp: {},
   skills: [".agent/skills"],
-  plugins: [".agent/plugins"],
-  subagent: { enabled: true, maxSteps: 4, maxOutputTokens: 4_000 }
+  plugins: [],
+  subagent: {
+    enabled: true,
+    maxSteps: 4,
+    maxOutputTokens: 4_000,
+    maxConcurrentSubagents: 2,
+    maxPendingSubagents: 16,
+    timeoutMs: 120_000,
+    model: undefined,
+    maxCostUsd: undefined,
+    allowedTools: [...defaultSubagentAllowedTools]
+  }
 });
 
 const webSearchSchema = z.object({
@@ -183,6 +226,7 @@ const canonicalConfigSchema = z.object({
   providers: z.record(providerConfigSchema),
   models: z.record(modelAliasSchema),
   thinking: thinkingSchema,
+  agent: agentSchema,
   permission: permissionSchema,
   workspace: z.object({
     ignore: z.array(z.string())
@@ -232,6 +276,41 @@ const canonicalConfigSchema = z.object({
       path: ["thinking", "effort"],
       message: `Model ${config.defaultModel} does not support ${config.thinking.effort} effort.`
     });
+  }
+
+  const subagentAlias = config.extensions.subagent.model;
+  if (subagentAlias) {
+    const subagentModel = config.models[subagentAlias];
+    if (!subagentModel) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["extensions", "subagent", "model"],
+        message: `Unknown subagent model alias: ${subagentAlias}`
+      });
+    } else if (subagentModel.supportsTools === false) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["extensions", "subagent", "model"],
+        message: `Subagent model ${subagentAlias} does not support tools.`
+      });
+    }
+  }
+
+  if (config.extensions.subagent.maxCostUsd !== undefined) {
+    const budgetAlias = subagentAlias ?? config.defaultModel;
+    const pricing = config.models[budgetAlias]?.pricing;
+    if (
+      pricing?.inputPerMillionTokens === undefined
+      || pricing.outputPerMillionTokens === undefined
+      || pricing.cacheReadPerMillionTokens === undefined
+      || pricing.cacheWritePerMillionTokens === undefined
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["extensions", "subagent", "maxCostUsd"],
+        message: `Subagent cost stop thresholds require input, output, cache-read, and cache-write pricing for model ${budgetAlias}.`
+      });
+    }
   }
 });
 
@@ -290,6 +369,7 @@ export const defaultConfig: AgentConfig = {
     }
   },
   thinking: { enabled: true, effort: "high" },
+  agent: { maxSteps: 8, maxConcurrentTools: 4, maxQueuedToolCalls: 64 },
   permission: {
     mode: "ask",
     allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search"],
@@ -318,8 +398,18 @@ export const defaultConfig: AgentConfig = {
   extensions: {
     mcp: {},
     skills: [".agent/skills"],
-    plugins: [".agent/plugins"],
-    subagent: { enabled: true, maxSteps: 4, maxOutputTokens: 4_000 }
+    plugins: [],
+    subagent: {
+      enabled: true,
+      maxSteps: 4,
+      maxOutputTokens: 4_000,
+      maxConcurrentSubagents: 2,
+      maxPendingSubagents: 16,
+      timeoutMs: 120_000,
+      model: undefined,
+      maxCostUsd: undefined,
+      allowedTools: [...defaultSubagentAllowedTools]
+    }
   }
 };
 

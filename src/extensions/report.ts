@@ -9,6 +9,16 @@ export interface ExtensionStatus {
     enabled: boolean;
     maxSteps: number;
     maxOutputTokens: number;
+    maxConcurrentSubagents: number;
+    maxPendingSubagents: number;
+    timeoutMs: number;
+    model?: string;
+    maxCostUsd?: number;
+    allowedTools: string[];
+  };
+  toolScheduling: {
+    maxConcurrentTools: number;
+    maxQueuedToolCalls: number;
   };
   toolCounts: Record<ToolSource, number>;
 }
@@ -44,10 +54,15 @@ export function formatExtensionReport(status: ExtensionStatus, section: Extensio
     "",
     "Subagent",
     status.subagent.enabled
-      ? `  enabled · delegate_task · read-only · max ${String(status.subagent.maxSteps)} steps · ${String(status.subagent.maxOutputTokens)} output tokens`
+      ? [
+        `  enabled · delegate_task · read-only · max ${String(status.subagent.maxSteps)} steps · ${String(status.subagent.maxOutputTokens)} output tokens`,
+        `  concurrency ${String(status.subagent.maxConcurrentSubagents)} · queue cap ${String(status.subagent.maxPendingSubagents)} · timeout ${String(status.subagent.timeoutMs)}ms · model ${status.subagent.model ?? "current"}`,
+        `  cost stop threshold ${status.subagent.maxCostUsd === undefined ? "not set" : `$${status.subagent.maxCostUsd.toFixed(6)}`} · tools ${status.subagent.allowedTools.join(", ")}`
+      ].join("\n")
       : "  disabled",
     "",
     "Tools",
+    `  scheduling concurrency ${String(status.toolScheduling.maxConcurrentTools)} · queue cap ${String(status.toolScheduling.maxQueuedToolCalls)}`,
     `  builtin ${String(counts.builtin)} · mcp ${String(counts.mcp)} · plugin ${String(counts.plugin)} · subagent ${String(counts.subagent)}`
   ].join("\n");
 }

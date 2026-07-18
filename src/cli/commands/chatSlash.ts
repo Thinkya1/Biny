@@ -1,5 +1,6 @@
 import type { CommandRuntime } from "../../runtime/CommandRuntime.js";
 import { parseThinkingSelection } from "../../llm/ModelManager.js";
+import { formatSubagentTaskReport } from "../../runtime/subagentTaskReport.js";
 import type { SlashCommand } from "../prompt/slashMenu.js";
 import { printSessionSummaries } from "./sessions.js";
 
@@ -14,7 +15,7 @@ export const CHAT_SLASH_COMMANDS: SlashCommand[] = [
   { name: "/mcp", description: "List configured MCP servers and tools", category: "extension" },
   { name: "/skills", description: "List loaded workspace skills", category: "extension" },
   { name: "/plugins", description: "List loaded plugins", category: "extension" },
-  { name: "/subagent", description: "Run a bounded read-only subagent", category: "extension", requiresArgs: true },
+  { name: "/subagent", description: "Run or manage a read-only subagent (start/status/cancel)", category: "extension", requiresArgs: true },
   { name: "/review", description: "Review current changes with a read-only subagent", category: "extension" },
   { name: "/sessions", description: "List recorded sessions", category: "session" },
   { name: "/resume", description: "Continue a previous session", category: "session" },
@@ -25,7 +26,7 @@ export const CHAT_SLASH_COMMANDS: SlashCommand[] = [
   { name: "/quit", description: "Exit chat", category: "system" }
 ];
 
-export async function executeChatSlashCommand(runtime: CommandRuntime, text: string): Promise<boolean> {
+export async function executeChatSlashCommand(runtime: CommandRuntime, text: string, signal?: AbortSignal): Promise<boolean> {
   const agent = runtime.agent;
   const [command, ...args] = text.split(/\s+/);
 
@@ -65,22 +66,47 @@ export async function executeChatSlashCommand(runtime: CommandRuntime, text: str
     return true;
   }
   if (command === "/subagent") {
-    const task = args.join(" ").trim();
-    if (!task) {
-      console.log("Usage: /subagent <read-only task>");
+    const action = args[0]?.toLowerCase();
+    if (action === "start") {
+      const task = args.slice(1).join(" ").trim();
+      if (!task) {
+        console.log("Usage: /subagent start <read-only task>");
+        return true;
+      }
+      const submitted = runtime.startSubagentTask(task);
+      console.log(`Started subagent task ${submitted.taskId}. Use /subagent status or /subagent cancel ${submitted.taskId}.`);
       return true;
     }
-    console.log(await runtime.runSubagentTask(task));
+    if (action === "status") {
+      console.log(formatSubagentTaskReport(runtime.listSubagentTasks()));
+      return true;
+    }
+    if (action === "cancel") {
+      const taskId = args[1]?.trim();
+      if (!taskId) {
+        console.log("Usage: /subagent cancel <task-id>");
+        return true;
+      }
+      const cancelled = runtime.cancelSubagentTask(taskId, "Cancelled from the CLI.");
+      console.log(cancelled ? `Cancelled subagent task ${taskId}.` : `No active subagent task found for ${taskId}.`);
+      return true;
+    }
+    const task = args.join(" ").trim();
+    if (!task) {
+      console.log("Usage: /subagent <read-only task> | start <read-only task> | status | cancel <task-id>");
+      return true;
+    }
+    console.log(await runtime.runSubagentTask(task, { signal }));
     return true;
   }
   if (command === "/review") {
     const instructions = args.join(" ").trim();
     const task = instructions || "Review the current git changes for correctness, regressions, missing tests, and concrete risks. Return concise findings with exact file paths and line numbers.";
-    console.log(await runtime.runSubagentTask(task));
+    console.log(await runtime.runSubagentTask(task, { signal }));
     return true;
   }
   if (command === "/compact") {
-    console.log(await agent.compactConversation(args.join(" ").trim() || undefined));
+    console.log(await agent.compactConversation(args.join(" ").trim() || undefined, signal));
     return true;
   }
   if (command === "/model") {
@@ -123,7 +149,7 @@ export async function executeChatSlashCommand(runtime: CommandRuntime, text: str
       console.log("Usage: /plan <task>");
       return true;
     }
-    console.log(await agent.createPlan(task));
+    console.log(await agent.createPlan(task, undefined, signal));
     return true;
   }
 

@@ -10,7 +10,7 @@ export interface UsageModelInfo {
   pricing?: ModelPricing;
 }
 
-export type ModelUsageObserver = (usage: LanguageModelUsage, operation: UsageOperation) => Promise<void> | void;
+export type ModelUsageObserver = (usage: LanguageModelUsage, operation: UsageOperation, modelAlias?: string) => Promise<void> | void;
 
 export function createSessionUsage(
   usage: LanguageModelUsage,
@@ -53,7 +53,7 @@ export function calculateUsageCost(
   let cost = 0;
 
   if (inputTokens !== undefined) {
-    const nonCachedInput = Math.max(0, inputTokens - cacheReadTokens);
+    const nonCachedInput = Math.max(0, inputTokens - cacheReadTokens - cacheWriteTokens);
     if (nonCachedInput > 0 && pricing.inputPerMillionTokens === undefined) known = false;
     else cost += (nonCachedInput / 1_000_000) * (pricing.inputPerMillionTokens ?? 0);
   }

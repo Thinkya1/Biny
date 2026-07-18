@@ -5,6 +5,9 @@
  * PermissionManager 统一决定。
  */
 import type { ActionType, PermissionRequestContext, RiskLevel } from "./PermissionManager.js";
+import type { ToolRisk } from "../tools/types.js";
+import { isProtectedCredentialPath } from "../utils/secrets.js";
+import path from "node:path";
 
 export type ToolName =
   | "read_file"
@@ -23,10 +26,11 @@ export interface AnalyzePermissionInput {
   args: unknown;
   sessionId: string;
   projectRoot: string;
+  toolRisk?: ToolRisk;
 }
 
 export function analyzePermissionRequest(input: AnalyzePermissionInput): PermissionRequestContext {
-  const targetPath = getStringField(input.args, "path");
+  const targetPath = normalizePermissionPath(getStringField(input.args, "path"));
 
   if (input.toolName === "read_file") {
     return {
@@ -88,6 +92,16 @@ export function analyzePermissionRequest(input: AnalyzePermissionInput): Permiss
     };
   }
 
+  if (input.toolRisk === "read") {
+    return { ...base(input), actionType: "read", riskLevel: "medium", targetPath: targetPath || undefined, reason: "extension declares a read-only action" };
+  }
+  if (input.toolRisk === "write") {
+    return { ...base(input), actionType: "write", riskLevel: "medium", targetPath: targetPath || undefined, reason: "extension declares a workspace-changing action" };
+  }
+  if (input.toolRisk === "execute") {
+    return { ...base(input), actionType: "shell", riskLevel: "medium", targetPath: targetPath || undefined, reason: "extension declares an executable action" };
+  }
+
   return {
     ...base(input),
     actionType: "unknown",
@@ -113,11 +127,6 @@ function analyzeCommand(input: AnalyzePermissionInput, command: string): Permiss
   const high = highRiskCommandReason(normalized);
   if (high) {
     return { ...base(input), actionType: commandAction(normalized, "high"), riskLevel: "high", command, reason: high };
-  }
-
-  const low = lowRiskCommandReason(normalized);
-  if (low) {
-    return { ...base(input), actionType: "git", riskLevel: "low", command, reason: low };
   }
 
   return {
@@ -146,11 +155,6 @@ function highRiskCommandReason(command: string): string | undefined {
   if (/(^|[;&|]\s*)git\s+(commit|push|reset|checkout|clean|rebase|merge)\b/.test(command)) return "changes git state";
   if (/(^|[;&|]\s*)(curl|wget)\b/.test(command)) return "accesses the network";
   if (/https?:\/\//.test(command)) return "accesses the network";
-  return undefined;
-}
-
-function lowRiskCommandReason(command: string): string | undefined {
-  if (/^git\s+(status|diff|log|show)\b/.test(command)) return "inspects git state";
   return undefined;
 }
 
@@ -183,7 +187,8 @@ function fileWriteReason(filePath: string): string {
 
 function isSensitivePath(filePath: string): boolean {
   const normalized = filePath.replaceAll("\\", "/").replace(/^\.\//, "");
-  return normalized === ".env"
+  return isProtectedCredentialPath(normalized)
+    || normalized === ".env"
     || normalized.startsWith(".env.")
     || normalized.startsWith(".ssh/")
     || normalized.endsWith("/.env")
@@ -210,4 +215,10 @@ function getStringField(value: unknown, key: string): string {
   if (typeof value !== "object" || value === null) return "";
   const field = (value as Record<string, unknown>)[key];
   return typeof field === "string" ? field : "";
+}
+
+function normalizePermissionPath(value: string): string {
+  if (!value) return "";
+  const normalized = path.posix.normalize(value.replaceAll("\\", "/")).replace(/^\.\//, "");
+  return normalized === "." ? "" : normalized;
 }

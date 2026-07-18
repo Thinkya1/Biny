@@ -7,8 +7,10 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { z } from "zod";
+import { filterProtectedGitDiff, protectedGitPathspecs, redactSecrets } from "../../utils/secrets.js";
 import { ToolAccesses } from "../access.js";
 import type { Tool, ToolContext } from "../types.js";
+import { gitInspectionEnvironment } from "./environment.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -31,10 +33,24 @@ export function createGitDiffTool(context: ToolContext): Tool<Record<string, nev
         display: { kind: "file_io", operation: "git", path: ".", detail: "git diff" },
         description: "Run git diff",
         approvalRule: "git_diff",
-        async execute() {
+        async execute({ signal }) {
           try {
-            const result = await execFileAsync("git", ["diff"], { cwd: context.workspaceRoot, maxBuffer: 1024 * 1024 });
-            return { output: result.stdout };
+            const result = await execFileAsync("git", [
+              "--no-pager",
+              "--no-optional-locks",
+              "-c",
+              "core.fsmonitor=false",
+              "-c",
+              "diff.external=",
+              "diff",
+              "--no-ext-diff",
+              "--no-textconv",
+              "--ignore-submodules=all",
+              "--",
+              ".",
+              ...protectedGitPathspecs()
+            ], { cwd: context.workspaceRoot, env: gitInspectionEnvironment(), maxBuffer: 1024 * 1024, timeout: 30_000, signal });
+            return { output: redactSecrets(filterProtectedGitDiff(result.stdout)) };
           } catch (error) {
             return { output: error instanceof Error ? error.message : String(error) };
           }

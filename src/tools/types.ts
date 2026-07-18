@@ -6,6 +6,7 @@
  */
 import type { z } from "zod";
 import type { ToolAccessList } from "./access.js";
+import type { FileSnapshot } from "./file/safeFileIo.js";
 import type { JsonObjectSchema } from "./schema.js";
 
 export type ToolSource = "builtin" | "mcp" | "skill" | "plugin" | "subagent";
@@ -21,10 +22,16 @@ export interface ToolUpdate {
   customData?: unknown;
 }
 
+export interface ApprovedFileSnapshot {
+  path: string;
+  snapshot: FileSnapshot | null;
+}
+
 export interface ToolExecutionContext {
   toolCallId: string;
   signal?: AbortSignal;
   onUpdate?: (update: ToolUpdate) => void;
+  approvedFile?: ApprovedFileSnapshot;
 }
 
 export type ToolInputDisplay =
@@ -37,7 +44,6 @@ export interface RunnableToolExecution<TResult = unknown> {
   display?: ToolInputDisplay;
   description?: string;
   approvalRule: string;
-  matchesRule?: (ruleArgs: string) => boolean;
   execute(context: ToolExecutionContext): Promise<TResult>;
 }
 

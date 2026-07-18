@@ -6,10 +6,10 @@ import { promisify } from "node:util";
 import type { AgentConfigStore } from "../../../config/store.js";
 import { listModelChoices, type ModelChoice } from "../../../llm/ModelManager.js";
 import type { AgentHostEvent, InteractiveRuntimeSnapshot } from "../../../runtime/agentEvents.js";
-import { listSessionSummaries } from "../../../session/events.js";
-import { readSessionEvents } from "../../../session/events.js";
-import { ensureAgentDirs, sessionFilePath } from "../../../session/store.js";
-import { resolveWorkspacePath } from "../../../workspace/resolvePath.js";
+import { listSessionSummaries, readStoredSessionEvents } from "../../../session/events.js";
+import { deleteSessionFile, duplicateSessionFile, ensureAgentDirs } from "../../../session/store.js";
+import { gitInspectionEnvironment } from "../../../tools/git/environment.js";
+import { resolveWorkspaceDirectory, resolveWorkspacePath, toWorkspaceRelative } from "../../../workspace/resolvePath.js";
 import type {
   DesktopAttachment,
   DesktopProject,
@@ -71,7 +71,7 @@ export class DesktopProjectService {
     if (missing) return { ...project, branch: undefined, dirty: false, missing: true };
     const [branch, status] = await Promise.all([
       gitOutput(project.path, ["branch", "--show-current"]),
-      gitOutput(project.path, ["status", "--porcelain"])
+      gitOutput(project.path, ["status", "--porcelain", "--ignore-submodules=all"])
     ]);
     return {
       ...project,
@@ -163,8 +163,7 @@ export class DesktopProjectService {
     const sessions = await this.listSessions(project, runtime, liveEvents);
     const session = sessions.find((candidate) => candidate.id === sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
-    const filePath = sessionFilePath(await this.storage.ensureProjectData(project), sessionId);
-    const events = await readSessionEvents(filePath).catch((error: unknown) => {
+    const events = await readStoredSessionEvents(await this.storage.ensureProjectData(project), sessionId).then((result) => result.events).catch((error: unknown) => {
       if (isNotFound(error)) return [];
       throw error;
     });
@@ -174,13 +173,13 @@ export class DesktopProjectService {
   async duplicateSession(project: DesktopProject, sessionId: string): Promise<string> {
     const targetSessionId = createSessionId();
     const dataRoot = await this.storage.ensureProjectData(project);
-    await fs.copyFile(sessionFilePath(dataRoot, sessionId), sessionFilePath(dataRoot, targetSessionId));
+    await duplicateSessionFile(dataRoot, sessionId, targetSessionId);
     await this.state.copySessionMetadata(project.id, sessionId, targetSessionId);
     return targetSessionId;
   }
 
   async deleteSession(project: DesktopProject, sessionId: string): Promise<void> {
-    await fs.rm(sessionFilePath(await this.storage.ensureProjectData(project), sessionId), { force: true });
+    await deleteSessionFile(await this.storage.ensureProjectData(project), sessionId);
     await this.state.deleteSessionMetadata(project.id, sessionId);
   }
 
@@ -204,11 +203,12 @@ export class DesktopProjectService {
     const directoryPath = this.workspaceDirectory(project, relativePath);
     const stat = await fs.stat(directoryPath);
     if (!stat.isDirectory()) throw new Error(`Path is not a directory: ${relativePath}`);
+    const directoryRelativePath = toWorkspaceRelative(project.path, directoryPath);
     const dirEntries = await fs.readdir(directoryPath, { withFileTypes: true });
     const entries: DesktopWorkspaceDirectoryEntry[] = dirEntries
       .map((entry) => ({
         name: entry.name,
-        path: path.relative(project.path, path.join(directoryPath, entry.name)).split(path.sep).join("/"),
+        path: directoryRelativePath === "." ? entry.name : `${directoryRelativePath.split(path.sep).join("/")}/${entry.name}`,
         kind: entry.isDirectory() ? "directory" : "file"
       } satisfies DesktopWorkspaceDirectoryEntry))
       .sort((left, right) => {
@@ -216,7 +216,7 @@ export class DesktopProjectService {
         return left.name.localeCompare(right.name);
       });
     return {
-      path: path.relative(project.path, directoryPath).split(path.sep).join("/") || ".",
+      path: directoryRelativePath.split(path.sep).join("/"),
       entries
     };
   }
@@ -243,7 +243,7 @@ export class DesktopProjectService {
     const content = buffer.subarray(0, bytesRead);
     const binary = content.includes(0);
     return {
-      path: path.relative(project.path, filePath),
+      path: toWorkspaceRelative(project.path, filePath),
       content: binary ? undefined : content.toString("utf8"),
       bytes: stat.size,
       binary,
@@ -256,12 +256,7 @@ export class DesktopProjectService {
   }
 
   workspaceDirectory(project: DesktopProject, relativePath: string): string {
-    const absolutePath = path.resolve(project.path, relativePath);
-    const workspaceRelativePath = path.relative(project.path, absolutePath);
-    if (workspaceRelativePath.startsWith("..") || path.isAbsolute(workspaceRelativePath)) {
-      throw new Error(`Path escapes workspace: ${relativePath}`);
-    }
-    return absolutePath;
+    return resolveWorkspaceDirectory(project.path, relativePath, ["node_modules", ".git"]);
   }
 
   requireProject(projectIdValue: string): DesktopProject {
@@ -298,7 +293,13 @@ async function directoryExists(directory: string): Promise<boolean> {
 
 async function gitOutput(cwd: string, args: string[]): Promise<string | undefined> {
   try {
-    return (await execFileAsync("git", args, { cwd, timeout: 4_000, maxBuffer: 512 * 1024 })).stdout;
+    return (await execFileAsync("git", [
+      "--no-pager",
+      "--no-optional-locks",
+      "-c",
+      "core.fsmonitor=false",
+      ...args
+    ], { cwd, env: gitInspectionEnvironment(), timeout: 4_000, maxBuffer: 512 * 1024 })).stdout;
   } catch {
     return undefined;
   }

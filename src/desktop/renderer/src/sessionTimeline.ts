@@ -40,6 +40,40 @@ export interface TimelineTool {
   timestamp?: string;
 }
 
+export interface TimelineToolEntry {
+  key: string;
+  label: string;
+  toolId?: string;
+}
+
+export function activeTimelineTool(tools: TimelineTool[], selectedToolId?: string): TimelineTool | undefined {
+  return [...tools].reverse().find((tool) => tool.permission && !tool.permission.resolved)
+    ?? tools.find((tool) => tool.id === selectedToolId);
+}
+
+export function timelineToolEntries(tools: TimelineTool[]): TimelineToolEntry[] {
+  const totals = new Map<string, number>();
+  const seen = new Map<string, number>();
+  for (const tool of tools) totals.set(tool.tool, (totals.get(tool.tool) ?? 0) + 1);
+  return tools.map((tool) => {
+    const occurrence = (seen.get(tool.tool) ?? 0) + 1;
+    seen.set(tool.tool, occurrence);
+    const duplicateLabel = (totals.get(tool.tool) ?? 0) > 1 ? ` ${String(occurrence)}` : "";
+    const permissionLabel = tool.permission && !tool.permission.resolved ? " · 待授权" : "";
+    return {
+      key: tool.id,
+      label: `${executionToolLabel(tool.tool)}${duplicateLabel}${permissionLabel}`,
+      toolId: tool.id
+    };
+  });
+}
+
+function executionToolLabel(tool: string): string {
+  if (tool === "run_command") return "Bash";
+  if (tool === "invoke_skill" || tool === "skill_call") return "技能调用";
+  return tool;
+}
+
 export interface TimelineTurn {
   id: string;
   user: string;
@@ -269,6 +303,10 @@ function buildLiveTurns(events: AgentHostEvent[]): TimelineTurn[] {
       tool.command ??= { command: event.command, cwd: event.cwd, stdout: "", stderr: "" };
       tool.command.exitCode = event.exitCode;
       tool.durationMs = event.durationMs;
+      if (event.exitCode !== undefined && event.exitCode !== 0) {
+        tool.status = "failed";
+        tool.error ??= `Command exited with code ${String(event.exitCode)}.`;
+      }
     } else if (event.type === "file.read" || event.type === "file.changed") {
       const tool = toolFor(event, event.type === "file.read" ? "read_file" : event.operation === "write" ? "write_file" : "edit_file");
       tool.path = event.path;

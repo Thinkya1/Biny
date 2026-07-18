@@ -18,7 +18,7 @@ export const TUI_SLASH_COMMANDS: SlashCommand[] = [
   { name: "/mcp", description: "List configured MCP servers and tools", category: "extension" },
   { name: "/skills", description: "List loaded workspace skills", category: "extension" },
   { name: "/plugins", description: "List loaded plugins", category: "extension" },
-  { name: "/subagent", description: "Run a bounded read-only subagent", category: "extension", requiresArgs: true },
+  { name: "/subagent", description: "Run, inspect, or cancel a read-only subagent", category: "extension", requiresArgs: true },
   { name: "/review", description: "Review current changes with a read-only subagent", category: "extension" },
   { name: "/sessions", description: "List recorded sessions", category: "session" },
   { name: "/resume", description: "Show a session, defaults to latest", category: "session" },
@@ -28,3 +28,10 @@ export const TUI_SLASH_COMMANDS: SlashCommand[] = [
   { name: "/exit", description: "Exit TUI", category: "system" },
   { name: "/quit", description: "Exit TUI", category: "system" }
 ];
+
+export function isConcurrentTuiSlashCommand(value: string): boolean {
+  const [command, action] = value.trim().split(/\s+/);
+  if (command !== "/subagent") return false;
+  const normalizedAction = action?.toLowerCase();
+  return normalizedAction === "status" || normalizedAction === "cancel";
+}

@@ -8,16 +8,18 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { isIgnoredPath } from "./ignore.js";
 
-export async function scanWorkspaceFiles(workspaceRoot: string, ignore: string[], limit = 200): Promise<string[]> {
+export async function scanWorkspaceFiles(workspaceRoot: string, ignore: string[], limit = 200, signal?: AbortSignal): Promise<string[]> {
   const files: string[] = [];
   // 递归扫描只收集文件相对路径；目录遍历过程会持续检查 limit。
   await walk(workspaceRoot, "");
   return files;
 
   async function walk(currentDir: string, relativeDir: string): Promise<void> {
+    signal?.throwIfAborted();
     if (files.length >= limit) return;
     const entries = await fs.readdir(currentDir, { withFileTypes: true });
     for (const entry of entries) {
+      signal?.throwIfAborted();
       if (files.length >= limit) return;
       const relativePath = relativeDir ? path.join(relativeDir, entry.name) : entry.name;
       // 在进入目录前先应用 ignore，避免不必要地读取大目录。

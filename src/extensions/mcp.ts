@@ -1,3 +1,4 @@
+import { promises as fs } from "node:fs";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client";
 import { StdioClientTransport, type StdioServerParameters } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -63,7 +64,7 @@ export class McpToolHost {
       command: serverConfig.command,
       args: serverConfig.args,
       env: serverConfig.env,
-      cwd: resolveWorkingDirectory(workspaceRoot, serverConfig.cwd),
+      cwd: await resolveWorkingDirectory(workspaceRoot, serverConfig.cwd),
       stderr: serverConfig.stderr
     } as StdioServerParameters);
     try {
@@ -141,12 +142,26 @@ function normalizeName(value: string): string {
   return normalized.slice(0, 42) || "tool";
 }
 
-function resolveWorkingDirectory(workspaceRoot: string, configuredPath: string | undefined): string | undefined {
-  if (!configuredPath) return workspaceRoot;
-  const absolute = path.resolve(workspaceRoot, configuredPath);
-  const relative = path.relative(workspaceRoot, absolute);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error(`MCP cwd must stay inside workspace: ${configuredPath}`);
-  return absolute;
+async function resolveWorkingDirectory(workspaceRoot: string, configuredPath: string | undefined): Promise<string> {
+  const canonicalWorkspace = await fs.realpath(path.resolve(workspaceRoot));
+  if (!configuredPath) return canonicalWorkspace;
+
+  const absolute = path.resolve(canonicalWorkspace, configuredPath);
+  const relative = path.relative(canonicalWorkspace, absolute);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`MCP cwd must stay inside workspace: ${configuredPath}`);
+  }
+
+  const stat = await fs.lstat(absolute);
+  if (stat.isSymbolicLink()) throw new Error(`MCP cwd cannot be a symbolic link: ${configuredPath}`);
+  if (!stat.isDirectory()) throw new Error(`MCP cwd must be a directory: ${configuredPath}`);
+  const canonical = await fs.realpath(absolute);
+  const canonicalRelative = path.relative(canonicalWorkspace, canonical);
+  if (canonicalRelative === ".." || canonicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(canonicalRelative)) {
+    throw new Error(`MCP cwd must stay inside workspace: ${configuredPath}`);
+  }
+  if (canonical !== absolute) throw new Error(`MCP cwd cannot contain symbolic links: ${configuredPath}`);
+  return canonical;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

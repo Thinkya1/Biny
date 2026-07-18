@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { PassThrough } from "node:stream";
 import React from "react";
-import { renderToString } from "ink";
+import { render, renderToString } from "ink";
 import { Transcript } from "../src/tui/components/Transcript.js";
 import { HelpDialog } from "../src/tui/components/HelpDialog.js";
 import { ModelPicker, ReasoningPicker, reasoningOptions } from "../src/tui/components/ModelPicker.js";
+import { PermissionPrompt } from "../src/tui/components/PermissionPrompt.js";
 import { TranscriptViewer, transcriptViewerPage } from "../src/tui/components/TranscriptViewer.js";
 import { diffLineStyle } from "../src/tui/diffLines.js";
 import { createInitialTuiState, tuiReducer } from "../src/tui/state.js";
@@ -17,15 +19,22 @@ import {
 } from "../src/tui/terminalText.js";
 import { transcriptRowsForDisplay, visibleTranscriptRows, type TranscriptDisplayRow } from "../src/tui/transcriptRows.js";
 import { latestExpandableTranscript } from "../src/tui/transcriptViewer.js";
-import type { ToolTranscriptItem } from "../src/tui/types.js";
+import type { PermissionChoice, ToolTranscriptItem } from "../src/tui/types.js";
 import type { ModelChoice } from "../src/llm/ModelManager.js";
 import { statusBarLayout } from "../src/tui/components/StatusBar.js";
 import { Welcome } from "../src/tui/components/Welcome.js";
 import { CHAT_SLASH_COMMANDS } from "../src/cli/commands/chatSlash.js";
-import { TUI_SLASH_COMMANDS } from "../src/tui/slashCommands.js";
+import { isConcurrentTuiSlashCommand, TUI_SLASH_COMMANDS } from "../src/tui/slashCommands.js";
+import {
+  confirmedPermissionChoice,
+  createPermissionPromptInteractionState,
+  permissionPromptStateForRequest
+} from "../src/tui/permissionOptions.js";
+import { isFullYesConfirmation, permissionResultFromAnswer } from "../src/permission/confirmation.js";
+import { permissionChoiceToResult } from "../src/tui/runtime/createTuiRuntime.js";
 import type { SessionEvent } from "../src/session/recorder.js";
 
-function main(): void {
+async function main(): Promise<void> {
   testStripAnsi();
   testTerminalWidth();
   testTruncateToTerminalWidth();
@@ -42,6 +51,8 @@ function main(): void {
   testReusedToolCallIdKeepsUniqueTranscriptCells();
   testRecoverableErrorDoesNotFinalizeSiblingTools();
   testPermissionRejectionKeepsTurnRunning();
+  testPermissionConfirmationContract();
+  await testPermissionPromptInputContract();
   testLongCommandStaysInFoldedDetails();
   testCommandDisplayNeverLeaksRawCommand();
   testNarrowToolCellFitsViewport();
@@ -63,6 +74,152 @@ function main(): void {
   testDiffUsesForegroundSemanticColors();
 }
 
+function testPermissionConfirmationContract(): void {
+  assert.equal(isFullYesConfirmation("yes"), true);
+  assert.equal(isFullYesConfirmation(" YES "), true);
+  assert.equal(isFullYesConfirmation("y"), false);
+  assert.equal(isFullYesConfirmation(""), false);
+
+  assert.deepEqual(permissionResultFromAnswer("", false), { approved: true, scope: "once" });
+  assert.deepEqual(permissionResultFromAnswer("y", false), { approved: true, scope: "once" });
+  assert.deepEqual(permissionResultFromAnswer("c", false), { approved: true, scope: "command" });
+  assert.equal(permissionResultFromAnswer("", true).approved, false);
+  assert.equal(permissionResultFromAnswer("y", true).approved, false);
+  assert.equal(permissionResultFromAnswer("c", true).approved, false);
+  assert.deepEqual(permissionResultFromAnswer("yes", true), { approved: true, scope: "once", confirmation: "yes" });
+  assert.deepEqual(permissionResultFromAnswer("YES   COMMAND", true), { approved: true, scope: "command", confirmation: "yes" });
+  assert.equal(permissionChoiceToResult("approve_once", false).confirmation, undefined);
+  assert.equal(permissionChoiceToResult("approve_once", true).confirmation, "yes");
+  assert.equal(permissionChoiceToResult("approve_command", true).confirmation, "yes");
+
+  assert.equal(confirmedPermissionChoice(0, true, ""), undefined);
+  assert.equal(confirmedPermissionChoice(0, true, "y"), undefined);
+  assert.equal(confirmedPermissionChoice(0, true, "yes"), "approve_once");
+  assert.equal(confirmedPermissionChoice(1, true, ""), "reject");
+  assert.equal(confirmedPermissionChoice(2, true, "yes"), "approve_command");
+  assert.equal(confirmedPermissionChoice(0, false, ""), "approve_once");
+
+  const baseRequest = {
+    tool: "run_command",
+    title: "Command execution request",
+    details: "sudo example",
+    actionType: "shell",
+    riskLevel: "critical",
+    requireFullYes: true
+  };
+  const enteredState = {
+    ...createPermissionPromptInteractionState(baseRequest),
+    selectedIndex: 2,
+    confirmation: "yes",
+    confirmationAttempted: true
+  };
+  assert.equal(permissionPromptStateForRequest(enteredState, baseRequest), enteredState);
+  assert.deepEqual(permissionPromptStateForRequest(enteredState, { ...baseRequest, title: "Next request" }), {
+    request: { ...baseRequest, title: "Next request" },
+    selectedIndex: 0,
+    confirmation: "",
+    confirmationAttempted: false
+  });
+
+  const normalView = stripAnsi(renderToString(React.createElement(PermissionPrompt, {
+    request: { ...baseRequest, requireFullYes: false },
+    detailsExpanded: false,
+    onAnswer: () => undefined,
+    onToggleDetails: () => undefined
+  })));
+  assert.match(normalView, /Y execute/u);
+  assert.doesNotMatch(normalView, /Approval requires the full word yes/u);
+
+  const strongView = stripAnsi(renderToString(React.createElement(PermissionPrompt, {
+    request: baseRequest,
+    detailsExpanded: false,
+    onAnswer: () => undefined,
+    onToggleDetails: () => undefined
+  })));
+  assert.match(strongView, /Type yes, then press Enter/u);
+  assert.match(strongView, /Empty Enter or y will not execute/u);
+  assert.doesNotMatch(strongView, /Y execute/u);
+}
+
+async function testPermissionPromptInputContract(): Promise<void> {
+  const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream & {
+    setRawMode(mode: boolean): void;
+  };
+  Object.assign(stdin, {
+    isTTY: true,
+    setRawMode: () => undefined,
+    ref: () => stdin,
+    unref: () => stdin
+  });
+  const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream;
+  Object.assign(stdout, { isTTY: true, columns: 100, rows: 40, getColorDepth: () => 8 });
+  const answers: PermissionChoice[] = [];
+  const request = {
+    tool: "run_command",
+    title: "Command execution request",
+    details: "sudo example",
+    actionType: "shell",
+    riskLevel: "critical",
+    requireFullYes: true
+  };
+  const prompt = (nextRequest: typeof request) => React.createElement(PermissionPrompt, {
+    request: nextRequest,
+    detailsExpanded: false,
+    onAnswer: (answer) => answers.push(answer),
+    onToggleDetails: () => undefined
+  });
+  const app = render(prompt(request), {
+    stdin,
+    stdout,
+    stderr: stdout,
+    interactive: false,
+    patchConsole: false,
+    exitOnCtrlC: false,
+    maxFps: 1_000
+  });
+
+  try {
+    await app.waitUntilRenderFlush();
+    await waitForPermissionInput();
+
+    await send("\r");
+    assert.deepEqual(answers, []);
+    await send("y");
+    await send("\r");
+    assert.deepEqual(answers, []);
+    await send("es");
+    await send("\r");
+    assert.deepEqual(answers, ["approve_once"]);
+
+    app.rerender(prompt({ ...request, title: "Second request" }));
+    await app.waitUntilRenderFlush();
+    await waitForPermissionInput();
+    await send("\r");
+    assert.deepEqual(answers, ["approve_once"]);
+
+    app.rerender(prompt({ ...request, title: "Third request" }));
+    await app.waitUntilRenderFlush();
+    await waitForPermissionInput();
+    await send("c");
+    await send("\r");
+    assert.deepEqual(answers, ["approve_once"]);
+  } finally {
+    app.unmount();
+    await app.waitUntilExit();
+    stdin.end();
+    stdout.end();
+  }
+
+  async function send(value: string): Promise<void> {
+    stdin.write(value);
+    await waitForPermissionInput();
+  }
+}
+
+async function waitForPermissionInput(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+
 function testSlashCommandParity(): void {
   assert.deepEqual(
     CHAT_SLASH_COMMANDS.map((command) => command.name),
@@ -70,6 +227,9 @@ function testSlashCommandParity(): void {
   );
   assert.equal(TUI_SLASH_COMMANDS.length, 19);
   assert.equal(TUI_SLASH_COMMANDS.find((command) => command.name === "/plan")?.requiresArgs, undefined);
+  assert.equal(isConcurrentTuiSlashCommand("/subagent status"), true);
+  assert.equal(isConcurrentTuiSlashCommand("/subagent CANCEL task-id"), true);
+  assert.equal(isConcurrentTuiSlashCommand("/subagent review this"), false);
 }
 
 function testModelPickerDialogs(): void {
@@ -636,4 +796,4 @@ function rowText(row: TranscriptDisplayRow): string {
   return "";
 }
 
-main();
+await main();

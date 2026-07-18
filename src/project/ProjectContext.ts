@@ -9,6 +9,8 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { isIgnoredPath } from "../workspace/ignore.js";
+import { resolveWorkspaceDirectory, resolveWorkspacePath } from "../workspace/resolvePath.js";
+import { gitInspectionEnvironment } from "../tools/git/environment.js";
 import { pathExists } from "../utils/fs.js";
 
 const execFileAsync = promisify(execFile);
@@ -39,17 +41,19 @@ export interface TsconfigSummary {
   exclude?: unknown;
 }
 
-export async function collectProjectContext(workspaceRoot: string, ignore: string[]): Promise<ProjectContext> {
+export async function collectProjectContext(workspaceRoot: string, ignore: string[], signal?: AbortSignal): Promise<ProjectContext> {
   // ProjectContext 只收集摘要，不读取整个项目。这样启动 chat/run 时足够快，
   // 也避免把大量源码直接塞进上下文。
+  signal?.throwIfAborted();
   const [packageManager, packageJson, tsconfig, readme, srcTree, gitStatus] = await Promise.all([
-    detectPackageManager(workspaceRoot),
-    readPackageJsonSummary(workspaceRoot),
-    readTsconfigSummary(workspaceRoot),
-    readTextSummary(path.join(workspaceRoot, "README.md"), 3000),
-    readSrcTree(workspaceRoot, ignore, 120),
-    readGitStatus(workspaceRoot)
+    detectPackageManager(workspaceRoot, ignore, signal),
+    readPackageJsonSummary(workspaceRoot, ignore, signal),
+    readTsconfigSummary(workspaceRoot, ignore, signal),
+    readTextSummary(workspaceRoot, "README.md", ignore, 3000, signal),
+    readSrcTree(workspaceRoot, ignore, 120, signal),
+    readGitStatus(workspaceRoot, signal)
   ]);
+  signal?.throwIfAborted();
 
   return {
     cwd: workspaceRoot,
@@ -75,20 +79,27 @@ export function formatProjectContext(context: ProjectContext): string {
   ].join("\n\n");
 }
 
-async function detectPackageManager(workspaceRoot: string): Promise<string> {
+async function detectPackageManager(workspaceRoot: string, ignore: string[], signal?: AbortSignal): Promise<string> {
   // 通过 lockfile 推断包管理器，优先级按项目中常见的显式锁文件排列。
-  if (await pathExists(path.join(workspaceRoot, "pnpm-lock.yaml"))) return "pnpm";
-  if (await pathExists(path.join(workspaceRoot, "yarn.lock"))) return "yarn";
-  if (await pathExists(path.join(workspaceRoot, "package-lock.json"))) return "npm";
-  if (await pathExists(path.join(workspaceRoot, "bun.lockb"))) return "bun";
+  signal?.throwIfAborted();
+  if (await hasWorkspaceFile(workspaceRoot, "pnpm-lock.yaml", ignore)) return "pnpm";
+  signal?.throwIfAborted();
+  if (await hasWorkspaceFile(workspaceRoot, "yarn.lock", ignore)) return "yarn";
+  signal?.throwIfAborted();
+  if (await hasWorkspaceFile(workspaceRoot, "package-lock.json", ignore)) return "npm";
+  signal?.throwIfAborted();
+  if (await hasWorkspaceFile(workspaceRoot, "bun.lockb", ignore)) return "bun";
+  signal?.throwIfAborted();
   return "unknown";
 }
 
-async function readPackageJsonSummary(workspaceRoot: string): Promise<PackageJsonSummary | undefined> {
+async function readPackageJsonSummary(workspaceRoot: string, ignore: string[], signal?: AbortSignal): Promise<PackageJsonSummary | undefined> {
   // package.json 只提取脚本和依赖名，不把完整版本约束放进上下文。
-  const filePath = path.join(workspaceRoot, "package.json");
-  if (!(await pathExists(filePath))) return undefined;
-  const value = JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
+  signal?.throwIfAborted();
+  const filePath = resolveProjectFile(workspaceRoot, "package.json", ignore);
+  if (!filePath || !(await pathExists(filePath))) return undefined;
+  const value = JSON.parse(await fs.readFile(filePath, { encoding: "utf8", signal })) as Record<string, unknown>;
+  signal?.throwIfAborted();
   return {
     name: stringValue(value.name),
     version: stringValue(value.version),
@@ -99,11 +110,13 @@ async function readPackageJsonSummary(workspaceRoot: string): Promise<PackageJso
   };
 }
 
-async function readTsconfigSummary(workspaceRoot: string): Promise<TsconfigSummary | undefined> {
+async function readTsconfigSummary(workspaceRoot: string, ignore: string[], signal?: AbortSignal): Promise<TsconfigSummary | undefined> {
   // tsconfig 摘要保留 compilerOptions，帮助模型判断模块系统和 JSX 配置。
-  const filePath = path.join(workspaceRoot, "tsconfig.json");
-  if (!(await pathExists(filePath))) return undefined;
-  const value = JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
+  signal?.throwIfAborted();
+  const filePath = resolveProjectFile(workspaceRoot, "tsconfig.json", ignore);
+  if (!filePath || !(await pathExists(filePath))) return undefined;
+  const value = JSON.parse(await fs.readFile(filePath, { encoding: "utf8", signal })) as Record<string, unknown>;
+  signal?.throwIfAborted();
   const compilerOptions = isRecord(value.compilerOptions) ? value.compilerOptions : {};
   return {
     compilerOptions,
@@ -112,45 +125,85 @@ async function readTsconfigSummary(workspaceRoot: string): Promise<TsconfigSumma
   };
 }
 
-async function readTextSummary(filePath: string, maxChars: number): Promise<string | undefined> {
+async function readTextSummary(workspaceRoot: string, requestedPath: string, ignore: string[], maxChars: number, signal?: AbortSignal): Promise<string | undefined> {
   // 文本文档摘要只截断，不做解析；README 内容通常足够说明项目用途。
-  if (!(await pathExists(filePath))) return undefined;
-  const content = await fs.readFile(filePath, "utf8");
+  signal?.throwIfAborted();
+  const filePath = resolveProjectFile(workspaceRoot, requestedPath, ignore);
+  if (!filePath || !(await pathExists(filePath))) return undefined;
+  const content = await fs.readFile(filePath, { encoding: "utf8", signal });
+  signal?.throwIfAborted();
   return content.slice(0, maxChars);
 }
 
-async function readSrcTree(workspaceRoot: string, ignore: string[], limit: number): Promise<string[]> {
+async function readSrcTree(workspaceRoot: string, ignore: string[], limit: number, signal?: AbortSignal): Promise<string[]> {
   // src tree 用来提供目录轮廓，限制深度和数量以保护大型仓库。
-  const srcRoot = path.join(workspaceRoot, "src");
-  if (!(await pathExists(srcRoot))) return [];
+  signal?.throwIfAborted();
+  const srcRoot = resolveProjectDirectory(workspaceRoot, "src", ignore);
+  if (!srcRoot || !(await pathExists(srcRoot))) return [];
   const entries: string[] = [];
   await walk(srcRoot, "src", 0);
   return entries;
 
   async function walk(currentDir: string, relativeDir: string, depth: number): Promise<void> {
     // 目录树只保留有限深度和数量，避免大型仓库启动时扫描过多文件。
+    signal?.throwIfAborted();
     if (entries.length >= limit || depth > 6) return;
     const dirEntries = await fs.readdir(currentDir, { withFileTypes: true });
     dirEntries.sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of dirEntries) {
+      signal?.throwIfAborted();
       if (entries.length >= limit) return;
       const relativePath = path.join(relativeDir, entry.name);
       if (isIgnoredPath(relativePath, ignore)) continue;
+      if (entry.isSymbolicLink()) continue;
       entries.push(`${"  ".repeat(depth)}${entry.isDirectory() ? "[d] " : "[f] "}${relativePath}`);
       if (entry.isDirectory()) {
-        await walk(path.join(currentDir, entry.name), relativePath, depth + 1);
+        const childDirectory = resolveProjectDirectory(workspaceRoot, relativePath, ignore);
+        if (childDirectory) await walk(childDirectory, relativePath, depth + 1);
       }
     }
   }
 }
 
-async function readGitStatus(workspaceRoot: string): Promise<string> {
+async function readGitStatus(workspaceRoot: string, signal?: AbortSignal): Promise<string> {
   // git status 失败时不阻断启动；非仓库目录仍可使用文件和命令工具。
   try {
-    const result = await execFileAsync("git", ["status", "--short"], { cwd: workspaceRoot, timeout: 10_000 });
+    signal?.throwIfAborted();
+    const result = await execFileAsync("git", [
+      "--no-pager",
+      "--no-optional-locks",
+      "-c",
+      "core.fsmonitor=false",
+      "status",
+      "--short",
+      "--ignore-submodules=all"
+    ], { cwd: workspaceRoot, env: gitInspectionEnvironment(), timeout: 10_000, signal });
+    signal?.throwIfAborted();
     return result.stdout.trim();
   } catch {
+    signal?.throwIfAborted();
     return "(not a git repository)";
+  }
+}
+
+async function hasWorkspaceFile(workspaceRoot: string, requestedPath: string, ignore: string[]): Promise<boolean> {
+  const filePath = resolveProjectFile(workspaceRoot, requestedPath, ignore);
+  return filePath ? await pathExists(filePath) : false;
+}
+
+function resolveProjectFile(workspaceRoot: string, requestedPath: string, ignore: string[]): string | undefined {
+  try {
+    return resolveWorkspacePath(workspaceRoot, requestedPath, ignore);
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveProjectDirectory(workspaceRoot: string, requestedPath: string, ignore: string[]): string | undefined {
+  try {
+    return resolveWorkspaceDirectory(workspaceRoot, requestedPath, ignore);
+  } catch {
+    return undefined;
   }
 }
 
