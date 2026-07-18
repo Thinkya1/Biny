@@ -1,4 +1,4 @@
-import { loadConfig, saveConfig } from "../config/loader.js";
+import { createFileConfigStore, type AgentConfigStore } from "../config/store.js";
 import {
   configSchema,
   type AgentConfig,
@@ -35,7 +35,8 @@ export class ModelManager {
 
   constructor(
     private readonly workspaceRoot: string,
-    private readonly config: AgentConfig
+    private readonly config: AgentConfig,
+    private readonly configStore: AgentConfigStore = createFileConfigStore(workspaceRoot)
   ) {
     this.activeSettings = createModelSettings(config);
   }
@@ -71,14 +72,14 @@ export class ModelManager {
 
     // Validate endpoint and credentials before changing memory or the config file.
     const nextSettings = createModelSettings(candidate);
-    await saveConfig(this.workspaceRoot, candidate);
+    await this.configStore.save(candidate);
     Object.assign(this.config, candidate);
     this.activeSettings = nextSettings;
     return this.getInfo();
   }
 
   async refreshFromDisk(): Promise<ModelRuntimeInfo> {
-    const nextConfig = await loadConfig(this.workspaceRoot);
+    const nextConfig = await this.configStore.load();
     const nextSettings = createModelSettings(nextConfig);
     Object.assign(this.config, nextConfig);
     this.activeSettings = nextSettings;

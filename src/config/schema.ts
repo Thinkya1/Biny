@@ -60,7 +60,7 @@ const providerConfigSchema = z.object({
   authMode: z.enum(["api-key", "oauth-bearer"]).optional(),
   oauth: z.object({
     provider: z.enum(["claude-code", "openai-codex"]),
-    refreshToken: z.string().min(1),
+    refreshToken: z.string().min(1).optional(),
     expiresAt: z.number().int().positive(),
     accountId: z.string().min(1).optional()
   }).optional(),

@@ -1,10 +1,12 @@
 import path from "node:path";
-import { app, BrowserWindow, dialog, Notification, shell } from "electron";
+import { app, BrowserWindow, dialog, Notification, safeStorage, shell } from "electron";
 import type { DesktopBootstrap } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
 import { DesktopAgentManager } from "./DesktopAgentManager.js";
+import { DesktopConfigStore } from "./DesktopConfigStore.js";
 import { DesktopProjectService } from "./DesktopProjectService.js";
 import { DesktopStateStore } from "./DesktopStateStore.js";
+import { DesktopUserDataStore } from "./DesktopUserDataStore.js";
 import { registerDesktopIpc } from "./ipc.js";
 import { installApplicationMenu } from "./menu.js";
 import { createDesktopWindow, type WindowCloseDecision } from "./window.js";
@@ -29,12 +31,23 @@ if (!app.requestSingleInstanceLock()) {
 
 async function startDesktopApplication(): Promise<void> {
   await app.whenReady();
-  const state = new DesktopStateStore(path.join(app.getPath("userData"), "desktop-state.json"));
+  const legacyDataRoot = app.getPath("userData");
+  const desktopRoot = path.join(legacyDataRoot, "workspaces", "default");
+  const storage = new DesktopUserDataStore(desktopRoot);
+  await storage.initialize();
+  await storage.migrateLegacyState(path.join(legacyDataRoot, "desktop-state.json"), path.join(desktopRoot, "desktop-state.json"));
+  const state = new DesktopStateStore(path.join(desktopRoot, "desktop-state.json"));
   await state.load();
-  const projects = new DesktopProjectService(state);
+  const configStore = new DesktopConfigStore(desktopRoot, {
+    isAvailable: () => safeStorage.isEncryptionAvailable(),
+    encrypt: (value) => safeStorage.encryptString(value).toString("base64"),
+    decrypt: (value) => safeStorage.decryptString(Buffer.from(value, "base64"))
+  });
+  await storage.migrateLegacyConfig(state.projects(), configStore);
+  const projects = new DesktopProjectService(state, storage, configStore);
   let mainWindow: BrowserWindow | undefined;
   let preparingQuit = false;
-  const agents = new DesktopAgentManager(state, projects, (projectId, event) => {
+  const agents = new DesktopAgentManager(state, projects, configStore, (projectId, event) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send(desktopIpc.event, { projectId, event });
     }

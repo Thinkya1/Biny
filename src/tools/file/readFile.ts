@@ -1,8 +1,8 @@
 /**
  * 文件读取工具模块。
  *
- * `read_file` 只读取工作区内通过路径校验的 UTF-8 文本文件，并按用户传入的相对路径返回内容。
- * 它不负责解释文件，也不绕过 workspace ignore 规则。
+ * `read_file` 读取工作区内通过路径校验的 UTF-8 文本文件；桌面端还可读取由应用保存的
+ * `@attachments/` 虚拟路径，但不能借此访问任意用户目录。
  */
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -25,7 +25,7 @@ export function createReadFileTool(context: ToolContext): Tool<ReadFileArgs, Rea
   // read_file 是最小只读工具：解析路径、读 utf8、按原路径返回内容。
   return {
     name: "read_file",
-    description: "Read a file inside the workspace.",
+    description: "Read a file inside the workspace or a supplied attachment.",
     parameters: {
       type: "object",
       properties: {
@@ -39,16 +39,31 @@ export function createReadFileTool(context: ToolContext): Tool<ReadFileArgs, Rea
     risk: "read",
     resolveExecution(args) {
       return {
-        accesses: ToolAccesses.readFile(path.join(context.workspaceRoot, args.path)),
+        accesses: ToolAccesses.readFile(resolveReadablePath(context, args.path)),
         display: { kind: "file_io", operation: "read", path: args.path },
         description: `Read ${args.path}`,
         approvalRule: `read_file(${args.path})`,
         async execute() {
-          const absolutePath = resolveWorkspacePath(context.workspaceRoot, args.path, context.ignore);
+          const absolutePath = resolveReadablePath(context, args.path);
           const content = await fs.readFile(absolutePath, "utf8");
           return { path: args.path, content };
         }
       };
     }
   };
+}
+
+function resolveReadablePath(context: ToolContext, requestedPath: string): string {
+  const attachmentPrefix = "@attachments/";
+  if (!requestedPath.startsWith(attachmentPrefix)) {
+    return resolveWorkspacePath(context.workspaceRoot, requestedPath, context.ignore);
+  }
+  if (!context.attachmentRoot) throw new Error("No attachments are available for this session.");
+  const relativePath = requestedPath.slice(attachmentPrefix.length);
+  const absolutePath = path.resolve(context.attachmentRoot, relativePath);
+  const relativeToRoot = path.relative(context.attachmentRoot, absolutePath);
+  if (!relativePath || relativeToRoot.startsWith(`..${path.sep}`) || relativeToRoot === ".." || path.isAbsolute(relativeToRoot)) {
+    throw new Error(`Attachment path escapes its storage directory: ${requestedPath}`);
+  }
+  return absolutePath;
 }

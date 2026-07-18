@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentRunOptions, AgentSessionInfo } from "../src/agent/AgentSession.js";
@@ -8,11 +8,15 @@ import type { ContextStatus } from "../src/agent/context/types.js";
 import type { CommandRuntime } from "../src/runtime/CommandRuntime.js";
 import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.js";
 import type { AgentHostEvent } from "../src/runtime/agentEvents.js";
-import { loadConfig, saveConfig } from "../src/config/loader.js";
+import { saveConfig } from "../src/config/loader.js";
+import { createFileConfigStore } from "../src/config/store.js";
 import { defaultConfig } from "../src/config/schema.js";
 import { DesktopAgentManager } from "../src/desktop/electron/main/DesktopAgentManager.js";
+import { DesktopConfigStore } from "../src/desktop/electron/main/DesktopConfigStore.js";
 import { DesktopProjectService } from "../src/desktop/electron/main/DesktopProjectService.js";
 import { DesktopStateStore } from "../src/desktop/electron/main/DesktopStateStore.js";
+import { DesktopUserDataStore } from "../src/desktop/electron/main/DesktopUserDataStore.js";
+import type { DesktopProject } from "../src/desktop/protocol.js";
 import { clampFilePanelWidth, DEFAULT_FILE_PANEL_WIDTH, MAX_FILE_PANEL_WIDTH, MIN_FILE_PANEL_WIDTH } from "../src/desktop/filePanelSizing.js";
 import {
   canNavigateBack,
@@ -40,6 +44,8 @@ testWorkspaceSyntaxHighlighting();
 testWorkspaceFileMarkers();
 await testFilePanelSizing();
 await testDesktopModelConfiguration();
+await testDesktopCredentialsAreSeparated();
+await testLegacyDesktopDataMigration();
 testModelChoicesDeduplicateEquivalentAliases();
 testHistoricalAbortProjection();
 testHistoricalUsageProjection();
@@ -126,10 +132,9 @@ async function testDraftSessionsDoNotReachTheSessionList(): Promise<void> {
 
 async function testWorkspaceFilePreview(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-file-preview-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-data-"));
   try {
-    const state = new DesktopStateStore(path.join(workspaceRoot, "desktop-state.json"));
-    await state.load();
-    const projects = new DesktopProjectService(state);
+    const { projects } = await createDesktopTestServices(desktopRoot);
     const project = await projects.createProject(workspaceRoot);
     await writeFile(path.join(workspaceRoot, "hello.py"), "print('hello')\n");
     assert.deepEqual(await projects.readWorkspaceFile(project, "hello.py"), {
@@ -150,15 +155,15 @@ async function testWorkspaceFilePreview(): Promise<void> {
     await assert.rejects(projects.readWorkspaceFile(project, "../outside.txt"), /Path escapes workspace/);
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
   }
 }
 
 async function testWorkspaceDirectoryListing(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-directory-listing-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-data-"));
   try {
-    const state = new DesktopStateStore(path.join(workspaceRoot, "desktop-state.json"));
-    await state.load();
-    const projects = new DesktopProjectService(state);
+    const { projects } = await createDesktopTestServices(desktopRoot);
     const project = await projects.createProject(workspaceRoot);
     await mkdir(path.join(workspaceRoot, "src"));
     await writeFile(path.join(workspaceRoot, "README.md"), "# Biny\n");
@@ -167,9 +172,7 @@ async function testWorkspaceDirectoryListing(): Promise<void> {
     const root = await projects.listWorkspaceDirectory(project, ".");
     assert.equal(root.path, ".");
     assert.deepEqual(root.entries.map((entry) => ({ name: entry.name, path: entry.path, kind: entry.kind })), [
-      { name: ".agent", path: ".agent", kind: "directory" },
       { name: "src", path: "src", kind: "directory" },
-      { name: "desktop-state.json", path: "desktop-state.json", kind: "file" },
       { name: "README.md", path: "README.md", kind: "file" }
     ]);
     const nested = await projects.listWorkspaceDirectory(project, "src");
@@ -177,6 +180,7 @@ async function testWorkspaceDirectoryListing(): Promise<void> {
     await assert.rejects(projects.listWorkspaceDirectory(project, "../outside"), /Path escapes workspace/);
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
   }
 }
 
@@ -222,15 +226,14 @@ async function testFilePanelSizing(): Promise<void> {
 
 async function testDesktopModelConfiguration(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-model-config-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-data-"));
   try {
     const initialConfig = structuredClone(defaultConfig);
     initialConfig.models["deepseek-deepseek-v4-flash"] = { ...initialConfig.models["deepseek-v4-flash"] };
-    await saveConfig(workspaceRoot, initialConfig);
-    const state = new DesktopStateStore(path.join(workspaceRoot, "desktop-state.json"));
-    await state.load();
-    const projects = new DesktopProjectService(state);
+    const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
+    await configStore.save(initialConfig);
     const project = await projects.createProject(workspaceRoot);
-    const agents = new DesktopAgentManager(state, projects, () => undefined);
+    const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
     const snapshot = await agents.saveModelConfiguration(project.id, {
       alias: "local-qwen",
       displayName: "本地 Qwen",
@@ -243,16 +246,16 @@ async function testDesktopModelConfiguration(): Promise<void> {
       supportsTools: true,
       supportsThinking: false
     });
-    const config = await loadConfig(workspaceRoot);
+    const config = await configStore.load();
     assert.equal(config.defaultModel, "local-qwen");
     assert.equal(config.providers.local?.type, "ollama");
     assert.equal(config.models["local-qwen"]?.model, "qwen3:8b");
     assert.equal(snapshot.models.some((model) => model.alias === "local-qwen"), true);
-    const modelManager = new ModelManager(workspaceRoot, config);
+    const modelManager = new ModelManager(desktopRoot, config, configStore);
     const externallyUpdatedConfig = structuredClone(config);
     externallyUpdatedConfig.defaultModel = "local-qwen-next";
     externallyUpdatedConfig.models["local-qwen-next"] = { ...externallyUpdatedConfig.models["local-qwen"], model: "qwen3:14b", displayName: "本地 Qwen Next" };
-    await saveConfig(workspaceRoot, externallyUpdatedConfig);
+    await configStore.save(externallyUpdatedConfig);
     const refreshedInfo = await modelManager.refreshFromDisk();
     assert.equal(refreshedInfo.modelAlias, "local-qwen-next");
     await agents.saveModelConfiguration(project.id, {
@@ -267,12 +270,93 @@ async function testDesktopModelConfiguration(): Promise<void> {
       supportsTools: true,
       supportsThinking: true
     });
-    const cleanedConfig = await loadConfig(workspaceRoot);
+    const cleanedConfig = await configStore.load();
     assert.equal(cleanedConfig.models["deepseek-deepseek-v4-flash"], undefined);
+    await projects.listSessions(project, undefined, new Map());
+    const attachment = await projects.saveAttachment(project, "notes.txt", "text/plain", new TextEncoder().encode("desktop only"));
+    assert.match(attachment.path, /^@attachments\//);
+    await access(path.join(desktopRoot, "projects", project.id, ".agent", "sessions"));
+    await assert.rejects(access(path.join(workspaceRoot, "agent.config.json")));
+    await assert.rejects(access(path.join(workspaceRoot, ".agent")));
     await agents.closeAll();
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
   }
+}
+
+async function testDesktopCredentialsAreSeparated(): Promise<void> {
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-credentials-"));
+  try {
+    const store = new DesktopConfigStore(desktopRoot, {
+      isAvailable: () => true,
+      encrypt: (value) => `encrypted:${Buffer.from(value).toString("base64")}`,
+      decrypt: (value) => Buffer.from(value.slice("encrypted:".length), "base64").toString("utf8")
+    });
+    const config = structuredClone(defaultConfig);
+    config.providers.deepseek!.apiKey = "desktop-secret";
+    await store.save(config);
+    const [settings, credentials] = await Promise.all([
+      readFile(path.join(desktopRoot, "agent.config.json"), "utf8"),
+      readFile(path.join(desktopRoot, "credentials.json"), "utf8")
+    ]);
+    assert.doesNotMatch(settings, /desktop-secret/);
+    assert.doesNotMatch(credentials, /desktop-secret/);
+    assert.equal((await store.load()).providers.deepseek?.apiKey, "desktop-secret");
+  } finally {
+    await rm(desktopRoot, { recursive: true, force: true });
+  }
+}
+
+async function testLegacyDesktopDataMigration(): Promise<void> {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "biny-legacy-project-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-data-"));
+  try {
+    const project: DesktopProject = {
+      id: "legacy-project",
+      path: projectRoot,
+      name: "Legacy Project",
+      dirty: false,
+      missing: false,
+      pinned: false,
+      addedAt: "2026-07-18T00:00:00.000Z",
+      lastOpenedAt: "2026-07-18T00:00:00.000Z"
+    };
+    const config = structuredClone(defaultConfig);
+    config.defaultModel = "deepseek-v4-pro";
+    await saveConfig(projectRoot, config);
+    await ensureAgentDirs(projectRoot);
+    await writeFile(sessionFilePath(projectRoot, "legacy-session"), `${JSON.stringify({ type: "user_message", content: "keep me" })}\n`);
+
+    const storage = new DesktopUserDataStore(desktopRoot);
+    await storage.initialize();
+    const configStore = new DesktopConfigStore(desktopRoot, {
+      isAvailable: () => true,
+      encrypt: (value) => value,
+      decrypt: (value) => value
+    });
+    await storage.migrateLegacyConfig([project], configStore);
+    const projectDataRoot = await storage.ensureProjectData(project);
+
+    assert.equal((await configStore.load()).defaultModel, "deepseek-v4-pro");
+    assert.equal(await readFile(sessionFilePath(projectDataRoot, "legacy-session"), "utf8"), await readFile(sessionFilePath(projectRoot, "legacy-session"), "utf8"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
+  }
+}
+
+async function createDesktopTestServices(root: string): Promise<{
+  configStore: ReturnType<typeof createFileConfigStore>;
+  projects: DesktopProjectService;
+  state: DesktopStateStore;
+}> {
+  const storage = new DesktopUserDataStore(root);
+  await storage.initialize();
+  const state = new DesktopStateStore(path.join(root, "desktop-state.json"));
+  await state.load();
+  const configStore = createFileConfigStore(root);
+  return { configStore, projects: new DesktopProjectService(state, storage, configStore), state };
 }
 
 function testModelChoicesDeduplicateEquivalentAliases(): void {

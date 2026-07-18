@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import { loadConfig } from "../../../config/loader.js";
+import type { AgentConfigStore } from "../../../config/store.js";
 import { listModelChoices, type ModelChoice } from "../../../llm/ModelManager.js";
 import type { AgentHostEvent, InteractiveRuntimeSnapshot } from "../../../runtime/agentEvents.js";
 import { listSessionSummaries } from "../../../session/events.js";
@@ -21,12 +21,17 @@ import type {
   DesktopWorkspaceFilePreview
 } from "../../protocol.js";
 import { DesktopStateStore } from "./DesktopStateStore.js";
+import { DesktopUserDataStore } from "./DesktopUserDataStore.js";
 
 const execFileAsync = promisify(execFile);
 const filePreviewLimit = 512 * 1024;
 
 export class DesktopProjectService {
-  constructor(private readonly state: DesktopStateStore) {}
+  constructor(
+    private readonly state: DesktopStateStore,
+    private readonly storage: DesktopUserDataStore,
+    private readonly configStore: AgentConfigStore
+  ) {}
 
   async createProject(projectPath: string): Promise<DesktopProject> {
     const resolvedPath = path.resolve(projectPath);
@@ -45,7 +50,7 @@ export class DesktopProjectService {
       addedAt: existing?.addedAt ?? now,
       lastOpenedAt: now
     });
-    await ensureAgentDirs(resolvedPath);
+    await this.storage.ensureProjectData(project);
     await this.state.upsertProject(project);
     return project;
   }
@@ -92,7 +97,8 @@ export class DesktopProjectService {
   }
 
   async listModels(project: DesktopProject): Promise<ModelChoice[]> {
-    return listModelChoices(await loadConfig(project.path));
+    void project;
+    return listModelChoices(await this.configStore.load());
   }
 
   async listSessions(
@@ -101,8 +107,9 @@ export class DesktopProjectService {
     liveEvents: ReadonlyMap<string, AgentHostEvent[]>
   ): Promise<DesktopSessionSummary[]> {
     if (project.missing) return [];
-    await ensureAgentDirs(project.path);
-    const summaries = await listSessionSummaries(project.path);
+    const dataRoot = await this.storage.ensureProjectData(project);
+    await ensureAgentDirs(dataRoot);
+    const summaries = await listSessionSummaries(dataRoot);
     const sessions = summaries.map((summary) => {
       const id = summary.fileName.replace(/\.jsonl$/, "");
       const metadata = this.state.sessionMetadata(project.id, id);
@@ -156,7 +163,7 @@ export class DesktopProjectService {
     const sessions = await this.listSessions(project, runtime, liveEvents);
     const session = sessions.find((candidate) => candidate.id === sessionId);
     if (!session) throw new Error(`Session not found: ${sessionId}`);
-    const filePath = sessionFilePath(project.path, sessionId);
+    const filePath = sessionFilePath(await this.storage.ensureProjectData(project), sessionId);
     const events = await readSessionEvents(filePath).catch((error: unknown) => {
       if (isNotFound(error)) return [];
       throw error;
@@ -166,26 +173,28 @@ export class DesktopProjectService {
 
   async duplicateSession(project: DesktopProject, sessionId: string): Promise<string> {
     const targetSessionId = createSessionId();
-    await fs.copyFile(sessionFilePath(project.path, sessionId), sessionFilePath(project.path, targetSessionId));
+    const dataRoot = await this.storage.ensureProjectData(project);
+    await fs.copyFile(sessionFilePath(dataRoot, sessionId), sessionFilePath(dataRoot, targetSessionId));
     await this.state.copySessionMetadata(project.id, sessionId, targetSessionId);
     return targetSessionId;
   }
 
   async deleteSession(project: DesktopProject, sessionId: string): Promise<void> {
-    await fs.rm(sessionFilePath(project.path, sessionId), { force: true });
+    await fs.rm(sessionFilePath(await this.storage.ensureProjectData(project), sessionId), { force: true });
     await this.state.deleteSessionMetadata(project.id, sessionId);
   }
 
   async saveAttachment(project: DesktopProject, name: string, mimeType: string, bytes: Uint8Array): Promise<DesktopAttachment> {
     const safeName = sanitizeFileName(name);
-    const directory = path.join(project.path, ".agent", "attachments");
+    await this.storage.ensureProjectData(project);
+    const directory = this.storage.attachmentsRoot(project);
     await fs.mkdir(directory, { recursive: true });
     const fileName = `${String(Date.now())}-${randomBytes(3).toString("hex")}-${safeName}`;
     const filePath = path.join(directory, fileName);
     await fs.writeFile(filePath, bytes);
     return {
       name: safeName,
-      path: path.relative(project.path, filePath),
+      path: `@attachments/${fileName}`,
       mimeType,
       size: bytes.byteLength
     };
@@ -259,6 +268,14 @@ export class DesktopProjectService {
     const project = this.state.project(projectIdValue);
     if (!project) throw new Error(`Unknown project: ${projectIdValue}`);
     return project;
+  }
+
+  async dataRoot(project: DesktopProject): Promise<string> {
+    return await this.storage.ensureProjectData(project);
+  }
+
+  attachmentsRoot(project: DesktopProject): string {
+    return this.storage.attachmentsRoot(project);
   }
 }
 

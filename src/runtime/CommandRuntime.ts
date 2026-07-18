@@ -4,7 +4,7 @@
  * 每个 CLI/TUI 入口最终都会通过这里创建一个 AgentSession。这里是 composition
  * root，只装配配置、provider、工具和权限，不向宿主泄露可变 conversation 或 recorder。
  */
-import { loadConfig } from "../config/loader.js";
+import { createFileConfigStore, type AgentConfigStore } from "../config/store.js";
 import { AgentSession } from "../agent/AgentSession.js";
 import { ModelManager } from "../llm/ModelManager.js";
 import { SessionRecorder } from "../session/recorder.js";
@@ -25,13 +25,21 @@ export interface CommandRuntime {
   close(): Promise<void>;
 }
 
-export async function createCommandRuntime(workspaceRoot: string): Promise<CommandRuntime> {
-  // 每次命令执行都在同一位置装配配置、session、provider、工具、权限和核心 Agent。
-  const config = await loadConfig(workspaceRoot);
-  const modelManager = new ModelManager(workspaceRoot, config);
-  await ensureAgentDirs(workspaceRoot);
-  const recorder = new SessionRecorder(workspaceRoot);
-  const toolRegistry = createToolRegistry({ workspaceRoot, ignore: config.workspace.ignore }, config.web.search);
+export interface CommandRuntimeOptions {
+  persistenceRoot?: string;
+  configStore?: AgentConfigStore;
+  attachmentRoot?: string;
+}
+
+export async function createCommandRuntime(workspaceRoot: string, options: CommandRuntimeOptions = {}): Promise<CommandRuntime> {
+  // CLI keeps data in the workspace. Desktop passes an isolated persistence root.
+  const persistenceRoot = options.persistenceRoot ?? workspaceRoot;
+  const configStore = options.configStore ?? createFileConfigStore(persistenceRoot);
+  const config = await configStore.load();
+  const modelManager = new ModelManager(persistenceRoot, config, configStore);
+  await ensureAgentDirs(persistenceRoot);
+  const recorder = new SessionRecorder(persistenceRoot);
+  const toolRegistry = createToolRegistry({ workspaceRoot, ignore: config.workspace.ignore, attachmentRoot: options.attachmentRoot }, config.web.search);
   const permissionManager = new PermissionManager({ ...config.permission, source: "agent.config.json" });
   const skills = await loadSkills(workspaceRoot, config.extensions.skills);
   const mcpHost = new McpToolHost();
@@ -53,6 +61,8 @@ export async function createCommandRuntime(workspaceRoot: string): Promise<Comma
     }
     agent = new AgentSession({
       workspaceRoot,
+      persistenceRoot,
+      configStore,
       config,
       model: modelManager.getModel(),
       modelManager,

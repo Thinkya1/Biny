@@ -9,7 +9,7 @@ import type { SessionSummary } from "../session/events.js";
 import type { SessionUsage } from "../session/metadata.js";
 import type { ToolInputDisplay } from "../tools/types.js";
 import { AgentEventBus } from "./AgentEventBus.js";
-import { createCommandRuntime, type CommandRuntime } from "./CommandRuntime.js";
+import { createCommandRuntime, type CommandRuntime, type CommandRuntimeOptions } from "./CommandRuntime.js";
 import type {
   ActiveRunSnapshot,
   AgentHostEvent,
@@ -518,8 +518,8 @@ export class InteractiveAgentRuntime {
   }
 }
 
-export async function createInteractiveAgentRuntime(workspaceRoot: string): Promise<InteractiveAgentRuntime> {
-  return new InteractiveAgentRuntime(await createCommandRuntime(workspaceRoot));
+export async function createInteractiveAgentRuntime(workspaceRoot: string, options?: CommandRuntimeOptions): Promise<InteractiveAgentRuntime> {
+  return new InteractiveAgentRuntime(await createCommandRuntime(workspaceRoot, options));
 }
 
 function publicToolStatus(tool: string, display: ToolInputDisplay | undefined): string {

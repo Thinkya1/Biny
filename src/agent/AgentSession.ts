@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import { stepCountIs, streamText, ToolLoopAgent, type LanguageModel, type LanguageModelUsage, type TextStreamPart, type ToolLoopAgentSettings, type ToolSet } from "ai";
 import type { AgentConfig } from "../config/schema.js";
-import { saveConfig } from "../config/loader.js";
+import { createFileConfigStore, type AgentConfigStore } from "../config/store.js";
 import {
   listModelChoices,
   modelRuntimeInfo,
@@ -30,6 +30,8 @@ import type { SessionUsage } from "../session/metadata.js";
 
 export interface AgentSessionOptions {
   workspaceRoot: string;
+  persistenceRoot?: string;
+  configStore?: AgentConfigStore;
   config: AgentConfig;
   model?: LanguageModel;
   toolRegistry: ToolRegistry;
@@ -75,6 +77,7 @@ export class AgentSession {
   private recorder: SessionRecorder;
 
   constructor(private readonly options: AgentSessionOptions) {
+    const persistenceRoot = this.persistenceRoot();
     const workspace = new WorkspaceContext(
       options.workspaceRoot,
       options.config.workspace.ignore,
@@ -88,9 +91,9 @@ export class AgentSession {
     const onUsage = async (usage: LanguageModelUsage, operation: "agent" | "plan" | "compaction" | "memory" | "subagent"): Promise<void> => {
       this.recordModelUsage(usage, operation);
     };
-    const telemetry = (functionId: string) => createSdkTelemetry(options.config, options.workspaceRoot, functionId);
+    const telemetry = (functionId: string) => createSdkTelemetry(options.config, persistenceRoot, functionId);
     const localMemory = options.config.context.memory.enabled
-      ? new LocalMemory(options.workspaceRoot, getModel, onUsage, telemetry)
+      ? new LocalMemory(persistenceRoot, getModel, onUsage, telemetry)
       : undefined;
     this.contextMemory = new ContextMemory(
       getModel,
@@ -138,7 +141,7 @@ export class AgentSession {
       reasoning: settings?.reasoning,
       timeout: settings?.timeoutMs,
       maxOutputTokens: settings?.maxOutputTokens,
-      telemetry: createSdkTelemetry(this.options.config, this.options.workspaceRoot, "biny.agent"),
+      telemetry: createSdkTelemetry(this.options.config, this.persistenceRoot(), "biny.agent"),
       // ToolLoopAgent forwards unknown stream options to streamText at runtime;
       // suppress its console.error default so Ink remains the only output sink.
       onError: () => undefined
@@ -249,7 +252,7 @@ export class AgentSession {
         reasoning: this.options.modelManager?.getModelSettings().reasoning,
         timeout: this.options.modelManager?.getModelSettings().timeoutMs,
         maxOutputTokens: this.options.modelManager?.getModelSettings().maxOutputTokens,
-        telemetry: createSdkTelemetry(this.options.config, this.options.workspaceRoot, "biny.plan"),
+        telemetry: createSdkTelemetry(this.options.config, this.persistenceRoot(), "biny.plan"),
         onError: () => undefined
       });
       for await (const delta of result.textStream) onDelta?.(delta);
@@ -276,14 +279,14 @@ export class AgentSession {
   }
 
   async resume(session: string | undefined): Promise<ResumedAgentSession> {
-    await ensureAgentDirs(this.options.workspaceRoot);
-    const filePath = await resolveSessionFile(this.options.workspaceRoot, session);
+    await ensureAgentDirs(this.persistenceRoot());
+    const filePath = await resolveSessionFile(this.persistenceRoot(), session);
     const replay = await replaySession(filePath);
     const previousRecorder = this.recorder;
     await previousRecorder.close();
     if (!previousRecorder.hasRecordedEvents()) await fs.rm(previousRecorder.filePath, { force: true });
 
-    this.recorder = new SessionRecorder(this.options.workspaceRoot, sessionIdFromFile(filePath));
+    this.recorder = new SessionRecorder(this.persistenceRoot(), sessionIdFromFile(filePath));
     this.recorder.restoreToolCallSequence(maxToolCallSequence(replay.events));
     this.options.permissionManager.resetSession();
     this.usageRecords = [...replay.usage];
@@ -292,7 +295,7 @@ export class AgentSession {
   }
 
   async listSessions(): Promise<SessionSummary[]> {
-    return await listSessionSummaries(this.options.workspaceRoot);
+    return await listSessionSummaries(this.persistenceRoot());
   }
 
   async contextReport(): Promise<string> {
@@ -357,7 +360,7 @@ export class AgentSession {
   async setPermissionMode(mode: PermissionMode): Promise<void> {
     this.options.permissionManager.setMode(mode);
     this.options.config.permission.mode = mode;
-    await saveConfig(this.options.workspaceRoot, this.options.config);
+    await this.configStore().save(this.options.config);
   }
 
   async runPermissionCommand(args: string[]): Promise<string> {
@@ -365,7 +368,7 @@ export class AgentSession {
     const output = runPermissionCommand(this.options.permissionManager, args);
     if (this.options.permissionManager.getStatus().mode !== previousMode) {
       this.options.config.permission.mode = this.options.permissionManager.getStatus().mode;
-      await saveConfig(this.options.workspaceRoot, this.options.config);
+      await this.configStore().save(this.options.config);
     }
     return output;
   }
@@ -408,6 +411,14 @@ export class AgentSession {
       confirmPermission: runOptions.confirmPermission,
       abortSignal: runOptions.abortSignal
     };
+  }
+
+  private persistenceRoot(): string {
+    return this.options.persistenceRoot ?? this.options.workspaceRoot;
+  }
+
+  private configStore(): AgentConfigStore {
+    return this.options.configStore ?? createFileConfigStore(this.persistenceRoot());
   }
 }
 

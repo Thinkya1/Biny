@@ -1,8 +1,8 @@
 import type { AgentRunMode } from "../../../agent/AgentSession.js";
 import { promises as fs } from "node:fs";
 import { generateText } from "ai";
-import { loadConfig, saveConfig } from "../../../config/loader.js";
 import { configSchema, type AgentConfig } from "../../../config/schema.js";
+import type { AgentConfigStore } from "../../../config/store.js";
 import { createModelSettings } from "../../../llm/factory.js";
 import type { ModelRuntimeInfo, ThinkingSelection } from "../../../llm/ModelManager.js";
 import { providerProfile } from "../../../llm/profiles.js";
@@ -39,6 +39,7 @@ export class DesktopAgentManager {
   constructor(
     private readonly state: DesktopStateStore,
     private readonly projects: DesktopProjectService,
+    private readonly configStore: AgentConfigStore,
     private readonly emit: (projectId: string, event: AgentHostEvent) => void,
     openExternal?: (url: string) => Promise<void>
   ) {
@@ -165,13 +166,13 @@ export class DesktopAgentManager {
     if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
       throw new Error("任务运行期间不能修改模型配置。");
     }
-    const project = this.projects.requireProject(projectId);
+    this.projects.requireProject(projectId);
     const authenticated = await this.modelLogin.complete(provider, authRequestId, pastedAuthorization);
-    const current = await loadConfig(project.path);
+    const current = await this.configStore.load();
     const candidate = this.buildConfigWithAuthenticatedLogin(current, authenticated);
     const test = await this.testCandidate(candidate, candidate.defaultModel);
     if (!test.ok) throw new Error(`账号已授权，但模型验证失败：${test.message}`);
-    await saveConfig(project.path, candidate);
+    await this.configStore.save(candidate);
     this.runtimeErrors.delete(projectId);
     if (managed) {
       managed.unsubscribe();
@@ -191,10 +192,10 @@ export class DesktopAgentManager {
     if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
       throw new Error("任务运行期间不能修改模型配置。");
     }
-    const project = this.projects.requireProject(projectId);
-    const current = await loadConfig(project.path);
+    this.projects.requireProject(projectId);
+    const current = await this.configStore.load();
     const next = this.buildConfigWithModel(current, input);
-    await saveConfig(project.path, next);
+    await this.configStore.save(next);
     this.runtimeErrors.delete(projectId);
     if (managed) {
       managed.unsubscribe();
@@ -209,8 +210,8 @@ export class DesktopAgentManager {
     if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
       throw new Error("任务运行期间不能修改模型配置。");
     }
-    const project = this.projects.requireProject(projectId);
-    const current = await loadConfig(project.path);
+    this.projects.requireProject(projectId);
+    const current = await this.configStore.load();
     if (!current.models[alias]) throw new Error(`未知模型：${alias}`);
     const remaining = Object.entries(current.models).filter(([key]) => key !== alias);
     if (!remaining.length) throw new Error("至少需要保留一个可用模型。");
@@ -220,7 +221,7 @@ export class DesktopAgentManager {
       defaultModel: nextDefault,
       models: Object.fromEntries(remaining)
     });
-    await saveConfig(project.path, next);
+    await this.configStore.save(next);
     this.runtimeErrors.delete(projectId);
     if (managed) {
       managed.unsubscribe();
@@ -231,8 +232,8 @@ export class DesktopAgentManager {
   }
 
   async testModelConfiguration(projectId: string, input: DesktopModelConfigurationInput): Promise<DesktopModelConnectionTestResult> {
-    const project = this.projects.requireProject(projectId);
-    const current = await loadConfig(project.path);
+    this.projects.requireProject(projectId);
+    const current = await this.configStore.load();
     const candidate = this.buildConfigWithModel(current, input);
     return await this.testCandidate(candidate, input.alias);
   }
@@ -386,7 +387,12 @@ export class DesktopAgentManager {
     const project = this.projects.requireProject(projectId);
     if (project.missing) throw new Error(`Project path is unavailable: ${project.path}`);
     await this.refreshOAuthCredentials(projectId);
-    const runtime = await createInteractiveAgentRuntime(project.path);
+    const persistenceRoot = await this.projects.dataRoot(project);
+    const runtime = await createInteractiveAgentRuntime(project.path, {
+      persistenceRoot,
+      configStore: this.configStore,
+      attachmentRoot: this.projects.attachmentsRoot(project)
+    });
     const initialSessionFile = runtime.getInfo().sessionFile;
     const selectedSessionId = this.state.selectedSessionId(projectId);
     if (selectedSessionId) {
@@ -458,12 +464,12 @@ export class DesktopAgentManager {
   }
 
   private async refreshOAuthCredentials(projectId: string): Promise<void> {
-    const project = this.projects.requireProject(projectId);
-    const current = await loadConfig(project.path);
+    this.projects.requireProject(projectId);
+    const current = await this.configStore.load();
     let refreshedConfig: AgentConfig | undefined;
     for (const [alias, provider] of Object.entries(current.providers)) {
       const oauth = provider.oauth;
-      if (provider.authMode !== "oauth-bearer" || !oauth || oauth.expiresAt - Date.now() > 5 * 60 * 1_000) continue;
+      if (provider.authMode !== "oauth-bearer" || !oauth || !oauth.refreshToken || oauth.expiresAt - Date.now() > 5 * 60 * 1_000) continue;
       const refreshed = await this.modelLogin.refresh(oauth.provider, {
         accessToken: provider.apiKey ?? "",
         refreshToken: oauth.refreshToken,
@@ -482,7 +488,7 @@ export class DesktopAgentManager {
         }
       };
     }
-    if (refreshedConfig) await saveConfig(project.path, refreshedConfig);
+    if (refreshedConfig) await this.configStore.save(refreshedConfig);
   }
 
   private projectEvents(projectId: string): Map<string, AgentHostEvent[]> {
@@ -554,7 +560,7 @@ function withAttachmentReferences(input: string, attachments: DesktopAttachment[
   return [
     input,
     "",
-    "Attached files (workspace-relative paths):",
+    "Attached files (read them with read_file using these @attachments/ paths):",
     ...attachments.map((attachment) => `- ${attachment.path} (${attachment.mimeType || "unknown type"}, ${String(attachment.size)} bytes)`)
   ].join("\n");
 }

@@ -59,4 +59,5 @@ export interface ToolContext {
   // 所有内置工具都绑定在当前 workspace 内，不能自行选择任意系统路径。
   workspaceRoot: string;
   ignore: string[];
+  attachmentRoot?: string;
 }
