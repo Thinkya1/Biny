@@ -1,435 +1,103 @@
 # Biny
 
-> 面向本地工作区的 AI Agent，可在 macOS 桌面端或终端中完成编码、研究和文件处理。
+> 你的项目，你的 Agent。
 
-Biny 在你的工作区中运行，支持多家模型服务，并提供工具调用、权限确认和可恢复会话。
+**Biny 是一个本地优先的 AI Agent，可在 macOS 桌面端或终端中完成编码、研究和文件处理。**
 
-Biny 不绑定单一模型或云平台，支持 DeepSeek、OpenAI、Anthropic、Gemini、Kimi、Qwen、Ollama 以及通用 OpenAI-compatible endpoint。它提供 macOS Electron 桌面端和 React Ink TUI，也保留传统交互式 `chat` 命令。
+它直接在你的工作区中运行。你可以连接自己的模型服务，在权限确认下读取文件、搜索代码、执行命令和修改项目；会话可以在本机恢复，而不是被锁定在某个云端产品里。
 
-[快速开始](#快速开始) · [核心能力](#核心能力) · [命令参考](#命令参考) · [模型配置](#模型配置) · [开发](#开发)
+> [!IMPORTANT]
+> Biny 正在持续开发中。桌面端、CLI 和模型接入仍会改进，建议先在副本或非关键项目中体验。
 
-## 项目状态
+## 为什么是 Biny
 
-- 当前版本：`0.2.1`
-- 运行方式：macOS 桌面端 / 本地 CLI / TUI
-- 默认入口：TUI
-- 默认模型：DeepSeek `deepseek-v4-flash`
-- 包管理器：pnpm
+- **本地优先**：项目文件留在你的电脑上，模型由你自行选择和配置。
+- **模型不设限**：支持 DeepSeek、OpenAI、Anthropic、Gemini、Kimi、Qwen、Ollama 及 OpenAI-compatible 服务。
+- **执行可控**：读取、写入、编辑和命令执行都经过权限确认；高风险操作不会静默执行。
+- **会话可恢复**：消息、工具调用和运行状态保存在本机，任务可以继续而不必从头描述。
 
-## 核心能力
+## 使用方式
 
-| 能力 | 说明 |
-| --- | --- |
-| 本地优先 | 在当前工作区内读取规则、文件、Git 状态和项目结构，模型请求由你配置的 provider 承载。 |
-| 多模型接入 | 通过 provider profile 与 model alias 管理不同厂商、模型和 endpoint。 |
-| 工具协作 | 内置文件、搜索、Git、命令和联网搜索工具，并统一经过权限与会话链路。 |
-| 可控执行 | 默认在写文件、编辑文件和执行命令前请求确认；高风险操作始终保留确认边界。 |
-| 持续会话 | 将用户消息、助手回复、工具调用、工具结果和错误记录为 JSONL，支持压缩、恢复和审计。 |
-| TUI 工作流 | 提供模型切换、推理档位、Plan mode、权限提示、上下文和 usage 面板。 |
-| macOS 桌面端 | 在图形界面中管理项目、模型、会话、权限和文件操作。 |
-| 可扩展 | 支持 Workspace Skill、Plugin、MCP stdio server 和受限只读 Subagent。 |
+| 入口 | 适合什么 | 说明 |
+| --- | --- | --- |
+| **Desktop** | 日常使用、管理项目与模型 | macOS 图形应用，提供项目、会话、文件、模型和权限界面。 |
+| **TUI / CLI** | 在终端中工作或执行单次任务 | 在当前工作区启动交互界面，或通过 `biny run` 执行任务。 |
+
+## 当前能力
+
+### Agent
+
+- 使用文件、搜索、Git、Shell 和联网搜索工具完成任务；
+- 支持工具调用、流式输出、推理档位和用量统计；
+- 支持 Plan 模式：先生成计划，不执行会产生副作用的操作；
+- 支持 Workspace Skill、Plugin、MCP stdio server 和受限只读 Subagent。
+
+### Desktop
+
+- 打开和管理本地项目、会话与附件；
+- 在“设置 → 模型”中连接 API、本地模型或账号订阅，并测试连接；
+- 展示消息、工具过程、命令输出、权限请求和文件 Diff；
+- 支持 DeepSeek、OpenAI、Anthropic、Gemini、Kimi、Qwen、Ollama 等厂商图标与接入方式。
 
 ## 快速开始
 
-### 环境要求
+### 使用 macOS 桌面端
 
-- Node.js LTS
-- pnpm 10
-- 一个已配置 API key 的模型 provider
+从 [GitHub Releases](https://github.com/Thinkya1/Biny/releases) 下载适合你 Mac 的安装包：
 
-### 安装 CLI
+1. 打开 `.dmg`，将 `Biny` 拖入“应用程序”文件夹；或解压 `.zip` 后移动 `Biny.app`。
+2. Apple 芯片 Mac 请选择 `arm64`，Intel Mac 请选择 `x64`。
+3. 首次打开后，进入“设置 → 模型”，连接一个模型并测试连接。
+4. 打开项目，开始任务。
 
-全局安装后，在任意工作区运行 `biny` 即可进入终端界面：
+如果 macOS 提示无法验证开发者，请在“系统设置 → 隐私与安全性”中允许打开 Biny。
 
-```bash
-npm install --global @biny012/biny
-biny
-```
+### 从终端运行
 
-也可以使用 pnpm：
-
-```bash
-pnpm add --global @biny012/biny
-biny
-```
-
-### 从源码运行
+需要 Node.js LTS、pnpm 10 和一个模型 API key。以下示例使用 DeepSeek：
 
 ```bash
 git clone https://github.com/Thinkya1/Biny.git
 cd Biny
 pnpm install
 pnpm dev -- init
-```
-
-默认配置使用 DeepSeek。先在当前 shell 设置 API key：
-
-```bash
 export DEEPSEEK_API_KEY="你的 DeepSeek API key"
-```
-
-然后启动 Biny：
-
-```bash
 pnpm dev
 ```
 
-不带子命令时，Biny 默认进入 TUI。初始化命令是幂等的：如果 `agent.config.json` 或 `.agent/` 已存在，不会覆盖已有配置。
-
-首次运行前可以检查本地环境：
+`pnpm dev` 默认打开 TUI。查看完整终端命令可运行 `biny --help`；常用单次任务形式为：
 
 ```bash
-pnpm dev -- doctor
+biny run "总结当前项目并指出最重要的风险"
 ```
 
-### 使用本地构建的 `biny` 命令
+## 模型与数据
 
-如果希望在任意工作区使用本地构建版本：
-
-```bash
-pnpm build
-pnpm link --global
-
-biny
-biny doctor
-```
-
-`biny` 默认进入 TUI；传统 readline 交互可以使用 `biny chat`。
-
-### 安装 macOS 桌面端
-
-前往 [GitHub Releases](https://github.com/Thinkya1/Biny/releases) 下载适合你 Mac 的安装包：
-
-1. 打开下载的 `.dmg` 文件。
-2. 将 `Biny` 拖入“应用程序”文件夹。
-3. 从“应用程序”中打开 Biny。
-
-如果下载的是 `.zip`，请先解压，再将 `Biny.app` 移入“应用程序”。Apple 芯片 Mac 请选择 `arm64`，Intel Mac 请选择 `x64`。
-
-首次打开时，如果 macOS 提示无法验证开发者，请在“系统设置 → 隐私与安全性”中允许打开 Biny。
-
-桌面端的模型设置、登录凭据、会话和附件会保存在你的用户数据目录中（macOS 通常为 `~/Library/Application Support/Biny/`），不会写入项目文件夹。已有桌面端数据会在首次启动新版时自动迁移，原文件会保留。
-
-## 常见工作流
-
-### 一次性任务
-
-```bash
-biny run "读取 package.json 并解释这个项目的入口"
-biny run "搜索 provider 相关配置并总结使用方式"
-biny run "运行 pnpm typecheck 并分析错误"
-```
-
-### 先规划，再执行
-
-`plan` 只生成计划，不执行写文件、编辑文件或命令工具：
-
-```bash
-biny plan "为工具系统增加只读搜索能力"
-```
-
-在 TUI 中也可以输入 `/plan` 或按 `Shift+Tab` 切换 Plan mode。Plan mode 允许普通回答和只读工具，禁止有副作用的工具。
-
-### 继续之前的会话
-
-```bash
-biny chat --continue
-biny chat --session <session-id>
-biny sessions
-biny resume latest
-```
-
-`chat --continue` 和 `chat --session` 会恢复模型可用的历史并继续对话；`resume` 只读打印会话历史，不会切换当前会话。
-
-## 命令参考
-
-| 命令 | 用途 |
-| --- | --- |
-| `biny` | 默认进入 TUI。 |
-| `biny init` | 创建默认配置和 `.agent/` 运行目录，不覆盖已有配置。 |
-| `biny doctor` | 检查 Node.js、pnpm、Git、配置文件和 `.agent/` 状态。 |
-| `biny run <task>` | 执行一次性 Agent 任务并记录会话事件。 |
-| `biny plan <task>` | 生成计划，不执行写入、编辑或命令工具。 |
-| `biny tui` | 显式进入 TUI，是默认入口的别名。 |
-| `biny chat` | 启动传统交互式会话。支持 `--continue` 和 `--session <id>`。 |
-| `biny sessions` | 列出当前工作区的历史会话。 |
-| `biny resume [session]` | 只读查看指定会话；不传参数时查看最新会话。 |
-
-## TUI 与 Chat 命令
-
-在 TUI 或 `chat` 中输入 `/` 可以查看命令菜单，并使用上下键选择、Tab 补全和 Enter 确认。
-
-| 命令 | 用途 |
-| --- | --- |
-| `/help` | 查看命令列表。 |
-| `/clear` | 清空当前可见内容。 |
-| `/status` | 查看当前模型、推理档位、权限和扩展状态。 |
-| `/context` | 查看已加载规则、项目快照、RepoMap 和上下文预算。 |
-| `/usage` | 查看 input/output/reasoning/cache token 与成本统计。 |
-| `/model [alias] [off\|high\|max]` | 查看或切换模型与推理档位。 |
-| `/plan` | 在 TUI 中切换 Plan mode；`chat` 中创建一次性计划。 |
-| `/compact [hint]` | 压缩较早的对话历史，减少上下文占用。 |
-| `/permissions <mode>` | 查看或切换权限模式。 |
-| `/approvals` | `/permissions` 的别名。 |
-| `/mcp` | 查看 MCP server 与已注册工具。 |
-| `/skills` | 查看已加载的 Workspace Skill。 |
-| `/plugins` | 查看已加载的 Plugin。 |
-| `/subagent <task>` | 执行一次受限只读 Subagent 任务。 |
-| `/review [instructions]` | 使用只读 Subagent 检查当前变更。 |
-| `/sessions` | 列出历史会话。 |
-| `/resume [session]` | 查看或恢复指定会话。 |
-| `/exit`、`/quit` | 退出当前交互。 |
-
-权限模式：
+桌面端通过“设置 → 模型”管理连接、默认模型和密钥。API key 与 OAuth 凭据由 macOS 系统钥匙串保护；模型设置、会话、附件和运行记录保存在用户数据目录，项目文件夹不会被桌面端写入这些应用数据。
 
 ```text
-/permissions status
-/permissions readonly
-/permissions ask
-/permissions auto
-/permissions full
-/permissions reset
+~/Library/Application Support/Biny/workspaces/default/
+  agent.config.json       模型设置（不含密钥）
+  credentials.json        经系统保护的凭据
+  projects/<project-id>/  会话、附件、记忆和运行记录
 ```
 
-默认模式是 `ask`。只读工具可以直接执行；写文件、编辑文件、Shell、安装依赖和其他高风险操作会根据当前策略请求确认。即使处于 `full`，Critical 操作仍可能继续请求确认。
+升级后，旧版桌面端的配置和会话会自动复制到新位置，原文件会保留。CLI/TUI 仍使用当前工作区中的 `agent.config.json` 和 `.agent/`；它们与桌面端数据相互隔离。
 
-## 模型配置
+## 当前边界
 
-CLI 和 TUI 使用工作区根目录下的 `agent.config.json`。推荐只保存环境变量名，不要把真实 API key 提交到仓库。
+- 本地安装包尚未签名或公证；
+- 图片附件目前以安全路径交给文本 Agent，尚未作为原生多模态消息发送；
+- 部分桌面端导航入口仍在开发中，会明确标注为暂未实现。
 
-桌面端请在“设置 → 模型”中连接和管理模型；其配置和凭据保存在用户数据目录，不会写入当前项目。
-
-API key 的解析顺序为：
-
-1. `providers.<alias>.apiKey`
-2. `providers.<alias>.apiKeyEnv`
-3. provider 类型对应的默认环境变量
-
-### 默认 DeepSeek 配置
-
-`pnpm dev -- init` 会生成默认配置。最小模型配置如下：
-
-```json
-{
-  "defaultModel": "deepseek-v4-flash",
-  "providers": {
-    "deepseek": {
-      "type": "deepseek",
-      "baseUrl": "https://api.deepseek.com",
-      "apiKeyEnv": "DEEPSEEK_API_KEY"
-    }
-  },
-  "models": {
-    "deepseek-v4-flash": {
-      "provider": "deepseek",
-      "model": "deepseek-v4-flash",
-      "supportsTools": true,
-      "thinking": {
-        "efforts": ["high", "max"],
-        "defaultEffort": "high"
-      }
-    }
-  },
-  "thinking": {
-    "enabled": true,
-    "effort": "high"
-  }
-}
-```
-
-### 支持的 provider
-
-| `type` | 默认环境变量 | 备注 |
-| --- | --- | --- |
-| `deepseek` | `DEEPSEEK_API_KEY` | 支持 reasoning。 |
-| `openai` | `OPENAI_API_KEY` | OpenAI API。 |
-| `anthropic` | `ANTHROPIC_API_KEY` | Anthropic Messages API。 |
-| `gemini` | `GEMINI_API_KEY` | Google Gemini OpenAI-compatible endpoint。 |
-| `kimi` | `MOONSHOT_API_KEY` | Moonshot AI endpoint。 |
-| `qwen` | `DASHSCOPE_API_KEY` | DashScope compatible endpoint。 |
-| `ollama` | 不需要 | 默认连接本机 Ollama。 |
-| `openai-compatible` | 自定义 | 必须配置 provider `baseUrl`。 |
-
-Provider 负责 endpoint 和凭证，model alias 负责实际模型 ID、输出限制、推理能力和可选价格。TUI 中可以通过 `/model` 切换 alias：
-
-```text
-/model deepseek-v4-pro max
-/model deepseek-v4-flash off
-```
-
-### OpenAI-compatible endpoint
-
-将下面的字段合并到 `agent.config.json`：
-
-```json
-{
-  "defaultModel": "custom-model",
-  "providers": {
-    "custom": {
-      "type": "openai-compatible",
-      "baseUrl": "https://provider.example/v1",
-      "apiKeyEnv": "PROVIDER_API_KEY"
-    }
-  },
-  "models": {
-    "custom-model": {
-      "provider": "custom",
-      "model": "provider-model"
-    }
-  },
-  "thinking": {
-    "enabled": false,
-    "effort": "high"
-  }
-}
-```
-
-通用 endpoint 是否支持工具调用，取决于上游模型和服务的实现。
-
-## 工作区上下文
-
-Biny 会根据当前任务按需装配工作区上下文，而不是把整个仓库直接塞进 prompt：
-
-- 分层读取根目录和被访问子目录中的 `AGENTS.override.md` / `AGENTS.md` 规则。
-- 生成包含工作目录、包管理器、脚本、README、目录轮廓和 Git 状态的项目快照。
-- 通过 RepoMap 保留入口、测试、import/export 和符号信息。
-- 使用精确的文件搜索、读取和工具结果获取源码细节。
-- 默认上下文预算为 24,000 token，超出后自动压缩，或通过 `/compact` 手动压缩。
-
-Biny 不使用 embedding、向量数据库或语义索引。`.agent/memory/` 中的本地 Markdown 记忆使用关键词、路径和主题做确定性匹配，并在写入前执行去重和敏感信息脱敏。
-
-## 工具与权限边界
-
-内置工具包括：
-
-- 文件：`read_file`、`list_files`、`write_file`、`edit_file`
-- 搜索：`search_files`、`grep_search`、`web_search`
-- Git：`git_status`、`git_diff`
-- 命令：`run_command`
-
-所有工具调用都会经过统一的 Tool Registry、Permission Manager、调度器和 Session Recorder。Skill、Plugin、MCP 和 Subagent 注册的工具也复用同一条权限与会话链路。
-
-工作区保护默认忽略 `node_modules`、`.git`、`dist`、`build`、`.env`、`.agent` 等路径；具体策略可以在 `agent.config.json` 的 `workspace.ignore` 和 `permission` 中调整。
-
-## 扩展能力
-
-扩展配置位于 `agent.config.json` 的 `extensions` 字段：
-
-```json
-{
-  "skills": [".agent/skills"],
-  "plugins": [".agent/plugins"],
-  "subagent": {
-    "enabled": true,
-    "maxSteps": 4,
-    "maxOutputTokens": 4000
-  },
-  "mcp": {
-    "filesystem": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-filesystem",
-        "/path/to/workspace"
-      ]
-    }
-  }
-}
-```
-
-- `.agent/skills/**/*.md` 会作为 Workspace Skill prompt 注入，但不会绕过权限系统。
-- `.agent/plugins/**/*.{js,mjs,cjs}` 可以导出 `register(context)` 或 `tools`。
-- `mcp` 当前使用 MCP SDK 的 stdio client，server tools 会转换为 Biny tools。
-- `delegate_task` 是默认注册的受限只读 Subagent，不能写文件、执行 Shell 或继续委派。
-- MCP server 连接失败会在 runtime 启动时显式报错，避免静默降级。
-
-## 会话、恢复与 usage
-
-CLI 与 TUI 的会话文件保存在：
-
-```text
-.agent/sessions/*.jsonl
-```
-
-稳定事件类型包括：
-
-- `user_message`
-- `assistant_message`
-- `tool_call`
-- `tool_result`
-- `error`
-
-会话会保存消息、工具调用和运行状态，恢复后可以继续此前的任务。桌面端会话保存在用户数据目录中，不会出现在项目文件夹内。
-
-## 架构概览
-
-```text
-CLI / TUI / Electron Main
-   │
-   ▼
-InteractiveAgentRuntime / CommandRuntime
-   │  装配 provider、工具、权限、扩展和 session
-   ▼
-AgentSession
-   ├── ContextMemory / WorkspaceContext / LocalMemory
-   ├── ModelManager / Vercel AI SDK
-   ├── ToolRegistry / PermissionManager
-   └── SessionRecorder / Observability
-```
-
-代码边界对应关系：
-
-- `src/cli/`、`src/tui/`：终端命令入口和交互展示。
-- `src/desktop/`：Electron Main/Preload 与只负责展示的 React Renderer。
-- `src/runtime/`：共享结构化事件适配层，以及组合 provider、工具、权限与 Agent 的 composition root。
-- `src/agent/`：有状态 AgentSession、上下文装配和模型消息处理。
-- `src/tools/`、`src/permission/`：能力注册、工具执行和权限策略。
-- `src/session/`、`src/extensions/`、`src/observability/`：会话、扩展和运行观测。
-
-## 当前限制
-
-- 命令执行仍依赖权限确认，尚未提供更强的 OS 级沙箱和进程隔离。
-- 批量文件编辑和复杂修改策略仍在持续完善。
-- MCP 当前支持 stdio server，尚未提供远程 HTTP/OAuth server 的管理界面。
-- Provider 价格不会自动同步，需要在 model 配置中显式填写后才能计算金额。
-- macOS 本地构建默认不签名、不公证；正式分发前需要配置 Apple Developer 签名与 notarization。
-- 图片和文件可以拖入或粘贴并保存为工作区附件；当前 Agent 消息核心仍以路径引用传递，尚未将图片转成 provider 原生多模态消息。
-- “已安排、插件、站点、拉取请求”等桌面导航入口目前仅展示“暂未实现”，不会伪造结果。
-
-## 开发
-
-安装依赖：
-
-```bash
-pnpm install
-```
-
-常用验证命令：
+## 开发与贡献
 
 ```bash
 pnpm test
 pnpm typecheck
 pnpm build
-git diff --check
 ```
 
-本地开发入口：
+欢迎通过 Issue 或 Pull Request 提交反馈和改进。请勿提交 API key、token 或其他本地敏感配置。
 
-```bash
-pnpm dev
-pnpm dev -- init
-pnpm dev -- doctor
-pnpm dev -- tui
-pnpm desktop:dev
-pnpm desktop:pack
-```
-
-如果要发布一个 GitHub Release，建议先完成上述验证，再为目标提交创建语义化 Git tag，例如 `v0.1.0`。
-
-## 贡献
-
-欢迎通过 Issue 或 Pull Request 反馈问题、提交改进和补充 provider 配置。提交代码前，请确保：
-
-- 不提交 API key、token、password 或本地敏感配置。
-- 通过 `pnpm test`、`pnpm typecheck` 和 `pnpm build`。
-- 修改用户可见行为时同步更新 README 和相关测试。
+桌面端实现与 IPC 协议见 [src/desktop/README.md](./src/desktop/README.md)。
