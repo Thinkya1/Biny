@@ -27,13 +27,28 @@
 
 ### Agent
 
-- 使用文件、搜索、Git、Shell 和联网搜索工具完成任务；
+- 使用文件、搜索、Git、Shell 和联网搜索工具完成任务；`web_search` 默认使用 AnySearch API，也支持无需密钥的 DuckDuckGo 和 Brave Search API；AnySearch 通过 `ANYSEARCH_API_KEY` 环境变量读取密钥，也可匿名访问；
 - 支持有并发上限、公平冲突排序和取消传播的工具调用，以及流式输出、推理档位和用量统计；
 - 支持 Plan 模式：先生成计划，不执行会产生副作用的操作；
 - 支持 Workspace Skill、Plugin、MCP stdio server 和受限只读 Subagent；子 Agent 默认仅能使用显式允许的本地读取、搜索和 Git 检查工具；`maxCostUsd` 是在每个模型 step 结束后按 provider usage 检查的软阈值，当前 step 可能使总成本超过阈值（启用时需配置输入、输出、缓存读和缓存写价格）。
 - 内置工具遵守取消信号；Plugin、MCP 等外部工具采用 best-effort 取消。若外部工具在有界 drain 后仍未结束，当前调用会明确标记为已隔离，AgentSession 会拒绝新的执行操作，直到迟到的外部调用真正 settle，避免副作用重叠。
 - 文件读取、编辑和权限 Diff 单文件上限为 1 MiB；搜索只扫描每个文件的前 1 MiB，并在结果中标记截断文件。写入与编辑使用同目录事务式替换，且把真正执行绑定到已审批的文件快照；新文件的父目录必须已存在，提交窗口检测到外部写入时会保留或恢复外部版本，而不是静默覆盖。
 - CLI 的 `run`、`plan`、`chat` 及其中的长操作会把第一次 Ctrl+C 传递为协作式取消，并在操作结束后清理信号监听。
+
+如果工作区配置覆盖了默认值，可在 `agent.config.json` 的 `web.search` 中显式设置 AnySearch 和密钥环境变量：
+
+```json
+{
+  "web": {
+    "search": {
+      "provider": "anysearch",
+      "apiKeyEnv": "ANYSEARCH_API_KEY"
+    }
+  }
+}
+```
+
+然后在启动 Biny 的环境中设置 `ANYSEARCH_API_KEY`。不设置 `apiKeyEnv` 时，AnySearch 也可以使用匿名额度。
 
 Workspace Skill 默认从 `.agent/skills` 加载。Plugin 会以当前进程权限执行本地 JavaScript，能够直接访问文件系统和环境变量，且没有沙箱，因此默认不自动加载；只有写入 `extensions.plugins` 的工作区内路径才会启用，并必须视为完全受信任代码。Skill、Plugin 与 MCP `cwd` 都拒绝越出工作区的路径和符号链接；传给 Plugin 的配置副本会移除 provider key、OAuth refresh token 与 MCP 环境变量，这只用于避免上下文意外泄漏，不构成安全隔离。
 

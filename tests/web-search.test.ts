@@ -8,6 +8,7 @@ async function main(): Promise<void> {
   testDuckDuckGoParser();
   await testDuckDuckGoSearch();
   await testBraveSearch();
+  await testAnySearch();
   testWebSearchPermission();
   testWebSearchRegistration();
 }
@@ -100,6 +101,60 @@ async function testBraveSearch(): Promise<void> {
     globalThis.fetch = originalFetch;
     if (originalKey === undefined) delete process.env.BINY_TEST_BRAVE_KEY;
     else process.env.BINY_TEST_BRAVE_KEY = originalKey;
+  }
+}
+
+async function testAnySearch(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.BINY_TEST_ANYSEARCH_KEY;
+  process.env.BINY_TEST_ANYSEARCH_KEY = "test-key";
+  let requestedUrl: URL | undefined;
+  let requestedMethod: string | undefined;
+  let requestedHeaders: Headers | undefined;
+  let requestedBody: { query?: string; max_results?: number } | undefined;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    requestedUrl = new URL(String(input));
+    requestedMethod = init?.method;
+    requestedHeaders = new Headers(init?.headers);
+    requestedBody = JSON.parse(String(init?.body)) as { query?: string; max_results?: number };
+    return new Response(JSON.stringify({
+      code: 0,
+      message: "success",
+      data: {
+        results: [{
+          title: "AnySearch result",
+          url: "https://example.com/anysearch",
+          snippet: "A result from AnySearch.",
+          content: "The full content is intentionally ignored by web_search."
+        }]
+      }
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    const tool = createWebSearchTool({
+      enabled: true,
+      provider: "anysearch",
+      apiKeyEnv: "BINY_TEST_ANYSEARCH_KEY",
+      timeoutMs: 1_000,
+      maxResults: 5
+    });
+    const execution = await tool.resolveExecution({ query: "Biny", maxResults: 2, domains: ["example.com"] });
+    assert.equal("isError" in execution, false);
+    if ("isError" in execution) return;
+    const result = await execution.execute({ toolCallId: "search-3", signal: undefined });
+    assert.equal(result.provider, "anysearch");
+    assert.equal(result.results[0]?.title, "AnySearch result");
+    assert.equal(result.results[0]?.snippet, "A result from AnySearch.");
+    assert.equal(requestedUrl?.toString(), "https://api.anysearch.com/v1/search");
+    assert.equal(requestedMethod, "POST");
+    assert.equal(requestedHeaders?.get("authorization"), "Bearer test-key");
+    assert.equal(requestedBody?.max_results, 2);
+    assert.match(requestedBody?.query ?? "", /site:example\.com/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.BINY_TEST_ANYSEARCH_KEY;
+    else process.env.BINY_TEST_ANYSEARCH_KEY = originalKey;
   }
 }
 

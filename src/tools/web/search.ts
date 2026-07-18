@@ -2,7 +2,7 @@
  * 公网搜索工具模块。
  *
  * `web_search` 只返回搜索结果标题、链接和摘要，不打开网页、不执行本地命令，也不修改工作区。
- * 默认使用无需密钥的 DuckDuckGo HTML 搜索；需要稳定 API 配额时可以切换到 Brave Search。
+ * 默认使用支持匿名额度的 AnySearch API，也支持无需密钥的 DuckDuckGo HTML 搜索和 Brave Search。
  */
 import { z } from "zod";
 import type { WebSearchConfig } from "../../config/schema.js";
@@ -88,9 +88,11 @@ async function searchWeb(config: WebSearchConfig, args: WebSearchArgs, signal: A
   const domains = normalizeDomains(args.domains);
   const maxResults = Math.min(args.maxResults ?? config.maxResults, config.maxResults);
   const searchQuery = buildSearchQuery(query, domains);
-  const results = config.provider === "brave"
-    ? await searchWithBrave(config, searchQuery, maxResults, args.recency, signal)
-    : await searchWithDuckDuckGo(config, searchQuery, maxResults, args.recency, signal);
+  const results = config.provider === "anysearch"
+    ? await searchWithAnySearch(config, searchQuery, maxResults, signal)
+    : config.provider === "brave"
+      ? await searchWithBrave(config, searchQuery, maxResults, args.recency, signal)
+      : await searchWithDuckDuckGo(config, searchQuery, maxResults, args.recency, signal);
 
   return {
     query,
@@ -148,6 +150,40 @@ async function searchWithBrave(
   return parseBraveResults(payload, maxResults);
 }
 
+async function searchWithAnySearch(
+  config: WebSearchConfig,
+  query: string,
+  maxResults: number,
+  signal: AbortSignal | undefined
+): Promise<WebSearchResult[]> {
+  const envName = config.apiKeyEnv ?? "ANYSEARCH_API_KEY";
+  const apiKey = process.env[envName];
+  if (config.apiKeyEnv && !apiKey) {
+    throw new Error(`AnySearch web search requires the ${envName} environment variable.`);
+  }
+
+  const headers: Record<string, string> = {
+    "accept": "application/json",
+    "content-type": "application/json",
+    "user-agent": "Biny web_search"
+  };
+  if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+
+  const url = new URL("https://api.anysearch.com/v1/search");
+  const body = await fetchText(url, headers, config.timeoutMs, signal, {
+    method: "POST",
+    body: JSON.stringify({ query, max_results: maxResults })
+  });
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(body) as unknown;
+  } catch {
+    throw new Error("AnySearch web search returned invalid JSON.");
+  }
+  return parseAnySearchResults(payload, maxResults);
+}
+
 export function parseDuckDuckGoResults(html: string, maxResults: number): WebSearchResult[] {
   const results: WebSearchResult[] = [];
   const seenUrls = new Set<string>();
@@ -187,11 +223,36 @@ function parseBraveResults(payload: unknown, maxResults: number): WebSearchResul
   return results;
 }
 
+export function parseAnySearchResults(payload: unknown, maxResults: number): WebSearchResult[] {
+  if (!isRecord(payload)) throw new Error("AnySearch web search returned an invalid response.");
+  if (payload.code !== 0) {
+    const message = typeof payload.message === "string" ? payload.message : "request failed";
+    throw new Error(`AnySearch web search failed: ${message}`);
+  }
+  if (!isRecord(payload.data) || !Array.isArray(payload.data.results)) {
+    throw new Error("AnySearch web search returned an invalid response.");
+  }
+
+  const results: WebSearchResult[] = [];
+  const seenUrls = new Set<string>();
+  for (const item of payload.data.results) {
+    if (results.length >= maxResults || !isRecord(item)) break;
+    const title = typeof item.title === "string" ? cleanHtmlText(item.title) : "";
+    const url = typeof item.url === "string" ? resolveSearchUrl(item.url) : undefined;
+    const snippet = typeof item.snippet === "string" ? cleanHtmlText(item.snippet) : "";
+    if (!title || !url || seenUrls.has(url)) continue;
+    seenUrls.add(url);
+    results.push({ title, url, snippet: snippet || undefined });
+  }
+  return results;
+}
+
 async function fetchText(
   url: URL,
   headers: Record<string, string>,
   timeoutMs: number,
-  signal: AbortSignal | undefined
+  signal: AbortSignal | undefined,
+  init: Pick<RequestInit, "method" | "body"> | undefined = undefined
 ): Promise<string> {
   const controller = new AbortController();
   let timedOut = false;
@@ -204,7 +265,12 @@ async function fetchText(
   signal?.addEventListener("abort", abort, { once: true });
 
   try {
-    const response = await fetch(url, { headers, signal: controller.signal });
+    const response = await fetch(url, {
+      method: init?.method,
+      body: init?.body,
+      headers,
+      signal: controller.signal
+    });
     const body = await response.text();
     if (!response.ok) {
       const detail = body.replace(/\s+/g, " ").trim().slice(0, 180);

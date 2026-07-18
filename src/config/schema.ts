@@ -173,7 +173,7 @@ const extensionsSchema = z.object({
 
 const webSearchSchema = z.object({
   enabled: z.boolean().default(true),
-  provider: z.enum(["duckduckgo", "brave"]).default("duckduckgo"),
+  provider: z.enum(["duckduckgo", "brave", "anysearch"]).default("anysearch"),
   apiKeyEnv: z.string().min(1).optional(),
   timeoutMs: z.number().int().min(1_000).max(60_000).default(10_000),
   maxResults: z.number().int().min(1).max(10).default(5)
@@ -190,7 +190,7 @@ const webSchema = z.object({
 }).default({
   search: {
     enabled: true,
-    provider: "duckduckgo",
+    provider: "anysearch",
     apiKeyEnv: undefined,
     timeoutMs: 10_000,
     maxResults: 5
@@ -388,7 +388,7 @@ export const defaultConfig: AgentConfig = {
   web: {
     search: {
       enabled: true,
-      provider: "duckduckgo",
+      provider: "anysearch",
       apiKeyEnv: undefined,
       timeoutMs: 10_000,
       maxResults: 5
