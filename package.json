@@ -1,6 +1,16 @@
 {
   "name": "@biny012/biny",
   "version": "0.2.1",
+  "description": "A local-first AI agent for macOS and the terminal.",
+  "author": "Biny contributors",
+  "homepage": "https://github.com/Thinkya1/Biny",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Thinkya1/Biny.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Thinkya1/Biny/issues"
+  },
   "type": "module",
   "main": "out/main/index.js",
   "bin": {
@@ -17,7 +27,7 @@
     "desktop:dev": "electron-vite dev",
     "desktop:preview": "electron-vite preview",
     "desktop:pack": "pnpm build:desktop && electron-builder --mac dir",
-    "desktop:dist": "pnpm build:desktop && electron-builder --mac dmg zip",
+    "desktop:dist": "pnpm build:desktop && electron-builder --mac dmg zip --publish never",
     "dev": "node --import tsx src/cli/index.ts",
     "lint": "eslint electron.vite.config.ts scripts src tests",
     "test": "tsx tests/ai-sdk-agent.test.ts && tsx tests/tui-transcript.test.ts && tsx tests/desktop.test.ts && tsx tests/context.test.ts && tsx tests/llm-provider.test.ts && tsx tests/extensions.test.ts && tsx tests/web-search.test.ts",

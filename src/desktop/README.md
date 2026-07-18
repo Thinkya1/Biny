@@ -16,7 +16,9 @@ pnpm desktop:pack  # release/mac-arm64/Biny.app
 pnpm desktop:dist  # release/Biny-<version>-<arch>.dmg/.zip
 ```
 
-本地打包产物未签名。公开分发前仍需在 `electron-builder.yml` 中配置 Apple Developer 签名、hardened runtime 和 notarization。
+`desktop:dist` 只构建本地安装包，不会发布。推送匹配版本号的 tag（例如 `v0.2.2`）会触发 GitHub Actions，为 Apple 芯片和 Intel Mac 分别构建 DMG/ZIP 并上传到对应 GitHub Release。安装包包含 Electron 运行时，用户不需要安装 Node.js 或 pnpm。
+
+当前产物未签名。公开分发前可在 `electron-builder.yml` 和 GitHub Actions secrets 中配置 Apple Developer 签名、hardened runtime 与 notarization。
 
 ## 进程边界
 

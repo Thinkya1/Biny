@@ -43,14 +43,14 @@
 
 ### 使用 macOS 桌面端
 
-从 [GitHub Releases](https://github.com/Thinkya1/Biny/releases) 下载适合你 Mac 的安装包：
+从 [GitHub Releases](https://github.com/Thinkya1/Biny/releases) 下载适合你 Mac 的 DMG 安装包。安装包已包含运行所需的应用运行时，不需要安装 Node.js、pnpm 或 CLI：
 
 1. 打开 `.dmg`，将 `Biny` 拖入“应用程序”文件夹；或解压 `.zip` 后移动 `Biny.app`。
 2. Apple 芯片 Mac 请选择 `arm64`，Intel Mac 请选择 `x64`。
 3. 首次打开后，进入“设置 → 模型”，连接一个模型并测试连接。
 4. 打开项目，开始任务。
 
-如果 macOS 提示无法验证开发者，请在“系统设置 → 隐私与安全性”中允许打开 Biny。
+当前安装包未签名或公证。如果 macOS 提示无法验证开发者，请在“系统设置 → 隐私与安全性”中允许打开 Biny。
 
 ### 从终端运行
 
