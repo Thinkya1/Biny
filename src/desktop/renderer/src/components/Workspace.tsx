@@ -11,6 +11,7 @@ import type { TimelineTurn } from "../sessionTimeline.js";
 import { highlightWorkspaceFile } from "../syntaxHighlight.js";
 import { workspaceFileMarker } from "../workspaceFileMarker.js";
 import { AppIcon } from "./AppIcon.js";
+import { CopyButton } from "./CopyButton.js";
 import { Icon } from "./Icon.js";
 import { MessageTimeline } from "./MessageTimeline.js";
 
@@ -482,7 +483,13 @@ function FilePreviewContent({ preview }: { preview: FilePreviewState }): React.J
   const highlighted = highlightWorkspaceFile(file.path, file.content);
   return (
     <>
-      <div className="file-preview-meta"><span>{highlighted.language ?? "纯文本"}</span><span>{formatBytes(file.bytes)}{file.truncated ? " · 仅显示前 512 KB" : ""}</span></div>
+      <div className="file-preview-meta">
+        <span>{highlighted.language ?? "纯文本"}</span>
+        <div className="file-preview-meta-actions">
+          <span>{formatBytes(file.bytes)}{file.truncated ? " · 仅显示前 512 KB" : ""}</span>
+          <CopyButton className="copy-button" label="复制文件内容" value={file.content} />
+        </div>
+      </div>
       <pre className="file-preview-code"><code className={highlighted.language ? `hljs language-${highlighted.language}` : "hljs"} dangerouslySetInnerHTML={{ __html: highlighted.html }} /></pre>
     </>
   );

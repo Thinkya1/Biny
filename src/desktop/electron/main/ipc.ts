@@ -30,7 +30,8 @@ const promptSchema = z.string().min(1).max(1_000_000);
 const titleSchema = z.string().trim().min(1).max(120);
 const permissionModeSchema = z.enum(["ask", "read-only", "auto", "full-access"]);
 const thinkingSchema = z.enum(["off", "high", "max"]);
-const modelProviderSchema = z.enum(["deepseek", "openai", "anthropic", "gemini", "kimi", "qwen", "ollama", "openai-compatible"]);
+const modelProviderSchema = z.enum(["deepseek", "openai", "anthropic", "claude-subscription", "openai-codex", "gemini", "kimi", "qwen", "ollama", "openai-compatible"]);
+const modelLoginProviderSchema = z.enum(["claude-code", "openai-codex"]);
 const modelConfigurationSchema = z.object({
   alias: idSchema,
   displayName: z.string().trim().min(1).max(120),
@@ -56,6 +57,7 @@ const attachmentSchema = z.object({
   mimeType: z.string().max(200),
   size: z.number().int().nonnegative().max(50 * 1024 * 1024)
 });
+const externalUrlSchema = z.string().url().refine((value) => new URL(value).protocol === "https:", "Only HTTPS links can be opened externally.");
 
 export function registerDesktopIpc(context: IpcContext): void {
   handle(desktopIpc.bootstrap, async () => await context.bootstrap());
@@ -211,6 +213,31 @@ export function registerDesktopIpc(context: IpcContext): void {
     return await context.agents.saveModelConfiguration(idSchema.parse(projectId), modelConfigurationSchema.parse(configuration));
   });
 
+  handle(desktopIpc.testModelConfiguration, async (_event, projectId: unknown, configuration: unknown) => {
+    return await context.agents.testModelConfiguration(idSchema.parse(projectId), modelConfigurationSchema.parse(configuration));
+  });
+
+  handle(desktopIpc.removeModelConfiguration, async (_event, projectId: unknown, alias: unknown) => {
+    return await context.agents.removeModelConfiguration(idSchema.parse(projectId), idSchema.parse(alias));
+  });
+
+  handle(desktopIpc.startModelLogin, async (_event, projectId: unknown, provider: unknown) => {
+    return await context.agents.startModelLogin(idSchema.parse(projectId), modelLoginProviderSchema.parse(provider));
+  });
+
+  handle(desktopIpc.completeModelLogin, async (_event, projectId: unknown, provider: unknown, authRequestId: unknown, pastedAuthorization: unknown) => {
+    return await context.agents.completeModelLogin(
+      idSchema.parse(projectId),
+      modelLoginProviderSchema.parse(provider),
+      idSchema.parse(authRequestId),
+      pastedAuthorization === undefined ? undefined : z.string().max(16_000).parse(pastedAuthorization)
+    );
+  });
+
+  handle(desktopIpc.cancelModelLogin, async (_event, projectId: unknown, provider: unknown, authRequestId: unknown) => {
+    await context.agents.cancelModelLogin(idSchema.parse(projectId), modelLoginProviderSchema.parse(provider), idSchema.parse(authRequestId));
+  });
+
   handle(desktopIpc.compact, async (_event, projectId: unknown, hint: unknown) => {
     return await context.agents.compact(idSchema.parse(projectId), hint === undefined ? undefined : z.string().max(2_000).parse(hint));
   });
@@ -240,6 +267,10 @@ export function registerDesktopIpc(context: IpcContext): void {
     const filePath = context.projects.workspaceFile(project, z.string().min(1).max(2_000).parse(relativePath));
     const error = await shell.openPath(filePath);
     if (error) throw new Error(error);
+  });
+
+  handle(desktopIpc.openExternal, async (_event, url: unknown) => {
+    await shell.openExternal(externalUrlSchema.parse(url));
   });
 
   handle(desktopIpc.setSidebarWidth, async (_event, width: unknown) => {

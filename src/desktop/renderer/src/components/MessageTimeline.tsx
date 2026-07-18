@@ -2,7 +2,9 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
+import { copyToClipboard } from "../copyToClipboard.js";
 import { listChangedFiles, type TimelineTool, type TimelineTurn } from "../sessionTimeline.js";
+import { CopyButton } from "./CopyButton.js";
 import { Icon } from "./Icon.js";
 import { ToolActivity } from "./ToolActivity.js";
 
@@ -116,7 +118,7 @@ const Turn = memo(function Turn({
             {errorOpen ? <pre><code>{turn.error}</code></pre> : null}
             <div className="run-error-actions">
               {turn.status === "failed" && turn.user ? <button onClick={() => onRetry(turn.user)} type="button">重试</button> : null}
-              <button onClick={() => void navigator.clipboard.writeText(turn.error ?? "")} type="button">复制错误</button>
+              <button onClick={() => void copyToClipboard(turn.error ?? "")} type="button">复制错误</button>
             </div>
           </section>
         ) : null}
@@ -186,7 +188,7 @@ function UserMessage({
 }
 
 function copyText(content: string): void {
-  void navigator.clipboard.writeText(content);
+  void copyToClipboard(content);
 }
 
 function plainTextFromMarkdown(content: string): string {
@@ -325,19 +327,32 @@ function MarkdownContent({ content, onPreviewFile }: { content: string; onPrevie
             return <code className={isPath ? "inline-path" : undefined} onClick={() => { if (isPath) onPreviewFile(stripLineSuffix(text)); }} title={isPath ? "在右侧预览" : undefined}>{children}</code>;
           },
           pre({ children }) {
-            const text = extractText(children);
-            return (
-              <div className="markdown-code-block">
-                <button aria-label="复制代码" onClick={() => void navigator.clipboard.writeText(text)} type="button"><Icon name="copy" size={12} /></button>
-                <pre>{children}</pre>
-              </div>
-            );
+            return <MarkdownCodeBlock>{children}</MarkdownCodeBlock>;
           }
         }}
         remarkPlugins={[remarkGfm]}
       >
         {content}
       </Markdown>
+    </div>
+  );
+}
+
+function MarkdownCodeBlock({ children }: { children: React.ReactNode }): React.JSX.Element {
+  const preRef = useRef<HTMLPreElement>(null);
+  const fallback = extractText(children).replace(/\n$/, "");
+  return (
+    <div className="markdown-code-block">
+      <CopyButton
+        className="copy-button markdown-code-copy"
+        label="复制代码"
+        resolveValue={() => {
+          const live = preRef.current?.innerText ?? preRef.current?.textContent ?? "";
+          return (live || fallback).replace(/\n$/, "");
+        }}
+        value={fallback}
+      />
+      <pre ref={preRef}>{children}</pre>
     </div>
   );
 }
@@ -361,7 +376,7 @@ function stripLineSuffix(path: string): string {
 function AssistantActions({ content, timestamp }: { content: string; timestamp?: string }): React.JSX.Element {
   return (
     <div className="assistant-actions">
-      <button aria-label="复制回复" className="assistant-action" onClick={() => void navigator.clipboard.writeText(content)} title="复制回复" type="button"><Icon name="copy" size={13} /></button>
+      <CopyButton className="assistant-action" label="复制回复" size={13} value={content} />
       {timestamp ? <time className="assistant-time" dateTime={timestamp}>{formatMessageTime(timestamp)}</time> : null}
     </div>
   );

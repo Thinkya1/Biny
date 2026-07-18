@@ -33,6 +33,18 @@ const providerProfiles: Record<ModelProvider, ProviderProfile> = {
     requiresApiKey: true,
     reasoningProtocol: "anthropic"
   },
+  "claude-subscription": {
+    protocol: "anthropic",
+    baseUrl: "https://api.anthropic.com",
+    requiresApiKey: true,
+    reasoningProtocol: "anthropic"
+  },
+  "openai-codex": {
+    protocol: "openai-compatible",
+    baseUrl: "https://chatgpt.com/backend-api/codex",
+    requiresApiKey: true,
+    reasoningProtocol: "openai"
+  },
   gemini: {
     protocol: "openai-compatible",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",

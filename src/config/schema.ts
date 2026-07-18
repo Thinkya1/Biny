@@ -36,6 +36,8 @@ export const modelProviderSchema = z.enum([
   "deepseek",
   "openai",
   "anthropic",
+  "claude-subscription",
+  "openai-codex",
   "gemini",
   "kimi",
   "qwen",
@@ -55,6 +57,13 @@ const providerConfigSchema = z.object({
   baseUrl: z.string().url().optional(),
   apiKey: z.string().min(1).optional(),
   apiKeyEnv: z.string().min(1).optional(),
+  authMode: z.enum(["api-key", "oauth-bearer"]).optional(),
+  oauth: z.object({
+    provider: z.enum(["claude-code", "openai-codex"]),
+    refreshToken: z.string().min(1),
+    expiresAt: z.number().int().positive(),
+    accountId: z.string().min(1).optional()
+  }).optional(),
   timeoutMs: z.number().int().min(1_000).max(600_000).optional()
 }).superRefine((provider, context) => {
   if (provider.type === "openai-compatible" && !provider.baseUrl) {
@@ -62,6 +71,27 @@ const providerConfigSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ["baseUrl"],
       message: "openai-compatible requires a provider baseUrl."
+    });
+  }
+  if (provider.authMode === "oauth-bearer" && !provider.oauth) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["oauth"],
+      message: "oauth-bearer requires OAuth refresh metadata."
+    });
+  }
+  if (provider.oauth?.provider === "claude-code" && provider.type !== "claude-subscription") {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["type"],
+      message: "Claude OAuth credentials require the claude-subscription provider."
+    });
+  }
+  if (provider.oauth?.provider === "openai-codex" && provider.type !== "openai-codex") {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["type"],
+      message: "Codex OAuth credentials require the openai-codex provider."
     });
   }
 });

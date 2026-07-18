@@ -1,7 +1,9 @@
 import type { AgentRunMode } from "../../../agent/AgentSession.js";
 import { promises as fs } from "node:fs";
+import { generateText } from "ai";
 import { loadConfig, saveConfig } from "../../../config/loader.js";
-import { configSchema } from "../../../config/schema.js";
+import { configSchema, type AgentConfig } from "../../../config/schema.js";
+import { createModelSettings } from "../../../llm/factory.js";
 import type { ModelRuntimeInfo, ThinkingSelection } from "../../../llm/ModelManager.js";
 import { providerProfile } from "../../../llm/profiles.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
@@ -10,11 +12,15 @@ import type { AgentHostEvent } from "../../../runtime/agentEvents.js";
 import type {
   DesktopAttachment,
   DesktopModelConfigurationInput,
+  DesktopModelConnectionTestResult,
+  DesktopModelLoginProvider,
+  DesktopModelLoginStartResult,
   DesktopRunReceipt,
   DesktopSessionDocument,
   DesktopWorkspaceSnapshot
 } from "../../protocol.js";
 import { DesktopProjectService } from "./DesktopProjectService.js";
+import { DesktopModelLoginService, type AuthenticatedModelLogin } from "./DesktopModelLoginService.js";
 import { DesktopStateStore } from "./DesktopStateStore.js";
 
 interface ManagedRuntime {
@@ -27,13 +33,19 @@ export class DesktopAgentManager {
   private readonly runtimeInitializations = new Map<string, Promise<InteractiveAgentRuntime>>();
   private readonly liveEvents = new Map<string, Map<string, AgentHostEvent[]>>();
   private readonly runtimeErrors = new Map<string, string>();
+  private readonly modelLogin: DesktopModelLoginService;
   private closing = false;
 
   constructor(
     private readonly state: DesktopStateStore,
     private readonly projects: DesktopProjectService,
-    private readonly emit: (projectId: string, event: AgentHostEvent) => void
-  ) {}
+    private readonly emit: (projectId: string, event: AgentHostEvent) => void,
+    openExternal?: (url: string) => Promise<void>
+  ) {
+    this.modelLogin = new DesktopModelLoginService(openExternal ?? (async () => {
+      throw new Error("当前环境无法打开浏览器。");
+    }));
+  }
 
   async workspaceSnapshot(projectId: string): Promise<DesktopWorkspaceSnapshot> {
     const storedProject = this.projects.requireProject(projectId);
@@ -93,6 +105,7 @@ export class DesktopAgentManager {
     mode: AgentRunMode,
     attachments: DesktopAttachment[]
   ): Promise<DesktopRunReceipt> {
+    await this.refreshOAuthCredentials(projectId);
     const runtime = await this.ensureRuntime(projectId);
     const snapshot = runtime.getSnapshot();
     if (!snapshot.activeRun && !snapshot.queuedRuns.length) await runtime.refreshModelFromDisk();
@@ -133,7 +146,44 @@ export class DesktopAgentManager {
   }
 
   async switchModel(projectId: string, alias: string, thinking: ThinkingSelection): Promise<ModelRuntimeInfo> {
+    await this.refreshOAuthCredentials(projectId);
     return await (await this.ensureRuntime(projectId)).switchModel(alias, thinking);
+  }
+
+  async startModelLogin(projectId: string, provider: DesktopModelLoginProvider): Promise<DesktopModelLoginStartResult> {
+    this.projects.requireProject(projectId);
+    return await this.modelLogin.start(provider);
+  }
+
+  async completeModelLogin(
+    projectId: string,
+    provider: DesktopModelLoginProvider,
+    authRequestId: string,
+    pastedAuthorization?: string
+  ): Promise<DesktopWorkspaceSnapshot> {
+    const managed = this.runtimes.get(projectId);
+    if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
+      throw new Error("任务运行期间不能修改模型配置。");
+    }
+    const project = this.projects.requireProject(projectId);
+    const authenticated = await this.modelLogin.complete(provider, authRequestId, pastedAuthorization);
+    const current = await loadConfig(project.path);
+    const candidate = this.buildConfigWithAuthenticatedLogin(current, authenticated);
+    const test = await this.testCandidate(candidate, candidate.defaultModel);
+    if (!test.ok) throw new Error(`账号已授权，但模型验证失败：${test.message}`);
+    await saveConfig(project.path, candidate);
+    this.runtimeErrors.delete(projectId);
+    if (managed) {
+      managed.unsubscribe();
+      await managed.runtime.close();
+      this.runtimes.delete(projectId);
+    }
+    return await this.workspaceSnapshot(projectId);
+  }
+
+  async cancelModelLogin(projectId: string, provider: DesktopModelLoginProvider, authRequestId: string): Promise<void> {
+    this.projects.requireProject(projectId);
+    this.modelLogin.cancel(provider, authRequestId);
   }
 
   async saveModelConfiguration(projectId: string, input: DesktopModelConfigurationInput): Promise<DesktopWorkspaceSnapshot> {
@@ -143,6 +193,88 @@ export class DesktopAgentManager {
     }
     const project = this.projects.requireProject(projectId);
     const current = await loadConfig(project.path);
+    const next = this.buildConfigWithModel(current, input);
+    await saveConfig(project.path, next);
+    this.runtimeErrors.delete(projectId);
+    if (managed) {
+      managed.unsubscribe();
+      await managed.runtime.close();
+      this.runtimes.delete(projectId);
+    }
+    return await this.workspaceSnapshot(projectId);
+  }
+
+  async removeModelConfiguration(projectId: string, alias: string): Promise<DesktopWorkspaceSnapshot> {
+    const managed = this.runtimes.get(projectId);
+    if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
+      throw new Error("任务运行期间不能修改模型配置。");
+    }
+    const project = this.projects.requireProject(projectId);
+    const current = await loadConfig(project.path);
+    if (!current.models[alias]) throw new Error(`未知模型：${alias}`);
+    const remaining = Object.entries(current.models).filter(([key]) => key !== alias);
+    if (!remaining.length) throw new Error("至少需要保留一个可用模型。");
+    const nextDefault = current.defaultModel === alias ? remaining[0]![0] : current.defaultModel;
+    const next = configSchema.parse({
+      ...current,
+      defaultModel: nextDefault,
+      models: Object.fromEntries(remaining)
+    });
+    await saveConfig(project.path, next);
+    this.runtimeErrors.delete(projectId);
+    if (managed) {
+      managed.unsubscribe();
+      await managed.runtime.close();
+      this.runtimes.delete(projectId);
+    }
+    return await this.workspaceSnapshot(projectId);
+  }
+
+  async testModelConfiguration(projectId: string, input: DesktopModelConfigurationInput): Promise<DesktopModelConnectionTestResult> {
+    const project = this.projects.requireProject(projectId);
+    const current = await loadConfig(project.path);
+    const candidate = this.buildConfigWithModel(current, input);
+    return await this.testCandidate(candidate, input.alias);
+  }
+
+  private async testCandidate(candidate: AgentConfig, alias: string): Promise<DesktopModelConnectionTestResult> {
+    const model = candidate.models[alias];
+    if (!model) return { ok: false, message: `未知模型：${alias}` };
+    const provider = candidate.providers[model.provider];
+    if (!provider) {
+      return { ok: false, message: `未找到服务商配置：${model.provider}` };
+    }
+    const profile = providerProfile(provider.type);
+    const envName = provider.apiKeyEnv ?? profile.apiKeyEnv;
+    const hasKey = Boolean(provider.apiKey || (envName && process.env[envName]));
+    if (profile.requiresApiKey && !hasKey) {
+      return { ok: false, message: envName ? `缺少 API Key。请填写密钥，或设置环境变量 ${envName}。` : "缺少 API Key。请先填写密钥后再测试。" };
+    }
+    const started = Date.now();
+    try {
+      const settings = createModelSettings(candidate, alias);
+      await generateText({
+        model: settings.model,
+        prompt: "ping",
+        maxOutputTokens: 16,
+        temperature: 0
+      });
+      const latencyMs = Date.now() - started;
+      return {
+        ok: true,
+        message: `连接成功 · ${String(latencyMs)}ms`,
+        latencyMs
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        message: formatModelConnectionError(error),
+        latencyMs: Date.now() - started
+      };
+    }
+  }
+
+  private buildConfigWithModel(current: AgentConfig, input: DesktopModelConfigurationInput): AgentConfig {
     const existingProvider = current.providers[input.providerAlias];
     const profile = providerProfile(input.providerType);
     const provider = {
@@ -150,12 +282,14 @@ export class DesktopAgentManager {
       baseUrl: input.baseUrl ?? existingProvider?.baseUrl ?? profile.baseUrl,
       apiKey: input.apiKey ?? existingProvider?.apiKey,
       apiKeyEnv: input.apiKeyEnv ?? existingProvider?.apiKeyEnv ?? profile.apiKeyEnv,
+      authMode: existingProvider?.authMode,
+      oauth: existingProvider?.oauth,
       timeoutMs: existingProvider?.timeoutMs
     };
     const models = Object.fromEntries(Object.entries(current.models).filter(([alias, model]) => (
       alias === input.alias || model.provider !== input.providerAlias || model.model !== input.model
     )));
-    const next = configSchema.parse({
+    return configSchema.parse({
       ...current,
       defaultModel: input.alias,
       providers: { ...current.providers, [input.providerAlias]: provider },
@@ -169,16 +303,8 @@ export class DesktopAgentManager {
           thinking: input.supportsThinking ? { efforts: ["high", "max"], defaultEffort: "high" } : undefined
         }
       },
-      thinking: { enabled: input.supportsThinking, effort: "high" }
+      thinking: { enabled: false, effort: "high" }
     });
-    await saveConfig(project.path, next);
-    this.runtimeErrors.delete(projectId);
-    if (managed) {
-      managed.unsubscribe();
-      await managed.runtime.close();
-      this.runtimes.delete(projectId);
-    }
-    return await this.workspaceSnapshot(projectId);
   }
 
   async compact(projectId: string, hint?: string): Promise<string> {
@@ -259,6 +385,7 @@ export class DesktopAgentManager {
   private async initializeRuntime(projectId: string): Promise<InteractiveAgentRuntime> {
     const project = this.projects.requireProject(projectId);
     if (project.missing) throw new Error(`Project path is unavailable: ${project.path}`);
+    await this.refreshOAuthCredentials(projectId);
     const runtime = await createInteractiveAgentRuntime(project.path);
     const initialSessionFile = runtime.getInfo().sessionFile;
     const selectedSessionId = this.state.selectedSessionId(projectId);
@@ -287,6 +414,77 @@ export class DesktopAgentManager {
     return runtime;
   }
 
+  private buildConfigWithAuthenticatedLogin(current: AgentConfig, authenticated: AuthenticatedModelLogin): AgentConfig {
+    const providerAlias = authenticated.provider;
+    const providerType = authenticated.provider === "claude-code" ? "claude-subscription" : "openai-codex";
+    const profile = providerProfile(providerType);
+    const models = Object.fromEntries(Object.entries(current.models).filter(([, model]) => model.provider !== providerAlias));
+    const configuredModels = authenticated.models.map((model) => {
+      const alias = modelAliasForAuthenticatedModel(providerAlias, model.id);
+      return [alias, {
+        provider: providerAlias,
+        model: model.id,
+        displayName: model.displayName,
+        supportsTools: true,
+        thinking: model.supportsThinking ? { efforts: ["high", "max"], defaultEffort: "high" } : undefined
+      }] as const;
+    });
+    const defaultModel = configuredModels[0]?.[0];
+    if (!defaultModel) throw new Error("账号没有返回可用模型。");
+    const existingProvider = current.providers[providerAlias];
+    return configSchema.parse({
+      ...current,
+      defaultModel,
+      providers: {
+        ...current.providers,
+        [providerAlias]: {
+          type: providerType,
+          baseUrl: profile.baseUrl,
+          apiKey: authenticated.accessToken,
+          apiKeyEnv: undefined,
+          authMode: "oauth-bearer",
+          oauth: {
+            provider: authenticated.provider,
+            refreshToken: authenticated.refreshToken,
+            expiresAt: authenticated.expiresAt,
+            accountId: authenticated.accountId
+          },
+          timeoutMs: existingProvider?.timeoutMs
+        }
+      },
+      models: { ...models, ...Object.fromEntries(configuredModels) },
+      thinking: { enabled: false, effort: "high" }
+    });
+  }
+
+  private async refreshOAuthCredentials(projectId: string): Promise<void> {
+    const project = this.projects.requireProject(projectId);
+    const current = await loadConfig(project.path);
+    let refreshedConfig: AgentConfig | undefined;
+    for (const [alias, provider] of Object.entries(current.providers)) {
+      const oauth = provider.oauth;
+      if (provider.authMode !== "oauth-bearer" || !oauth || oauth.expiresAt - Date.now() > 5 * 60 * 1_000) continue;
+      const refreshed = await this.modelLogin.refresh(oauth.provider, {
+        accessToken: provider.apiKey ?? "",
+        refreshToken: oauth.refreshToken,
+        expiresAt: oauth.expiresAt,
+        accountId: oauth.accountId
+      });
+      refreshedConfig ??= structuredClone(current);
+      refreshedConfig.providers[alias] = {
+        ...provider,
+        apiKey: refreshed.accessToken,
+        oauth: {
+          provider: oauth.provider,
+          refreshToken: refreshed.refreshToken,
+          expiresAt: refreshed.expiresAt,
+          accountId: refreshed.accountId
+        }
+      };
+    }
+    if (refreshedConfig) await saveConfig(project.path, refreshedConfig);
+  }
+
   private projectEvents(projectId: string): Map<string, AgentHostEvent[]> {
     const current = this.liveEvents.get(projectId);
     if (current) return current;
@@ -296,9 +494,59 @@ export class DesktopAgentManager {
   }
 }
 
+function modelAliasForAuthenticatedModel(providerAlias: string, modelId: string): string {
+  return `${providerAlias}-${modelId}`.replace(/[^a-z0-9.-]+/gi, "-");
+}
+
 function isMissingSession(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return message.startsWith("Session not found:") || message.startsWith("Session file not found:");
+}
+
+function formatModelConnectionError(error: unknown): string {
+  if (!error || typeof error !== "object") return String(error ?? "未知错误");
+  const record = error as Record<string, unknown>;
+  const parts: string[] = [];
+  const statusCode = typeof record.statusCode === "number" ? record.statusCode : undefined;
+  if (statusCode !== undefined) {
+    if (statusCode === 401 || statusCode === 403) parts.push(`鉴权失败（HTTP ${String(statusCode)}）`);
+    else if (statusCode === 404) parts.push(`接口不存在（HTTP 404）`);
+    else if (statusCode === 429) parts.push(`请求过于频繁（HTTP 429）`);
+    else parts.push(`HTTP ${String(statusCode)}`);
+  }
+  const message = typeof record.message === "string" ? record.message.trim() : error instanceof Error ? error.message : String(error);
+  if (message) parts.push(message);
+  const responseBody = typeof record.responseBody === "string" ? record.responseBody.trim() : undefined;
+  if (responseBody) {
+    const compact = compactJsonError(responseBody);
+    if (compact && !parts.some((part) => part.includes(compact))) parts.push(compact);
+  }
+  const url = typeof record.url === "string" ? record.url : undefined;
+  if (url) parts.push(`请求：${url}`);
+  const cause = record.cause;
+  if (cause instanceof Error && cause.message && !parts.some((part) => part.includes(cause.message))) {
+    parts.push(cause.message);
+  }
+  return parts.filter(Boolean).join(" · ") || "连接失败";
+}
+
+function compactJsonError(body: string): string | undefined {
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const error = parsed.error;
+    if (typeof error === "string") return error;
+    if (error && typeof error === "object") {
+      const detail = error as Record<string, unknown>;
+      if (typeof detail.message === "string") return detail.message;
+      if (typeof detail.msg === "string") return detail.msg;
+    }
+    if (typeof parsed.message === "string") return parsed.message;
+    if (typeof parsed.msg === "string") return parsed.msg;
+  } catch {
+    // fall through
+  }
+  const trimmed = body.replace(/\s+/g, " ").trim();
+  return trimmed.length > 240 ? `${trimmed.slice(0, 240)}…` : trimmed || undefined;
 }
 
 function withAttachmentReferences(input: string, attachments: DesktopAttachment[]): string {

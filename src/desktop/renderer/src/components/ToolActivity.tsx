@@ -1,6 +1,7 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
 import type { TimelineCommand, TimelineTool } from "../sessionTimeline.js";
+import { CopyButton } from "./CopyButton.js";
 import { Icon, type IconName } from "./Icon.js";
 
 interface ToolActivityProps {
@@ -68,7 +69,12 @@ export const ToolActivity = memo(function ToolActivity({ projectId, tool, onPrev
             <button className="file-path-row" onClick={() => onPreviewFile(tool.path ?? "")} title="在右侧预览" type="button"><Icon name="file" size={13} /><span>{tool.path}</span></button>
           ) : null}
           {!command && !diff ? <ToolPayload tool={tool} /> : null}
-          {tool.error ? <pre className="tool-error-output">{tool.error}</pre> : null}
+          {tool.error ? (
+            <div className="copyable-code-block is-error">
+              <CopyButton className="copy-button" label="复制错误" value={tool.error} />
+              <pre className="tool-error-output"><code>{tool.error}</code></pre>
+            </div>
+          ) : null}
         </div>
       ) : null}
     </article>
@@ -205,31 +211,20 @@ function ToolPayload({ tool }: { tool: TimelineTool }): React.JSX.Element {
           {display.detail ? <div><dt>说明</dt><dd>{display.detail}</dd></div> : null}
           {resultPreview?.count !== undefined ? <div><dt>结果</dt><dd>{resultPreview.count}</dd></div> : null}
         </dl>
-        {resultPreview?.text ? <pre className="tool-payload"><code>{resultPreview.text}</code></pre> : null}
+        {resultPreview?.text ? <CopyableCodeBlock label="复制结果" value={resultPreview.text} /> : null}
       </>
     );
   }
   const value = friendlyResult(tool.result) ?? (progress || friendlyResult(tool.args));
-  return value ? <pre className="tool-payload"><code>{value}</code></pre> : <div className="empty-output">没有可展示的详细信息</div>;
+  return value ? <CopyableCodeBlock label="复制结果" value={value} /> : <div className="empty-output">没有可展示的详细信息</div>;
 }
 
-function CopyButton({ value, label }: { value: string; label: string }): React.JSX.Element {
-  const [copied, setCopied] = useState(false);
+function CopyableCodeBlock({ value, label }: { value: string; label: string }): React.JSX.Element {
   return (
-    <button
-      aria-label={label}
-      className="copy-button"
-      onClick={() => {
-        void navigator.clipboard.writeText(value).then(() => {
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1_200);
-        });
-      }}
-      title={label}
-      type="button"
-    >
-      <Icon name={copied ? "check" : "copy"} size={12} />
-    </button>
+    <div className="copyable-code-block">
+      <CopyButton className="copy-button" label={label} value={value} />
+      <pre className="tool-payload"><code>{value}</code></pre>
+    </div>
   );
 }
 

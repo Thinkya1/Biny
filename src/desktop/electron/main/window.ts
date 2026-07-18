@@ -1,9 +1,13 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { BrowserWindow, screen } from "electron";
+import { BrowserWindow, nativeTheme, screen } from "electron";
 import { DesktopStateStore } from "./DesktopStateStore.js";
 
 export type WindowCloseDecision = "hide" | "close" | "cancel";
+
+function themeBackgroundColor(): string {
+  return nativeTheme.shouldUseDarkColors ? "#181818" : "#ffffff";
+}
 
 export function createDesktopWindow(
   state: DesktopStateStore,
@@ -18,7 +22,7 @@ export function createDesktopWindow(
     minWidth: 960,
     minHeight: 650,
     show: false,
-    backgroundColor: "#ffffff",
+    backgroundColor: themeBackgroundColor(),
     title: "Biny",
     titleBarStyle: "hidden",
     titleBarOverlay: process.platform === "darwin" ? true : undefined,
@@ -30,6 +34,14 @@ export function createDesktopWindow(
       sandbox: true,
       spellcheck: true
     }
+  });
+
+  const syncBackgroundColor = (): void => {
+    if (!window.isDestroyed()) window.setBackgroundColor(themeBackgroundColor());
+  };
+  nativeTheme.on("updated", syncBackgroundColor);
+  window.on("closed", () => {
+    nativeTheme.off("updated", syncBackgroundColor);
   });
 
   let allowClose = false;

@@ -1,5 +1,5 @@
 import path from "node:path";
-import { app, BrowserWindow, dialog, Notification } from "electron";
+import { app, BrowserWindow, dialog, Notification, shell } from "electron";
 import type { DesktopBootstrap } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
 import { DesktopAgentManager } from "./DesktopAgentManager.js";
@@ -45,7 +45,7 @@ async function startDesktopApplication(): Promise<void> {
         silent: true
       }).show();
     }
-  });
+  }, async (url) => await shell.openExternal(url));
 
   const bootstrap = async (): Promise<DesktopBootstrap> => {
     const allProjects = await projects.refreshAllProjects();

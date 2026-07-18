@@ -58,6 +58,8 @@ async function testProviderMappingsUseNativeSdkModels(): Promise<void> {
   const cases: Array<{ type: ModelProvider; provider: string; baseUrl?: string; key?: string }> = [
     { type: "openai", provider: "openai.chat", key: "key" },
     { type: "anthropic", provider: "anthropic.messages", key: "key" },
+    { type: "claude-subscription", provider: "anthropic.messages", key: "oauth-token" },
+    { type: "openai-codex", provider: "openai.responses", key: "oauth-token" },
     { type: "deepseek", provider: "deepseek.chat", key: "key" },
     { type: "kimi", provider: "moonshotai.chat", key: "key" },
     { type: "qwen", provider: "alibaba.chat", key: "key" },

@@ -8,6 +8,7 @@ import type {
   DesktopAttachment,
   DesktopMenuAction,
   DesktopModelConfigurationInput,
+  DesktopModelLoginProvider,
   DesktopProject,
   DesktopSessionDocument,
   DesktopSessionSummary,
@@ -418,6 +419,36 @@ export function App(): React.JSX.Element {
     mergeWorkspaceProject(await window.biny.saveModelConfiguration(projectId, configuration));
   }, [mergeWorkspaceProject]);
 
+  const testModelConfiguration = useCallback(async (configuration: DesktopModelConfigurationInput) => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    return await window.biny.testModelConfiguration(projectId, configuration);
+  }, []);
+
+  const removeModelConfiguration = useCallback(async (alias: string): Promise<void> => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    mergeWorkspaceProject(await window.biny.removeModelConfiguration(projectId, alias));
+  }, [mergeWorkspaceProject]);
+
+  const startModelLogin = useCallback(async (provider: DesktopModelLoginProvider) => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    return await window.biny.startModelLogin(projectId, provider);
+  }, []);
+
+  const completeModelLogin = useCallback(async (provider: DesktopModelLoginProvider, authRequestId: string, pastedAuthorization?: string): Promise<void> => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    mergeWorkspaceProject(await window.biny.completeModelLogin(projectId, provider, authRequestId, pastedAuthorization));
+  }, [mergeWorkspaceProject]);
+
+  const cancelModelLogin = useCallback(async (provider: DesktopModelLoginProvider, authRequestId: string): Promise<void> => {
+    const projectId = projectRef.current;
+    if (!projectId) return;
+    await window.biny.cancelModelLogin(projectId, provider, authRequestId);
+  }, []);
+
   const setPermissionMode = useCallback(async (mode: PermissionMode): Promise<void> => {
     const projectId = projectRef.current;
     if (!projectId) return;
@@ -508,7 +539,6 @@ export function App(): React.JSX.Element {
         resizing={sidebarResizing}
         selectedSessionId={selectedSessionId}
         sessions={workspace?.sessions ?? []}
-        version={version}
         visible={sidebarVisible}
         width={sidebarWidth}
       />
@@ -573,11 +603,17 @@ export function App(): React.JSX.Element {
       <SettingsOverlay
         onClose={() => setSettingsOpen(false)}
         onCompact={async () => { const projectId = projectRef.current; if (projectId) await window.biny.compact(projectId); }}
+        onOpenExternal={async (url) => await window.biny.openExternal(url)}
         onOpenTerminal={async () => { const projectId = projectRef.current; if (projectId) await window.biny.openProjectTerminal(projectId); }}
         onPermissionMode={setPermissionMode}
         onRemoveProject={async () => { const projectId = projectRef.current; if (projectId) await removeProject(projectId); setSettingsOpen(false); }}
         onRevealProject={async () => { const projectId = projectRef.current; if (projectId) await window.biny.revealProject(projectId); }}
+        onRemoveModelConfiguration={removeModelConfiguration}
+        onStartModelLogin={startModelLogin}
+        onCompleteModelLogin={completeModelLogin}
+        onCancelModelLogin={cancelModelLogin}
         onSaveModelConfiguration={saveModelConfiguration}
+        onTestModelConfiguration={testModelConfiguration}
         onSwitchModel={switchModel}
         open={settingsOpen}
         version={version}

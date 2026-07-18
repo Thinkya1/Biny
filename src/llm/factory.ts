@@ -78,6 +78,20 @@ function missingKeyMessage(providerAlias: string, configuredEnv: string | undefi
 function createLanguageModel(providerType: AgentConfig["providers"][string]["type"], baseUrl: string, apiKey: string | undefined, modelId: string): LanguageModel {
   if (providerType === "openai") return createOpenAI({ baseURL: baseUrl, apiKey }).chat(modelId);
   if (providerType === "anthropic") return createAnthropic({ baseURL: baseUrl, apiKey }).languageModel(modelId);
+  if (providerType === "claude-subscription") {
+    return createAnthropic({
+      baseURL: baseUrl,
+      authToken: apiKey,
+      headers: claudeSubscriptionHeaders()
+    }).languageModel(modelId);
+  }
+  if (providerType === "openai-codex") {
+    return createOpenAI({
+      baseURL: baseUrl,
+      apiKey,
+      headers: openAiCodexHeaders(apiKey)
+    }).responses(modelId);
+  }
   if (providerType === "deepseek") return createDeepSeek({ baseURL: baseUrl, apiKey }).languageModel(modelId);
   if (providerType === "kimi") return createMoonshotAI({ baseURL: baseUrl, apiKey }).languageModel(modelId);
   if (providerType === "qwen") return createAlibaba({ baseURL: baseUrl, apiKey }).languageModel(modelId);
@@ -89,6 +103,46 @@ function createLanguageModel(providerType: AgentConfig["providers"][string]["typ
     includeUsage: true
   });
   return compatible.languageModel(modelId);
+}
+
+const CLAUDE_SUBSCRIPTION_BETA = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219";
+
+function claudeSubscriptionHeaders(): Record<string, string> {
+  return {
+    "User-Agent": "claude-cli/2.1.153 (external, cli)",
+    "anthropic-beta": CLAUDE_SUBSCRIPTION_BETA,
+    "anthropic-dangerous-direct-browser-access": "true",
+    "x-app": "cli"
+  };
+}
+
+function openAiCodexHeaders(accessToken: string | undefined): Record<string, string> {
+  const accountId = accessToken ? extractOpenAiAccountId(accessToken) : undefined;
+  const headers: Record<string, string> = {
+    "OpenAI-Beta": "responses=experimental",
+    originator: "codex_cli_rs",
+    "User-Agent": "codex_cli_rs/0.0.0 (Biny)"
+  };
+  if (accountId) headers["ChatGPT-Account-Id"] = accountId;
+  return headers;
+}
+
+function extractOpenAiAccountId(token: string): string | undefined {
+  const payload = token.split(".")[1];
+  if (!payload) return undefined;
+  try {
+    const padded = payload + "=".repeat((4 - (payload.length % 4)) % 4);
+    const parsed = JSON.parse(Buffer.from(padded.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) as Record<string, unknown>;
+    const nested = parsed["https://api.openai.com/auth"];
+    if (nested && typeof nested === "object") {
+      const accountId = (nested as Record<string, unknown>).chatgpt_account_id;
+      if (typeof accountId === "string" && accountId) return accountId;
+    }
+    const accountId = parsed.chatgpt_account_id;
+    return typeof accountId === "string" && accountId ? accountId : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function createProviderOptions(providerType: AgentConfig["providers"][string]["type"], config: AgentConfig): Record<string, any> | undefined {
@@ -103,8 +157,8 @@ function createProviderOptions(providerType: AgentConfig["providers"][string]["t
       }
     };
   }
-  if (providerType === "openai") return { openai: { reasoningEffort: enabled ? effort : "none" } };
-  if (providerType === "anthropic") {
+  if (providerType === "openai" || providerType === "openai-codex") return { openai: { reasoningEffort: enabled ? effort : "none" } };
+  if (providerType === "anthropic" || providerType === "claude-subscription") {
     return { anthropic: { thinking: enabled ? { type: "enabled", budgetTokens } : { type: "disabled" } } };
   }
   if (providerType === "qwen") return { alibaba: { enableThinking: enabled, thinkingBudget: enabled ? budgetTokens : undefined } };

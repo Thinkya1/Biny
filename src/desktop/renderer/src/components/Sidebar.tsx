@@ -8,7 +8,6 @@ interface SidebarProps {
   visible: boolean;
   width: number;
   resizing: boolean;
-  version: string;
   projects: DesktopProject[];
   sessions: DesktopSessionSummary[];
   activeProjectId?: string;
@@ -27,7 +26,7 @@ interface SidebarProps {
   onRemoveProject(projectId: string): void;
   onSearch(): void;
   onSettings(): void;
-  onUnavailable(label: string): void;
+  onUnavailable(feature: string): void;
 }
 
 type SidebarSectionName = "pinned" | "projects";
@@ -39,7 +38,6 @@ export const Sidebar = memo(function Sidebar({
   visible,
   width,
   resizing,
-  version,
   projects,
   sessions,
   activeProjectId,
@@ -231,10 +229,7 @@ export const Sidebar = memo(function Sidebar({
         </div>
 
         <div className="sidebar-footer">
-          <button className="identity-row" type="button"><span className="identity-avatar"><Icon name="person" size={14} /></span><span>本地</span></button>
-          <button aria-label="设置" className="icon-button" onClick={onSettings} type="button"><Icon name="settings" /></button>
-          <button aria-label="帮助" className="icon-button" onClick={() => onUnavailable("帮助")} type="button"><Icon name="help" /></button>
-          <span className="version-label">v{version}</span>
+          <button className="sidebar-settings-button" onClick={onSettings} type="button"><Icon name="settings" size={15} /><span>设置</span></button>
         </div>
         <SidebarResizer onResizeEnd={onResizeEnd} onResizeStart={onResizeStart} onWidthChange={onWidthChange} width={width} />
       </div>

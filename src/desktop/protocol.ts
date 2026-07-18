@@ -29,12 +29,18 @@ export const desktopIpc = {
   setPermissionMode: "desktop:permission:mode",
   switchModel: "desktop:model:switch",
   saveModelConfiguration: "desktop:model:save-configuration",
+  testModelConfiguration: "desktop:model:test-configuration",
+  removeModelConfiguration: "desktop:model:remove-configuration",
+  startModelLogin: "desktop:model:login:start",
+  completeModelLogin: "desktop:model:login:complete",
+  cancelModelLogin: "desktop:model:login:cancel",
   compact: "desktop:agent:compact",
   saveAttachment: "desktop:attachment:save",
   resolveDroppedFile: "desktop:attachment:resolve-path",
   listWorkspaceDirectory: "desktop:file:list-directory",
   readWorkspaceFile: "desktop:file:read",
   openWorkspaceFile: "desktop:file:open",
+  openExternal: "desktop:external:open",
   setSidebarWidth: "desktop:ui:sidebar-width",
   setFilePanelWidth: "desktop:ui:file-panel-width",
   event: "desktop:agent:event",
@@ -146,6 +152,21 @@ export interface DesktopModelConfigurationInput {
   supportsThinking: boolean;
 }
 
+export type DesktopModelLoginProvider = "claude-code" | "openai-codex";
+export type DesktopModelLoginMethod = "paste-code" | "browser-callback";
+
+export interface DesktopModelLoginStartResult {
+  authRequestId: string;
+  stateHint: string;
+  method: DesktopModelLoginMethod;
+}
+
+export interface DesktopModelConnectionTestResult {
+  ok: boolean;
+  message: string;
+  latencyMs?: number;
+}
+
 export type DesktopMenuAction = "new-task" | "open-project" | "search" | "settings" | "toggle-sidebar" | "focus-composer";
 export type DesktopSessionMenuAction = "rename" | "pin" | "unpin" | "duplicate" | "delete";
 
@@ -173,12 +194,18 @@ export interface DesktopApi {
   setPermissionMode(projectId: string, mode: PermissionMode): Promise<DesktopWorkspaceSnapshot>;
   switchModel(projectId: string, alias: string, thinking: ThinkingSelection): Promise<ModelRuntimeInfo>;
   saveModelConfiguration(projectId: string, configuration: DesktopModelConfigurationInput): Promise<DesktopWorkspaceSnapshot>;
+  testModelConfiguration(projectId: string, configuration: DesktopModelConfigurationInput): Promise<DesktopModelConnectionTestResult>;
+  removeModelConfiguration(projectId: string, alias: string): Promise<DesktopWorkspaceSnapshot>;
+  startModelLogin(projectId: string, provider: DesktopModelLoginProvider): Promise<DesktopModelLoginStartResult>;
+  completeModelLogin(projectId: string, provider: DesktopModelLoginProvider, authRequestId: string, pastedAuthorization?: string): Promise<DesktopWorkspaceSnapshot>;
+  cancelModelLogin(projectId: string, provider: DesktopModelLoginProvider, authRequestId: string): Promise<void>;
   compact(projectId: string, hint?: string): Promise<string>;
   saveAttachment(projectId: string, name: string, mimeType: string, bytes: Uint8Array): Promise<DesktopAttachment>;
   resolveDroppedFile(file: File): string;
   listWorkspaceDirectory(projectId: string, relativePath: string): Promise<DesktopWorkspaceDirectory>;
   readWorkspaceFile(projectId: string, relativePath: string): Promise<DesktopWorkspaceFilePreview>;
   openWorkspaceFile(projectId: string, relativePath: string): Promise<void>;
+  openExternal(url: string): Promise<void>;
   setSidebarWidth(width: number): Promise<void>;
   setFilePanelWidth(width: number): Promise<void>;
   onAgentEvent(listener: (envelope: DesktopAgentEventEnvelope) => void): () => void;
