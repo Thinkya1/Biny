@@ -10,11 +10,7 @@
 - 减少冗余；每个函数、文件和模块只承担一个清晰职责。不要把无关逻辑堆进同一文件，优先通过明确边界解耦。
 - 只有新增、删除或改变功能/用户可见行为时才更新 `PROJECT_DESCRIPTION.local.md`；纯重构、测试、格式化或其他非功能改动无需更新。
 ## 当前项目约束
-
-- 当前不保留 `MockProvider`；模型通过命名 provider profile 或通用 OpenAI-compatible 接口接入。
 - 真实模型 API key 可从 `providers.<alias>.apiKey` 或 `providers.<alias>.apiKeyEnv` 读取。不得把真实 key 写入代码、README、测试快照或 session 示例；配置文件中的 key 应视作敏感本地数据。
-- 新功能优先保持 CLI、Runtime、AgentLoop、Tool、Permission、Session、Context 的边界清晰。
-- 不要把新能力继续堆进 `agent/loop.ts` 或 `cli/commands/chat.ts`；能抽到 runtime、prompt、tools、session、permission 的，应放到对应模块。
 - 同样不要把业务逻辑堆进 TUI 组件；入口只负责装配和路由，具体上下文、会话、记忆和提示词逻辑应落在各自模块。
 - 保持 `pnpm typecheck` 通过。
 - 修改工具行为时，确保 session 仍记录 `user_message`、`assistant_message`、`tool_call`、`tool_result`、`error` 这些稳定事件类型。
