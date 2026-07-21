@@ -81,7 +81,11 @@ export class WorkspaceContext {
     const paths = collectPaths(args, result);
     for (const filePath of paths) addUnique(this.activePaths, filePath, 24);
     addUnique(this.recentSummaries, summarizeToolResult(tool, paths, result), 12);
-    if (tool === "run_command" || ((tool === "write_file" || tool === "edit_file") && !isFailure(result))) {
+    if (
+      tool === "run_command"
+      || tool === "start_process"
+      || (["write_file", "edit_file", "multi_edit", "delete_file", "apply_patch", "move_file"].includes(tool) && !isFailure(result))
+    ) {
       this.snapshotDirty = true;
       this.repoMapDirty = true;
     }

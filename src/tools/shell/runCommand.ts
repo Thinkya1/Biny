@@ -8,6 +8,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { z } from "zod";
 import { ToolAccesses } from "../access.js";
 import type { Tool, ToolContext, ToolUpdate } from "../types.js";
+import { resolveWorkspaceDirectory } from "../../workspace/resolvePath.js";
 
 const maxOutputBytes = 1024 * 1024;
 const defaultTimeoutMs = 120_000;
@@ -16,12 +17,15 @@ const defaultKillSettleMs = 1_000;
 
 export interface RunCommandArgs {
   command: string;
+  cwd?: string;
 }
 
 export interface RunCommandResult {
+  status: "completed" | "failed" | "timed_out";
   stdout: string;
   stderr: string;
   exitCode: number;
+  error?: string;
 }
 
 export interface RunShellCommandOptions {
@@ -35,31 +39,41 @@ export interface RunShellCommandOptions {
 export function createRunCommandTool(context: ToolContext): Tool<RunCommandArgs, RunCommandResult> {
   return {
     name: "run_command",
-    description: "Run a local shell command in the workspace.",
+    description: "Run a finite local shell command in the workspace. Commands have a bounded timeout; use start_process for long-running servers instead of &, nohup, or disown.",
     parameters: {
       type: "object",
       properties: {
-        command: { type: "string", minLength: 1, description: "Shell command to run in the workspace." }
+        command: { type: "string", minLength: 1, description: "Shell command to run in the workspace." },
+        cwd: { type: "string", minLength: 1, description: "Optional workspace-relative working directory. Use it so independent commands in different projects can run concurrently." }
       },
       required: ["command"],
       additionalProperties: false
     },
-    schema: z.object({ command: z.string().min(1) }),
+    schema: z.object({ command: z.string().min(1), cwd: z.string().min(1).optional() }),
     capability: "shell.execute",
     risk: "execute",
     resolveExecution(args) {
       const preview = args.command.length > 80 ? `${args.command.slice(0, 80)}...` : args.command;
+      const inferredCwd = inferredCommandCwd(args.command);
+      const commandCwd = resolveWorkspaceDirectory(context.workspaceRoot, args.cwd ?? inferredCwd ?? ".", context.ignore);
       return {
-        accesses: ToolAccesses.all(),
-        display: { kind: "command", command: args.command, cwd: context.workspaceRoot, language: "bash" },
+        accesses: ToolAccesses.readWriteTree(commandCwd),
+        display: { kind: "command", command: args.command, cwd: commandCwd, language: "bash" },
         description: `Run ${preview}`,
         approvalRule: `run_command(${args.command})`,
         async execute({ signal, onUpdate }) {
-          return await runShellCommand(context.workspaceRoot, args.command, { signal, onUpdate });
+          const currentCwd = resolveWorkspaceDirectory(context.workspaceRoot, args.cwd ?? inferredCwd ?? ".", context.ignore);
+          if (currentCwd !== commandCwd) throw new Error("The command working directory changed after the tool call was prepared.");
+          return await runShellCommand(args.cwd || !inferredCwd ? commandCwd : context.workspaceRoot, args.command, { signal, onUpdate });
         }
       };
     }
   };
+}
+
+function inferredCommandCwd(command: string): string | undefined {
+  const match = command.match(/^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*&&/u);
+  return match?.[1] ?? match?.[2] ?? match?.[3];
 }
 
 export async function runShellCommand(cwd: string, command: string, options: RunShellCommandOptions = {}): Promise<RunCommandResult> {
@@ -123,9 +137,9 @@ export async function runShellCommand(cwd: string, command: string, options: Run
         settle(abortReason(options.signal));
         return;
       }
-      settle(undefined, 124);
+      settle(undefined, 124, "timed_out");
     };
-    const settle = (error: unknown, exitCode?: number) => {
+    const settle = (error: unknown, exitCode?: number, stopStatus?: Extract<RunCommandResult["status"], "timed_out">) => {
       if (settled) return;
       settled = true;
       cleanup();
@@ -134,8 +148,15 @@ export async function runShellCommand(cwd: string, command: string, options: Run
         return;
       }
       const resolvedExitCode = exitCode ?? 1;
-      options.onUpdate?.({ kind: "status", text: `Exited with ${String(resolvedExitCode)}` });
-      resolve({ stdout, stderr, exitCode: resolvedExitCode });
+      const status = stopStatus ?? (resolvedExitCode === 0 ? "completed" : "failed");
+      const failureMessage = status === "timed_out"
+        ? `Command timed out after ${String(timeoutMs)}ms.`
+        : status === "failed" ? `Command exited with code ${String(resolvedExitCode)}.` : undefined;
+      options.onUpdate?.({
+        kind: "status",
+        text: status === "timed_out" ? `Timed out with exit code ${String(resolvedExitCode)}` : `Exited with ${String(resolvedExitCode)}`
+      });
+      resolve({ status, stdout, stderr, exitCode: resolvedExitCode, error: failureMessage });
     };
     const forceKill = async () => {
       if (settled) return;

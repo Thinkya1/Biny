@@ -30,7 +30,7 @@
     "desktop:dist": "pnpm build:desktop && electron-builder --mac dmg zip --publish never",
     "dev": "node --import tsx src/cli/index.ts",
     "lint": "eslint electron.vite.config.ts scripts src tests",
-    "test": "tsx tests/tools-scheduler.test.ts && tsx tests/tool-cancellation.test.ts && tsx tests/ai-sdk-agent.test.ts && tsx tests/tui-transcript.test.ts && tsx tests/desktop.test.ts && tsx tests/context.test.ts && tsx tests/llm-provider.test.ts && tsx tests/extensions.test.ts && tsx tests/web-search.test.ts && tsx tests/subagent-runtime.test.ts && tsx tests/cli-sigint.test.ts",
+    "test": "tsx tests/tools-scheduler.test.ts && tsx tests/tool-cancellation.test.ts && tsx tests/file-tools.test.ts && tsx tests/managed-process.test.ts && tsx tests/ai-sdk-agent.test.ts && tsx tests/tui-transcript.test.ts && tsx tests/desktop.test.ts && tsx tests/context.test.ts && tsx tests/llm-provider.test.ts && tsx tests/extensions.test.ts && tsx tests/web-search.test.ts && tsx tests/subagent-runtime.test.ts && tsx tests/root-run-scheduler.test.ts && tsx tests/root-run-ledger.test.ts && tsx tests/harness.test.ts && tsx tests/task-run-store.test.ts && tsx tests/task-request-factory.test.ts && tsx tests/acceptance-verifier.test.ts && tsx tests/task-runtime.test.ts && tsx tests/cli-sigint.test.ts",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.desktop.json",
     "start": "node dist/cli/index.js",
     "prepack": "pnpm build:cli"

@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { createEditFileTool } from "../src/tools/file/editFile.js";
+import { createDeleteFileTool } from "../src/tools/file/deleteFile.js";
+import { createMultiEditTool } from "../src/tools/file/multiEdit.js";
 import { createReadFileTool } from "../src/tools/file/readFile.js";
 import { atomicWriteUtf8File, maxEditFileBytes, maxReadFileBytes, maxSearchFileBytes, readUtf8FileForEdit } from "../src/tools/file/safeFileIo.js";
 import { createWriteFileTool } from "../src/tools/file/writeFile.js";
@@ -29,10 +31,13 @@ async function main(): Promise<void> {
     await testPermissionPreviewRejectsOversizeExistingFile(workspaceRoot);
     await testSearchReportsTruncatedFiles(workspaceRoot);
     await testPreAbortedWriteHasNoSideEffect(workspaceRoot);
-    await testWriteRequiresExistingParent(workspaceRoot);
+    await testWriteCreatesMissingParents(workspaceRoot);
+    await testWriteRejectsSymlinkedMissingParent(workspaceRoot);
     await testPreAbortedEditHasNoSideEffect(workspaceRoot);
     await testCancellationBeforeAtomicCommitPreservesTargets(workspaceRoot);
     await testAtomicWriteAndEditCommitCleanly(workspaceRoot);
+    await testMultiEditIsAtomic(workspaceRoot);
+    await testDeleteFileBindsPreparedTarget(workspaceRoot);
     await testAtomicWriteDetachesExistingHardlink(workspaceRoot);
     await testAtomicWriteRejectsChangedSnapshot(workspaceRoot);
     await testApprovedFileSnapshotCannotBeOverwritten(workspaceRoot);
@@ -41,6 +46,7 @@ async function main(): Promise<void> {
     await testPreAbortedShellDoesNotSpawn(workspaceRoot);
     await testAbortKillsStubbornProcessGroup(workspaceRoot);
     await testAbortKillsDetachedDescendant(workspaceRoot);
+    await testCommandExitStatus(workspaceRoot);
     await testCommandTimeoutHardSettles(workspaceRoot);
     await testGitInspectionDisablesConfiguredHelpers(workspaceRoot);
   } finally {
@@ -124,14 +130,34 @@ async function testPreAbortedWriteHasNoSideEffect(workspaceRoot: string): Promis
   await assert.rejects(access(path.join(workspaceRoot, "created")));
 }
 
-async function testWriteRequiresExistingParent(workspaceRoot: string): Promise<void> {
+async function testWriteCreatesMissingParents(workspaceRoot: string): Promise<void> {
   const execution = runnable(createWriteFileTool({ workspaceRoot, ignore: [] }).resolveExecution({
-    path: "missing-parent/file.txt",
+    path: "missing-parent/nested/file.txt",
     content: "content"
   }));
 
-  await assert.rejects(execution.execute({ toolCallId: "missing-parent" }), /parent directory must already exist/i);
-  await assert.rejects(access(path.join(workspaceRoot, "missing-parent")));
+  assert.deepEqual(await execution.execute({ toolCallId: "missing-parent" }), {
+    path: "missing-parent/nested/file.txt",
+    bytes: Buffer.byteLength("content")
+  });
+  assert.equal(await readFile(path.join(workspaceRoot, "missing-parent", "nested", "file.txt"), "utf8"), "content");
+}
+
+async function testWriteRejectsSymlinkedMissingParent(workspaceRoot: string): Promise<void> {
+  if (process.platform === "win32") return;
+  const outside = await mkdtemp(path.join(os.tmpdir(), "biny-write-parent-outside-"));
+  const alias = path.join(workspaceRoot, "parent-alias");
+  try {
+    await symlink(outside, alias, "dir");
+    assert.throws(
+      () => createWriteFileTool({ workspaceRoot, ignore: [] }).resolveExecution({ path: "parent-alias/new/file.txt", content: "blocked" }),
+      /escapes workspace through a symbolic link/i
+    );
+    await assert.rejects(access(path.join(outside, "new", "file.txt")));
+  } finally {
+    await unlink(alias).catch(() => undefined);
+    await rm(outside, { recursive: true, force: true });
+  }
 }
 
 async function testPreAbortedEditHasNoSideEffect(workspaceRoot: string): Promise<void> {
@@ -205,6 +231,53 @@ async function testAtomicWriteAndEditCommitCleanly(workspaceRoot: string): Promi
   });
   assert.equal(await readFile(target, "utf8"), "after");
   assert.deepEqual((await readdir(workspaceRoot)).filter((entry) => entry.startsWith(".biny-write-")), []);
+}
+
+async function testMultiEditIsAtomic(workspaceRoot: string): Promise<void> {
+  const target = path.join(workspaceRoot, "multi-edit.txt");
+  await writeFile(target, "alpha beta beta\n", "utf8");
+  const tool = createMultiEditTool({ workspaceRoot, ignore: [] });
+  const execution = runnable(await tool.resolveExecution({
+    path: "multi-edit.txt",
+    edits: [
+      { oldText: "alpha", newText: "first" },
+      { oldText: "beta", newText: "second", replaceAll: true }
+    ]
+  }));
+  assert.deepEqual(await execution.execute({ toolCallId: "multi-edit" }), {
+    path: "multi-edit.txt",
+    edits: 2,
+    replacements: 3,
+    bytes: Buffer.byteLength("first second second\n")
+  });
+  assert.equal(await readFile(target, "utf8"), "first second second\n");
+
+  await assert.rejects(
+    tool.resolveExecution({
+      path: "multi-edit.txt",
+      edits: [
+        { oldText: "first", newText: "changed" },
+        { oldText: "missing", newText: "never" }
+      ]
+    }),
+    /edit 2.*not found/i
+  );
+  assert.equal(await readFile(target, "utf8"), "first second second\n");
+}
+
+async function testDeleteFileBindsPreparedTarget(workspaceRoot: string): Promise<void> {
+  const target = path.join(workspaceRoot, "delete-bound.txt");
+  await writeFile(target, "approved", "utf8");
+  const tool = createDeleteFileTool({ workspaceRoot, ignore: [] });
+  const staleExecution = runnable(await tool.resolveExecution({ path: "delete-bound.txt" }));
+  await writeFile(target, "replacement", "utf8");
+  await assert.rejects(staleExecution.execute({ toolCallId: "delete-stale" }), /changed after the tool call was prepared/i);
+  assert.equal(await readFile(target, "utf8"), "replacement");
+
+  const execution = runnable(await tool.resolveExecution({ path: "delete-bound.txt" }));
+  assert.deepEqual(await execution.execute({ toolCallId: "delete-current" }), { path: "delete-bound.txt", deleted: true });
+  await assert.rejects(access(target));
+  assert.deepEqual((await readdir(workspaceRoot)).filter((entry) => entry.startsWith(".biny-delete-")), []);
 }
 
 async function testAtomicWriteRejectsChangedSnapshot(workspaceRoot: string): Promise<void> {
@@ -458,9 +531,27 @@ async function testCommandTimeoutHardSettles(workspaceRoot: string): Promise<voi
     killSettleMs: 50
   });
 
+  assert.equal(result.status, "timed_out");
   assert.equal(result.exitCode, 124);
+  assert.match(result.error ?? "", /timed out after 200ms/i);
   assert.match(result.stderr, /timed out after 200ms/i);
   assert.ok(Date.now() - startedAt < 1_500, "hard timeout should settle even when SIGTERM is ignored");
+}
+
+async function testCommandExitStatus(workspaceRoot: string): Promise<void> {
+  const completed = await runShellCommand(workspaceRoot, `${shellQuote(process.execPath)} -e ${shellQuote("process.exit(0)")}`);
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.exitCode, 0);
+  assert.equal(completed.error, undefined);
+
+  const failed = await runShellCommand(workspaceRoot, `${shellQuote(process.execPath)} -e ${shellQuote("process.exit(1)")}`);
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.exitCode, 1);
+  assert.match(failed.error ?? "", /exited with code 1/i);
+
+  const explicit124 = await runShellCommand(workspaceRoot, `${shellQuote(process.execPath)} -e ${shellQuote("process.exit(124)")}`);
+  assert.equal(explicit124.status, "failed", "an explicit exit 124 must not be mistaken for the tool timeout");
+  assert.equal(explicit124.exitCode, 124);
 }
 
 async function testGitInspectionDisablesConfiguredHelpers(workspaceRoot: string): Promise<void> {

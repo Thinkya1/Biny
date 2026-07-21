@@ -794,7 +794,7 @@ async function testFailedCurrentSessionResumeKeepsRecorderUsable(): Promise<void
     await assert.rejects(agent.resume(brokenSessionId), /Invalid JSONL event at line 2/);
     const fallbackSession = agent.getInfo();
     assert.notEqual(fallbackSession.sessionId, brokenSessionId);
-    assert.equal(await agent.runTask("continue in a healthy session"), "ok");
+    assert.equal((await agent.runTask("continue in a healthy session")).output, "ok");
     await agent.close();
     const fallbackEvents = await readSessionEvents(fallbackSession.sessionFile);
     assert.deepEqual(fallbackEvents.map((event) => event.type), ["user_message", "assistant_message"]);

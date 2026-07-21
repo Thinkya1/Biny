@@ -20,7 +20,13 @@ import { ensureAgentDirs, resolveSessionFile, sessionIdFromFile } from "../sessi
 import type { ToolRegistry } from "../tools/registry.js";
 import { SdkToolExecutionCoordinator } from "./sdkToolExecutionCoordinator.js";
 import { buildSystemPrompt } from "./prompts.js";
-import type { AgentPermissionRequest, AgentPermissionResult, AgentRuntimeContext, AgentSessionEvent } from "./types.js";
+import type {
+  AgentPermissionRequest,
+  AgentPermissionResult,
+  AgentRuntimeContext,
+  AgentSessionEvent,
+  AgentTurnOutcome
+} from "./types.js";
 import { ContextMemory } from "./context/ContextMemory.js";
 import { LocalMemory } from "./context/LocalMemory.js";
 import { WorkspaceContext } from "./context/WorkspaceContext.js";
@@ -28,6 +34,7 @@ import type { ContextStatus } from "./context/types.js";
 import { createSdkTelemetry } from "../observability/telemetry.js";
 import { createSessionUsage, formatUsageSummary, summarizeUsage, type UsageModelInfo } from "../observability/usage.js";
 import type { SessionUsage } from "../session/metadata.js";
+import { AsyncEventQueue } from "../runtime/AsyncEventQueue.js";
 
 export interface AgentSessionOptions {
   workspaceRoot: string;
@@ -39,6 +46,7 @@ export interface AgentSessionOptions {
   permissionManager: PermissionManager;
   recorder: SessionRecorder;
   modelManager?: ModelManager;
+  taskStatePrompt?: () => Promise<string | undefined>;
   skillPrompt?: string;
   skillPaths?: string[];
 }
@@ -47,6 +55,10 @@ export interface AgentRunOptions {
   abortSignal?: AbortSignal;
   confirmPermission?: (request: AgentPermissionRequest) => Promise<AgentPermissionResult>;
   mode?: AgentRunMode;
+  /** Per-attempt cap, bounded by the configured circuit breaker. */
+  maxSteps?: number;
+  /** A task harness may defer success memory until external acceptance checks pass. */
+  deferSuccessfulMemory?: boolean;
 }
 
 export interface AgentSessionInfo {
@@ -144,53 +156,79 @@ export class AgentSession {
     try {
     if (abortSignal.aborted) {
       recordUserMessage();
-      yield { type: "error", message: "Current turn interrupted before execution." };
-      yield { type: "status", status: "error" };
-      yield { type: "done", content: "" };
+      const outcome = abortedTurn("Current turn interrupted before execution.", 0);
+      yield { type: "error", message: outcome.error ?? "Current turn interrupted." };
+      yield { type: "status", status: "aborted" };
+      yield doneEvent(outcome);
       return;
     }
     const model = this.options.modelManager?.getModel() ?? this.options.model;
     if (!model) {
       recordUserMessage();
-      throw new Error("Vercel AI SDK model is not configured.");
+      const outcome = failedTurn("Vercel AI SDK model is not configured.", 0);
+      this.recordError(outcome.error);
+      yield { type: "error", message: outcome.error ?? "Agent run failed." };
+      yield { type: "status", status: "error" };
+      yield doneEvent(outcome);
+      return;
     }
     const settings = this.options.modelManager?.getModelSettings();
     const mode = runOptions.mode ?? "chat";
     let messages: ModelMessage[];
     try {
+      const durableTaskPrompt = await this.options.taskStatePrompt?.();
+      const systemPrompt = [
+        buildSystemPrompt(mode === "plan" ? "plan" : "qa", this.options.skillPrompt),
+        durableTaskPrompt
+      ].filter((section): section is string => Boolean(section)).join("\n\n");
       messages = await this.contextMemory.prepareTurn(
         input,
-        buildSystemPrompt(mode === "plan" ? "plan" : "qa", this.options.skillPrompt),
+        systemPrompt,
         abortSignal
       );
     } catch (error) {
       recordUserMessage();
-      if (!abortSignal.aborted) throw error;
-      yield { type: "error", message: "Current turn interrupted during context preparation." };
-      yield { type: "status", status: "error" };
-      yield { type: "done", content: "" };
+      const outcome = abortSignal.aborted
+        ? abortedTurn("Current turn interrupted during context preparation.", 0)
+        : failedTurn(errorMessage(error), 0, isTimeoutFailure(error) ? "timeout" : "provider_error");
+      this.recordError(outcome.error);
+      yield { type: "error", message: outcome.error ?? "Agent run failed." };
+      yield { type: "status", status: outcome.status === "aborted" ? "aborted" : "error" };
+      yield doneEvent(outcome);
       return;
     }
     if (abortSignal.aborted) {
       recordUserMessage();
-      yield { type: "error", message: "Current turn interrupted during context preparation." };
-      yield { type: "status", status: "error" };
-      yield { type: "done", content: "" };
+      const outcome = abortedTurn("Current turn interrupted during context preparation.", 0);
+      this.recordError(outcome.error);
+      yield { type: "error", message: outcome.error ?? "Current turn interrupted." };
+      yield { type: "status", status: "aborted" };
+      yield doneEvent(outcome);
       return;
     }
     const permissionManager = this.options.permissionManager;
+    const maxSteps = runOptions.maxSteps ?? this.options.config.agent.maxSteps;
+    if (!Number.isSafeInteger(maxSteps) || maxSteps < 1 || maxSteps > this.options.config.agent.maxSteps) {
+      throw new RangeError(`Agent attempt maxSteps must be between 1 and ${String(this.options.config.agent.maxSteps)}.`);
+    }
     const stepContext = { assistantContent: "", reasoningContent: "" };
-    const queue = createSessionEventQueue();
+    const queue = new AsyncEventQueue<AgentSessionEvent>();
     const runtime = this.runtimeContext(effectiveRunOptions);
     const allowedToolNames = mode === "plan"
       ? new Set(this.options.toolRegistry.list().filter((tool) => tool.risk === "read").map((tool) => tool.name))
       : undefined;
-    const coordinator = new SdkToolExecutionCoordinator(runtime, permissionManager, queue.push, () => ({ ...stepContext }), allowedToolNames);
+    const coordinator = new SdkToolExecutionCoordinator(
+      runtime,
+      permissionManager,
+      (event) => queue.push(event),
+      () => ({ ...stepContext }),
+      allowedToolNames
+    );
     const agentSettings = {
       model,
       tools: coordinator.createTools(),
       allowSystemInMessages: true,
-      stopWhen: stepCountIs(this.options.config.agent.maxSteps),
+      stopWhen: stepCountIs(maxSteps),
       maxRetries: 0,
       providerOptions: settings?.providerOptions,
       reasoning: settings?.reasoning,
@@ -210,15 +248,19 @@ export class AgentSession {
     try {
       result = await agent.stream({ messages, abortSignal });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = errorMessage(error);
+      const outcome = runOptions.abortSignal?.aborted
+        ? abortedTurn(message || "Current turn interrupted.", 0)
+        : failedTurn(message, 0, isTimeoutFailure(error) ? "timeout" : "provider_error");
       this.recordError(message);
       yield { type: "error", message };
-      yield { type: "status", status: "error" };
-      yield { type: "done", content: "" };
+      yield { type: "status", status: outcome.status === "aborted" ? "aborted" : "error" };
+      yield doneEvent(outcome);
       return;
     }
 
     let streamError: unknown;
+    let observedSteps = 0;
     const invalidToolCalls: Array<{ toolName: string; toolCallId: string; input: unknown }> = [];
     let duplicateToolCallError: Error | undefined;
     let streamFailureReported = false;
@@ -226,6 +268,7 @@ export class AgentSession {
       try {
         for await (const part of result.fullStream) {
           if (part.type === "start-step") {
+            observedSteps += 1;
             stepContext.assistantContent = "";
             stepContext.reasoningContent = "";
           } else if (part.type === "text-delta") {
@@ -263,17 +306,27 @@ export class AgentSession {
       }
     })();
 
-    for await (const event of queue) yield event;
+    for await (const event of queue) {
+      yield event;
+      // Acknowledge after the host asked for the next event, so producers can
+      // distinguish buffered events from facts the host has actually handled.
+      queue.ackConsumed();
+    }
     await streamTask;
 
     try {
-      const [content, reasoningContent, responseMessages, usage, finalStep] = await Promise.all([
+      const [content, reasoningContent, responseMessages, usage, finalStep, steps] = await Promise.all([
         result.text,
         result.reasoningText,
         result.responseMessages,
         result.usage,
-        result.finalStep
+        result.finalStep,
+        result.steps
       ]);
+      // A provider can surface an error as a fullStream part while still
+      // resolving the convenience promises with partial output. Do not let a
+      // partial answer commit history or look like a successful turn.
+      if (streamError !== undefined) throw streamError;
       this.contextMemory.recordProviderUsage(finalStep.usage.inputTokens !== undefined ? finalStep.usage : usage);
       const nextMessages = [...messages, ...responseMessages];
       this.contextMemory.replaceHistory(nextMessages);
@@ -286,16 +339,34 @@ export class AgentSession {
         relatedUsage: this.takeRelatedUsage(),
         contextState: this.contextMemory.snapshot()
       });
-      this.contextMemory.queueSuccessfulTask(input, content);
-      yield { type: "status", status: "completed" };
-      yield { type: "done", content, usage: usageRecord };
+      const outcome = finishedTurn(
+        content,
+        finalStep.finishReason,
+        steps.length,
+        maxSteps,
+        usageRecord
+      );
+      if (outcome.status === "completed") {
+        if (!runOptions.deferSuccessfulMemory) this.contextMemory.queueSuccessfulTask(input, content);
+        yield { type: "status", status: "completed" };
+      } else if (outcome.status === "incomplete") {
+        yield { type: "status", status: "incomplete" };
+      } else {
+        this.recordError(outcome.error ?? `Agent stopped with finish reason ${outcome.finishReason ?? "unknown"}.`);
+        yield { type: "error", message: outcome.error ?? "Agent run failed." };
+        yield { type: "status", status: "error" };
+      }
+      yield doneEvent(outcome);
     } catch (error) {
       const failure = streamError ?? error;
-      const message = failure instanceof Error ? failure.message : String(failure);
+      const message = errorMessage(failure);
+      const outcome = runOptions.abortSignal?.aborted
+        ? abortedTurn(message || "Current turn interrupted.", observedSteps)
+        : failedTurn(message, observedSteps, isTimeoutFailure(failure) ? "timeout" : "provider_error");
       this.recordError(message);
       if (!streamFailureReported) yield { type: "error", message };
-      yield { type: "status", status: "error" };
-      yield { type: "done", content: "" };
+      yield { type: "status", status: outcome.status === "aborted" ? "aborted" : "error" };
+      yield doneEvent(outcome);
     }
     } finally {
       turnController.abort(new Error("Agent turn stream was closed."));
@@ -307,12 +378,18 @@ export class AgentSession {
     }
   }
 
-  async runTask(input: string, runOptions: AgentRunOptions = {}): Promise<string> {
-    let output = "";
-    for await (const event of this.run(input, runOptions)) {
-      if (event.type === "done") output = event.content;
+  async runTask(input: string, runOptions: AgentRunOptions = {}): Promise<AgentTurnOutcome> {
+    let outcome: AgentTurnOutcome | undefined;
+    try {
+      for await (const event of this.run(input, runOptions)) {
+        if (event.type === "done") outcome = event.outcome;
+      }
+    } catch (error) {
+      const message = errorMessage(error);
+      this.recordError(message);
+      return failedTurn(message, 0, isTimeoutFailure(error) ? "timeout" : "provider_error");
     }
-    return output;
+    return outcome ?? failedTurn("Agent stream ended without a terminal result.", 0);
   }
 
   async createPlan(task: string, onDelta?: (delta: string) => void, abortSignal?: AbortSignal): Promise<string> {
@@ -376,6 +453,9 @@ export class AgentSession {
         usage: this.recordModelUsage(usage, "plan"),
         contextState: this.contextMemory.snapshot()
       });
+      if (finalStep.finishReason !== "stop") {
+        throw new Error(`Plan generation did not reach a terminal model stop (finishReason=${finalStep.finishReason}).`);
+      }
       this.contextMemory.queueSuccessfulTask(userContent, output);
       return output;
     } catch (error) {
@@ -451,6 +531,10 @@ export class AgentSession {
     modelAlias?: string
   ): void {
     this.recordModelUsage(usage, operation, modelAlias);
+  }
+
+  rememberSuccessfulTask(task: string, answer: string): void {
+    this.contextMemory.queueSuccessfulTask(task, answer);
   }
 
   async compactConversation(hint?: string, signal?: AbortSignal): Promise<string> {
@@ -693,34 +777,101 @@ function maxToolCallSequence(events: SessionReplay["events"]): number {
   }, 0);
 }
 
-interface SessionEventQueue extends AsyncIterable<AgentSessionEvent> {
-  push(event: AgentSessionEvent): void;
-  close(): void;
+function doneEvent(outcome: AgentTurnOutcome): Extract<AgentSessionEvent, { type: "done" }> {
+  return {
+    type: "done",
+    content: outcome.output,
+    usage: outcome.usage,
+    outcome
+  };
 }
 
-function createSessionEventQueue(): SessionEventQueue {
-  const values: AgentSessionEvent[] = [];
-  const waiters: Array<(result: IteratorResult<AgentSessionEvent>) => void> = [];
-  let closed = false;
+function finishedTurn(
+  output: string,
+  finishReason: string,
+  steps: number,
+  maxSteps: number,
+  usage: SessionUsage
+): AgentTurnOutcome {
+  if (finishReason === "stop") {
+    return { status: "completed", stopReason: "model_stop", finishReason, steps, output, usage };
+  }
+  if (finishReason === "tool-calls") {
+    return {
+      status: "incomplete",
+      stopReason: steps >= maxSteps ? "step_limit" : "tool_pending",
+      finishReason,
+      steps,
+      output,
+      usage
+    };
+  }
+  if (finishReason === "length") {
+    return {
+      status: "incomplete",
+      stopReason: "model_length",
+      finishReason,
+      steps,
+      output,
+      usage,
+      error: "The model reached its output limit before completing the turn."
+    };
+  }
+  if (finishReason === "content-filter") {
+    return {
+      status: "failed",
+      stopReason: "content_filter",
+      finishReason,
+      steps,
+      output,
+      usage,
+      error: "The model response was stopped by the provider content filter."
+    };
+  }
   return {
-    push(event) {
-      const waiter = waiters.shift();
-      if (waiter) waiter({ value: event, done: false });
-      else values.push(event);
-    },
-    close() {
-      closed = true;
-      while (waiters.length) waiters.shift()?.({ value: undefined as unknown as AgentSessionEvent, done: true });
-    },
-    [Symbol.asyncIterator]() {
-      return {
-        next() {
-          const value = values.shift();
-          if (value !== undefined) return Promise.resolve({ value, done: false });
-          if (closed) return Promise.resolve({ value: undefined as unknown as AgentSessionEvent, done: true });
-          return new Promise<IteratorResult<AgentSessionEvent>>((resolve) => waiters.push(resolve));
-        }
-      };
-    }
+    status: "failed",
+    stopReason: "provider_error",
+    finishReason,
+    steps,
+    output,
+    usage,
+    error: `The model stopped without a successful terminal response (${finishReason || "unknown"}).`
   };
+}
+
+function failedTurn(
+  message: string,
+  steps: number,
+  stopReason: "timeout" | "provider_error" = "provider_error"
+): AgentTurnOutcome {
+  return {
+    status: "failed",
+    stopReason,
+    finishReason: undefined,
+    steps,
+    output: "",
+    usage: undefined,
+    error: message || "Agent run failed."
+  };
+}
+
+function abortedTurn(message: string, steps: number): AgentTurnOutcome {
+  return {
+    status: "aborted",
+    stopReason: "aborted",
+    finishReason: undefined,
+    steps,
+    output: "",
+    usage: undefined,
+    error: message
+  };
+}
+
+function isTimeoutFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /timeout|timed out|deadline/i.test(`${error.name} ${error.message}`);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

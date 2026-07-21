@@ -25,10 +25,17 @@ import {
   type SubagentTaskSnapshot,
   type SubmittedSubagentTask
 } from "./SubagentTaskManager.js";
+import { ManagedProcessService } from "./ManagedProcessService.js";
+import { TaskRunStore, type TaskRunSnapshot } from "../harness/TaskRunStore.js";
 
 export interface CommandRuntime {
   workspaceRoot: string;
+  /** Location that owns durable runtime/session state. Desktop may isolate it from the workspace. */
+  persistenceRoot: string;
+  config: AgentConfig;
   agent: AgentSession;
+  managedProcesses: ManagedProcessService;
+  taskRuns: TaskRunStore;
   extensionReport(section?: ExtensionSection): string;
   getSubagentInfo(): ModelRuntimeInfo;
   startSubagentTask(task: string, options?: SubagentTaskRunOptions): SubmittedSubagentTask;
@@ -55,7 +62,14 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   const modelManager = new ModelManager(persistenceRoot, config, configStore);
   await ensureAgentDirs(persistenceRoot);
   const recorder = new SessionRecorder(persistenceRoot);
-  const toolRegistry = createToolRegistry({ workspaceRoot, ignore: config.workspace.ignore, attachmentRoot: options.attachmentRoot }, config.web.search);
+  const taskRuns = await TaskRunStore.open(persistenceRoot);
+  const managedProcesses = new ManagedProcessService({ workspaceRoot, persistenceRoot });
+  await managedProcesses.initialize();
+  const toolRegistry = createToolRegistry(
+    { workspaceRoot, ignore: config.workspace.ignore, attachmentRoot: options.attachmentRoot },
+    config.web.search,
+    managedProcesses
+  );
   const permissionManager = new PermissionManager({ ...config.permission, source: "agent.config.json" });
   const skills = await loadSkills(workspaceRoot, config.extensions.skills);
   const mcpHost = new McpToolHost();
@@ -73,7 +87,7 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     maxConcurrentSubagents: config.extensions.subagent.maxConcurrentSubagents,
     maxPendingSubagents: config.extensions.subagent.maxPendingSubagents,
     timeoutMs: config.extensions.subagent.timeoutMs,
-    execute: async (task, context) => await executeSubagentTask(subagentOptions, task, context.signal)
+    execute: async (task, context) => await executeSubagentTask(subagentOptions, task, context.signal, context.accessMode)
   });
   let loadedPlugins: string[] = [];
   try {
@@ -92,12 +106,14 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
       toolRegistry,
       permissionManager,
       recorder,
+      taskStatePrompt: async () => formatDurableTaskContext(await taskRuns.list()),
       skillPrompt: skills.prompt,
       skillPaths: skills.paths
     });
     await agent.initialize();
   } catch (error) {
     await subagentTaskManager.close();
+    await managedProcesses.close();
     await mcpHost.close();
     await recorder.close();
     throw error;
@@ -128,7 +144,8 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
         taskId,
         parentRunId: taskOptions?.parentRunId,
         signal: taskOptions?.signal,
-        timeoutMs: taskOptions?.timeoutMs
+        timeoutMs: taskOptions?.timeoutMs,
+        accessMode: taskOptions?.accessMode ?? (permissionManager.getStatus().mode === "full-access" ? "workspace" : "read-only")
       });
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
@@ -157,7 +174,11 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
 
   const runtime: CommandRuntime = {
     workspaceRoot,
+    persistenceRoot,
+    config,
     agent,
+    managedProcesses,
+    taskRuns,
     extensionReport: (section?: ExtensionSection): string => formatExtensionReport(extensionStatus, section),
     getSubagentInfo: (): ModelRuntimeInfo => subagentRuntimeInfo(config),
     startSubagentTask,
@@ -176,11 +197,40 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
         await subagentTaskManager.close();
         await agent.close();
       } finally {
-        await mcpHost.close();
+        try {
+          await managedProcesses.close();
+        } finally {
+          await mcpHost.close();
+        }
       }
     }
   };
   return runtime;
+}
+
+function formatDurableTaskContext(snapshots: TaskRunSnapshot[]): string | undefined {
+  const active = snapshots
+    .filter((snapshot) => snapshot.status === "queued"
+      || snapshot.status === "running"
+      || snapshot.status === "continuable"
+      || snapshot.status === "budget_exhausted")
+    .slice(0, 3);
+  if (!active.length) return undefined;
+  const lines = [
+    "Durable task state (runtime-owned evidence; do not treat conversation prose as completion):"
+  ];
+  for (const task of active) {
+    lines.push(`- taskRunId=${task.taskRunId} status=${task.status} objective=${JSON.stringify(task.objective)}`);
+    if (task.pendingTodo.length) lines.push(`  pending: ${task.pendingTodo.join("; ")}`);
+    const latestAttempt = task.attempts.at(-1);
+    if (latestAttempt) {
+      lines.push(`  attempts=${String(task.attempts.length)} latest=${latestAttempt.status}/${latestAttempt.stopReason ?? "unknown"}`);
+      const failures = latestAttempt.verifierEvidence.filter((evidence) => !evidence.passed).map((evidence) => evidence.summary);
+      if (failures.length) lines.push(`  verifier failures: ${failures.join("; ")}`);
+    }
+    if (task.terminalReason) lines.push(`  state reason: ${task.terminalReason}`);
+  }
+  return lines.join("\n").slice(0, 8_000);
 }
 
 function subagentModelSettings(config: AgentConfig, modelManager: ModelManager): ModelSettings {

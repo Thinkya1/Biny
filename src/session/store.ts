@@ -1,7 +1,7 @@
 /**
  * Session 存储定位模块。
  *
- * `.agent/sessions` 和 `.agent/logs` 的目录创建、session 文件名生成、latest 解析以及 session id
+ * `.agent/sessions`、`.agent/logs`、`.agent/runs`、`.agent/tasks` 和 `.agent/processes` 的目录创建、session 文件名生成、latest 解析以及 session id
  * 前缀匹配都在这里处理。命令层只需要给出 workspace 和可选 session 参数，不必关心文件布局。
  */
 import { randomBytes } from "node:crypto";
@@ -53,7 +53,7 @@ export async function ensureAgentDirs(workspaceRoot: string): Promise<void> {
     throw new Error("Session storage .agent resolves outside the canonical persistence root.");
   }
 
-  for (const name of ["sessions", "logs"] as const) {
+  for (const name of ["sessions", "logs", "runs", "tasks", "processes"] as const) {
     const directory = path.join(agentPath, name);
     await ensureRealDirectory(directory, `.agent/${name}`);
     if (await fs.realpath(directory) !== path.join(canonicalAgent, name)) {

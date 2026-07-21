@@ -7,10 +7,24 @@
 import { z } from "zod";
 
 const agentSchema = z.object({
-  maxSteps: z.number().int().min(1).max(32).default(8),
+  maxSteps: z.number().int().min(1).max(32).default(32),
+  maxAttempts: z.number().int().min(1).max(10).default(3),
+  maxTaskSteps: z.number().int().min(1).max(1_024).default(96),
+  maxWallTimeMs: z.number().int().min(1_000).max(86_400_000).default(30 * 60_000),
+  maxTotalTokens: z.number().int().min(1).max(10_000_000).default(500_000),
+  maxCostUsd: z.number().positive().max(1_000).optional(),
   maxConcurrentTools: z.number().int().min(1).max(32).default(4),
   maxQueuedToolCalls: z.number().int().min(1).max(1_024).default(64)
-}).default({ maxSteps: 8, maxConcurrentTools: 4, maxQueuedToolCalls: 64 });
+}).default({
+  maxSteps: 32,
+  maxAttempts: 3,
+  maxTaskSteps: 96,
+  maxWallTimeMs: 30 * 60_000,
+  maxTotalTokens: 500_000,
+  maxCostUsd: undefined,
+  maxConcurrentTools: 4,
+  maxQueuedToolCalls: 64
+});
 
 const permissionSchema = z.object({
   mode: z.enum(["safe", "ask", "read-only", "auto", "full-access"]).default("ask"),
@@ -124,7 +138,14 @@ export const defaultSubagentAllowedTools = [
   "search_files",
   "grep_search",
   "git_status",
-  "git_diff"
+  "git_diff",
+  "write_file",
+  "edit_file",
+  "multi_edit",
+  "delete_file",
+  "apply_patch",
+  "move_file",
+  "run_command"
 ] as const;
 
 const subagentToolNameSchema = z.enum(defaultSubagentAllowedTools);
@@ -135,21 +156,21 @@ const extensionsSchema = z.object({
   plugins: z.array(z.string().trim().min(1)).max(32).default([]),
   subagent: z.object({
     enabled: z.boolean().default(true),
-    maxSteps: z.number().int().min(1).max(12).default(4),
-    maxOutputTokens: z.number().int().min(256).max(32_768).default(4_000),
+    maxSteps: z.number().int().min(1).max(32).default(16),
+    maxOutputTokens: z.number().int().min(256).max(32_768).default(8_000),
     maxConcurrentSubagents: z.number().int().min(1).max(8).default(2),
     maxPendingSubagents: z.number().int().min(0).max(128).default(16),
-    timeoutMs: z.number().int().min(1_000).max(600_000).default(120_000),
+    timeoutMs: z.number().int().min(1_000).max(600_000).default(300_000),
     model: z.string().min(1).optional(),
     maxCostUsd: z.number().positive().max(100).optional(),
     allowedTools: z.array(subagentToolNameSchema).min(1).default([...defaultSubagentAllowedTools])
   }).default({
     enabled: true,
-    maxSteps: 4,
-    maxOutputTokens: 4_000,
+    maxSteps: 16,
+    maxOutputTokens: 8_000,
     maxConcurrentSubagents: 2,
     maxPendingSubagents: 16,
-    timeoutMs: 120_000,
+    timeoutMs: 300_000,
     model: undefined,
     maxCostUsd: undefined,
     allowedTools: [...defaultSubagentAllowedTools]
@@ -160,11 +181,11 @@ const extensionsSchema = z.object({
   plugins: [],
   subagent: {
     enabled: true,
-    maxSteps: 4,
-    maxOutputTokens: 4_000,
+    maxSteps: 16,
+    maxOutputTokens: 8_000,
     maxConcurrentSubagents: 2,
     maxPendingSubagents: 16,
-    timeoutMs: 120_000,
+    timeoutMs: 300_000,
     model: undefined,
     maxCostUsd: undefined,
     allowedTools: [...defaultSubagentAllowedTools]
@@ -278,6 +299,22 @@ const canonicalConfigSchema = z.object({
     });
   }
 
+  if (config.agent.maxCostUsd !== undefined) {
+    const pricing = activeModel?.pricing;
+    if (
+      pricing?.inputPerMillionTokens === undefined
+      || pricing.outputPerMillionTokens === undefined
+      || pricing.cacheReadPerMillionTokens === undefined
+      || pricing.cacheWritePerMillionTokens === undefined
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["agent", "maxCostUsd"],
+        message: `Agent task cost budgets require input, output, cache-read, and cache-write pricing for model ${config.defaultModel}.`
+      });
+    }
+  }
+
   const subagentAlias = config.extensions.subagent.model;
   if (subagentAlias) {
     const subagentModel = config.models[subagentAlias];
@@ -369,7 +406,16 @@ export const defaultConfig: AgentConfig = {
     }
   },
   thinking: { enabled: true, effort: "high" },
-  agent: { maxSteps: 8, maxConcurrentTools: 4, maxQueuedToolCalls: 64 },
+  agent: {
+    maxSteps: 32,
+    maxAttempts: 3,
+    maxTaskSteps: 96,
+    maxWallTimeMs: 30 * 60_000,
+    maxTotalTokens: 500_000,
+    maxCostUsd: undefined,
+    maxConcurrentTools: 4,
+    maxQueuedToolCalls: 64
+  },
   permission: {
     mode: "ask",
     allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search"],
@@ -401,11 +447,11 @@ export const defaultConfig: AgentConfig = {
     plugins: [],
     subagent: {
       enabled: true,
-      maxSteps: 4,
-      maxOutputTokens: 4_000,
+      maxSteps: 16,
+      maxOutputTokens: 8_000,
       maxConcurrentSubagents: 2,
       maxPendingSubagents: 16,
-      timeoutMs: 120_000,
+      timeoutMs: 300_000,
       model: undefined,
       maxCostUsd: undefined,
       allowedTools: [...defaultSubagentAllowedTools]

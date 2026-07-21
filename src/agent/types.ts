@@ -24,6 +24,37 @@ export interface Intent {
 export type AgentPermissionRequest = PermissionPrompt;
 export type AgentPermissionResult = PermissionResult;
 
+export type AgentTurnStatus = "completed" | "incomplete" | "failed" | "aborted";
+
+/**
+ * Why one bounded AgentSession attempt stopped. `step_limit` and
+ * `tool_pending` are deliberately non-success terminal reasons: callers may
+ * continue them through the task harness, but must never present them as a
+ * completed task.
+ */
+export type AgentTurnStopReason =
+  | "model_stop"
+  | "step_limit"
+  | "tool_pending"
+  | "timeout"
+  | "verification_failed"
+  | "model_length"
+  | "content_filter"
+  | "provider_error"
+  | "aborted"
+  | "budget_exhausted";
+
+/** Structured result for a single bounded model/tool turn. */
+export interface AgentTurnOutcome {
+  status: AgentTurnStatus;
+  stopReason: AgentTurnStopReason;
+  finishReason?: string;
+  steps: number;
+  output: string;
+  usage?: SessionUsage;
+  error?: string;
+}
+
 /** SDK-native stream plus the small set of Biny lifecycle events that the SDK does not own. */
 export type AgentSessionEvent =
   | { type: "status"; status: AgentStatus }
@@ -33,7 +64,7 @@ export type AgentSessionEvent =
   | { type: "permission-requested"; toolCallId: string; request: AgentPermissionRequest }
   | { type: "permission-result"; toolCallId: string; request: AgentPermissionRequest; result: AgentPermissionResult }
   | { type: "error"; message: string; recorded?: boolean; fatal?: boolean }
-  | { type: "done"; content: string; usage?: SessionUsage };
+  | { type: "done"; content: string; usage?: SessionUsage; outcome: AgentTurnOutcome };
 
 export interface AgentRuntimeContext {
   // Agent loop 的所有外部依赖都由 runtime 注入，方便 CLI 和 TUI 复用同一套执行逻辑。
@@ -50,4 +81,4 @@ export interface AgentRuntimeContext {
   abortSignal?: AbortSignal;
 }
 
-export type AgentStatus = "thinking" | "running" | "waiting_permission" | "completed" | "error";
+export type AgentStatus = "thinking" | "running" | "waiting_permission" | "completed" | "incomplete" | "aborted" | "error";

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 export type SubagentTaskStatus = "queued" | "running" | "completed" | "failed" | "aborted" | "timed_out";
+export type SubagentAccessMode = "read-only" | "workspace";
 
 export interface SubagentTaskSnapshot {
   taskId: string;
@@ -12,6 +13,7 @@ export interface SubagentTaskSnapshot {
   startedAt?: string;
   completedAt?: string;
   error?: string;
+  accessMode?: SubagentAccessMode;
 }
 
 export interface SubagentTaskRunOptions {
@@ -19,6 +21,7 @@ export interface SubagentTaskRunOptions {
   parentRunId?: string;
   signal?: AbortSignal;
   timeoutMs?: number;
+  accessMode?: SubagentAccessMode;
 }
 
 export interface SubmittedSubagentTask {
@@ -33,10 +36,11 @@ export interface SubagentTaskManagerOptions {
   maxPendingSubagents?: number;
   timeoutMs: number;
   shutdownDrainMs?: number;
-  execute(task: string, context: { taskId: string; parentRunId: string; signal: AbortSignal; deadline: string }): Promise<string>;
+  execute(task: string, context: { taskId: string; parentRunId: string; signal: AbortSignal; deadline: string; accessMode: SubagentAccessMode }): Promise<string>;
 }
 
 interface ManagedSubagentTask extends SubagentTaskSnapshot {
+  accessMode: SubagentAccessMode;
   controller: AbortController;
   completion: Promise<string>;
   resolve(value: string): void;
@@ -113,6 +117,7 @@ export class SubagentTaskManager {
       status: "queued",
       createdAt: new Date(createdAtMs).toISOString(),
       deadline: new Date(deadlineMs).toISOString(),
+      accessMode: options.accessMode ?? "read-only",
       controller,
       completion,
       resolve: resolveCompletion,
@@ -226,7 +231,8 @@ export class SubagentTaskManager {
         taskId: task.taskId,
         parentRunId: task.parentRunId,
         signal: task.controller.signal,
-        deadline: task.deadline
+        deadline: task.deadline,
+        accessMode: task.accessMode
       });
       if (task.controller.signal.aborted) this.fail(task, abortError(task));
       else this.complete(task, output);
@@ -343,7 +349,8 @@ function publicSnapshot(task: ManagedSubagentTask): SubagentTaskSnapshot {
     deadline: task.deadline,
     startedAt: task.startedAt,
     completedAt: task.completedAt,
-    error: task.error
+    error: task.error,
+    accessMode: task.accessMode
   };
 }
 

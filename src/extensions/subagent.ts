@@ -15,16 +15,18 @@ import type { ModelSettings } from "../llm/factory.js";
 import { calculateUsageCost, type ModelUsageObserver } from "../observability/usage.js";
 import { createSdkTelemetry } from "../observability/telemetry.js";
 import type { SubagentTaskManager } from "../runtime/SubagentTaskManager.js";
+import type { SubagentAccessMode } from "../runtime/SubagentTaskManager.js";
 import { usageSnapshot } from "../session/metadata.js";
 import { ToolAccesses } from "../tools/access.js";
 import type { ToolRegistry } from "../tools/registry.js";
+import { ToolScheduler } from "../tools/scheduler.js";
 import type { Tool, ToolExecution } from "../tools/types.js";
 import { filterProtectedGitDiff, isProtectedCredentialPath, redactSecrets } from "../utils/secrets.js";
 
 const subagentParameters = {
   type: "object" as const,
   properties: {
-    task: { type: "string" as const, description: "A focused read-only investigation for the subagent." }
+    task: { type: "string" as const, description: "A focused repository task for the subagent, including implementation and finite validation when needed." }
   },
   required: ["task"],
   additionalProperties: false
@@ -36,6 +38,14 @@ const safeBuiltinCapabilities = new Set([
   "filesystem.search",
   "git.status",
   "git.diff"
+]);
+const workspaceBuiltinCapabilities = new Set([
+  ...safeBuiltinCapabilities,
+  "filesystem.write",
+  "filesystem.edit",
+  "filesystem.delete",
+  "filesystem.move",
+  "shell.execute"
 ]);
 const maxSubagentReadBytes = 256 * 1024;
 const maxSubagentTextChars = 64_000;
@@ -52,22 +62,23 @@ export interface SubagentOptions {
 export function createSubagentTool(options: SubagentOptions, taskManager: SubagentTaskManager): Tool<{ task: string }, string> {
   return {
     name: "delegate_task",
-    description: "Delegate a focused read-only repository investigation to a subagent, then return its answer.",
+    description: "Delegate a focused repository investigation, implementation, repair, or finite validation task to a bounded subagent.",
     parameters: subagentParameters,
     schema: z.object({ task: z.string().min(1).max(20_000) }),
     source: "subagent",
-    capability: "subagent.readonly",
-    risk: "read",
+    capability: "subagent.workspace",
+    risk: "execute",
     resolveExecution(args) {
       return {
-        accesses: ToolAccesses.readTree(options.workspaceRoot),
-        display: { kind: "generic", summary: "Delegate read-only investigation", detail: args.task },
-        description: "Runs a bounded read-only subagent with an explicit local-tool allowlist.",
+        accesses: ToolAccesses.all(),
+        display: { kind: "generic", summary: "Delegate repository task", detail: args.task },
+        description: "Runs a bounded workspace subagent with an explicit local-tool allowlist and restricted validation commands.",
         approvalRule: "delegate_task",
         async execute(context): Promise<string> {
           return await taskManager.run(args.task, {
             parentRunId: options.getParentRunId?.() ?? context.toolCallId,
-            signal: context.signal
+            signal: context.signal,
+            accessMode: "workspace"
           });
         }
       };
@@ -76,10 +87,19 @@ export function createSubagentTool(options: SubagentOptions, taskManager: Subage
 }
 
 /** Executes one already-admitted child task. Concurrency and deadlines belong to SubagentTaskManager. */
-export async function runSubagentTask(options: SubagentOptions, task: string, signal?: AbortSignal): Promise<string> {
+export async function runSubagentTask(
+  options: SubagentOptions,
+  task: string,
+  signal?: AbortSignal,
+  accessMode: SubagentAccessMode = "read-only"
+): Promise<string> {
   const settings = options.config.extensions.subagent;
   const modelSettings = options.getModelSettings();
-  const tools = createReadOnlyTools(options.toolRegistry, settings.allowedTools);
+  const scheduler = new ToolScheduler<unknown>({
+    maxConcurrency: options.config.agent.maxConcurrentTools,
+    maxQueuedTasks: options.config.agent.maxQueuedToolCalls
+  });
+  const tools = createSubagentTools(options.toolRegistry, settings.allowedTools, { accessMode, scheduler });
   const costBudgetStop: StopCondition<ToolSet> = ({ steps }) => subagentCostBudgetReached(
     options.config,
     steps.map((step) => step.usage)
@@ -88,12 +108,15 @@ export async function runSubagentTask(options: SubagentOptions, task: string, si
     model: modelSettings.model,
     tools,
     instructions: [
-      "You are Biny's bounded read-only subagent.",
-      "Inspect the repository using only the available local read/search/git inspection tools.",
-      "Never request secrets, credentials, environment files, agent.config.json, network access, writes, shell commands, or another subagent.",
-      "Return concise grounded findings with exact paths."
+      accessMode === "workspace" ? "You are Biny's bounded workspace subagent." : "You are Biny's bounded read-only subagent.",
+      accessMode === "workspace"
+        ? "Inspect, implement, repair, and validate the focused task using only the explicitly available workspace tools."
+        : "Inspect the repository using only the available local read/search/git inspection tools.",
+      "Never request secrets, credentials, environment files, agent.config.json, network access, long-running processes, or another subagent.",
+      "Use run_command only for finite allowlisted build, test, lint, and typecheck commands.",
+      "Return concise grounded findings with exact paths, changes, and validation evidence."
     ].join("\n"),
-    stopWhen: [stepCountIs(settings.maxSteps), costBudgetStop],
+    stopWhen: [stepCountIs(subagentStepBudget(task, settings.maxSteps)), costBudgetStop],
     maxRetries: 0,
     providerOptions: modelSettings.providerOptions,
     reasoning: modelSettings.reasoning,
@@ -103,37 +126,73 @@ export async function runSubagentTask(options: SubagentOptions, task: string, si
     onError: () => undefined
   } as ToolLoopAgentSettings<never, ToolSet> & { onError: () => undefined });
   const result = await agent.generate({ prompt: task, abortSignal: signal });
-  const usage = await result.usage;
+  const [text, usage, finalStep, steps] = await Promise.all([
+    result.text,
+    result.usage,
+    result.finalStep,
+    result.steps
+  ]);
   if (signal?.aborted) throw abortReason(signal);
   const modelAlias = settings.model ?? options.config.defaultModel;
   await options.onUsage?.(usage, "subagent", modelAlias);
   enforceSubagentCostBudget(options.config, usage);
-  return redactSecrets(result.text);
+  if (finalStep.finishReason !== "stop") {
+    throw new Error(`Subagent did not reach a terminal model stop after ${String(steps.length)} steps (finishReason=${finalStep.finishReason}).`);
+  }
+  return redactSecrets(text);
 }
 
-export function createReadOnlyTools(registry: ToolRegistry, allowedTools: readonly string[]): ToolSet {
+export interface CreateSubagentToolsOptions {
+  accessMode?: SubagentAccessMode;
+  scheduler?: ToolScheduler<unknown>;
+}
+
+export function createSubagentTools(
+  registry: ToolRegistry,
+  allowedTools: readonly string[],
+  options: CreateSubagentToolsOptions = {}
+): ToolSet {
   const tools: Record<string, unknown> = {};
   const allowed = new Set(allowedTools);
+  const accessMode = options.accessMode ?? "read-only";
+  const capabilities = accessMode === "workspace" ? workspaceBuiltinCapabilities : safeBuiltinCapabilities;
   for (const entry of registry.listEntries()) {
     if (
       entry.source !== "builtin"
-      || entry.tool.risk !== "read"
       || !entry.tool.capability
-      || !safeBuiltinCapabilities.has(entry.tool.capability)
+      || !capabilities.has(entry.tool.capability)
+      || (accessMode === "read-only" && entry.tool.risk !== "read")
       || !allowed.has(entry.tool.name)
     ) continue;
     tools[entry.tool.name] = tool({
       description: entry.tool.description,
       inputSchema: entry.tool.schema,
       execute: async (input: unknown, executionOptions: ToolExecutionOptions<unknown>) => {
-        assertSafeToolInput(entry.tool.name, input);
+        assertSafeToolInput(entry.tool.name, input, accessMode);
         const resolved = await entry.tool.resolveExecution(input);
-        const result = await executeReadOnlyTool(entry.tool.name, resolved, executionOptions);
+        const result = await executeSubagentTool(entry.tool.name, resolved, executionOptions, options.scheduler);
         return sanitizeToolResult(entry.tool.name, result);
       }
     });
   }
   return tools as ToolSet;
+}
+
+/** Backward-compatible read-only view used by review and inspection callers. */
+export function createReadOnlyTools(registry: ToolRegistry, allowedTools: readonly string[]): ToolSet {
+  return createSubagentTools(registry, allowedTools, { accessMode: "read-only" });
+}
+
+export function subagentStepBudget(task: string, configuredMaximum: number): number {
+  if (!Number.isSafeInteger(configuredMaximum) || configuredMaximum < 1) {
+    throw new RangeError("Subagent maxSteps must be a positive safe integer.");
+  }
+  const compact = task.trim().toLowerCase();
+  const implementationTask = /\b(implement|fix|repair|refactor|change|update|write|edit|test|build|lint|typecheck)\b|实现|修复|修改|重构|编写|测试|构建|检查/.test(compact);
+  if (implementationTask) return configuredMaximum;
+  const broadInvestigation = compact.length > 400 || /\b(investigate|analyze|audit|trace|compare)\b|调查|分析|审计|追踪|对比/.test(compact);
+  if (broadInvestigation) return Math.min(configuredMaximum, 12);
+  return Math.min(configuredMaximum, 8);
 }
 
 export function enforceSubagentCostBudget(config: AgentConfig, usage: LanguageModelUsage): void {
@@ -185,23 +244,69 @@ export function isSensitiveSubagentPath(value: string): boolean {
   });
 }
 
-async function executeReadOnlyTool(toolName: string, execution: ToolExecution, options: ToolExecutionOptions<unknown>): Promise<unknown> {
+async function executeSubagentTool(
+  toolName: string,
+  execution: ToolExecution,
+  options: ToolExecutionOptions<unknown>,
+  scheduler?: ToolScheduler<unknown>
+): Promise<unknown> {
   if ("isError" in execution) return execution.result;
-  if (toolName === "read_file") {
-    const filePath = execution.accesses?.find((access) => access.kind === "file")?.path;
-    if (filePath) {
-      const stat = await fs.stat(filePath);
-      if (stat.size > maxSubagentReadBytes) {
-        throw new Error(`Subagent read_file limit exceeded (${String(stat.size)} bytes; max ${String(maxSubagentReadBytes)}). Use search instead.`);
+  const execute = async (): Promise<unknown> => {
+    if (toolName === "read_file") {
+      const filePath = execution.accesses?.find((access) => access.kind === "file")?.path;
+      if (filePath) {
+        const stat = await fs.stat(filePath);
+        if (stat.size > maxSubagentReadBytes) {
+          throw new Error(`Subagent read_file limit exceeded (${String(stat.size)} bytes; max ${String(maxSubagentReadBytes)}). Use search instead.`);
+        }
       }
     }
-  }
-  return await execution.execute({ toolCallId: options.toolCallId, signal: options.abortSignal });
+    return await execution.execute({ toolCallId: options.toolCallId, signal: options.abortSignal });
+  };
+  if (!scheduler) return await execute();
+  return await scheduler.schedule({
+    accesses: execution.accesses ?? ToolAccesses.all(),
+    signal: options.abortSignal,
+    start: execute
+  });
 }
 
-function assertSafeToolInput(toolName: string, input: unknown): void {
-  if (toolName !== "read_file" || !isRecord(input) || typeof input.path !== "string") return;
-  if (isSensitiveSubagentPath(input.path)) throw new Error(`Subagent access denied for protected path: ${input.path}`);
+function assertSafeToolInput(toolName: string, input: unknown, accessMode: SubagentAccessMode): void {
+  if (!isRecord(input)) return;
+  if (typeof input.path === "string" && isSensitiveSubagentPath(input.path)) {
+    throw new Error(`Subagent access denied for protected path: ${input.path}`);
+  }
+  if (toolName === "run_command") {
+    if (accessMode !== "workspace") throw new Error("Subagent command execution is not available in read-only mode.");
+    const command = typeof input.command === "string" ? input.command.trim() : "";
+    if (!isAllowedSubagentValidationCommand(command)) {
+      throw new Error("Subagent run_command only permits finite build, test, lint, and typecheck commands without shell operators.");
+    }
+  }
+}
+
+export function isAllowedSubagentValidationCommand(command: string): boolean {
+  // The command is passed to a shell. Only horizontal ASCII whitespace is
+  // accepted so a newline cannot smuggle a second command past this allowlist.
+  if (!command || !/^[\w@%+.,:/=\- \t]+$/u.test(command)) return false;
+  const words = command.trim().split(/[ \t]+/u);
+  const executable = words[0] ?? "";
+  const firstArgument = words[1] ?? "";
+  const secondArgument = words[2] ?? "";
+  if (["pnpm", "npm", "yarn", "bun"].includes(executable)) {
+    if (["test", "build", "lint", "typecheck", "check"].includes(firstArgument)) return true;
+    if (firstArgument === "run" && ["test", "build", "lint", "typecheck", "check"].includes(secondArgument)) return true;
+    return executable === "pnpm" && firstArgument === "exec" && ["tsc", "eslint", "vitest", "jest"].includes(secondArgument);
+  }
+  if (["mvn", "./mvnw"].includes(executable)) return ["test", "verify", "package"].includes(firstArgument);
+  if (["gradle", "./gradlew"].includes(executable)) return ["test", "check", "build"].includes(firstArgument);
+  if (executable === "cargo") return ["test", "check", "build", "clippy"].includes(firstArgument);
+  if (executable === "go") return firstArgument === "test";
+  if (["pytest", "py.test"].includes(executable)) return true;
+  if (["python", "python3"].includes(executable)) return firstArgument === "-m" && secondArgument === "pytest";
+  if (executable === "dotnet") return ["test", "build"].includes(firstArgument);
+  if (executable === "make") return ["test", "check", "build", "lint"].includes(firstArgument);
+  return false;
 }
 
 function sanitizeToolResult(toolName: string, result: unknown): unknown {

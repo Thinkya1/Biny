@@ -22,6 +22,11 @@ interface FileIdentity {
   inode: bigint;
 }
 
+interface CreatedDirectory {
+  path: string;
+  identity: FileIdentity;
+}
+
 export interface BoundedFileRead {
   content: string;
   truncated: boolean;
@@ -206,6 +211,243 @@ export async function atomicWriteUtf8File(
     }
     if (backupPath && backupSnapshot) {
       await removeBoundAuxiliaryFile(directory, directorySnapshot, backupPath, backupSnapshot);
+    }
+  }
+}
+
+/**
+ * Atomically writes a workspace file, creating only the missing real-directory
+ * components below the canonical workspace root. Directories created before a
+ * failed or cancelled write are removed again when they are still empty and
+ * still refer to the exact inodes created by this call.
+ */
+export async function atomicWriteWorkspaceUtf8File(
+  workspaceRoot: string,
+  filePath: string,
+  content: string,
+  expectedSnapshot: FileSnapshot | null | undefined,
+  signal?: AbortSignal
+): Promise<number> {
+  signal?.throwIfAborted();
+  const createdDirectories = await createMissingWorkspaceDirectories(workspaceRoot, path.dirname(filePath), signal);
+  let committed = false;
+  try {
+    signal?.throwIfAborted();
+    const bytes = await atomicWriteUtf8File(filePath, content, expectedSnapshot, signal);
+    committed = true;
+    return bytes;
+  } finally {
+    if (!committed) await removeCreatedDirectories(createdDirectories);
+  }
+}
+
+export async function snapshotRegularFile(filePath: string, signal?: AbortSignal): Promise<FileSnapshot> {
+  signal?.throwIfAborted();
+  const handle = await openBoundRegularFile(filePath);
+  try {
+    signal?.throwIfAborted();
+    return await assertFileBinding(filePath, handle);
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Deletes one bound regular file by first moving the approved inode to a
+ * private same-directory quarantine path. A replacement detected during that
+ * move is restored rather than silently deleted.
+ */
+export async function deleteBoundRegularFile(
+  filePath: string,
+  expectedSnapshot: FileSnapshot,
+  signal?: AbortSignal
+): Promise<void> {
+  signal?.throwIfAborted();
+  const directory = path.dirname(filePath);
+  const directoryIdentity = await snapshotDirectory(directory);
+  const handle = await openBoundRegularFile(filePath);
+  const quarantinePath = path.join(
+    directory,
+    `.biny-delete-${String(process.pid)}-${randomBytes(8).toString("hex")}.tmp`
+  );
+  let quarantined = false;
+  try {
+    const initial = await assertFileBinding(filePath, handle);
+    if (!sameFileSnapshot(initial, expectedSnapshot)) {
+      throw new Error("The delete target changed after the tool call was prepared.");
+    }
+    await assertDirectoryBinding(directory, directoryIdentity);
+    signal?.throwIfAborted();
+    const beforeCommit = await assertFileBinding(filePath, handle);
+    if (!sameFileSnapshot(beforeCommit, expectedSnapshot)) {
+      throw new Error("The delete target changed before it could be removed.");
+    }
+
+    // From this rename onward the small transaction is completed without an
+    // abort check so cancellation cannot strand a half-deleted target.
+    await fs.rename(filePath, quarantinePath);
+    quarantined = true;
+    const moved = await assertFileBinding(quarantinePath, handle);
+    if (!sameStableFileVersion(moved, expectedSnapshot)) {
+      throw new Error("The delete target changed during the atomic removal.");
+    }
+    await fs.unlink(quarantinePath);
+    quarantined = false;
+    await syncDirectory(directory).catch(() => undefined);
+  } catch (error) {
+    if (quarantined) {
+      try {
+        await assertDirectoryBinding(directory, directoryIdentity);
+        await assertFileBinding(quarantinePath, handle);
+        if (await snapshotTarget(filePath) === null) {
+          await fs.rename(quarantinePath, filePath);
+          quarantined = false;
+        }
+      } catch {
+        // Preserve the quarantined inode if its directory or destination changed;
+        // overwriting a newer external target would be worse than leaving evidence.
+      }
+    }
+    throw error;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+/**
+ * Moves one prepared regular file without replacing a destination that appeared
+ * after permission approval. The hard-link/unlink sequence is used instead of
+ * rename so the destination commit is no-replace on filesystems that support
+ * hard links; cross-device moves are rejected rather than downgraded to an
+ * unverified copy.
+ */
+export async function moveBoundRegularFile(
+  sourcePath: string,
+  destinationPath: string,
+  expectedSnapshot: FileSnapshot,
+  signal?: AbortSignal
+): Promise<void> {
+  signal?.throwIfAborted();
+  const source = path.resolve(sourcePath);
+  const destination = path.resolve(destinationPath);
+  if (source === destination) throw new Error("The move source and destination must differ.");
+
+  const sourceDirectory = path.dirname(source);
+  const destinationDirectory = path.dirname(destination);
+  const sourceDirectorySnapshot = await snapshotDirectory(sourceDirectory);
+  const destinationDirectorySnapshot = await snapshotDirectory(destinationDirectory);
+  const handle = await openBoundRegularFile(source);
+  let linked = false;
+  let sourceRemoved = false;
+  try {
+    const initial = await assertFileBinding(source, handle, true);
+    if (!sameFileSnapshot(initial, expectedSnapshot)) {
+      throw new Error("The move source changed after the tool call was prepared.");
+    }
+    if (await snapshotTarget(destination) !== null) {
+      throw new Error("The move destination already exists.");
+    }
+    await assertDirectoryBinding(sourceDirectory, sourceDirectorySnapshot);
+    await assertDirectoryBinding(destinationDirectory, destinationDirectorySnapshot);
+    signal?.throwIfAborted();
+
+    const beforeCommit = await assertFileBinding(source, handle, true);
+    if (!sameFileSnapshot(beforeCommit, expectedSnapshot)) {
+      throw new Error("The move source changed before it could be moved.");
+    }
+    if (await snapshotTarget(destination) !== null) {
+      throw new Error("The move destination appeared before it could be moved.");
+    }
+
+    try {
+      await fs.link(source, destination);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EXDEV") {
+        throw new Error("The move source and destination must be on the same filesystem.");
+      }
+      if (isAlreadyExists(error)) throw new Error("The move destination appeared before it could be moved.");
+      throw error;
+    }
+    linked = true;
+
+    // The link is the no-replace commit point. Do not honor cancellation after
+    // it: finish the unlink or leave a verifiable duplicate for manual recovery.
+    const moved = await assertFileBinding(destination, handle);
+    if (!sameStableFileVersion(moved, expectedSnapshot)) {
+      throw new Error("The move destination does not contain the prepared source inode.");
+    }
+    const sourceBeforeUnlink = await assertFileBinding(source, handle);
+    if (!sameStableFileVersion(sourceBeforeUnlink, expectedSnapshot)) {
+      throw new Error("The move source changed during the move commit.");
+    }
+    await fs.unlink(source);
+    sourceRemoved = true;
+    linked = false;
+    await syncDirectory(sourceDirectory).catch(() => undefined);
+    if (destinationDirectory !== sourceDirectory) await syncDirectory(destinationDirectory).catch(() => undefined);
+  } catch (error) {
+    if (linked && !sourceRemoved) {
+      try {
+        await assertFileBinding(destination, handle);
+        if (await snapshotTarget(source) === null) sourceRemoved = true;
+        if (!sourceRemoved) await fs.unlink(destination);
+      } catch {
+        // Preserve an uncertain destination rather than deleting a replacement.
+      }
+    }
+    throw error;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+async function createMissingWorkspaceDirectories(
+  workspaceRoot: string,
+  targetDirectory: string,
+  signal?: AbortSignal
+): Promise<CreatedDirectory[]> {
+  const canonicalRoot = await fs.realpath(path.resolve(workspaceRoot));
+  const absoluteTarget = path.resolve(targetDirectory);
+  const relative = path.relative(canonicalRoot, absoluteTarget);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("The target parent directory escapes the workspace.");
+  }
+
+  const created: CreatedDirectory[] = [];
+  let current = canonicalRoot;
+  try {
+    await snapshotDirectory(current);
+    for (const segment of relative.split(path.sep).filter(Boolean)) {
+      signal?.throwIfAborted();
+      const parentIdentity = await snapshotDirectory(current);
+      const candidate = path.join(current, segment);
+      let madeDirectory = false;
+      try {
+        await fs.mkdir(candidate);
+        madeDirectory = true;
+      } catch (error) {
+        if (!isAlreadyExists(error)) throw error;
+      }
+      await assertDirectoryBinding(current, parentIdentity);
+      const identity = await snapshotDirectory(candidate);
+      if (madeDirectory) created.push({ path: candidate, identity });
+      current = candidate;
+    }
+    signal?.throwIfAborted();
+    return created;
+  } catch (error) {
+    await removeCreatedDirectories(created);
+    throw error;
+  }
+}
+
+async function removeCreatedDirectories(created: readonly CreatedDirectory[]): Promise<void> {
+  for (const directory of [...created].reverse()) {
+    try {
+      const current = await snapshotDirectory(directory.path);
+      if (sameIdentity(current, directory.identity)) await fs.rmdir(directory.path);
+    } catch {
+      // Never remove a replaced or non-empty directory during rollback.
     }
   }
 }

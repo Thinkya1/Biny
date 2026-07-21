@@ -13,12 +13,21 @@ export type ToolName =
   | "read_file"
   | "write_file"
   | "edit_file"
+  | "multi_edit"
+  | "delete_file"
+  | "apply_patch"
+  | "move_file"
   | "list_files"
   | "search_files"
   | "grep_search"
   | "git_status"
   | "git_diff"
   | "run_command"
+  | "start_process"
+  | "process_status"
+  | "read_process_output"
+  | "stop_process"
+  | "list_processes"
   | "web_search";
 
 export interface AnalyzePermissionInput {
@@ -60,26 +69,57 @@ export function analyzePermissionRequest(input: AnalyzePermissionInput): Permiss
     };
   }
 
-  if (input.toolName === "write_file" || input.toolName === "edit_file") {
+  if (input.toolName === "write_file" || input.toolName === "edit_file" || input.toolName === "multi_edit" || input.toolName === "apply_patch" || input.toolName === "move_file") {
+    const moveTarget = input.toolName === "move_file" ? normalizePermissionPath(getStringField(input.args, "from")) : targetPath;
     return {
       ...base(input),
       actionType: "write",
-      riskLevel: fileWriteRisk(targetPath),
-      targetPath,
-      reason: fileWriteReason(targetPath)
+      riskLevel: fileWriteRisk(moveTarget),
+      targetPath: moveTarget,
+      reason: fileWriteReason(moveTarget)
     };
   }
 
-  if (input.toolName === "run_command") {
+  if (input.toolName === "delete_file") {
+    return {
+      ...base(input),
+      actionType: "delete",
+      riskLevel: isSensitivePath(targetPath) ? "critical" : "high",
+      targetPath,
+      reason: isSensitivePath(targetPath) ? "deletes a sensitive file" : "deletes a workspace file"
+    };
+  }
+
+  if (input.toolName === "run_command" || input.toolName === "start_process") {
     return analyzeCommand(input, getStringField(input.args, "command"));
+  }
+
+  if (input.toolName === "process_status" || input.toolName === "read_process_output" || input.toolName === "list_processes") {
+    return {
+      ...base(input),
+      actionType: "read",
+      riskLevel: "low",
+      reason: "inspects runtime-owned managed processes"
+    };
+  }
+
+  if (input.toolName === "stop_process") {
+    return {
+      ...base(input),
+      actionType: "shell",
+      riskLevel: "medium",
+      reason: "stops a runtime-owned managed process group"
+    };
   }
 
   if (input.toolName === "delegate_task") {
     return {
       ...base(input),
-      actionType: "read",
-      riskLevel: "low",
-      reason: "delegates a bounded read-only repository investigation"
+      actionType: input.toolRisk === "execute" ? "shell" : "read",
+      riskLevel: input.toolRisk === "execute" ? "medium" : "low",
+      reason: input.toolRisk === "execute"
+        ? "delegates a bounded workspace task with write and finite validation capabilities"
+        : "delegates a bounded read-only repository investigation"
     };
   }
 

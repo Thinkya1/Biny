@@ -32,9 +32,91 @@ async function main(): Promise<void> {
   await testStalePermissionPreviewPreventsExecution();
   await testCanonicalPermissionPathCannotBypassDeny();
   await testModelFailureIsNotRetried();
+  await testStepLimitIsIncompleteAndDoesNotQueueSuccessfulMemory();
+  await testHarnessCanDeferSuccessfulMemoryUntilAcceptance();
   await testPreAbortedRunStopsBeforeRequest();
   await testPreAbortedPlanRecordsAttempt();
   await testConsumerReturnAbortsAndDrainsStream();
+}
+
+async function testStepLimitIsIncompleteAndDoesNotQueueSuccessfulMemory(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const maxSteps of [8, 32]) {
+      let requestCount = 0;
+      globalThis.fetch = (async (): Promise<Response> => {
+        requestCount += 1;
+        return sseResponse([
+          { choices: [{ index: 0, delta: { tool_calls: [{
+            index: 0,
+            id: `read-step-${String(requestCount)}`,
+            type: "function",
+            function: { name: "read_file", arguments: "{\"path\":\"README.md\"}" }
+          }] }, finish_reason: null }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+          "[DONE]"
+        ]);
+      }) as typeof fetch;
+
+      const registry = new ToolRegistry();
+      registry.register(readFileTool());
+      const { agent, cleanup } = await createAgent(registry, (config) => {
+        config.agent.maxSteps = maxSteps;
+      });
+      const memory = (agent as unknown as {
+        contextMemory: { queueSuccessfulTask(input: string, output: string): void };
+      }).contextMemory;
+      const originalQueueSuccessfulTask = memory.queueSuccessfulTask.bind(memory);
+      let successfulTaskCount = 0;
+      memory.queueSuccessfulTask = (input, output) => {
+        successfulTaskCount += 1;
+        originalQueueSuccessfulTask(input, output);
+      };
+      try {
+        const outcome = await agent.runTask(`continue through ${String(maxSteps)} tool steps`);
+        assert.equal(outcome.status, "incomplete");
+        assert.equal(outcome.stopReason, "step_limit");
+        assert.equal(outcome.finishReason, "tool-calls");
+        assert.equal(outcome.steps, maxSteps);
+        assert.equal(requestCount, maxSteps);
+        assert.equal(successfulTaskCount, 0);
+      } finally {
+        await cleanup(agent);
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testHarnessCanDeferSuccessfulMemoryUntilAcceptance(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (): Promise<Response> => sseResponse([
+    { choices: [{ index: 0, delta: { content: "model says done" }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    "[DONE]"
+  ])) as typeof fetch;
+
+  const { agent, cleanup } = await createAgent();
+  const memory = (agent as unknown as {
+    contextMemory: { queueSuccessfulTask(input: string, output: string): void };
+  }).contextMemory;
+  const originalQueueSuccessfulTask = memory.queueSuccessfulTask.bind(memory);
+  let successfulTaskCount = 0;
+  memory.queueSuccessfulTask = (input, output) => {
+    successfulTaskCount += 1;
+    originalQueueSuccessfulTask(input, output);
+  };
+  try {
+    const outcome = await agent.runTask("finish only after verification", { deferSuccessfulMemory: true });
+    assert.equal(outcome.status, "completed");
+    assert.equal(successfulTaskCount, 0, "a model stop is not yet a verified task success");
+    agent.rememberSuccessfulTask("finish only after verification", outcome.output);
+    assert.equal(successfulTaskCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanup(agent);
+  }
 }
 
 async function testCommandScopedGrantUsesExactArguments(): Promise<void> {

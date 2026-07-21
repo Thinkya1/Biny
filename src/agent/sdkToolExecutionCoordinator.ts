@@ -498,8 +498,8 @@ export class SdkToolExecutionCoordinator {
   }
 
   private resolvePermissionTarget(toolName: string, args: unknown, execution: RunnableToolExecution): string | undefined {
-    if (toolName !== "write_file" && toolName !== "edit_file") return undefined;
-    const requestedPath = readStringField(args, "path");
+    if (toolName !== "write_file" && toolName !== "edit_file" && toolName !== "multi_edit" && toolName !== "delete_file" && toolName !== "apply_patch" && toolName !== "move_file") return undefined;
+    const requestedPath = toolName === "move_file" ? readStringField(args, "from") : readStringField(args, "path");
     if (!requestedPath) return undefined;
     const resolvedPath = resolveWorkspacePath(this.context.workspaceRoot, requestedPath, this.context.config.workspace.ignore);
     const declaredPath = execution.accesses?.find((access) => access.kind === "file")?.path;

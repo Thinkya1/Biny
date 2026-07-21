@@ -1,10 +1,11 @@
 import type { AgentRunMode, AgentSessionInfo } from "../agent/AgentSession.js";
+import type { AgentTurnStopReason } from "../agent/types.js";
 import type { ContextStatus } from "../agent/context/types.js";
 import type { PermissionGrantScope, PermissionMode } from "../permission/PermissionManager.js";
 import type { SessionUsage } from "../session/metadata.js";
 import type { ToolInputDisplay, ToolUpdate } from "../tools/types.js";
 
-export type AgentRunStatus = "queued" | "thinking" | "running" | "waiting_permission" | "completed" | "aborted" | "failed";
+export type AgentRunStatus = "queued" | "thinking" | "running" | "waiting_permission" | "completed" | "incomplete" | "aborted" | "failed";
 export type RuntimeOperation = "resume" | "compact" | "switch_model" | "refresh_model" | "subagent";
 
 export interface AgentEventBase {
@@ -47,15 +48,17 @@ export type AgentHostEvent =
   | (AgentEventBase & { type: "command.started"; toolCallId: string; command: string; cwd?: string })
   | (AgentEventBase & { type: "command.output"; toolCallId: string; stream: "stdout" | "stderr" | "status"; content: string })
   | (AgentEventBase & { type: "command.completed"; toolCallId: string; command: string; cwd?: string; exitCode?: number; durationMs?: number })
+  | (AgentEventBase & { type: "command.failed"; toolCallId: string; command: string; cwd?: string; exitCode?: number; status?: string; error: string; durationMs?: number })
   | (AgentEventBase & { type: "file.read"; toolCallId: string; path: string; lineStart?: number; lineEnd?: number })
   | (AgentEventBase & { type: "file.changed"; toolCallId: string; path: string; operation: "write" | "edit"; summary?: string })
   | (AgentEventBase & { type: "diff.created"; toolCallId: string; diff: string; path?: string })
   | (AgentEventBase & { type: "context.updated"; context: ContextStatus })
   | (AgentEventBase & { type: "compact.started"; hint?: string })
   | (AgentEventBase & { type: "compact.completed"; summary: string; context: ContextStatus })
-  | (AgentEventBase & { type: "run.completed"; durationMs: number; usage?: SessionUsage })
-  | (AgentEventBase & { type: "run.aborted"; durationMs: number; reason: string })
-  | (AgentEventBase & { type: "run.failed"; durationMs: number; error: string });
+  | (AgentEventBase & { type: "run.completed"; durationMs: number; stopReason?: "model_stop"; finishReason?: string; steps?: number; usage?: SessionUsage })
+  | (AgentEventBase & { type: "run.incomplete"; durationMs: number; reason: string; stopReason: AgentTurnStopReason; finishReason?: string; steps: number; usage?: SessionUsage })
+  | (AgentEventBase & { type: "run.aborted"; durationMs: number; reason: string; stopReason?: AgentTurnStopReason; finishReason?: string; steps?: number })
+  | (AgentEventBase & { type: "run.failed"; durationMs: number; error: string; stopReason?: AgentTurnStopReason; finishReason?: string; steps?: number });
 
 export interface AgentPermissionEventRequest {
   toolCallId: string;

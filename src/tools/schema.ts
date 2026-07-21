@@ -43,6 +43,7 @@ export interface JsonArraySchema {
   type: "array";
   description?: string;
   items?: JsonSchema;
+  minItems?: number;
   maxItems?: number;
 }
 
@@ -130,6 +131,9 @@ function validateArray(schema: JsonArraySchema, value: unknown, path: string, er
   if (!Array.isArray(value)) {
     errors.push(`${path} must be an array`);
     return;
+  }
+  if (schema.minItems !== undefined && value.length < schema.minItems) {
+    errors.push(`${path} must contain at least ${String(schema.minItems)} item(s)`);
   }
   if (schema.maxItems !== undefined && value.length > schema.maxItems) {
     errors.push(`${path} must contain at most ${String(schema.maxItems)} item(s)`);

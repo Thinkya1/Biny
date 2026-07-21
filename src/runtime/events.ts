@@ -6,7 +6,7 @@
  */
 import type { ToolInputDisplay, ToolUpdate } from "../tools/types.js";
 
-export type RuntimeStatus = "idle" | "thinking" | "running" | "waiting_permission" | "completed" | "error";
+export type RuntimeStatus = "idle" | "thinking" | "running" | "waiting_permission" | "completed" | "incomplete" | "aborted" | "error";
 
 // RuntimeEvent 是 agent/runtime 到 TUI 的唯一事件协议；UI reducer 只消费这些事件更新状态。
 export type RuntimeEvent =
@@ -14,6 +14,8 @@ export type RuntimeEvent =
   | { type: "model.changed"; provider: string; modelLabel: string; reasoningLabel: string }
   | { type: "runtime.status"; status: RuntimeStatus }
   | { type: "session.completed"; sessionId: string }
+  | { type: "session.incomplete"; sessionId: string; message: string }
+  | { type: "session.aborted"; sessionId: string; message: string }
   | { type: "session.error"; sessionId?: string; message: string }
   | { type: "error.message"; message: string }
   | { type: "system.message"; content: string }

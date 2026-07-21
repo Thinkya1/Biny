@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
 import { ToolAccesses } from "../src/tools/access.js";
 import { ToolScheduler, ToolSchedulerQueueFullError } from "../src/tools/scheduler.js";
+import { createRunCommandTool } from "../src/tools/shell/runCommand.js";
 
 async function main(): Promise<void> {
   await testQueuedAbortNeverStartsTask();
@@ -10,12 +13,30 @@ async function main(): Promise<void> {
   await testQueueLimitAndStatusSnapshot();
   await testWaitingWriterIsNotStarvedByLaterReaders();
   await testSynchronousStartFailureReleasesCapacity();
+  testIndependentCommandDirectoriesDoNotConflict();
   assert.throws(() => new ToolScheduler(0), /positive integer/);
   assert.throws(() => new ToolScheduler(Number.NaN), /positive integer/);
   assert.throws(() => new ToolScheduler(1.5), /positive integer/);
   assert.throws(() => new ToolScheduler({ maxConcurrency: 1, maxQueuedTasks: 0 }), /positive integer/);
   assert.throws(() => new ToolScheduler({ maxConcurrency: 1, maxQueuedTasks: Number.POSITIVE_INFINITY }), /positive integer/);
   testSchedulerConfigDefaultsAndValidation();
+}
+
+function testIndependentCommandDirectoriesDoNotConflict(): void {
+  const workspaceRoot = mkdtempSync(path.join(os.tmpdir(), "biny-command-access-"));
+  try {
+    mkdirSync(path.join(workspaceRoot, "backend"));
+    mkdirSync(path.join(workspaceRoot, "frontend"));
+    const tool = createRunCommandTool({ workspaceRoot, ignore: [] });
+    const backend = tool.resolveExecution({ command: "mvn test", cwd: "backend" });
+    const frontend = tool.resolveExecution({ command: "npm run build", cwd: "frontend" });
+    if (backend instanceof Promise || frontend instanceof Promise || "isError" in backend || "isError" in frontend) {
+      throw new Error("run_command unexpectedly failed to resolve.");
+    }
+    assert.equal(ToolAccesses.conflict(backend.accesses ?? ToolAccesses.all(), frontend.accesses ?? ToolAccesses.all()), false);
+  } finally {
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  }
 }
 
 async function testQueuedAbortNeverStartsTask(): Promise<void> {
@@ -180,6 +201,10 @@ function testSchedulerConfigDefaultsAndValidation(): void {
   const parsed = configSchema.parse(input);
   assert.deepEqual(parsed.agent, {
     maxSteps: 8,
+    maxAttempts: 3,
+    maxTaskSteps: 96,
+    maxWallTimeMs: 30 * 60_000,
+    maxTotalTokens: 500_000,
     maxConcurrentTools: 4,
     maxQueuedToolCalls: 64
   });
@@ -193,6 +218,10 @@ function testSchedulerConfigDefaultsAndValidation(): void {
   ]) {
     assert.throws(() => configSchema.parse({ ...defaultConfig, agent }));
   }
+  assert.throws(
+    () => configSchema.parse({ ...defaultConfig, agent: { ...defaultConfig.agent, maxCostUsd: 1 } }),
+    /cost budgets require.*pricing/iu
+  );
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve(value: T | PromiseLike<T>): void } {

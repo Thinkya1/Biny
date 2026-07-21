@@ -8,10 +8,10 @@ import { z } from "zod";
 import { resolveWorkspacePath } from "../../workspace/resolvePath.js";
 import { ToolAccesses } from "../access.js";
 import type { Tool, ToolContext } from "../types.js";
-import { atomicWriteUtf8File } from "./safeFileIo.js";
+import { atomicWriteWorkspaceUtf8File } from "./safeFileIo.js";
 
 export interface WriteFileArgs {
-  // path 可以创建新文件，但父目录必须已存在并通过 workspace canonical 校验。
+  // path 可以创建新文件及其缺失父目录，所有目录仍需通过 workspace canonical 校验。
   path: string;
   content: string;
 }
@@ -25,7 +25,7 @@ export function createWriteFileTool(context: ToolContext): Tool<WriteFileArgs, W
   // write_file 的权限确认在 agent loop 完成；这里保持纯粹的文件写入实现。
   return {
     name: "write_file",
-    description: "Atomically write a file inside an existing workspace directory.",
+    description: "Atomically write a UTF-8 file in the workspace, safely creating missing parent directories.",
     parameters: {
       type: "object",
       properties: {
@@ -52,7 +52,8 @@ export function createWriteFileTool(context: ToolContext): Tool<WriteFileArgs, W
           if (approvedFile && approvedFile.path !== absolutePath) {
             throw new Error("The approved write target does not match the prepared tool target.");
           }
-          const bytes = await atomicWriteUtf8File(
+          const bytes = await atomicWriteWorkspaceUtf8File(
+            context.workspaceRoot,
             absolutePath,
             args.content,
             approvedFile ? approvedFile.snapshot : undefined,
