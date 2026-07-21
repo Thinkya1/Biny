@@ -4,6 +4,7 @@ import {
   dialog,
   ipcMain,
   Menu,
+  nativeTheme,
   shell,
   type MenuItemConstructorOptions,
   type MessageBoxOptions,
@@ -11,7 +12,7 @@ import {
   type SaveDialogOptions
 } from "electron";
 import { z } from "zod";
-import type { DesktopBootstrap, DesktopSessionMenuAction } from "../../protocol.js";
+import type { DesktopBootstrap, DesktopSessionMenuAction, DesktopThemePreference } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
 import { DesktopAgentManager } from "./DesktopAgentManager.js";
 import { DesktopProjectService } from "./DesktopProjectService.js";
@@ -106,6 +107,12 @@ export function registerDesktopIpc(context: IpcContext): void {
 
   handle(desktopIpc.setProjectPinned, async (_event, projectId: unknown, pinned: unknown) => {
     return await context.agents.setProjectPinned(idSchema.parse(projectId), z.boolean().parse(pinned));
+  });
+
+  handle(desktopIpc.reorderProjects, async (_event, projectIds: unknown) => {
+    const ids = z.array(idSchema).parse(projectIds);
+    await context.state.reorderProjects(ids);
+    return context.state.projects();
   });
 
   handle(desktopIpc.renameProject, async (_event, projectId: unknown, name: unknown) => {
@@ -293,6 +300,26 @@ export function registerDesktopIpc(context: IpcContext): void {
   handle(desktopIpc.setFilePanelWidth, async (_event, width: unknown) => {
     await context.state.setFilePanelWidth(z.number().finite().parse(width));
   });
+
+  handle(desktopIpc.setThemePreference, async (_event, theme: unknown) => {
+    const preference = z.enum(["system", "light", "dark"]).parse(theme);
+    await context.state.setThemePreference(preference);
+    applyNativeThemePreference(preference);
+    const window = context.getWindow();
+    if (window && !window.isDestroyed()) {
+      window.setBackgroundColor(themeBackgroundColor(preference));
+    }
+    return preference;
+  });
+}
+
+function applyNativeThemePreference(preference: DesktopThemePreference): void {
+  nativeTheme.themeSource = preference;
+}
+
+function themeBackgroundColor(preference: DesktopThemePreference): string {
+  const dark = preference === "dark" || (preference === "system" && nativeTheme.shouldUseDarkColors);
+  return dark ? "#181818" : "#ffffff";
 }
 
 function handle(channel: string, listener: Parameters<typeof ipcMain.handle>[1]): void {

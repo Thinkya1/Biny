@@ -1,18 +1,22 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { BrowserWindow, nativeTheme, screen } from "electron";
+import type { DesktopThemePreference } from "../../protocol.js";
 import { DesktopStateStore } from "./DesktopStateStore.js";
 
 export type WindowCloseDecision = "hide" | "close" | "cancel";
 
-function themeBackgroundColor(): string {
-  return nativeTheme.shouldUseDarkColors ? "#181818" : "#ffffff";
+function themeBackgroundColor(preference: DesktopThemePreference = "system"): string {
+  const dark = preference === "dark" || (preference === "system" && nativeTheme.shouldUseDarkColors);
+  return dark ? "#181818" : "#ffffff";
 }
 
 export function createDesktopWindow(
   state: DesktopStateStore,
   decideClose: () => Promise<WindowCloseDecision>
 ): BrowserWindow {
+  const preference = state.themePreference();
+  nativeTheme.themeSource = preference;
   const savedBounds = visibleBounds(state.windowBounds());
   const window = new BrowserWindow({
     width: savedBounds?.width ?? 1480,
@@ -22,7 +26,7 @@ export function createDesktopWindow(
     minWidth: 960,
     minHeight: 650,
     show: false,
-    backgroundColor: themeBackgroundColor(),
+    backgroundColor: themeBackgroundColor(preference),
     title: "Biny",
     titleBarStyle: "hidden",
     titleBarOverlay: process.platform === "darwin" ? true : undefined,
@@ -37,7 +41,7 @@ export function createDesktopWindow(
   });
 
   const syncBackgroundColor = (): void => {
-    if (!window.isDestroyed()) window.setBackgroundColor(themeBackgroundColor());
+    if (!window.isDestroyed()) window.setBackgroundColor(themeBackgroundColor(state.themePreference()));
   };
   nativeTheme.on("updated", syncBackgroundColor);
   window.on("closed", () => {

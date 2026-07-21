@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { clampStoredFilePanelWidth, DEFAULT_FILE_PANEL_WIDTH } from "../../filePanelSizing.js";
-import type { DesktopProject } from "../../protocol.js";
+import type { DesktopProject, DesktopThemePreference } from "../../protocol.js";
 
 interface DesktopSessionMetadata {
   title?: string;
@@ -23,6 +23,7 @@ interface PersistedDesktopState {
   sessionMetadata: Record<string, DesktopSessionMetadata>;
   sidebarWidth: number;
   filePanelWidth: number;
+  themePreference: DesktopThemePreference;
   windowBounds?: DesktopWindowBounds;
 }
 
@@ -34,6 +35,7 @@ const defaultState: PersistedDesktopState = {
   sessionMetadata: {},
   sidebarWidth: 216,
   filePanelWidth: DEFAULT_FILE_PANEL_WIDTH,
+  themePreference: "system",
   windowBounds: undefined
 };
 
@@ -54,6 +56,7 @@ export class DesktopStateStore {
         sessionMetadata: isRecord(raw.sessionMetadata) ? metadataRecord(raw.sessionMetadata) : {},
         sidebarWidth: typeof raw.sidebarWidth === "number" ? clampSidebarWidth(raw.sidebarWidth) : 216,
         filePanelWidth: typeof raw.filePanelWidth === "number" ? clampStoredFilePanelWidth(raw.filePanelWidth) : DEFAULT_FILE_PANEL_WIDTH,
+        themePreference: validThemePreference(raw.themePreference) ? raw.themePreference : "system",
         windowBounds: validWindowBounds(raw.windowBounds) ? raw.windowBounds : undefined
       };
     } catch (error) {
@@ -104,6 +107,23 @@ export class DesktopStateStore {
     const project = this.state.projects.find((candidate) => candidate.id === projectId);
     if (!project) throw new Error(`Unknown project: ${projectId}`);
     project.pinned = pinned;
+    await this.save();
+  }
+
+  async reorderProjects(projectIds: string[]): Promise<void> {
+    const byId = new Map(this.state.projects.map((project) => [project.id, project]));
+    const seen = new Set<string>();
+    const ordered: DesktopProject[] = [];
+    for (const projectId of projectIds) {
+      const project = byId.get(projectId);
+      if (!project || seen.has(projectId)) continue;
+      ordered.push(project);
+      seen.add(projectId);
+    }
+    for (const project of this.state.projects) {
+      if (!seen.has(project.id)) ordered.push(project);
+    }
+    this.state.projects = ordered;
     await this.save();
   }
 
@@ -173,6 +193,15 @@ export class DesktopStateStore {
     await this.save();
   }
 
+  themePreference(): DesktopThemePreference {
+    return this.state.themePreference;
+  }
+
+  async setThemePreference(theme: DesktopThemePreference): Promise<void> {
+    this.state.themePreference = theme;
+    await this.save();
+  }
+
   windowBounds(): DesktopWindowBounds | undefined {
     return this.state.windowBounds ? { ...this.state.windowBounds } : undefined;
   }
@@ -200,6 +229,10 @@ function metadataKey(projectId: string, sessionId: string): string {
 
 function clampSidebarWidth(width: number): number {
   return Math.min(320, Math.max(190, Math.round(width)));
+}
+
+function validThemePreference(value: unknown): value is DesktopThemePreference {
+  return value === "system" || value === "light" || value === "dark";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

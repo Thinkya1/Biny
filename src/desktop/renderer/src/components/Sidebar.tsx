@@ -20,6 +20,7 @@ interface SidebarProps {
   onSelectProject(projectId: string): void;
   onSelectSession(sessionId: string): void;
   onProjectPinned(projectId: string, pinned: boolean): void;
+  onReorderProjects(projectIds: string[]): void;
   onRevealProject(projectId: string): void;
   onRenameProject(projectId: string): void;
   onNewTask(projectId: string): void;
@@ -28,6 +29,15 @@ interface SidebarProps {
   onSettings(): void;
   onUnavailable(feature: string): void;
 }
+
+type ProjectDragPlacement = "before" | "after";
+
+type ProjectDragState = {
+  sourceId: string;
+  targetId?: string;
+  placement?: ProjectDragPlacement;
+  section: "pinned" | "projects";
+};
 
 type SidebarSectionName = "pinned" | "projects";
 type ProjectGrouping = "by-project" | "list";
@@ -50,6 +60,7 @@ export const Sidebar = memo(function Sidebar({
   onSelectProject,
   onSelectSession,
   onProjectPinned,
+  onReorderProjects,
   onRevealProject,
   onRenameProject,
   onNewTask,
@@ -65,6 +76,8 @@ export const Sidebar = memo(function Sidebar({
   const [projectGrouping, setProjectGrouping] = useState<ProjectGrouping>("by-project");
   const [projectSort, setProjectSort] = useState<ProjectSort>("priority");
   const [collapsedProjectIds, setCollapsedProjectIds] = useState(() => new Set<string>());
+  const [dragState, setDragState] = useState<ProjectDragState | undefined>();
+  const dragStateRef = useRef<ProjectDragState | undefined>(undefined);
   const projectOrganizationButtonRef = useRef<HTMLButtonElement>(null);
   const projectCreateButtonRef = useRef<HTMLButtonElement>(null);
 
@@ -102,6 +115,60 @@ export const Sidebar = memo(function Sidebar({
   const orderedProjects = sortProjects(projects, projectSort);
   const pinnedProjects = orderedProjects.filter((project) => project.pinned);
   const unpinnedProjects = orderedProjects.filter((project) => !project.pinned);
+
+  const setProjectDragState = (next: ProjectDragState | undefined): void => {
+    dragStateRef.current = next;
+    setDragState(next);
+  };
+
+  const beginProjectDrag = (projectId: string, section: "pinned" | "projects"): void => {
+    setProjectMenuOpen(undefined);
+    setProjectOrganizationMenuOpen(false);
+    setProjectCreateMenuOpen(false);
+    setProjectDragState({ sourceId: projectId, section });
+  };
+
+  const updateProjectDragTarget = (projectId: string, section: "pinned" | "projects", clientY: number, bounds: DOMRect): void => {
+    const current = dragStateRef.current;
+    if (!current || current.section !== section || current.sourceId === projectId) return;
+    const placement: ProjectDragPlacement = clientY < bounds.top + bounds.height / 2 ? "before" : "after";
+    if (current.targetId === projectId && current.placement === placement) return;
+    setProjectDragState({ ...current, targetId: projectId, placement });
+  };
+
+  const dropProjectDrag = (targetId: string, clientY: number, bounds: DOMRect): void => {
+    const current = dragStateRef.current;
+    setProjectDragState(undefined);
+    if (!current || current.sourceId === targetId) return;
+    const placement: ProjectDragPlacement = clientY < bounds.top + bounds.height / 2 ? "before" : "after";
+    const sectionProjects = current.section === "pinned" ? pinnedProjects : unpinnedProjects;
+    const sectionIds = sectionProjects.map((project) => project.id);
+    if (!sectionIds.includes(current.sourceId) || !sectionIds.includes(targetId)) return;
+    const nextIds = reorderSectionProjectIds(
+      orderedProjects.map((project) => project.id),
+      sectionIds,
+      current.sourceId,
+      targetId,
+      placement
+    );
+    if (nextIds.join("\0") === orderedProjects.map((project) => project.id).join("\0")) return;
+    setProjectSort("manual");
+    onReorderProjects(nextIds);
+  };
+
+  const endProjectDrag = (): void => {
+    // Commit only on drop; dragend without drop cancels quietly.
+    setProjectDragState(undefined);
+  };
+
+  const cancelProjectDrag = (): void => {
+    setProjectDragState(undefined);
+  };
+
+  const projectDropClass = (projectId: string, section: "pinned" | "projects"): string => {
+    if (!dragState || dragState.section !== section || dragState.targetId !== projectId || !dragState.placement) return "";
+    return dragState.placement === "before" ? " is-drop-before" : " is-drop-after";
+  };
 
   const toggleSection = (section: SidebarSectionName): void => {
     setExpandedSections((current) => ({ ...current, [section]: !current[section] }));
@@ -161,9 +228,27 @@ export const Sidebar = memo(function Sidebar({
               onToggle={() => toggleSection("pinned")}
             >
               {pinnedProjects.map((project) => (
-                <div className="project-group" key={`pinned-${project.id}`}>
+                <div
+                  className={`project-group${dragState?.sourceId === project.id ? " is-dragging" : ""}${projectDropClass(project.id, "pinned")}`}
+                  key={`pinned-${project.id}`}
+                  onDragOver={(event) => {
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = "move";
+                    const bounds = event.currentTarget.getBoundingClientRect();
+                    updateProjectDragTarget(project.id, "pinned", event.clientY, bounds);
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    dropProjectDrag(project.id, event.clientY, event.currentTarget.getBoundingClientRect());
+                  }}
+                >
                   <ProjectRow
+                    dragActive={Boolean(dragState)}
                     menuOpen={projectMenuOpen === `pinned-${project.id}`}
+                    onDragCancel={cancelProjectDrag}
+                    onDragEnd={endProjectDrag}
+                    onDragStart={() => beginProjectDrag(project.id, "pinned")}
                     onMenu={() => openProjectMenu(`pinned-${project.id}`)}
                     onPin={() => { setProjectMenuOpen(undefined); onProjectPinned(project.id, !project.pinned); }}
                     onReveal={() => { setProjectMenuOpen(undefined); onRevealProject(project.id); }}
@@ -174,7 +259,7 @@ export const Sidebar = memo(function Sidebar({
                     onSelect={selectOrToggleProject}
                     project={project}
                     running={project.id === activeProjectId && hasRunningSession(sessions)}
-                    selected={project.id === activeProjectId}
+                    selected={project.id === activeProjectId && !selectedSessionId}
                     sessionsExpanded={project.id === activeProjectId && !collapsedProjectIds.has(project.id)}
                   />
                   {project.id === activeProjectId ? <ProjectSessions expanded={!collapsedProjectIds.has(project.id)} onSelectSession={onSelectSession} selectedSessionId={selectedSessionId} sessions={sessions} /> : null}
@@ -204,9 +289,27 @@ export const Sidebar = memo(function Sidebar({
           >
             {unpinnedProjects.map((project) => {
               return (
-                <div className="project-group" key={project.id}>
+                <div
+                  className={`project-group${dragState?.sourceId === project.id ? " is-dragging" : ""}${projectDropClass(project.id, "projects")}`}
+                  key={project.id}
+                  onDragOver={(event) => {
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = "move";
+                    const bounds = event.currentTarget.getBoundingClientRect();
+                    updateProjectDragTarget(project.id, "projects", event.clientY, bounds);
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    dropProjectDrag(project.id, event.clientY, event.currentTarget.getBoundingClientRect());
+                  }}
+                >
                   <ProjectRow
+                    dragActive={Boolean(dragState)}
                     menuOpen={projectMenuOpen === `project-${project.id}`}
+                    onDragCancel={cancelProjectDrag}
+                    onDragEnd={endProjectDrag}
+                    onDragStart={() => beginProjectDrag(project.id, "projects")}
                     onMenu={() => openProjectMenu(`project-${project.id}`)}
                     onPin={() => { setProjectMenuOpen(undefined); onProjectPinned(project.id, !project.pinned); }}
                     onReveal={() => { setProjectMenuOpen(undefined); onRevealProject(project.id); }}
@@ -217,7 +320,7 @@ export const Sidebar = memo(function Sidebar({
                     onSelect={selectOrToggleProject}
                     project={project}
                     running={project.id === activeProjectId && hasRunningSession(sessions)}
-                    selected={project.id === activeProjectId}
+                    selected={project.id === activeProjectId && !selectedSessionId}
                     sessionsExpanded={project.id === activeProjectId && !collapsedProjectIds.has(project.id)}
                   />
                   {project.id === activeProjectId ? <ProjectSessions expanded={!collapsedProjectIds.has(project.id)} onSelectSession={onSelectSession} selectedSessionId={selectedSessionId} sessions={sessions} /> : null}
@@ -274,6 +377,7 @@ const ProjectRow = memo(function ProjectRow({
   selected,
   sessionsExpanded,
   running,
+  dragActive,
   onSelect,
   menuOpen,
   onMenu,
@@ -282,12 +386,16 @@ const ProjectRow = memo(function ProjectRow({
   onPin,
   onReveal,
   onArchive,
-  onRemove
+  onRemove,
+  onDragStart,
+  onDragEnd,
+  onDragCancel
 }: {
   project: DesktopProject;
   selected: boolean;
   sessionsExpanded: boolean;
   running: boolean;
+  dragActive: boolean;
   onSelect(projectId: string): void;
   menuOpen: boolean;
   onMenu(): void;
@@ -297,22 +405,61 @@ const ProjectRow = memo(function ProjectRow({
   onReveal(): void;
   onArchive(): void;
   onRemove(): void;
+  onDragStart(): void;
+  onDragEnd(): void;
+  onDragCancel(): void;
 }): React.JSX.Element {
   const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const suppressClickRef = useRef(false);
 
   return (
-    <div className={`project-row-wrap${selected ? " is-active" : ""}`}>
-      <button
+    <div
+      className={`project-row-wrap${selected ? " is-active" : ""}${dragActive ? " is-drag-active" : ""}`}
+      draggable
+      onDragEnd={(event) => {
+        event.preventDefault();
+        // Suppress the trailing click that browsers emit after a drag gesture.
+        suppressClickRef.current = true;
+        window.setTimeout(() => {
+          suppressClickRef.current = false;
+        }, 0);
+        onDragEnd();
+      }}
+      onDragStart={(event) => {
+        if (event.target instanceof Element && event.target.closest(".project-row-actions, button, a, input, textarea")) {
+          event.preventDefault();
+          return;
+        }
+        suppressClickRef.current = true;
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", project.id);
+        onDragStart();
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && dragActive) onDragCancel();
+      }}
+    >
+      <div
         aria-expanded={sessionsExpanded}
         className={`project-row${selected ? " is-active" : ""}`}
-        onClick={() => onSelect(project.id)}
+        onClick={() => {
+          if (suppressClickRef.current) return;
+          onSelect(project.id);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onSelect(project.id);
+          }
+        }}
+        role="button"
+        tabIndex={0}
         title={project.path}
-        type="button"
       >
         <Icon name="folder" size={15} />
         <span className="row-label">{project.name}</span>
         {project.missing ? <span className="status-dot is-failed" title="路径不可用" /> : running ? <span className="status-dot is-running" title="正在运行" /> : null}
-      </button>
+      </div>
       <div className={`project-row-actions${menuOpen ? " is-open" : ""}`}>
         <button ref={menuButtonRef} aria-label={`${project.name} 项目操作`} className="project-row-action" onClick={onMenu} type="button"><Icon name="more" size={14} /></button>
         <button aria-label={`新建任务 ${project.name}`} className="project-row-action" onClick={onNewTask} title="新建任务" type="button"><Icon name="edit" size={14} /></button>
@@ -357,10 +504,31 @@ function MenuCheck({ checked }: { checked: boolean }): React.JSX.Element {
 function sortProjects(projects: DesktopProject[], sort: ProjectSort): DesktopProject[] {
   const ordered = [...projects];
   if (sort === "manual") return ordered;
-  return ordered.sort((left, right) => {
-    if (sort === "priority" && left.pinned !== right.pinned) return left.pinned ? -1 : 1;
-    return right.lastOpenedAt.localeCompare(left.lastOpenedAt) || left.name.localeCompare(right.name);
-  });
+  if (sort === "priority") {
+    // Pinned first; keep existing relative order within each group so selecting a project never reorders the list.
+    return ordered.sort((left, right) => {
+      if (left.pinned === right.pinned) return 0;
+      return left.pinned ? -1 : 1;
+    });
+  }
+  return ordered.sort((left, right) => right.lastOpenedAt.localeCompare(left.lastOpenedAt) || left.name.localeCompare(right.name));
+}
+
+function reorderSectionProjectIds(
+  fullIds: string[],
+  sectionIds: string[],
+  sourceId: string,
+  targetId: string,
+  placement: ProjectDragPlacement
+): string[] {
+  const nextSection = sectionIds.filter((projectId) => projectId !== sourceId);
+  const targetIndex = nextSection.indexOf(targetId);
+  if (targetIndex < 0) return fullIds;
+  nextSection.splice(placement === "after" ? targetIndex + 1 : targetIndex, 0, sourceId);
+
+  const sectionMembers = new Set(sectionIds);
+  let sectionIndex = 0;
+  return fullIds.map((projectId) => sectionMembers.has(projectId) ? nextSection[sectionIndex++]! : projectId);
 }
 
 function ProjectCreationMenu({ anchorRef, onCreateEmptyProject, onOpenProject }: { anchorRef: FloatingMenuAnchor; onCreateEmptyProject(): void; onOpenProject(): void }): React.JSX.Element {

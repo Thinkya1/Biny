@@ -3,7 +3,7 @@ import type { AgentPermissionEventRequest, AgentRunModel, AgentHostEvent } from 
 import type { SessionEvent } from "../../../session/recorder.js";
 import type { SessionUsage } from "../../../session/metadata.js";
 
-export type TimelineRunStatus = "idle" | "queued" | "running" | "waiting_permission" | "completed" | "aborted" | "failed";
+export type TimelineRunStatus = "idle" | "queued" | "running" | "waiting_permission" | "completed" | "incomplete" | "aborted" | "failed";
 export type TimelineToolStatus = "waiting" | "running" | "success" | "failed" | "denied" | "aborted";
 
 export interface TimelinePermission {
@@ -321,6 +321,13 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
         tool.status = "failed";
         tool.error ??= `Command exited with code ${String(event.exitCode)}.`;
       }
+    } else if (event.type === "command.failed") {
+      const tool = toolFor(event, "run_command");
+      tool.command ??= { command: event.command, cwd: event.cwd, stdout: "", stderr: "" };
+      tool.command.exitCode = event.exitCode;
+      tool.status = "failed";
+      tool.error = event.error;
+      tool.durationMs = event.durationMs;
     } else if (event.type === "file.read" || event.type === "file.changed") {
       const tool = toolFor(event, event.type === "file.read" ? "read_file" : event.operation === "write" ? "write_file" : "edit_file");
       tool.path = event.path;
@@ -336,6 +343,17 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       turn.reasoningDurationMs = addReasoningDuration(turn.reasoningDurationMs, turn.reasoningStartedAt, event.timestamp);
       turn.reasoningStartedAt = undefined;
       turn.usage = event.usage;
+    } else if (event.type === "run.incomplete") {
+      turn.status = "incomplete";
+      turn.timestamp = event.timestamp;
+      turn.error = event.reason;
+      turn.durationMs = event.durationMs;
+      turn.reasoningDurationMs = addReasoningDuration(turn.reasoningDurationMs, turn.reasoningStartedAt, event.timestamp);
+      turn.reasoningStartedAt = undefined;
+      turn.usage = event.usage;
+      for (const tool of turn.tools) {
+        if (tool.status === "running" || tool.status === "waiting") tool.status = "aborted";
+      }
     } else if (event.type === "run.aborted") {
       turn.status = "aborted";
       turn.timestamp = event.timestamp;
@@ -415,7 +433,12 @@ function permissionFallback(toolCallId: string, tool: string): AgentPermissionEv
 function resultFailed(result: unknown): boolean {
   if (typeof result !== "object" || result === null) return false;
   const record = result as Record<string, unknown>;
-  return typeof record.error === "string" || (typeof record.exitCode === "number" && record.exitCode !== 0) || record.status === "failed" || record.status === "denied";
+  return typeof record.error === "string"
+    || (typeof record.exitCode === "number" && record.exitCode !== 0)
+    || record.status === "failed"
+    || record.status === "timed_out"
+    || record.status === "aborted"
+    || record.status === "denied";
 }
 
 function resultError(result: unknown): string | undefined {

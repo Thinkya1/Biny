@@ -54,9 +54,12 @@ await testDesktopGitInspectionDisablesHelpers();
 testWorkspaceSyntaxHighlighting();
 testWorkspaceFileMarkers();
 await testFilePanelSizing();
+await testDesktopThemePreference();
 await testDesktopModelConfiguration();
 await testDesktopCredentialsAreSeparated();
 await testDesktopRequiresModelConfiguration();
+await testWorkspaceSnapshotDoesNotReorderProjects();
+await testDesktopProjectReorder();
 await testLegacyDesktopDataMigration();
 testModelChoicesDeduplicateEquivalentAliases();
 testHistoricalAbortProjection();
@@ -412,6 +415,24 @@ async function testFilePanelSizing(): Promise<void> {
   }
 }
 
+async function testDesktopThemePreference(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-theme-"));
+  try {
+    const statePath = path.join(workspaceRoot, "desktop-state.json");
+    const state = new DesktopStateStore(statePath);
+    await state.load();
+    assert.equal(state.themePreference(), "system");
+    await state.setThemePreference("dark");
+    const restored = new DesktopStateStore(statePath);
+    await restored.load();
+    assert.equal(restored.themePreference(), "dark");
+    await restored.setThemePreference("light");
+    assert.equal(restored.themePreference(), "light");
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function testDesktopModelConfiguration(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-model-config-"));
   const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-data-"));
@@ -523,6 +544,86 @@ async function testDesktopRequiresModelConfiguration(): Promise<void> {
     await rm(workspaceRoot, { recursive: true, force: true });
     await rm(desktopRoot, { recursive: true, force: true });
   }
+}
+
+async function testWorkspaceSnapshotDoesNotReorderProjects(): Promise<void> {
+  const firstRoot = await mkdtemp(path.join(os.tmpdir(), "biny-order-a-"));
+  const secondRoot = await mkdtemp(path.join(os.tmpdir(), "biny-order-b-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-order-data-"));
+  try {
+    const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
+    const first = await projects.createProject(firstRoot);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = await projects.createProject(secondRoot);
+    const firstOpenedAt = state.project(first.id)?.lastOpenedAt;
+    const secondOpenedAt = state.project(second.id)?.lastOpenedAt;
+    assert.ok(firstOpenedAt);
+    assert.ok(secondOpenedAt);
+    assert.notEqual(firstOpenedAt, secondOpenedAt);
+
+    const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
+    await agents.workspaceSnapshot(first.id);
+
+    assert.equal(state.project(first.id)?.lastOpenedAt, firstOpenedAt);
+    assert.equal(state.project(second.id)?.lastOpenedAt, secondOpenedAt);
+    assert.deepEqual(state.projects().map((project) => project.id), [first.id, second.id]);
+  } finally {
+    await rm(firstRoot, { recursive: true, force: true });
+    await rm(secondRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
+  }
+}
+
+async function testDesktopProjectReorder(): Promise<void> {
+  const firstRoot = await mkdtemp(path.join(os.tmpdir(), "biny-reorder-a-"));
+  const secondRoot = await mkdtemp(path.join(os.tmpdir(), "biny-reorder-b-"));
+  const thirdRoot = await mkdtemp(path.join(os.tmpdir(), "biny-reorder-c-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-reorder-data-"));
+  try {
+    const { projects, state } = await createDesktopTestServices(desktopRoot);
+    const first = await projects.createProject(firstRoot);
+    const second = await projects.createProject(secondRoot);
+    const third = await projects.createProject(thirdRoot);
+    assert.deepEqual(state.projects().map((project) => project.id), [first.id, second.id, third.id]);
+
+    await state.reorderProjects([third.id, first.id, second.id]);
+    assert.deepEqual(state.projects().map((project) => project.id), [third.id, first.id, second.id]);
+
+    await state.reorderProjects([second.id, "missing-project", first.id]);
+    assert.deepEqual(state.projects().map((project) => project.id), [second.id, first.id, third.id]);
+
+    // Drag-down semantics: insert after target so moving first→second actually changes order.
+    assert.deepEqual(
+      reorderSectionProjectIdsForTest([first.id, second.id, third.id], [first.id, second.id, third.id], first.id, second.id, "after"),
+      [second.id, first.id, third.id]
+    );
+    // Drag-up semantics: insert before target.
+    assert.deepEqual(
+      reorderSectionProjectIdsForTest([first.id, second.id, third.id], [first.id, second.id, third.id], third.id, first.id, "before"),
+      [third.id, first.id, second.id]
+    );
+  } finally {
+    await rm(firstRoot, { recursive: true, force: true });
+    await rm(secondRoot, { recursive: true, force: true });
+    await rm(thirdRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
+  }
+}
+
+function reorderSectionProjectIdsForTest(
+  fullIds: string[],
+  sectionIds: string[],
+  sourceId: string,
+  targetId: string,
+  placement: "before" | "after"
+): string[] {
+  const nextSection = sectionIds.filter((projectId) => projectId !== sourceId);
+  const targetIndex = nextSection.indexOf(targetId);
+  if (targetIndex < 0) return fullIds;
+  nextSection.splice(placement === "after" ? targetIndex + 1 : targetIndex, 0, sourceId);
+  const sectionMembers = new Set(sectionIds);
+  let sectionIndex = 0;
+  return fullIds.map((projectId) => sectionMembers.has(projectId) ? nextSection[sectionIndex++]! : projectId);
 }
 
 async function testLegacyDesktopDataMigration(): Promise<void> {
@@ -738,6 +839,16 @@ function testLiveTimelineProjection(): void {
     { ...base, runId: "failed-command", type: "command.completed", toolCallId: "command", command: "false", exitCode: 1, durationMs: 8 }
   ]);
   assert.equal(failedCommand[0]?.tools[0]?.status, "failed");
+
+  const typedFailure = buildSessionTimeline([], [
+    { ...base, runId: "typed-failure", type: "message.user", messageId: "typed-message", content: "run" },
+    { ...base, runId: "typed-failure", type: "tool.started", toolCallId: "typed-command", tool: "run_command", args: { command: "false" } },
+    { ...base, runId: "typed-failure", type: "command.failed", toolCallId: "typed-command", command: "false", status: "failed", exitCode: 1, error: "Command exited with code 1.", durationMs: 8 },
+    { ...base, runId: "typed-failure", type: "run.incomplete", durationMs: 30, reason: "Step limit reached.", stopReason: "step_limit", finishReason: "tool-calls", steps: 8 }
+  ]);
+  assert.equal(typedFailure[0]?.tools[0]?.status, "failed");
+  assert.equal(typedFailure[0]?.status, "incomplete");
+  assert.equal(typedFailure[0]?.error, "Step limit reached.");
 }
 
 function testLiveReasoningAndSkillProjection(): void {

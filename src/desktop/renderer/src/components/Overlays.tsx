@@ -2,7 +2,7 @@ import { useDeferredValue, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { ModelChoice, ThinkingSelection } from "../../../../llm/ModelManager.js";
 import type { PermissionMode } from "../../../../permission/PermissionManager.js";
-import type { DesktopModelConfigurationInput, DesktopModelConnectionTestResult, DesktopModelLoginProvider, DesktopModelLoginStartResult, DesktopProject, DesktopSessionSummary, DesktopWorkspaceSnapshot } from "../../../protocol.js";
+import type { DesktopModelConfigurationInput, DesktopModelConnectionTestResult, DesktopModelLoginProvider, DesktopModelLoginStartResult, DesktopProject, DesktopSessionSummary, DesktopThemePreference, DesktopWorkspaceSnapshot } from "../../../protocol.js";
 import { useClosingPresence } from "../useClosingPresence.js";
 import { AppIcon } from "./AppIcon.js";
 import { Icon } from "./Icon.js";
@@ -52,6 +52,8 @@ interface SettingsOverlayProps {
   version: string;
   workspace?: DesktopWorkspaceSnapshot;
   modelSetupRequired: boolean;
+  themePreference: DesktopThemePreference;
+  onThemePreference(theme: DesktopThemePreference): void;
   onClose(): void;
   onSkipModelSetup(): void;
   onPermissionMode(mode: PermissionMode): Promise<void>;
@@ -110,6 +112,8 @@ export function SettingsOverlay({
   version,
   workspace,
   modelSetupRequired,
+  themePreference,
+  onThemePreference,
   onClose,
   onSkipModelSetup,
   onPermissionMode,
@@ -225,7 +229,7 @@ export function SettingsOverlay({
             }}
           /> : null}
           {tab === "权限与能力" ? <SettingsPermissions mode={runtime?.permissionMode ?? "ask"} onChange={(mode) => execute(async () => await onPermissionMode(mode), "权限模式已更新")} /> : null}
-          {tab === "外观" ? <SettingsAppearance /> : null}
+          {tab === "外观" ? <SettingsAppearance theme={themePreference} onThemeChange={onThemePreference} /> : null}
           {tab === "记忆" ? <SettingsAgent disabled={Boolean(runtime?.activeRun)} onCompact={() => execute(onCompact, "会话已压缩")} /> : null}
           {tab === "数据" ? (
             <SettingsProject
@@ -1341,8 +1345,54 @@ function SettingsPermissions({ mode, onChange }: { mode: PermissionMode; onChang
   return <div className="settings-sections"><section><h3>当前项目权限</h3>{options.map((option) => <button className="permission-setting-row" key={option.value} onClick={() => onChange(option.value)} type="button"><span className={`radio${mode === option.value ? " is-selected" : ""}`} /><span><strong>{option.title}</strong><small>{option.detail}</small></span></button>)}</section></div>;
 }
 
-function SettingsAppearance(): React.JSX.Element {
-  return <div className="settings-sections"><section><h3>主题</h3><div className="setting-row"><span><strong>跟随 macOS</strong><small>自动适配系统浅色与深色模式</small></span><span className="setting-value">系统</span></div><div className="setting-row"><span><strong>减少动画</strong><small>自动遵循系统“减少动态效果”设置</small></span><span className="setting-value">系统</span></div></section></div>;
+function SettingsAppearance({ theme, onThemeChange }: { theme: DesktopThemePreference; onThemeChange(theme: DesktopThemePreference): void }): React.JSX.Element {
+  const options: Array<{ value: DesktopThemePreference; title: string }> = [
+    { value: "system", title: "系统" },
+    { value: "light", title: "浅色" },
+    { value: "dark", title: "深色" }
+  ];
+  return (
+    <div className="settings-sections">
+      <section>
+        <h3>主题</h3>
+        <div className="theme-card-grid" role="radiogroup" aria-label="主题">
+          {options.map((option) => (
+            <button
+              aria-checked={theme === option.value}
+              className={`theme-card${theme === option.value ? " is-selected" : ""}`}
+              key={option.value}
+              onClick={() => onThemeChange(option.value)}
+              role="radio"
+              type="button"
+            >
+              <span className={`theme-card-preview theme-card-preview--${option.value}`} aria-hidden="true">
+                <span className="theme-card-window">
+                  <span className="theme-card-chrome" />
+                  <span className="theme-card-panel theme-card-panel--main">
+                    <span className="theme-card-line" />
+                    <span className="theme-card-line is-short" />
+                    <span className="theme-card-line is-medium" />
+                  </span>
+                  <span className="theme-card-panel theme-card-panel--float">
+                    <span className="theme-card-line is-short" />
+                    <span className="theme-card-line is-medium" />
+                  </span>
+                </span>
+              </span>
+              <span className="theme-card-label">{option.title}</span>
+            </button>
+          ))}
+        </div>
+      </section>
+      <section>
+        <h3>动效</h3>
+        <div className="setting-row">
+          <span><strong>减少动画</strong><small>自动遵循系统“减少动态效果”设置</small></span>
+          <span className="setting-value">系统</span>
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function SettingsComingSoon({ tab }: { tab: "使用统计" | "每日回顾" | "语音" | "开放网关" | "远程接入" | "联网搜索" | "健康" }): React.JSX.Element {

@@ -13,6 +13,7 @@ import type {
   DesktopProject,
   DesktopSessionDocument,
   DesktopSessionSummary,
+  DesktopThemePreference,
   DesktopWorkspaceDirectory,
   DesktopWorkspaceSnapshot
 } from "../../protocol.js";
@@ -55,6 +56,7 @@ export function App(): React.JSX.Element {
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const [filePanelWidth, setFilePanelWidth] = useState(DEFAULT_FILE_PANEL_WIDTH);
   const [filePanelResizing, setFilePanelResizing] = useState(false);
+  const [themePreference, setThemePreference] = useState<DesktopThemePreference>("system");
   const [focusToken, setFocusToken] = useState(0);
   const [deletedUserMessages, setDeletedUserMessages] = useState<Set<string>>(() => new Set());
   const [searchOpen, setSearchOpen] = useState(false);
@@ -156,6 +158,7 @@ export function App(): React.JSX.Element {
       setProjects(bootstrap.projects);
       setSidebarWidth(bootstrap.sidebarWidth);
       setFilePanelWidth(bootstrap.filePanelWidth ?? DEFAULT_FILE_PANEL_WIDTH);
+      setThemePreference(bootstrap.themePreference ?? "system");
       if (bootstrap.workspace) {
         mergeWorkspaceProject(bootstrap.workspace);
         const nextSessionId = bootstrap.selectedSessionId ?? bootstrap.workspace.selectedSessionId;
@@ -197,7 +200,7 @@ export function App(): React.JSX.Element {
       }
       const completedProjects = new Map<string, string>();
       for (const envelope of batch) {
-        if (envelope.event.type === "run.completed" || envelope.event.type === "run.aborted" || envelope.event.type === "run.failed") {
+        if (envelope.event.type === "run.completed" || envelope.event.type === "run.incomplete" || envelope.event.type === "run.aborted" || envelope.event.type === "run.failed") {
           completedProjects.set(envelope.projectId, envelope.event.sessionId);
         }
       }
@@ -427,6 +430,15 @@ export function App(): React.JSX.Element {
     setToast(files.length ? "当前消息的文件变更没有安全快照，暂不自动回滚" : "当前消息没有可回滚的文件");
   }, []);
 
+  useEffect(() => {
+    window.document.documentElement.dataset.theme = themePreference;
+  }, [themePreference]);
+
+  const changeThemePreference = useCallback((theme: DesktopThemePreference): void => {
+    setThemePreference(theme);
+    void window.biny.setThemePreference(theme).catch(() => undefined);
+  }, []);
+
   const toggleProjectPinned = useCallback(async (projectId: string, pinned: boolean): Promise<void> => {
     try {
       mergeProjectSnapshot(await window.biny.setProjectPinned(projectId, pinned));
@@ -434,6 +446,16 @@ export function App(): React.JSX.Element {
       setToast(errorMessage(error));
     }
   }, [mergeProjectSnapshot]);
+
+  const reorderProjects = useCallback(async (projectIds: string[]): Promise<void> => {
+    // Quiet optimistic reorder — this is a low-stakes UI preference, not a warnable action.
+    setProjects((current) => applyProjectOrder(current, projectIds));
+    try {
+      setProjects(await window.biny.reorderProjects(projectIds));
+    } catch {
+      // Keep the optimistic order; persistence can catch up on the next successful reorder.
+    }
+  }, []);
 
   const renameProject = useCallback((projectId: string): void => {
     const project = projects.find((candidate) => candidate.id === projectId);
@@ -584,6 +606,7 @@ export function App(): React.JSX.Element {
         onProjectPinned={(projectId, pinned) => void toggleProjectPinned(projectId, pinned)}
         onRemoveProject={(projectId) => void removeProject(projectId)}
         onRenameProject={renameProject}
+        onReorderProjects={(projectIds) => void reorderProjects(projectIds)}
         onRevealProject={(projectId) => { void window.biny.revealProject(projectId).catch((error) => setToast(errorMessage(error))); }}
         onSearch={() => setSearchOpen(true)}
         onSelectProject={(projectId) => void selectProject(projectId)}
@@ -675,7 +698,9 @@ export function App(): React.JSX.Element {
         onSaveModelConfiguration={saveModelConfiguration}
         onTestModelConfiguration={testModelConfiguration}
         onSwitchModel={switchModel}
+        onThemePreference={changeThemePreference}
         open={settingsOpen}
+        themePreference={themePreference}
         version={version}
         workspace={workspace}
       />
@@ -742,8 +767,16 @@ function applyEventsToWorkspace(workspace: DesktopWorkspaceSnapshot, events: Age
       replaceSession(sessions, { ...session, status: "running", updatedAt: event.timestamp });
       if (runtime?.pendingPermission?.requestId === event.requestId) runtime = { ...runtime, pendingPermission: undefined };
     }
-    if (session && (event.type === "run.completed" || event.type === "run.aborted" || event.type === "run.failed")) {
-      replaceSession(sessions, { ...session, status: event.type === "run.failed" ? "failed" : "completed", updatedAt: event.timestamp });
+    if (session && (event.type === "run.completed" || event.type === "run.incomplete" || event.type === "run.aborted" || event.type === "run.failed")) {
+      replaceSession(sessions, {
+        ...session,
+        status: event.type === "run.failed"
+          ? "failed"
+          : event.type === "run.incomplete"
+            ? "incomplete"
+            : event.type === "run.aborted" ? "aborted" : "completed",
+        updatedAt: event.timestamp
+      });
       if (runtime?.activeRun?.runId === event.runId) runtime = { ...runtime, activeRun: undefined, pendingPermission: undefined };
     }
   }
@@ -801,6 +834,22 @@ function mergeProject(projects: DesktopProject[], next: DesktopProject): Desktop
   const copy = [...projects];
   copy[index] = next;
   return copy;
+}
+
+function applyProjectOrder(projects: DesktopProject[], projectIds: string[]): DesktopProject[] {
+  const byId = new Map(projects.map((project) => [project.id, project]));
+  const seen = new Set<string>();
+  const ordered: DesktopProject[] = [];
+  for (const projectId of projectIds) {
+    const project = byId.get(projectId);
+    if (!project || seen.has(projectId)) continue;
+    ordered.push(project);
+    seen.add(projectId);
+  }
+  for (const project of projects) {
+    if (!seen.has(project.id)) ordered.push(project);
+  }
+  return ordered;
 }
 
 function titleFromInput(input: string): string {

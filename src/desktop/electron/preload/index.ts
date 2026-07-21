@@ -8,6 +8,7 @@ const api: DesktopApi = {
   createEmptyProject: async () => await ipcRenderer.invoke(desktopIpc.createEmptyProject),
   selectProject: async (projectId) => await ipcRenderer.invoke(desktopIpc.selectProject, projectId),
   setProjectPinned: async (projectId, pinned) => await ipcRenderer.invoke(desktopIpc.setProjectPinned, projectId, pinned),
+  reorderProjects: async (projectIds) => await ipcRenderer.invoke(desktopIpc.reorderProjects, projectIds),
   renameProject: async (projectId, name) => await ipcRenderer.invoke(desktopIpc.renameProject, projectId, name),
   removeProject: async (projectId) => await ipcRenderer.invoke(desktopIpc.removeProject, projectId),
   refreshProject: async (projectId) => await ipcRenderer.invoke(desktopIpc.refreshProject, projectId),
@@ -41,6 +42,7 @@ const api: DesktopApi = {
   openExternal: async (url) => await ipcRenderer.invoke(desktopIpc.openExternal, url),
   setSidebarWidth: async (width) => await ipcRenderer.invoke(desktopIpc.setSidebarWidth, width),
   setFilePanelWidth: async (width) => await ipcRenderer.invoke(desktopIpc.setFilePanelWidth, width),
+  setThemePreference: async (theme) => await ipcRenderer.invoke(desktopIpc.setThemePreference, theme),
   onAgentEvent(listener) {
     const handler = (_event: Electron.IpcRendererEvent, envelope: DesktopAgentEventEnvelope): void => listener(envelope);
     ipcRenderer.on(desktopIpc.event, handler);

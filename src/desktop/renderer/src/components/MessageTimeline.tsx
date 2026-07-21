@@ -134,7 +134,7 @@ const Turn = memo(function Turn({
         {!running && turn.status !== "idle" && (turn.status !== "completed" || summary || turn.model) ? (
           <footer className={`run-result is-${turn.status}`}>
             {turn.status !== "completed" ? <>
-              <span className="run-result-icon"><Icon name={turn.status === "failed" ? "warning" : "stop"} size={13} /></span>
+              <span className="run-result-icon"><Icon name={turn.status === "failed" || turn.status === "incomplete" ? "warning" : "stop"} size={13} /></span>
               <span className="run-result-label">{runStatusLabel(turn.status)}</span>
             </> : null}
             {summary ? <span className="run-result-summary">{summary}</span> : null}
@@ -142,12 +142,12 @@ const Turn = memo(function Turn({
           </footer>
         ) : null}
 
-        {turn.error && (turn.status === "failed" || turn.status === "aborted") ? (
+        {turn.error && (turn.status === "failed" || turn.status === "incomplete" || turn.status === "aborted") ? (
           <section className="run-error">
-            <button className="run-error-heading" onClick={() => setErrorOpen(!errorOpen)} type="button"><span>{turn.status === "failed" ? "执行失败" : "任务已中止"}</span><Icon name="chevron" size={12} /></button>
+            <button className="run-error-heading" onClick={() => setErrorOpen(!errorOpen)} type="button"><span>{turn.status === "failed" ? "执行失败" : turn.status === "incomplete" ? "任务未完成" : "任务已中止"}</span><Icon name="chevron" size={12} /></button>
             {errorOpen ? <pre><code>{turn.error}</code></pre> : null}
             <div className="run-error-actions">
-              {turn.status === "failed" && turn.user ? <button onClick={() => onRetry(turn.user)} type="button">重试</button> : null}
+              {(turn.status === "failed" || turn.status === "incomplete") && turn.user ? <button onClick={() => onRetry(turn.user)} type="button">重试</button> : null}
               <button onClick={() => void copyToClipboard(turn.error ?? "")} type="button">复制错误</button>
             </div>
           </section>
@@ -482,6 +482,7 @@ function turnSummary(turn: TimelineTurn): string {
 
 function runStatusLabel(status: TimelineTurn["status"]): string {
   if (status === "completed") return "已完成";
+  if (status === "incomplete") return "未完成";
   if (status === "aborted") return "已中止";
   if (status === "failed") return "执行失败";
   return "部分完成";

@@ -84,7 +84,7 @@ export class DesktopProjectService {
   async refreshStoredProject(projectIdValue: string): Promise<DesktopProject> {
     const project = this.requireProject(projectIdValue);
     const refreshed = await this.inspectProject(project);
-    await this.state.upsertProject({ ...refreshed, lastOpenedAt: new Date().toISOString() });
+    await this.state.upsertProject(refreshed);
     return refreshed;
   }
 
@@ -333,9 +333,11 @@ function sessionStatus(
   if (runtime?.pendingPermission?.sessionId === sessionId) return "waiting_permission";
   if (runtime?.activeRun?.sessionId === sessionId) return "running";
   const finalEvent = events
-    ? [...events].reverse().find((event) => event.type === "run.completed" || event.type === "run.failed" || event.type === "run.aborted")
+    ? [...events].reverse().find((event) => event.type === "run.completed" || event.type === "run.incomplete" || event.type === "run.failed" || event.type === "run.aborted")
     : undefined;
   if (finalEvent?.type === "run.failed") return "failed";
+  if (finalEvent?.type === "run.incomplete") return "incomplete";
+  if (finalEvent?.type === "run.aborted") return "aborted";
   if (finalEvent?.type === "run.completed") return "completed";
   return lastAssistantMessage ? "completed" : "idle";
 }

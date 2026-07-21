@@ -7,7 +7,11 @@ import { createModelSettings } from "../../../llm/factory.js";
 import { hasUsableModelConfiguration, listConfiguredModelChoices, type ModelRuntimeInfo, type ThinkingSelection } from "../../../llm/ModelManager.js";
 import { providerProfile } from "../../../llm/profiles.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
-import { createInteractiveAgentRuntime, type InteractiveAgentRuntime } from "../../../runtime/InteractiveAgentRuntime.js";
+import {
+  createInteractiveAgentRuntime,
+  type AgentRunOutcome,
+  type InteractiveAgentRuntime
+} from "../../../runtime/InteractiveAgentRuntime.js";
 import type { AgentHostEvent } from "../../../runtime/agentEvents.js";
 import type {
   DesktopAttachment,
@@ -51,7 +55,8 @@ export class DesktopAgentManager {
   async workspaceSnapshot(projectId: string): Promise<DesktopWorkspaceSnapshot> {
     const storedProject = this.projects.requireProject(projectId);
     const project = await this.projects.inspectProject(storedProject);
-    await this.state.upsertProject({ ...project, lastOpenedAt: new Date().toISOString() });
+    // Keep lastOpenedAt stable on select/refresh so the sidebar order does not jump.
+    await this.state.upsertProject(project);
     const runtime = this.runtimes.get(projectId)?.runtime;
     const [config, sessions] = await Promise.all([
       this.configStore.load().catch(() => undefined),
@@ -124,7 +129,7 @@ export class DesktopAgentManager {
     const prompt = withAttachmentReferences(input, attachments);
     const submitted = runtime.submitPrompt(prompt, mode);
     await this.state.setSelectedSession(projectId, info.sessionId);
-    void submitted.completion.catch(() => undefined);
+    this.observeRunCompletion(projectId, submitted.completion);
     return {
       sessionId: info.sessionId,
       runId: submitted.runId,
@@ -166,7 +171,7 @@ export class DesktopAgentManager {
     const info = nextRuntime.getInfo();
     const prompt = withAttachmentReferences(input, attachments);
     const submitted = nextRuntime.submitPrompt(prompt, mode);
-    void submitted.completion.catch(() => undefined);
+    this.observeRunCompletion(projectId, submitted.completion);
     return {
       sessionId: info.sessionId,
       runId: submitted.runId,
@@ -434,6 +439,19 @@ export class DesktopAgentManager {
     } finally {
       if (this.runtimeInitializations.get(projectId) === initialization) this.runtimeInitializations.delete(projectId);
     }
+  }
+
+  private observeRunCompletion(projectId: string, completion: Promise<AgentRunOutcome>): void {
+    void completion.then(
+      (outcome) => {
+        // Normal terminal outcomes are presented through AgentHostEvent. Only a
+        // successfully completed task clears a prior runtime initialization error.
+        if (outcome.status === "completed") this.runtimeErrors.delete(projectId);
+      },
+      (error: unknown) => {
+        this.runtimeErrors.set(projectId, error instanceof Error ? error.message : String(error));
+      }
+    );
   }
 
   private async initializeRuntime(projectId: string): Promise<InteractiveAgentRuntime> {

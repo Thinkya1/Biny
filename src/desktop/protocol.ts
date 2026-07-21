@@ -11,6 +11,7 @@ export const desktopIpc = {
   createEmptyProject: "desktop:project:create-empty",
   selectProject: "desktop:project:select",
   setProjectPinned: "desktop:project:pin",
+  reorderProjects: "desktop:project:reorder",
   renameProject: "desktop:project:rename",
   removeProject: "desktop:project:remove",
   refreshProject: "desktop:project:refresh",
@@ -44,11 +45,13 @@ export const desktopIpc = {
   openExternal: "desktop:external:open",
   setSidebarWidth: "desktop:ui:sidebar-width",
   setFilePanelWidth: "desktop:ui:file-panel-width",
+  setThemePreference: "desktop:ui:theme",
   event: "desktop:agent:event",
   menuAction: "desktop:menu:action"
 } as const;
 
-export type DesktopSessionStatus = "idle" | "running" | "waiting_permission" | "failed" | "completed";
+export type DesktopThemePreference = "system" | "light" | "dark";
+export type DesktopSessionStatus = "idle" | "running" | "waiting_permission" | "incomplete" | "aborted" | "failed" | "completed";
 
 export interface DesktopProject {
   id: string;
@@ -101,6 +104,7 @@ export interface DesktopBootstrap {
   workspace?: DesktopWorkspaceSnapshot;
   sidebarWidth: number;
   filePanelWidth: number;
+  themePreference: DesktopThemePreference;
 }
 
 export interface DesktopRunReceipt {
@@ -178,6 +182,7 @@ export interface DesktopApi {
   createEmptyProject(): Promise<DesktopWorkspaceSnapshot | undefined>;
   selectProject(projectId: string): Promise<DesktopWorkspaceSnapshot>;
   setProjectPinned(projectId: string, pinned: boolean): Promise<DesktopWorkspaceSnapshot>;
+  reorderProjects(projectIds: string[]): Promise<DesktopProject[]>;
   renameProject(projectId: string, name: string): Promise<DesktopWorkspaceSnapshot>;
   removeProject(projectId: string): Promise<DesktopBootstrap>;
   refreshProject(projectId: string): Promise<DesktopWorkspaceSnapshot>;
@@ -211,6 +216,7 @@ export interface DesktopApi {
   openExternal(url: string): Promise<void>;
   setSidebarWidth(width: number): Promise<void>;
   setFilePanelWidth(width: number): Promise<void>;
+  setThemePreference(theme: DesktopThemePreference): Promise<DesktopThemePreference>;
   onAgentEvent(listener: (envelope: DesktopAgentEventEnvelope) => void): () => void;
   onMenuAction(listener: (action: DesktopMenuAction) => void): () => void;
 }
