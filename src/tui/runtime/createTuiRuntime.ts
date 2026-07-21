@@ -8,7 +8,7 @@ import type { ContextStatus } from "../../agent/context/types.js";
 import type { ExtensionSection } from "../../extensions/report.js";
 import type { ModelChoice, ModelRuntimeInfo, ThinkingSelection } from "../../llm/ModelManager.js";
 import type { PermissionMode, PermissionResult } from "../../permission/PermissionManager.js";
-import { createInteractiveAgentRuntime } from "../../runtime/InteractiveAgentRuntime.js";
+import { createInteractiveAgentRuntime, type AgentRunOutcome } from "../../runtime/InteractiveAgentRuntime.js";
 import type { SubagentTaskSnapshot } from "../../runtime/SubagentTaskManager.js";
 import type { RuntimeEventSink } from "../../runtime/events.js";
 import type { SessionSummary } from "../../session/events.js";
@@ -24,7 +24,7 @@ export interface TuiRuntime {
   listModels(): ModelChoice[];
   switchModel(alias: string, thinking?: ThinkingSelection): Promise<ModelRuntimeInfo>;
   refreshModelFromDisk(): Promise<ModelRuntimeInfo>;
-  sendPrompt(prompt: string, mode?: AgentRunMode): Promise<void>;
+  sendPrompt(prompt: string, mode?: AgentRunMode): Promise<AgentRunOutcome>;
   resumeSession(session: string): Promise<ResumedAgentSession>;
   listSessions(): Promise<SessionSummary[]>;
   extensionReport(section?: ExtensionSection): string;
@@ -83,10 +83,10 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
       emitModelChanged(info);
       return info;
     },
-    async sendPrompt(prompt: string, mode: AgentRunMode = "chat"): Promise<void> {
+    async sendPrompt(prompt: string, mode: AgentRunMode = "chat"): Promise<AgentRunOutcome> {
       const info = await host.refreshModelFromDisk();
       emitModelChanged(info);
-      await host.submitPrompt(prompt, mode).completion;
+      return await host.submitPrompt(prompt, mode).completion;
     },
     async resumeSession(session: string): Promise<ResumedAgentSession> {
       const resumed = await host.resumeSession(session);

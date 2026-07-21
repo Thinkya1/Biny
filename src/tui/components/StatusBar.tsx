@@ -86,15 +86,21 @@ function runtimeStatusLabel(status: RuntimeStatus, mode: "chat" | "plan"): strin
         ? "waiting approval"
         : status === "error"
           ? "error"
-          : status === "completed"
-            ? "done"
-            : "idle";
+          : status === "incomplete"
+            ? "incomplete"
+            : status === "aborted"
+              ? "aborted"
+              : status === "completed"
+                ? "done"
+                : "idle";
   if (mode !== "plan") return activity;
   return activity === "idle" ? "Plan mode" : `${activity} · Plan mode`;
 }
 
 function statusColor(status: RuntimeStatus): string {
   if (status === "error") return tuiColors.error;
+  if (status === "incomplete") return tuiColors.warning;
+  if (status === "aborted") return tuiColors.warning;
   if (status === "waiting_permission") return tuiColors.warning;
   if (status === "completed") return tuiColors.success;
   if (status === "thinking" || status === "running") return tuiColors.accent;

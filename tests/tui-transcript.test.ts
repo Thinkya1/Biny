@@ -42,6 +42,8 @@ async function main(): Promise<void> {
   testClampTerminalLines();
   testTranscriptUsesIndependentItemKinds();
   testRuntimeStatusEventsReachFooterState();
+  testIncompleteSessionStaysDistinctFromCompletion();
+  testAbortedSessionStaysDistinctFromCompletion();
   testAssistantStreamingUpdatesOneActiveCell();
   testToolProgressUpdatesOneActiveCell();
   testToolDurationMeasuredInUi();
@@ -360,6 +362,24 @@ function testRuntimeStatusEventsReachFooterState(): void {
   assert.equal(state.status, "thinking");
   state = tuiReducer(state, { type: "runtime.status", status: "running" });
   assert.equal(state.status, "running");
+}
+
+function testIncompleteSessionStaysDistinctFromCompletion(): void {
+  let state = createInitialTuiState("/workspace");
+  state = tuiReducer(state, { type: "user.message", content: "finish the project" });
+  state = tuiReducer(state, { type: "session.incomplete", sessionId: "session", message: "Step limit reached." });
+  assert.equal(state.status, "incomplete");
+  assert.equal(state.transcript.committed.at(-1)?.kind, "notification");
+  assert.match(state.transcript.committed.at(-1)?.content ?? "", /Step limit/);
+}
+
+function testAbortedSessionStaysDistinctFromCompletion(): void {
+  let state = createInitialTuiState("/workspace");
+  state = tuiReducer(state, { type: "user.message", content: "run the project" });
+  state = tuiReducer(state, { type: "session.aborted", sessionId: "session", message: "Current turn interrupted." });
+  assert.equal(state.status, "aborted");
+  assert.equal(state.transcript.committed.at(-1)?.kind, "notification");
+  assert.match(state.transcript.committed.at(-1)?.content ?? "", /interrupted/i);
 }
 
 function testAssistantStreamingUpdatesOneActiveCell(): void {

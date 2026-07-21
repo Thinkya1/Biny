@@ -95,7 +95,7 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
           });
         unsubscribe = runtime.subscribe((event) => {
           dispatch(event);
-          if (event.type === "session.completed" || event.type === "session.error") {
+          if (event.type === "session.completed" || event.type === "session.incomplete" || event.type === "session.error") {
             void refreshContextUsage(runtime);
           }
         });
@@ -172,11 +172,19 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
     }
     if (mode === "plan") {
       const runtime = runtimeRef.current;
-      if (runtime) void runtime.sendPrompt(value, "plan").finally(() => refreshContextUsage(runtime));
+      if (runtime) {
+        void runtime.sendPrompt(value, "plan")
+          .catch((error) => dispatch({ type: "error.message", message: error instanceof Error ? error.message : String(error) }))
+          .finally(() => refreshContextUsage(runtime));
+      }
       return;
     }
     const runtime = runtimeRef.current;
-    if (runtime) void runtime.sendPrompt(value, mode).finally(() => refreshContextUsage(runtime));
+    if (runtime) {
+      void runtime.sendPrompt(value, mode)
+        .catch((error) => dispatch({ type: "error.message", message: error instanceof Error ? error.message : String(error) }))
+        .finally(() => refreshContextUsage(runtime));
+    }
   };
 
   const appendHistory = (value: string): void => {

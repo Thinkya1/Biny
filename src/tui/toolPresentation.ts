@@ -93,6 +93,7 @@ export function toolStatusFromResult(result: unknown): ToolTranscriptStatus {
   if (typeof result === "object" && result !== null) {
     const record = result as Record<string, unknown>;
     if (record.status === "denied") return "denied";
+    if (record.status === "failed" || record.status === "timed_out" || record.status === "aborted") return "failed";
     if (typeof record.exitCode === "number" && record.exitCode !== 0) return "failed";
     if ("error" in record) return "failed";
   }

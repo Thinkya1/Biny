@@ -74,6 +74,28 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
         transcript
       };
     }
+    case "session.incomplete": {
+      const finalized = finalizeActiveCells(state.transcript, "skipped", event.message);
+      return {
+        ...state,
+        status: "incomplete",
+        permission: undefined,
+        lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
+        turnStartedAt: undefined,
+        transcript: commitItem(finalized, notificationItem(finalized, event.message))
+      };
+    }
+    case "session.aborted": {
+      const finalized = finalizeActiveCells(state.transcript, "skipped", event.message);
+      return {
+        ...state,
+        status: "aborted",
+        permission: undefined,
+        lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
+        turnStartedAt: undefined,
+        transcript: commitItem(finalized, notificationItem(finalized, event.message))
+      };
+    }
     case "session.error": {
       const finalized = finalizeActiveCells(state.transcript, "failed", event.message);
       return {

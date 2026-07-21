@@ -55,10 +55,15 @@ export function agentEventToRuntimeEvents(event: AgentHostEvent): RuntimeEvent[]
         { type: "runtime.status", status: "completed" },
         { type: "session.completed", sessionId: event.sessionId }
       ];
+    case "run.incomplete":
+      return [
+        { type: "runtime.status", status: "incomplete" },
+        { type: "session.incomplete", sessionId: event.sessionId, message: event.reason }
+      ];
     case "run.aborted":
       return [
-        { type: "system.message", content: "当前轮次已中断。" },
-        { type: "session.completed", sessionId: event.sessionId }
+        { type: "runtime.status", status: "aborted" },
+        { type: "session.aborted", sessionId: event.sessionId, message: event.reason }
       ];
     case "run.failed":
       return [{ type: "session.error", sessionId: event.sessionId, message: event.error }];
@@ -67,6 +72,7 @@ export function agentEventToRuntimeEvents(event: AgentHostEvent): RuntimeEvent[]
     case "command.started":
     case "command.output":
     case "command.completed":
+    case "command.failed":
     case "file.read":
     case "file.changed":
     case "diff.created":
