@@ -1,5 +1,5 @@
 import path from "node:path";
-import { app, BrowserWindow, dialog, Notification, safeStorage, shell } from "electron";
+import { app, BrowserWindow, dialog, nativeImage, Notification, safeStorage, shell } from "electron";
 import type { DesktopBootstrap } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
 import { DesktopAgentManager } from "./DesktopAgentManager.js";
@@ -31,6 +31,7 @@ if (!app.requestSingleInstanceLock()) {
 
 async function startDesktopApplication(): Promise<void> {
   await app.whenReady();
+  setDesktopIcon();
   const legacyDataRoot = app.getPath("userData");
   const desktopRoot = path.join(legacyDataRoot, "workspaces", "default");
   const storage = new DesktopUserDataStore(desktopRoot);
@@ -157,6 +158,15 @@ async function startDesktopApplication(): Promise<void> {
       }
     })();
   });
+}
+
+function setDesktopIcon(): void {
+  if (process.platform !== "darwin") return;
+  const iconPath = app.isPackaged
+    ? path.join(process.resourcesPath, "icon.icns")
+    : path.join(app.getAppPath(), "build/icon-master.png");
+  const icon = nativeImage.createFromPath(iconPath);
+  if (!icon.isEmpty()) app.dock?.setIcon(icon);
 }
 
 async function showMessage(
