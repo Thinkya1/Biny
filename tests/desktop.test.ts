@@ -66,6 +66,8 @@ testHistoricalAbortProjection();
 testHistoricalUsageProjection();
 testHistoricalToolProjection();
 testHistoricalReasoningAndSkillProjection();
+testExecutionTimelineKeepsReasoningAndToolsInOrder();
+testLiveExecutionTimelineKeepsReasoningAndToolsInOrder();
 testHistoricalPrefixKeepsUnpersistedDuplicatePrompt();
 testHistoricalEmptyAssistantDoesNotEraseReply();
 testChangedFileProjection();
@@ -769,6 +771,48 @@ function testHistoricalReasoningAndSkillProjection(): void {
   assert.deepEqual(timeline[0]?.skills, ["programmatic-tools"]);
   assert.equal(timeline[0]?.reasoning, "先确认当前工作目录。\n\n然后整理结果。");
   assert.equal(timeline[0]?.durationMs, 2_512);
+}
+
+function testExecutionTimelineKeepsReasoningAndToolsInOrder(): void {
+  const timeline = buildSessionTimeline([
+    { type: "user_message", content: "inspect and test" },
+    { type: "tool_call", tool: "read_file", args: { path: "src/index.ts" }, toolCallId: "read", assistantContent: "先检查入口。", reasoningContent: "先确认入口文件。" },
+    { type: "tool_result", tool: "read_file", result: { path: "src/index.ts" }, toolCallId: "read" },
+    { type: "tool_call", tool: "run_command", args: { command: "pnpm test" }, toolCallId: "test", assistantContent: "再运行测试。", reasoningContent: "根据入口继续验证。" },
+    { type: "tool_result", tool: "run_command", result: { exitCode: 0 }, toolCallId: "test" },
+    { type: "assistant_message", content: "完成。", reasoningContent: "最后整理结果。" }
+  ], []);
+  const turn = timeline[0];
+  assert.deepEqual(turn?.steps.map((step) => step.kind), ["reasoning", "assistant", "tool", "reasoning", "assistant", "tool", "reasoning", "assistant"]);
+  assert.equal(turn?.steps[0]?.kind === "reasoning" ? turn.steps[0].content : undefined, "先确认入口文件。");
+  assert.equal(turn?.steps[2]?.kind === "tool" ? turn.steps[2].tool.id : undefined, "read");
+  assert.equal(turn?.steps[5]?.kind === "tool" ? turn.steps[5].tool.id : undefined, "test");
+  assert.equal(turn?.steps[6]?.kind === "reasoning" ? turn.steps[6].content : undefined, "最后整理结果。");
+}
+
+function testLiveExecutionTimelineKeepsReasoningAndToolsInOrder(): void {
+  const base = { sessionId: "session", runId: "ordered-run", timestamp: "2026-01-01T00:00:00.000Z" };
+  const timeline = buildSessionTimeline([], [
+    { ...base, type: "message.user", messageId: "message", content: "inspect and test" },
+    { ...base, type: "run.started", messageId: "message", input: "inspect and test", mode: "chat", model: { alias: "test", provider: "test", label: "test/model", reasoning: "High" }, skills: [] },
+    { ...base, type: "reasoning.started", messageId: "message", status: "正在分析任务" },
+    { ...base, timestamp: "2026-01-01T00:00:01.000Z", type: "reasoning.delta", messageId: "message", content: "先检查入口。" },
+    { ...base, timestamp: "2026-01-01T00:00:02.000Z", type: "reasoning.completed", messageId: "message", status: "分析完成" },
+    { ...base, timestamp: "2026-01-01T00:00:03.000Z", type: "tool.started", toolCallId: "read", tool: "read_file", args: { path: "src/index.ts" } },
+    { ...base, timestamp: "2026-01-01T00:00:04.000Z", type: "tool.completed", toolCallId: "read", tool: "read_file", result: {}, durationMs: 1_000 },
+    { ...base, timestamp: "2026-01-01T00:00:05.000Z", type: "reasoning.started", messageId: "message", status: "正在验证" },
+    { ...base, timestamp: "2026-01-01T00:00:06.000Z", type: "reasoning.delta", messageId: "message", content: "再运行测试。" },
+    { ...base, timestamp: "2026-01-01T00:00:07.000Z", type: "reasoning.completed", messageId: "message", status: "分析完成" },
+    { ...base, timestamp: "2026-01-01T00:00:08.000Z", type: "tool.started", toolCallId: "test", tool: "run_command", args: { command: "pnpm test" } },
+    { ...base, timestamp: "2026-01-01T00:00:09.000Z", type: "tool.completed", toolCallId: "test", tool: "run_command", result: {}, durationMs: 1_000 },
+    { ...base, timestamp: "2026-01-01T00:00:10.000Z", type: "assistant.delta", messageId: "message", content: "完成。" },
+    { ...base, timestamp: "2026-01-01T00:00:11.000Z", type: "assistant.completed", messageId: "message", content: "完成。" },
+    { ...base, timestamp: "2026-01-01T00:00:12.000Z", type: "run.completed", durationMs: 12_000 }
+  ]);
+  const turn = timeline[0];
+  assert.deepEqual(turn?.steps.map((step) => step.kind), ["reasoning", "tool", "reasoning", "tool", "assistant"]);
+  assert.deepEqual(turn?.steps.filter((step) => step.kind === "reasoning").map((step) => step.content), ["先检查入口。", "再运行测试。"]);
+  assert.deepEqual(turn?.steps.filter((step) => step.kind === "tool").map((step) => step.tool.id), ["read", "test"]);
 }
 
 function testHistoricalPrefixKeepsUnpersistedDuplicatePrompt(): void {

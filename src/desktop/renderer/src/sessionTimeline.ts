@@ -46,6 +46,30 @@ export interface TimelineToolEntry {
   toolId?: string;
 }
 
+export interface TimelineReasoningStep {
+  kind: "reasoning";
+  id: string;
+  content: string;
+  status?: string;
+  startedAt?: string;
+  durationMs?: number;
+  completed?: boolean;
+}
+
+export interface TimelineAssistantStep {
+  kind: "assistant";
+  id: string;
+  content: string;
+}
+
+export interface TimelineToolStep {
+  kind: "tool";
+  id: string;
+  tool: TimelineTool;
+}
+
+export type TimelineStep = TimelineReasoningStep | TimelineAssistantStep | TimelineToolStep;
+
 export function activeTimelineTool(tools: TimelineTool[], selectedToolId?: string): TimelineTool | undefined {
   return [...tools].reverse().find((tool) => tool.permission && !tool.permission.resolved)
     ?? tools.find((tool) => tool.id === selectedToolId);
@@ -87,6 +111,7 @@ export interface TimelineTurn {
   status: TimelineRunStatus;
   model?: AgentRunModel;
   tools: TimelineTool[];
+  steps: TimelineStep[];
   error?: string;
   durationMs?: number;
   usage?: SessionUsage;
@@ -103,7 +128,7 @@ export function buildSessionTimeline(events: SessionEvent[], liveEvents: AgentHo
   const history = historicalPrefix(events, liveEvents);
   const historicalTurns = buildHistoricalTurns(history);
   const historicalUserMessages = history.filter((event) => event.type === "user_message").length;
-  return [...historicalTurns, ...buildLiveTurns(liveEvents, historicalUserMessages)].filter((turn) => turn.user || turn.assistant || turn.tools.length || turn.error);
+  return [...historicalTurns, ...buildLiveTurns(liveEvents, historicalUserMessages)].filter((turn) => turn.user || turn.assistant || turn.steps.length || turn.tools.length || turn.error);
 }
 
 function historicalPrefix(events: SessionEvent[], liveEvents: AgentHostEvent[]): SessionEvent[] {
@@ -150,7 +175,8 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
     if (event.type === "assistant_message") {
       const turn = ensureTurn(event.time);
       turn.assistant = event.content || turn.assistant;
-      turn.reasoning = appendReasoning(turn.reasoning, event.reasoningContent);
+      appendHistoricalReasoning(turn, event.reasoningContent);
+      appendHistoricalAssistant(turn, event.content);
       turn.durationMs = elapsedMs(turn.timestamp, event.time) ?? turn.durationMs;
       turn.timestamp = event.time ?? turn.timestamp;
       turn.status = "completed";
@@ -168,8 +194,9 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
     if (event.type === "tool_call") {
       const turn = ensureTurn(event.time);
       const projection = historicalToolProjection(event.tool, event.args);
-      turn.reasoning = appendReasoning(turn.reasoning, event.reasoningContent);
-      turn.tools.push({
+      appendHistoricalReasoning(turn, event.reasoningContent);
+      appendHistoricalAssistant(turn, event.assistantContent);
+      const tool: TimelineTool = {
         id: event.toolCallId ?? `history-tool-${String(turn.tools.length)}`,
         tool: event.tool,
         args: event.args,
@@ -178,7 +205,9 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
         path: projection.path,
         updates: [],
         timestamp: event.time
-      });
+      };
+      turn.tools.push(tool);
+      turn.steps.push({ kind: "tool", id: tool.id, tool });
       continue;
     }
     if (event.type === "tool_result") {
@@ -211,6 +240,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
   const turns = new Map<string, TimelineTurn>();
   const order: string[] = [];
   const toolMaps = new Map<string, Map<string, TimelineTool>>();
+  const activeReasoning = new Map<string, TimelineReasoningStep>();
   let userMessageIndex = initialUserMessageIndex;
   const turnFor = (event: AgentHostEvent): TimelineTurn => {
     const current = turns.get(event.runId);
@@ -237,7 +267,49 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
     };
     tools.set(event.toolCallId, tool);
     turn.tools.push(tool);
+    turn.steps.push({ kind: "tool", id: tool.id, tool });
     return tool;
+  };
+
+  const finishReasoning = (runId: string, timestamp: string): void => {
+    const step = activeReasoning.get(runId);
+    const turn = turns.get(runId);
+    if (!step || !turn) return;
+    step.completed = true;
+    step.durationMs = elapsedMs(step.startedAt, timestamp);
+    turn.reasoningDurationMs = addReasoningDuration(turn.reasoningDurationMs, turn.reasoningStartedAt, timestamp);
+    turn.reasoningStartedAt = undefined;
+    activeReasoning.delete(runId);
+  };
+
+  const startReasoning = (event: Extract<AgentHostEvent, { type: "reasoning.started" }>): TimelineReasoningStep => {
+    finishReasoning(event.runId, event.timestamp);
+    const turn = turnFor(event);
+    const step: TimelineReasoningStep = {
+      kind: "reasoning",
+      id: `${event.runId}:reasoning:${String(turn.steps.filter((candidate) => candidate.kind === "reasoning").length)}`,
+      content: "",
+      status: event.status,
+      startedAt: event.timestamp
+    };
+    turn.steps.push(step);
+    activeReasoning.set(event.runId, step);
+    turn.reasoningStatus = event.status;
+    turn.reasoningStartedAt = event.timestamp;
+    return step;
+  };
+
+  const reasoningStepFor = (event: Extract<AgentHostEvent, { type: "reasoning.delta" }>): TimelineReasoningStep => {
+    const existing = activeReasoning.get(event.runId);
+    if (existing) return existing;
+    return startReasoning({ ...event, type: "reasoning.started", status: "正在思考" });
+  };
+
+  const appendAssistant = (turn: TimelineTurn, content: string): void => {
+    if (!content) return;
+    const previous = turn.steps.at(-1);
+    if (previous?.kind === "assistant") previous.content += content;
+    else turn.steps.push({ kind: "assistant", id: `${turn.id}:assistant:${String(turn.steps.filter((step) => step.kind === "assistant").length)}`, content });
   };
 
   for (const event of events) {
@@ -253,21 +325,34 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       turn.skills = skillNames(event.skills);
     } else if (event.type === "assistant.delta") {
       turn.assistant += event.content;
+      finishReasoning(event.runId, event.timestamp);
+      appendAssistant(turn, event.content);
     } else if (event.type === "assistant.completed") {
       turn.assistant = event.content || turn.assistant;
+      finishReasoning(event.runId, event.timestamp);
+      const previous = turn.steps.at(-1);
+      if (event.content && previous?.kind === "assistant") previous.content = event.content;
+      else appendAssistant(turn, event.content);
       turn.timestamp = event.timestamp;
     } else if (event.type === "reasoning.started") {
-      turn.reasoningStatus = event.status;
-      if (turn.reasoningStartedAt === undefined) turn.reasoningStartedAt = event.timestamp;
+      startReasoning(event);
     } else if (event.type === "reasoning.delta") {
+      const step = reasoningStepFor(event);
+      step.content += event.content;
       turn.reasoning += event.content;
     } else if (event.type === "reasoning.status") {
       turn.reasoningStatus = event.status;
+      const step = activeReasoning.get(event.runId);
+      if (step) step.status = event.status;
     } else if (event.type === "reasoning.completed") {
       turn.reasoningStatus = event.status;
-      turn.reasoningDurationMs = addReasoningDuration(turn.reasoningDurationMs, turn.reasoningStartedAt, event.timestamp);
-      turn.reasoningStartedAt = undefined;
+      const step = activeReasoning.get(event.runId);
+      if (step) {
+        step.status = event.status;
+        finishReasoning(event.runId, event.timestamp);
+      }
     } else if (event.type === "tool.started") {
+      finishReasoning(event.runId, event.timestamp);
       const tool = toolFor(event, event.tool);
       tool.tool = event.tool;
       tool.args = event.args;
@@ -340,16 +425,14 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       turn.status = "completed";
       turn.timestamp = event.timestamp;
       turn.durationMs = event.durationMs;
-      turn.reasoningDurationMs = addReasoningDuration(turn.reasoningDurationMs, turn.reasoningStartedAt, event.timestamp);
-      turn.reasoningStartedAt = undefined;
+      finishReasoning(event.runId, event.timestamp);
       turn.usage = event.usage;
     } else if (event.type === "run.incomplete") {
       turn.status = "incomplete";
       turn.timestamp = event.timestamp;
       turn.error = event.reason;
       turn.durationMs = event.durationMs;
-      turn.reasoningDurationMs = addReasoningDuration(turn.reasoningDurationMs, turn.reasoningStartedAt, event.timestamp);
-      turn.reasoningStartedAt = undefined;
+      finishReasoning(event.runId, event.timestamp);
       turn.usage = event.usage;
       for (const tool of turn.tools) {
         if (tool.status === "running" || tool.status === "waiting") tool.status = "aborted";
@@ -359,8 +442,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       turn.timestamp = event.timestamp;
       turn.error = event.reason;
       turn.durationMs = event.durationMs;
-      turn.reasoningDurationMs = addReasoningDuration(turn.reasoningDurationMs, turn.reasoningStartedAt, event.timestamp);
-      turn.reasoningStartedAt = undefined;
+      finishReasoning(event.runId, event.timestamp);
       for (const tool of turn.tools) {
         if (tool.status === "running" || tool.status === "waiting") tool.status = "aborted";
       }
@@ -369,8 +451,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       turn.timestamp = event.timestamp;
       turn.error = event.error;
       turn.durationMs = event.durationMs;
-      turn.reasoningDurationMs = addReasoningDuration(turn.reasoningDurationMs, turn.reasoningStartedAt, event.timestamp);
-      turn.reasoningStartedAt = undefined;
+      finishReasoning(event.runId, event.timestamp);
       for (const tool of turn.tools) {
         if (tool.status === "running" || tool.status === "waiting") tool.status = "failed";
       }
@@ -380,7 +461,25 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
 }
 
 function emptyTurn(id: string, timestamp?: string): TimelineTurn {
-  return { id, user: "", assistant: "", reasoning: "", skills: [], status: "idle", tools: [], timestamp };
+  return { id, user: "", assistant: "", reasoning: "", skills: [], status: "idle", tools: [], steps: [], timestamp };
+}
+
+function appendHistoricalReasoning(turn: TimelineTurn, content: string | undefined): void {
+  if (!content || turn.reasoning.endsWith(content)) return;
+  turn.reasoning = appendReasoning(turn.reasoning, content);
+  const previous = turn.steps.at(-1);
+  if (previous?.kind === "reasoning") {
+    previous.content = appendReasoning(previous.content, content);
+    return;
+  }
+  turn.steps.push({ kind: "reasoning", id: `${turn.id}:reasoning:${String(turn.steps.filter((step) => step.kind === "reasoning").length)}`, content, completed: true });
+}
+
+function appendHistoricalAssistant(turn: TimelineTurn, content: string | undefined): void {
+  if (!content) return;
+  const previous = turn.steps.at(-1);
+  if (previous?.kind === "assistant" && previous.content === content) return;
+  turn.steps.push({ kind: "assistant", id: `${turn.id}:assistant:${String(turn.steps.filter((step) => step.kind === "assistant").length)}`, content });
 }
 
 function appendReasoning(existing: string, next: string | undefined): string {

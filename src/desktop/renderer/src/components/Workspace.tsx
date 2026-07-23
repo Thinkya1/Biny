@@ -103,7 +103,7 @@ export function Workspace({
   const [preview, setPreview] = useState<FilePreviewState>();
   const [directoryStates, setDirectoryStates] = useState<Map<string, FileDirectoryState>>(new Map());
   const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(() => new Set());
-  const contentKey = useMemo(() => turns.map((turn) => `${turn.id}:${String(turn.assistant.length)}:${String(turn.tools.length)}:${turn.status}`).join("|"), [turns]);
+  const contentKey = useMemo(() => turns.map((turn) => `${turn.id}:${String(turn.assistant.length)}:${String(turn.steps.length)}:${turn.steps.map((step) => step.kind === "tool" ? `${step.id}:${step.tool.status}:${String(step.tool.updates.length)}` : `${step.id}:${String(step.content.length)}`).join(",")}:${turn.status}`).join("|"), [turns]);
   const previewSource = `${projectId ?? "none"}:${sessionId ?? "draft"}`;
   const activePreview = preview?.source === previewSource ? preview : undefined;
 

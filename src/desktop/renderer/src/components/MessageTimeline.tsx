@@ -3,7 +3,7 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
 import { copyToClipboard } from "../copyToClipboard.js";
-import { activeTimelineTool, listChangedFiles, timelineToolEntries, type TimelineToolEntry, type TimelineTurn } from "../sessionTimeline.js";
+import { listChangedFiles, type TimelineReasoningStep, type TimelineStep, type TimelineTurn } from "../sessionTimeline.js";
 import { CopyButton } from "./CopyButton.js";
 import { Icon } from "./Icon.js";
 import { ToolActivity } from "./ToolActivity.js";
@@ -88,13 +88,19 @@ const Turn = memo(function Turn({
   onRollbackFiles(turn: TimelineTurn): void;
   onDeleteUserMessage(turnId: string): void;
 }): React.JSX.Element {
-  const [reasoningOpen, setReasoningOpen] = useState(false);
+  const [expandedReasoning, setExpandedReasoning] = useState<Set<string>>(() => new Set());
   const [errorOpen, setErrorOpen] = useState(false);
-  const [selectedToolId, setSelectedToolId] = useState<string>();
   const summary = useMemo(() => turnSummary(turn), [turn]);
   const running = turn.status === "running" || turn.status === "waiting_permission" || turn.status === "queued";
-  const activeTool = activeTimelineTool(turn.tools, selectedToolId);
-  const hasReasoning = Boolean(turn.reasoningStatus || turn.reasoning || turn.durationMs !== undefined);
+  const executionSteps = turn.steps.length ? turn.steps : fallbackExecutionSteps(turn);
+  const toggleReasoning = (stepId: string): void => {
+    setExpandedReasoning((current) => {
+      const next = new Set(current);
+      if (next.has(stepId)) next.delete(stepId);
+      else next.add(stepId);
+      return next;
+    });
+  };
   return (
     <article className={`timeline-turn is-${turn.status}`}>
       {turn.user ? (
@@ -113,21 +119,21 @@ const Turn = memo(function Turn({
         />
       ) : null}
       <div className="agent-response">
-        {hasReasoning || turn.tools.length || turn.skills.length ? (
-          <ExecutionSummary
-            onSelectTool={(toolId) => setSelectedToolId((current) => current === toolId ? undefined : toolId)}
-            onToggleReasoning={() => setReasoningOpen((open) => !open)}
-            reasoningOpen={reasoningOpen}
+        {executionSteps.length || turn.skills.length ? (
+          <ExecutionTimeline
+            expandedReasoning={expandedReasoning}
+            onPreviewFile={onPreviewFile}
+            onResolvePermission={onResolvePermission}
+            onToggleReasoning={toggleReasoning}
+            projectId={projectId}
             running={running}
-            turn={turn}
+            steps={executionSteps}
+            skills={turn.skills}
           />
         ) : running && !turn.assistant ? (
           <div className="reasoning-row is-static"><span className="reasoning-pulse" /><span>{turn.status === "queued" ? "等待上一项任务完成" : "正在处理"}</span></div>
         ) : null}
-        {reasoningOpen ? <ReasoningDetail content={turn.reasoning} status={turn.reasoningStatus} /> : null}
-
-        {activeTool ? <div className="selected-tool-detail"><ToolActivity onPreviewFile={onPreviewFile} onResolvePermission={onResolvePermission} projectId={projectId} tool={activeTool} /></div> : null}
-        {turn.assistant ? <MarkdownContent content={turn.assistant} onPreviewFile={onPreviewFile} /> : null}
+        {!executionSteps.some((step) => step.kind === "assistant") && turn.assistant ? <MarkdownContent content={turn.assistant} onPreviewFile={onPreviewFile} /> : null}
 
         {turn.assistant ? <AssistantActions content={turn.assistant} timestamp={turn.timestamp} /> : null}
 
@@ -156,6 +162,83 @@ const Turn = memo(function Turn({
     </article>
   );
 });
+
+function fallbackExecutionSteps(turn: TimelineTurn): TimelineStep[] {
+  if (!turn.reasoningStatus && !turn.reasoning && turn.durationMs === undefined) return [];
+  return [{
+    kind: "reasoning",
+    id: `${turn.id}:reasoning:fallback`,
+    content: turn.reasoning,
+    status: turn.reasoningStatus,
+    durationMs: turn.reasoningDurationMs ?? (turn.status === "running" || turn.status === "waiting_permission" || turn.status === "queued" ? undefined : turn.durationMs),
+    completed: turn.status !== "running" && turn.status !== "waiting_permission" && turn.status !== "queued"
+  }];
+}
+
+function ExecutionTimeline({
+  expandedReasoning,
+  onPreviewFile,
+  onResolvePermission,
+  onToggleReasoning,
+  projectId,
+  running,
+  skills,
+  steps
+}: {
+  expandedReasoning: Set<string>;
+  onPreviewFile(path: string): void;
+  onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
+  onToggleReasoning(stepId: string): void;
+  projectId: string;
+  running: boolean;
+  skills: string[];
+  steps: TimelineStep[];
+}): React.JSX.Element {
+  return (
+    <div className="execution-timeline">
+      {skills.length ? (
+        <div className="execution-skills">
+          <Icon name="wand" size={14} />
+          <span>使用 {String(skills.length)} 个技能</span>
+          <span className="execution-skills-list">{skills.join(" · ")}</span>
+        </div>
+      ) : null}
+      {steps.map((step) => {
+        if (step.kind === "reasoning") {
+          return <ReasoningStepView key={step.id} expanded={expandedReasoning.has(step.id)} onToggle={() => onToggleReasoning(step.id)} running={running} step={step} />;
+        }
+        if (step.kind === "tool") {
+          return <div className="execution-tool-step" key={step.id}><ToolActivity onPreviewFile={onPreviewFile} onResolvePermission={onResolvePermission} projectId={projectId} tool={step.tool} /></div>;
+        }
+        return <div className="execution-assistant-step" key={step.id}><MarkdownContent content={step.content} onPreviewFile={onPreviewFile} /></div>;
+      })}
+    </div>
+  );
+}
+
+function ReasoningStepView({ expanded, onToggle, running, step }: {
+  expanded: boolean;
+  onToggle(): void;
+  running: boolean;
+  step: TimelineReasoningStep;
+}): React.JSX.Element {
+  const text = step.content.trim() || step.status || "暂无可展开的思考内容";
+  const label = step.durationMs !== undefined
+    ? `思考了 ${formatThinkingDuration(step.durationMs)}`
+    : step.completed
+      ? "深度思考"
+      : step.status ?? (running ? "正在思考" : "深度思考");
+  return (
+    <section className={`execution-reasoning${expanded ? " is-open" : ""}`}>
+      <button aria-expanded={expanded} className="execution-reasoning-button" onClick={onToggle} type="button">
+        {running && !step.completed ? <span className="reasoning-pulse" /> : <Icon name="brain" size={14} />}
+        <span>{label}</span>
+        <span className={`reasoning-chevron${expanded ? " is-expanded" : ""}`}><Icon name="chevron" size={12} /></span>
+      </button>
+      {expanded ? <div className="reasoning-detail"><div className="reasoning-detail-copy">{text}</div></div> : null}
+    </section>
+  );
+}
 
 function UserMessage({
   content,
@@ -306,89 +389,6 @@ function plainTextFromMarkdown(content: string): string {
     .replace(/^#{1,6}\s+/gm, "")
     .replace(/[*_~`]/g, "")
     .trim();
-}
-
-function ExecutionSummary({
-  turn,
-  running,
-  reasoningOpen,
-  onToggleReasoning,
-  onSelectTool
-}: {
-  turn: TimelineTurn;
-  running: boolean;
-  reasoningOpen: boolean;
-  onToggleReasoning(): void;
-  onSelectTool(toolId: string): void;
-}): React.JSX.Element {
-  const toolEntries = useMemo(() => timelineToolEntries(turn.tools), [turn.tools]);
-  const [openMenu, setOpenMenu] = useState<"tools" | "skills">();
-  return (
-    <div className="execution-summary">
-      {turn.reasoningStatus || turn.reasoning || turn.durationMs !== undefined ? (
-        <button aria-expanded={reasoningOpen} className={`execution-summary-button${reasoningOpen ? " is-open" : ""}`} onClick={() => { setOpenMenu(undefined); onToggleReasoning(); }} type="button">
-          {running ? <span className="reasoning-pulse" /> : <Icon name="brain" size={14} />}
-          <span>{thinkingLabel(turn, running)}</span>
-          <span className={`reasoning-chevron${reasoningOpen ? " is-expanded" : ""}`}><Icon name="chevron" size={12} /></span>
-        </button>
-      ) : null}
-      {toolEntries.length ? <SummaryMenu icon="wrench" label={`${String(toolEntries.length)} 个工具`} title="自动选择的工具：" items={toolEntries} onSelect={onSelectTool} open={openMenu === "tools"} onToggle={() => setOpenMenu((current) => current === "tools" ? undefined : "tools")} onClose={() => setOpenMenu(undefined)} /> : null}
-      {turn.skills.length ? <SummaryMenu icon="wand" label={`${String(turn.skills.length)} 个技能`} title="自动选择的技能：" items={turn.skills.map((label) => ({ key: label, label }))} open={openMenu === "skills"} onToggle={() => setOpenMenu((current) => current === "skills" ? undefined : "skills")} onClose={() => setOpenMenu(undefined)} /> : null}
-    </div>
-  );
-}
-
-function SummaryMenu({
-  icon,
-  label,
-  title,
-  items,
-  onSelect,
-  open,
-  onToggle,
-  onClose
-}: {
-  icon: "wand" | "wrench";
-  label: string;
-  title: string;
-  items: TimelineToolEntry[];
-  onSelect?: (toolId: string) => void;
-  open: boolean;
-  onToggle(): void;
-  onClose(): void;
-}): React.JSX.Element {
-  return (
-    <div className={`summary-menu${open ? " is-open" : ""}`}>
-      <button aria-expanded={open} className="execution-summary-button" onClick={onToggle} type="button">
-        <Icon name={icon} size={14} />
-        <span>{label}</span>
-        <span className={`reasoning-chevron${open ? " is-expanded" : ""}`}><Icon name="chevron" size={12} /></span>
-      </button>
-      {open ? (
-        <div className="summary-popover">
-          <div className="summary-popover-title">{title}</div>
-          <ul>
-            {items.map((item) => (
-              <li key={item.key}>
-                {onSelect && item.toolId ? <button className="summary-popover-item" onClick={() => { onSelect(item.toolId ?? ""); onClose(); }} type="button"><span className="summary-popover-bullet">•</span><span>{item.label}</span></button> : <span className="summary-popover-item"><span className="summary-popover-bullet">•</span><span>{item.label}</span></span>}
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function ReasoningDetail({ content, status }: { content: string; status?: string }): React.JSX.Element {
-  const text = content.trim() || status || "暂无可展开的思考内容";
-  return <div className="reasoning-detail"><div className="reasoning-detail-copy">{text}</div></div>;
-}
-
-function thinkingLabel(turn: TimelineTurn, running: boolean): string {
-  const duration = turn.reasoningDurationMs ?? (!running ? turn.durationMs : undefined);
-  if (duration !== undefined) return `思考了 ${formatThinkingDuration(duration)}`;
-  return turn.reasoningStatus ?? "正在思考";
 }
 
 function formatThinkingDuration(durationMs: number): string {
