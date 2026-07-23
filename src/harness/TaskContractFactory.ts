@@ -1,21 +1,42 @@
 import { promises as fs, type Dirent } from "node:fs";
 import path from "node:path";
-import type { AcceptanceCriterion, TaskRequest } from "./types.js";
+import { compileTaskContract } from "./TaskContractCompiler.js";
+import type { AcceptanceCriterion, TaskContract } from "./types.js";
+import { workspaceStateDigest } from "./WorkspaceState.js";
 
 const ignoredDirectoryNames = new Set([".agent", ".git", "node_modules", "dist", "build", "out", "target", "coverage"]);
 const launchIntentPattern = /(?:启动|运行起来|跑起来|启动服务|start\s+(?:the\s+)?(?:project|app|server|service)|run\s+(?:the\s+)?(?:project|app|server|service)|serve\s+(?:the\s+)?(?:project|app))/iu;
+const codeChangeIntentPattern = /(?:修改|改动|更改|实现|修复|增加|添加|删除|重构|编写|更新|替换|迁移|优化|开发|补全|完善|实现一下|implement|fix|add|remove|refactor|update|change|create|write|modify|improve|complete)/iu;
 
-/** Builds deterministic acceptance predicates for project launch tasks. */
-export async function createTaskRequest(workspaceRoot: string, objective: string): Promise<TaskRequest> {
+/** Compiles deterministic acceptance predicates for project tasks. */
+export async function createTaskContract(workspaceRoot: string, objective: string, ignore: string[] = []): Promise<TaskContract> {
   const trimmed = objective.trim();
   if (!trimmed) throw new Error("Task objective cannot be empty.");
-  if (!launchIntentPattern.test(trimmed)) return { objective: trimmed, acceptanceCriteria: [] };
+  const isLaunchTask = launchIntentPattern.test(trimmed);
+  const isCodeTask = !isLaunchTask && codeChangeIntentPattern.test(trimmed);
+  if (!isLaunchTask && !isCodeTask) {
+    return compileTaskContract({
+      objective: trimmed,
+      taskType: "conversation",
+      acceptanceCriteria: [],
+      verificationMode: "model_only"
+    });
+  }
 
   const manifests = await discoverFiles(workspaceRoot, new Set(["pom.xml", "package.json"]), 3, 2_000);
   const criteria: AcceptanceCriterion[] = [];
   const pendingTodo: string[] = [];
   const mavenProjects = manifests.filter((filePath) => path.basename(filePath) === "pom.xml");
   const nodeProjects: NodeProject[] = [];
+
+  if (isCodeTask) {
+    criteria.push({
+      id: "workspace-changed",
+      kind: "workspace_changed",
+      baselineDigest: await workspaceStateDigest(workspaceRoot, ignore),
+      description: "Workspace content changed for the requested code task"
+    });
+  }
 
   for (const manifestPath of manifests) {
     const relative = toRelative(workspaceRoot, manifestPath);
@@ -26,7 +47,7 @@ export async function createTaskRequest(workspaceRoot: string, objective: string
       description: `Required project file ${relative}`
     });
     if (path.basename(manifestPath) !== "package.json") continue;
-    const project = await readNodeProject(manifestPath);
+    const project = await readNodeProject(manifestPath, workspaceRoot);
     if (project) nodeProjects.push(project);
   }
 
@@ -35,27 +56,29 @@ export async function createTaskRequest(workspaceRoot: string, objective: string
     criteria.push({
       id: criterionId("maven-test", cwd),
       kind: "command_succeeded",
-      commandPattern: "(?:^|\\s)(?:\\./mvnw|mvn)(?:\\s+[^;&|]*)?\\s+test(?:\\s|$)",
+      command: await mavenTestCommand(path.dirname(pomPath)),
       cwd,
       description: `Maven tests in ${cwd}`
     });
-    criteria.push({
-      id: criterionId("backend-process", cwd),
-      kind: "managed_process",
-      cwd,
-      requireHttpReadiness: true,
-      description: `Backend service in ${cwd}`
-    });
-    pendingTodo.push(`Keep the backend in ${cwd} managed and HTTP-ready.`);
+    if (isLaunchTask) {
+      criteria.push({
+        id: criterionId("backend-process", cwd),
+        kind: "managed_process",
+        cwd,
+        requireHttpReadiness: true,
+        description: `Backend service in ${cwd}`
+      });
+      pendingTodo.push(`Keep the backend in ${cwd} managed and HTTP-ready.`);
+    }
   }
 
   for (const project of nodeProjects) {
     const cwd = toRelative(workspaceRoot, project.directory);
-    if (project.scripts.has("build")) {
+    if (project.scripts.has("build") && (isLaunchTask || isCodeTask)) {
       criteria.push({
         id: criterionId("node-build", cwd),
         kind: "command_succeeded",
-        commandPattern: "(?:npm|pnpm|yarn|bun)(?:\\s+run)?\\s+build(?:\\s|$)",
+        command: packageScriptCommand(project.packageManager, "build"),
         cwd,
         description: `Frontend build in ${cwd}`
       });
@@ -64,20 +87,33 @@ export async function createTaskRequest(workspaceRoot: string, objective: string
       criteria.push({
         id: criterionId("node-test", cwd),
         kind: "command_succeeded",
-        commandPattern: "(?:npm|pnpm|yarn|bun)(?:\\s+run)?\\s+test(?:\\s|$)",
+        command: packageScriptCommand(project.packageManager, "test"),
         cwd,
         description: `Frontend tests in ${cwd}`
       });
     }
-    if (!project.isFrontend) continue;
-    criteria.push({
-      id: criterionId("frontend-process", cwd),
-      kind: "managed_process",
-      cwd,
-      requireHttpReadiness: true,
-      description: `Frontend service in ${cwd}`
-    });
-    pendingTodo.push(`Keep the frontend in ${cwd} managed and HTTP-ready.`);
+    if (isCodeTask) {
+      for (const script of ["typecheck", "lint"]) {
+        if (!project.scripts.has(script)) continue;
+        criteria.push({
+          id: criterionId(`node-${script}`, cwd),
+          kind: "command_succeeded",
+          command: packageScriptCommand(project.packageManager, script),
+          cwd,
+          description: `${script} in ${cwd}`
+        });
+      }
+    }
+    if (isLaunchTask && project.isFrontend) {
+      criteria.push({
+        id: criterionId("frontend-process", cwd),
+        kind: "managed_process",
+        cwd,
+        requireHttpReadiness: true,
+        description: `Frontend service in ${cwd}`
+      });
+      pendingTodo.push(`Keep the frontend in ${cwd} managed and HTTP-ready.`);
+    }
   }
 
   const backend = mavenProjects[0] ? await inferJavaService(workspaceRoot, path.dirname(mavenProjects[0])) : undefined;
@@ -112,16 +148,28 @@ export async function createTaskRequest(workspaceRoot: string, objective: string
     pendingTodo.push("Verify the frontend proxy reaches a backend API with HTTP 200.");
   }
 
-  return { objective: trimmed, acceptanceCriteria: deduplicateCriteria(criteria), pendingTodo };
+  const acceptanceCriteria = deduplicateCriteria(criteria);
+  const taskType = isLaunchTask ? "launch" : "code_change";
+  return compileTaskContract({
+    objective: trimmed,
+    taskType,
+    acceptanceCriteria,
+    verificationMode: "deterministic",
+    artifacts: manifests.map((manifestPath) => toRelative(workspaceRoot, manifestPath)),
+    pendingTodo
+  });
 }
 
 interface NodeProject {
   directory: string;
   scripts: Map<string, string>;
   isFrontend: boolean;
+  packageManager: PackageManager;
 }
 
-async function readNodeProject(manifestPath: string): Promise<NodeProject | undefined> {
+type PackageManager = "pnpm" | "npm" | "yarn" | "bun";
+
+async function readNodeProject(manifestPath: string, workspaceRoot: string): Promise<NodeProject | undefined> {
   try {
     const text = await readBoundedText(manifestPath, 512 * 1024);
     const parsed: unknown = JSON.parse(text);
@@ -152,11 +200,29 @@ async function readNodeProject(manifestPath: string): Promise<NodeProject | unde
         || "react" in dependencies
         || "vue" in dependencies
         || "@angular/core" in dependencies
-        || scripts.has("dev") && /vite|next|nuxt|webpack|react-scripts/iu.test(scripts.get("dev") ?? "")
+        || scripts.has("dev") && /vite|next|nuxt|webpack|react-scripts/iu.test(scripts.get("dev") ?? ""),
+      packageManager: await detectPackageManager(directory, workspaceRoot)
     };
   } catch {
     return undefined;
   }
+}
+
+async function mavenTestCommand(directory: string): Promise<string> {
+  return (await firstExisting(directory, ["mvnw"])) ? "./mvnw test" : "mvn test";
+}
+
+async function detectPackageManager(directory: string, workspaceRoot: string): Promise<PackageManager> {
+  if (await firstExisting(directory, ["pnpm-lock.yaml"])) return "pnpm";
+  if (await firstExisting(directory, ["yarn.lock"])) return "yarn";
+  if (await firstExisting(directory, ["bun.lockb", "bun.lock"])) return "bun";
+  const root = path.resolve(workspaceRoot);
+  if (path.resolve(directory) !== root) return await detectPackageManager(root, root);
+  return "npm";
+}
+
+function packageScriptCommand(packageManager: PackageManager, script: string): string {
+  return `${packageManager} run ${script}`;
 }
 
 async function inferFrontendService(directory: string): Promise<{ port: number; proxyPrefix?: string }> {

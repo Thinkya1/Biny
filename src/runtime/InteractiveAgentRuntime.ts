@@ -10,12 +10,7 @@ import type { SessionSummary } from "../session/events.js";
 import type { SessionUsage } from "../session/metadata.js";
 import type { ToolInputDisplay } from "../tools/types.js";
 import { redactSecrets, redactSensitiveValue } from "../utils/secrets.js";
-import { AcceptanceVerifier } from "../harness/AcceptanceVerifier.js";
-import { AgentAttemptExecutor } from "../harness/AgentAttemptExecutor.js";
-import { TaskAttemptLoop, type TaskAttemptBudget, type TaskHarnessRunResult } from "../harness/TaskAttemptLoop.js";
-import { createTaskRequest } from "../harness/TaskRequestFactory.js";
 import type { TaskRunStore } from "../harness/TaskRunStore.js";
-import type { AgentAttemptExecution, TaskRequest, TaskToolEvidence } from "../harness/types.js";
 import { AgentEventBus } from "./AgentEventBus.js";
 import { createCommandRuntime, type CommandRuntime, type CommandRuntimeOptions } from "./CommandRuntime.js";
 import {
@@ -24,6 +19,7 @@ import {
 } from "./SubagentTaskManager.js";
 import { RootRunLedger, type RootRunLedgerSnapshot, type RootRunLedgerStatus } from "./RootRunLedger.js";
 import { RootRunScheduler } from "./RootRunScheduler.js";
+import { TaskRunCoordinator } from "./TaskRunCoordinator.js";
 import type {
   ActiveRunSnapshot,
   AgentHostEvent,
@@ -83,7 +79,7 @@ export class InteractiveAgentRuntime {
   private readonly events = new AgentEventBus<AgentHostEvent>();
   private readonly rootRunScheduler: RootRunScheduler<QueuedAgentRun, AgentRunOutcome>;
   private readonly runLedger: RootRunLedger | undefined;
-  private readonly taskRunStore: TaskRunStore | undefined;
+  private readonly taskRunCoordinator: TaskRunCoordinator;
   private readonly tools = new Map<string, ActiveTool>();
   private readonly permissionRequestIds = new Map<string, string>();
   private directRun: ActiveRunSnapshot | undefined;
@@ -105,7 +101,10 @@ export class InteractiveAgentRuntime {
       throw new Error("shutdownDrainMs must be a non-negative safe integer.");
     }
     this.runLedger = options.runLedger;
-    this.taskRunStore = options.taskRunStore ?? commandRuntime.taskRuns;
+    this.taskRunCoordinator = new TaskRunCoordinator({
+      runtime: commandRuntime,
+      taskRunStore: options.taskRunStore
+    });
     this.rootRunScheduler = new RootRunScheduler({
       maxQueuedRuns: options.maxQueuedRuns ?? InteractiveAgentRuntime.maxQueuedRuns,
       execute: async (run, signal) => await this.executeRun(run, signal),
@@ -535,122 +534,29 @@ export class InteractiveAgentRuntime {
       skills: info.skills ?? []
     });
 
-    let reasoningActive = false;
-    let latestExecution: AgentAttemptExecution | undefined;
-    const executions = new Map<string, AgentAttemptExecution>();
-    let durableTaskCreated = false;
     try {
-      const resolvedTask = await resolveTaskRequest(
-        this.commandRuntime.workspaceRoot,
-        run.input,
-        run.mode,
-        this.taskRunStore
-      );
-      const task = resolvedTask.request;
-      const budget = taskBudget(this.commandRuntime);
-      if (this.taskRunStore) {
-        await this.taskRunStore.create({
-          taskRunId: run.runId,
-          sessionId: run.sessionId,
-          rootRunId: run.runId,
-          request: task,
-          budget
-        });
-        durableTaskCreated = true;
-        await this.taskRunStore.markRunning(run.runId);
-      }
-      const verifier = new AcceptanceVerifier({
-        workspaceRoot: this.commandRuntime.workspaceRoot,
-        ignore: this.commandRuntime.config?.workspace.ignore,
-        managedProcesses: this.commandRuntime.managedProcesses
-      });
-      const executor = new AgentAttemptExecutor({
-        agent,
-        initialEvidence: resolvedTask.priorToolEvidence,
-        runOptions: (context) => ({
-          abortSignal: context.signal,
-          confirmPermission: async (request) => await this.waitForPermission(run, request),
-          mode: run.mode,
-          maxSteps: context.remainingRuntimeSteps === undefined
-            ? undefined
-            : Math.min(this.commandRuntime.config?.agent.maxSteps ?? context.remainingRuntimeSteps, context.remainingRuntimeSteps),
-          deferSuccessfulMemory: true
-        }),
-        onEvent: (event) => {
+      let reasoningActive = false;
+      const { turn } = await this.taskRunCoordinator.execute({
+        runId: run.runId,
+        sessionId: run.sessionId,
+        input: run.input,
+        mode: run.mode,
+        signal,
+        confirmPermission: async (request) => await this.waitForPermission(run, request),
+        onAgentEvent: (event) => {
           const mapped = this.handleAgentEvent(run, event, reasoningActive);
-          reasoningActive = mapped.reasoningActive;
+          return reasoningActive = mapped.reasoningActive;
+        },
+        onReasoningCompleted: () => {
+          this.events.emit({
+            ...this.eventBase(run),
+            type: "reasoning.completed",
+            messageId: run.messageId,
+            status: "分析完成"
+          });
         }
       });
-      const loop = new TaskAttemptLoop<TaskRequest>({
-        budget,
-        execute: async (context) => {
-          await this.taskRunStore?.startAttempt(run.runId, {
-            attemptId: context.attemptId,
-            attemptNumber: context.attemptNumber,
-            feedback: context.feedback
-          });
-          let execution: AgentAttemptExecution;
-          try {
-            execution = await executor.execute(context);
-          } catch (error) {
-            await this.taskRunStore?.completeAttempt(run.runId, context.attemptId, {
-              status: context.signal?.aborted ? "aborted" : "failed",
-              runtimeSteps: 0,
-              stopReason: context.signal?.aborted ? "aborted" : "provider_error",
-              error: errorMessage(error)
-            });
-            throw error;
-          }
-          executions.set(context.attemptId, execution);
-          latestExecution = execution;
-          await this.taskRunStore?.completeAttempt(run.runId, context.attemptId, {
-            status: execution.outcomeStatus,
-            output: execution.output,
-            runtimeSteps: execution.runtimeSteps,
-            usage: execution.usage,
-            stopReason: execution.stopReason,
-            finishReason: execution.finishReason,
-            error: execution.error,
-            toolEvidence: execution.attemptToolEvidence
-          });
-          if (reasoningActive) {
-            this.events.emit({
-              ...this.eventBase(run),
-              type: "reasoning.completed",
-              messageId: run.messageId,
-              status: "分析完成"
-            });
-            reasoningActive = false;
-          }
-          return {
-            output: execution.output,
-            runtimeSteps: execution.runtimeSteps,
-            usage: execution.usage
-          };
-        },
-        verify: async (context) => {
-          const execution = executions.get(context.attemptId);
-          if (!execution) return { passed: false, summary: "Attempt execution evidence is unavailable." };
-          const result = await verifier.verify(task, execution);
-          await this.taskRunStore?.recordVerification(run.runId, context.attemptId, result.evidence);
-          return { passed: result.passed, summary: result.summary, details: { evidence: result.evidence } };
-        },
-        decide: (context) => {
-          const execution = executions.get(context.attemptId);
-          if (execution?.outcomeStatus === "aborted") return "abort";
-          if (execution?.stopReason === "content_filter") return "stop";
-          // Legacy/test hosts without task-level configuration retain their
-          // previous single-attempt semantics. Product runtimes always provide
-          // config and automatically retry within the configured budget.
-          if (!this.commandRuntime.config && execution?.outcomeStatus !== "completed") return "stop";
-          return "retry";
-        },
-        feedbackPrompt: (context) => continuationFeedback(context.verification.summary, context.task)
-      });
-      const harness = await loop.run(task, signal, run.runId);
       const durationMs = Date.now() - startedAtMs;
-      const turn = harnessTurnOutcome(harness, latestExecution, aggregateAttemptUsage([...executions.values()]));
-      await this.persistTaskHarnessResult(run.runId, harness);
       if (turn.output && (turn.status === "completed" || turn.status === "incomplete")) {
         this.emitAssistantCompleted(run, turn.output);
       }
@@ -663,16 +569,14 @@ export class InteractiveAgentRuntime {
       }
       if (turn.status === "incomplete") return this.incompleteRun(run, durationMs, turn);
       if (turn.status === "aborted") return this.abortRun(run, durationMs, turn.error ?? "Current turn interrupted.", turn);
-      return this.failRun(run, durationMs, turn.error ?? harness.terminalReason, turn);
+      return this.failRun(run, durationMs, turn.error ?? "Task verification failed.", turn);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const durationMs = Date.now() - startedAtMs;
       if (signal.aborted) {
         const reason = "Current turn interrupted.";
-        if (durableTaskCreated) await this.finishUnsettledTaskRun(run.runId, "aborted", reason);
         return this.abortRun(run, durationMs, reason);
       }
-      if (durableTaskCreated) await this.finishUnsettledTaskRun(run.runId, "failed", message);
       agent.recordError(error);
       return this.failRun(run, durationMs, message);
     } finally {
@@ -690,41 +594,6 @@ export class InteractiveAgentRuntime {
       messageId: run.messageId,
       content: redactSecrets(content)
     });
-  }
-
-  private async persistTaskHarnessResult(taskRunId: string, result: TaskHarnessRunResult): Promise<void> {
-    if (!this.taskRunStore) return;
-    if (result.status === "passed") {
-      await this.taskRunStore.setPendingTodo(taskRunId, []);
-      await this.taskRunStore.finish(taskRunId, "completed", result.terminalReason);
-    } else if (result.status === "budget_exhausted") {
-      const snapshot = await this.taskRunStore.get(taskRunId);
-      const verifierTodo = snapshot.attempts.at(-1)?.verifierEvidence
-        .filter((evidence) => !evidence.passed)
-        .map((evidence) => evidence.summary) ?? [];
-      if (verifierTodo.length) await this.taskRunStore.setPendingTodo(taskRunId, verifierTodo);
-      await this.taskRunStore.finish(taskRunId, "budget_exhausted", result.terminalReason);
-    } else if (result.status === "aborted") {
-      await this.taskRunStore.finish(taskRunId, "aborted", result.terminalReason);
-    } else {
-      await this.taskRunStore.finish(taskRunId, "failed", result.terminalReason);
-    }
-  }
-
-  private async finishUnsettledTaskRun(
-    taskRunId: string,
-    status: "failed" | "aborted",
-    reason: string
-  ): Promise<void> {
-    if (!this.taskRunStore) return;
-    try {
-      const snapshot = await this.taskRunStore.get(taskRunId);
-      if (snapshot.status === "queued" || snapshot.status === "running" || snapshot.status === "continuable") {
-        await this.taskRunStore.finish(taskRunId, status, reason);
-      }
-    } catch {
-      // Preserve the original run failure when durable cleanup itself is unavailable.
-    }
   }
 
   private completeRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): AgentRunOutcome {
@@ -1005,7 +874,7 @@ export class InteractiveAgentRuntime {
       return { reasoningActive, failure: fatal === false ? undefined : event.message };
     }
     if (event.type === "done") {
-      return { reasoningActive, done: event.outcome ?? legacyDoneOutcome(event) };
+      return { reasoningActive, done: event.outcome };
     }
     return { reasoningActive };
   }
@@ -1142,136 +1011,6 @@ export async function createInteractiveAgentRuntime(workspaceRoot: string, optio
   }
 }
 
-async function resolveTaskRequest(
-  workspaceRoot: string,
-  input: string,
-  mode: AgentRunMode,
-  store: TaskRunStore | undefined
-): Promise<{ request: TaskRequest; priorToolEvidence: TaskToolEvidence[] }> {
-  if (mode === "plan") return { request: { objective: input, acceptanceCriteria: [] }, priorToolEvidence: [] };
-  const inferred = await createTaskRequest(workspaceRoot, input);
-  if (!store || !isContinuationRequest(input)) return { request: inferred, priorToolEvidence: [] };
-  const previous = (await store.list()).find((snapshot) =>
-    snapshot.status === "continuable" || snapshot.status === "budget_exhausted"
-  );
-  if (!previous) return { request: inferred, priorToolEvidence: [] };
-  return {
-    request: {
-      objective: `${previous.objective}\n\nCurrent user request: ${input}`,
-      acceptanceCriteria: previous.acceptanceCriteria,
-      pendingTodo: previous.pendingTodo
-    },
-    priorToolEvidence: previous.attempts.flatMap((attempt) => attempt.toolEvidence)
-  };
-}
-
-function isContinuationRequest(input: string): boolean {
-  return /(?:^|\s)(?:继续|接着|完成了吗|怎么样了|启动了吗|启动起来了吗)(?:\s|[？?。！!]|$)|\b(?:continue|resume|is it (?:done|running)|did it finish)\b/iu.test(input.trim());
-}
-
-function taskBudget(runtime: CommandRuntime): TaskAttemptBudget {
-  const agent = runtime.config?.agent;
-  return {
-    maxAttempts: agent?.maxAttempts ?? 1,
-    maxRuntimeSteps: agent?.maxTaskSteps ?? agent?.maxSteps ?? 32,
-    maxWallTimeMs: agent?.maxWallTimeMs,
-    maxTotalTokens: agent?.maxTotalTokens,
-    maxCostUsd: agent?.maxCostUsd
-  };
-}
-
-function continuationFeedback(summary: string, task: TaskRequest): string {
-  const pending = task.pendingTodo?.length ? ` Remaining durable TODO: ${task.pendingTodo.join("; ")}.` : "";
-  return `Verification did not accept the previous attempt: ${summary}.${pending}`;
-}
-
-function harnessTurnOutcome(
-  harness: TaskHarnessRunResult,
-  latest: AgentAttemptExecution | undefined,
-  usage: SessionUsage | undefined
-): AgentTurnOutcome {
-  const common = {
-    finishReason: latest?.finishReason,
-    steps: harness.runtimeStepsUsed,
-    output: latest?.output ?? "",
-    usage
-  };
-  if (harness.status === "passed") {
-    return { status: "completed", stopReason: "model_stop", ...common };
-  }
-  if (harness.status === "budget_exhausted") {
-    return {
-      status: "incomplete",
-      stopReason: "budget_exhausted",
-      ...common,
-      error: harness.terminalReason
-    };
-  }
-  if (harness.status === "aborted") {
-    return {
-      status: "aborted",
-      stopReason: "aborted",
-      ...common,
-      error: harness.terminalReason
-    };
-  }
-  if (latest?.outcomeStatus === "incomplete") {
-    return {
-      status: "incomplete",
-      stopReason: latest.stopReason,
-      ...common,
-      error: latest.error ?? harness.terminalReason
-    };
-  }
-  return {
-    status: "failed",
-    stopReason: latest?.outcomeStatus === "failed" ? latest.stopReason : "verification_failed",
-    ...common,
-    error: harness.terminalReason
-  };
-}
-
-function aggregateAttemptUsage(attempts: AgentAttemptExecution[]): SessionUsage | undefined {
-  const usages = attempts.flatMap((attempt) => attempt.usage ? [attempt.usage] : []);
-  const latest = usages.at(-1);
-  if (!latest) return undefined;
-  const pricingKnown = usages.every((usage) => usage.pricingKnown && usage.costUsd !== undefined);
-  return {
-    operation: "agent",
-    modelAlias: latest.modelAlias,
-    provider: latest.provider,
-    model: latest.model,
-    inputTokens: sumOptional(usages, "inputTokens"),
-    outputTokens: sumOptional(usages, "outputTokens"),
-    totalTokens: sumTotalTokens(usages),
-    reasoningTokens: sumOptional(usages, "reasoningTokens"),
-    cacheReadTokens: sumOptional(usages, "cacheReadTokens"),
-    cacheWriteTokens: sumOptional(usages, "cacheWriteTokens"),
-    costUsd: pricingKnown ? usages.reduce((total, usage) => total + (usage.costUsd ?? 0), 0) : undefined,
-    pricingKnown,
-    time: latest.time
-  };
-}
-
-function sumTotalTokens(usages: SessionUsage[]): number | undefined {
-  const hasTokenUsage = usages.some((usage) =>
-    usage.totalTokens !== undefined || usage.inputTokens !== undefined || usage.outputTokens !== undefined
-  );
-  if (!hasTokenUsage) return undefined;
-  return usages.reduce(
-    (total, usage) => total + (usage.totalTokens ?? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)),
-    0
-  );
-}
-
-function sumOptional(
-  usages: SessionUsage[],
-  key: "inputTokens" | "outputTokens" | "totalTokens" | "reasoningTokens" | "cacheReadTokens" | "cacheWriteTokens"
-): number | undefined {
-  const values = usages.flatMap((usage) => usage[key] === undefined ? [] : [usage[key]]);
-  return values.length ? values.reduce((total, value) => total + value, 0) : undefined;
-}
-
 function redactPermissionRequest(request: AgentPermissionEventRequest): AgentPermissionEventRequest {
   return {
     ...request,
@@ -1390,15 +1129,4 @@ function incompleteReason(outcome: AgentTurnOutcome): string {
   if (outcome.stopReason === "model_length") return "Agent attempt reached the model output limit before completion.";
   if (outcome.stopReason === "budget_exhausted") return "Task budget was exhausted before completion.";
   return `Agent attempt is incomplete (${outcome.stopReason}).`;
-}
-
-function legacyDoneOutcome(event: Extract<AgentSessionEvent, { type: "done" }>): AgentTurnOutcome {
-  return {
-    status: "completed",
-    stopReason: "model_stop",
-    finishReason: "stop",
-    steps: 1,
-    output: event.content,
-    usage: event.usage
-  };
 }

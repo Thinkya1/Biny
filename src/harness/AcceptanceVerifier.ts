@@ -1,14 +1,15 @@
 import { promises as fs } from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { runShellCommand } from "../tools/shell/runCommand.js";
 import { redactSensitiveValue } from "../utils/secrets.js";
-import { resolveWorkspacePath } from "../workspace/resolvePath.js";
+import { resolveWorkspaceDirectory, resolveWorkspacePath } from "../workspace/resolvePath.js";
+import { workspaceStateDigest } from "./WorkspaceState.js";
 import type {
   AcceptanceCriterion,
   AcceptanceEvidence,
   AgentAttemptExecution,
-  TaskRequest,
-  TaskToolEvidence
+  TaskContract
 } from "./types.js";
 
 export interface ManagedProcessInspection {
@@ -35,24 +36,30 @@ export interface AcceptanceVerifierOptions {
   ignore?: string[];
   managedProcesses?: ManagedProcessInspector;
   defaultProbeTimeoutMs?: number;
+  defaultCommandTimeoutMs?: number;
 }
 
 /**
- * Verifies observable acceptance predicates. Model prose is deliberately not
- * evidence: command criteria use recorded tool results and service criteria
- * probe live runtime state.
+ * Verifies observable acceptance predicates. Model prose and Agent command
+ * results are deliberately not evidence: command criteria run independently
+ * here, while service criteria probe live runtime state.
  */
 export class AcceptanceVerifier {
   private readonly defaultProbeTimeoutMs: number;
+  private readonly defaultCommandTimeoutMs: number;
 
   constructor(private readonly options: AcceptanceVerifierOptions) {
     this.defaultProbeTimeoutMs = options.defaultProbeTimeoutMs ?? 5_000;
     if (!Number.isSafeInteger(this.defaultProbeTimeoutMs) || this.defaultProbeTimeoutMs < 1) {
       throw new RangeError("defaultProbeTimeoutMs must be a positive safe integer.");
     }
+    this.defaultCommandTimeoutMs = options.defaultCommandTimeoutMs ?? 120_000;
+    if (!Number.isSafeInteger(this.defaultCommandTimeoutMs) || this.defaultCommandTimeoutMs < 1) {
+      throw new RangeError("defaultCommandTimeoutMs must be a positive safe integer.");
+    }
   }
 
-  async verify(task: TaskRequest, attempt: AgentAttemptExecution): Promise<AcceptanceVerificationResult> {
+  async verify(task: TaskContract, attempt: AgentAttemptExecution): Promise<AcceptanceVerificationResult> {
     const evidence: AcceptanceEvidence[] = [];
     if (attempt.outcomeStatus !== "completed" || attempt.stopReason !== "model_stop") {
       evidence.push(this.evidence(
@@ -71,8 +78,13 @@ export class AcceptanceVerifier {
       };
     }
 
-    for (const criterion of task.acceptanceCriteria) {
-      evidence.push(await this.verifyCriterion(criterion, attempt.toolEvidence));
+    for (const criterion of task.acceptanceCriteria) evidence.push(await this.verifyCriterion(criterion));
+    if (task.verificationMode === "deterministic" && task.acceptanceCriteria.length === 0) {
+      evidence.push(this.evidence(
+        "deterministic_verification",
+        false,
+        "This task requires deterministic verification, but no executable acceptance criteria were generated."
+      ));
     }
     const failures = evidence.filter((item) => !item.passed);
     if (!failures.length) {
@@ -91,13 +103,11 @@ export class AcceptanceVerifier {
     };
   }
 
-  private async verifyCriterion(
-    criterion: AcceptanceCriterion,
-    toolEvidence: TaskToolEvidence[]
-  ): Promise<AcceptanceEvidence> {
+  private async verifyCriterion(criterion: AcceptanceCriterion): Promise<AcceptanceEvidence> {
     try {
       if (criterion.kind === "file_exists") return await this.verifyFile(criterion);
-      if (criterion.kind === "command_succeeded") return this.verifyCommand(criterion, toolEvidence);
+      if (criterion.kind === "workspace_changed") return await this.verifyWorkspaceChanged(criterion);
+      if (criterion.kind === "command_succeeded") return await this.verifyCommand(criterion);
       if (criterion.kind === "http") return await this.verifyHttp(criterion);
       if (criterion.kind === "tcp") return await this.verifyTcp(criterion);
       return await this.verifyManagedProcess(criterion);
@@ -128,40 +138,48 @@ export class AcceptanceVerifier {
     );
   }
 
-  private verifyCommand(
-    criterion: Extract<AcceptanceCriterion, { kind: "command_succeeded" }>,
-    toolEvidence: TaskToolEvidence[]
-  ): AcceptanceEvidence {
-    const commandPattern = criterion.commandPattern === undefined
-      ? undefined
-      : new RegExp(criterion.commandPattern, "u");
-    const observed = [...toolEvidence].reverse().find((item) => {
-      if (item.tool !== "run_command") return false;
-      const command = readString(item.args, "command");
-      if (!command) return false;
-      if (criterion.command !== undefined && command !== criterion.command) return false;
-      if (commandPattern && !commandPattern.test(command)) return false;
-      const cwd = observedCommandCwd(this.options.workspaceRoot, item.args);
-      if (criterion.cwd !== undefined && path.resolve(this.options.workspaceRoot, criterion.cwd) !== path.resolve(cwd)) return false;
-      return true;
-    });
-    if (!observed) {
-      return this.evidence(
-        criterion.id,
-        false,
-        `${criterion.description ?? criterion.command ?? criterion.commandPattern ?? criterion.id}: no matching run_command evidence.`
-      );
-    }
-    const exitCode = readNumber(observed.result, "exitCode");
-    const status = readString(observed.result, "status");
-    const passed = observed.error === undefined && exitCode === 0 && status !== "timed_out" && status !== "aborted";
+  private async verifyWorkspaceChanged(
+    criterion: Extract<AcceptanceCriterion, { kind: "workspace_changed" }>
+  ): Promise<AcceptanceEvidence> {
+    const digest = await workspaceStateDigest(this.options.workspaceRoot, this.options.ignore ?? []);
+    const passed = digest !== criterion.baselineDigest;
     return this.evidence(
       criterion.id,
       passed,
       passed
-        ? `${criterion.description ?? readString(observed.args, "command") ?? criterion.id} succeeded.`
-        : `${criterion.description ?? readString(observed.args, "command") ?? criterion.id} did not succeed (exit ${String(exitCode ?? "unknown")}${status ? `, ${status}` : ""}).`,
-      { toolCallId: observed.toolCallId, exitCode, status }
+        ? `${criterion.description ?? criterion.id} changed from its task baseline.`
+        : `${criterion.description ?? criterion.id} did not change from its task baseline.`,
+      { baselineDigest: criterion.baselineDigest, digest }
+    );
+  }
+
+  private async verifyCommand(
+    criterion: Extract<AcceptanceCriterion, { kind: "command_succeeded" }>
+  ): Promise<AcceptanceEvidence> {
+    const cwd = resolveWorkspaceDirectory(
+      this.options.workspaceRoot,
+      criterion.cwd ?? ".",
+      this.options.ignore ?? []
+    );
+    const result = await runShellCommand(cwd, criterion.command, {
+      timeoutMs: criterion.timeoutMs ?? this.defaultCommandTimeoutMs
+    });
+    const passed = result.status === "completed" && result.exitCode === 0;
+    return this.evidence(
+      criterion.id,
+      passed,
+      passed
+        ? `${criterion.description ?? criterion.command} succeeded in an independent verifier run.`
+        : `${criterion.description ?? criterion.command} failed in an independent verifier run (exit ${String(result.exitCode)}, ${result.status}).`,
+      {
+        execution: "independent_verifier",
+        command: criterion.command,
+        cwd: path.relative(this.options.workspaceRoot, cwd) || ".",
+        status: result.status,
+        exitCode: result.exitCode,
+        stdout: compactOutput(result.stdout),
+        stderr: compactOutput(result.stderr)
+      }
     );
   }
 
@@ -203,12 +221,10 @@ export class AcceptanceVerifier {
       return this.evidence(criterion.id, false, `${criterion.description ?? criterion.id}: managed process runtime is unavailable.`);
     }
     const processes = await this.options.managedProcesses.listProcesses();
-    const commandPattern = criterion.commandPattern === undefined ? undefined : new RegExp(criterion.commandPattern, "u");
     const matchingProcesses = processes.filter((candidate) => {
       if (criterion.processId !== undefined && candidate.processId !== criterion.processId) return false;
       if (criterion.url !== undefined && candidate.url !== criterion.url) return false;
       if (criterion.cwd !== undefined && path.resolve(this.options.workspaceRoot, criterion.cwd) !== path.resolve(candidate.cwd ?? "")) return false;
-      if (commandPattern && !commandPattern.test(candidate.command ?? "")) return false;
       return true;
     });
     const process = matchingProcesses.find((candidate) =>
@@ -294,21 +310,14 @@ function readString(value: unknown, key: string): string | undefined {
   return isRecord(value) && typeof value[key] === "string" ? value[key] : undefined;
 }
 
-function readNumber(value: unknown, key: string): number | undefined {
-  return isRecord(value) && typeof value[key] === "number" ? value[key] : undefined;
+function compactOutput(value: string): string | undefined {
+  if (!value) return undefined;
+  const maxChars = 4_000;
+  return value.length <= maxChars ? value : `${value.slice(0, maxChars - 1)}…`;
 }
 
 function readBoolean(value: unknown, key: string): boolean | undefined {
   return isRecord(value) && typeof value[key] === "boolean" ? value[key] : undefined;
-}
-
-function observedCommandCwd(workspaceRoot: string, args: unknown): string {
-  const explicit = readString(args, "cwd");
-  if (explicit) return path.resolve(workspaceRoot, explicit);
-  const command = readString(args, "command") ?? "";
-  const changeDirectory = command.match(/^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*&&/u);
-  const requested = changeDirectory?.[1] ?? changeDirectory?.[2] ?? changeDirectory?.[3];
-  return requested ? path.resolve(workspaceRoot, requested) : path.resolve(workspaceRoot);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

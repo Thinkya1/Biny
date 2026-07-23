@@ -6,9 +6,21 @@ import type { SessionUsage } from "../session/metadata.js";
 import { ensureAgentDirs } from "../session/store.js";
 import { redactSecrets, redactSensitiveValue } from "../utils/secrets.js";
 import type { TaskAttemptBudget } from "./TaskAttemptLoop.js";
-import type { AcceptanceEvidence, TaskRequest, TaskToolEvidence } from "./types.js";
+import {
+  attachCleanupLineage,
+  collectAttemptEvidence,
+  collectVerificationEvidence,
+  toolEvidenceId
+} from "./TaskEvidenceCollector.js";
+import type {
+  AcceptanceEvidence,
+  TaskCleanupPlan,
+  TaskContract,
+  TaskEvidence,
+  TaskToolEvidence
+} from "./types.js";
 
-const taskRunVersion = 1;
+const taskRunVersion = 2;
 const taskFilePrefix = "task-run-";
 const taskFileSuffix = ".json";
 const maxTaskRecordBytes = 4 * 1024 * 1024;
@@ -47,14 +59,13 @@ export interface TaskRunSnapshot {
   taskRunId: string;
   sessionId?: string;
   rootRunId?: string;
-  objective: string;
-  acceptanceCriteria: TaskRequest["acceptanceCriteria"];
-  pendingTodo: string[];
+  contract: TaskContract;
   budget: TaskAttemptBudget;
   status: DurableTaskStatus;
   createdAt: string;
   updatedAt: string;
   attempts: DurableTaskAttempt[];
+  evidence: TaskEvidence[];
   terminalReason?: string;
   recovered?: boolean;
 }
@@ -63,7 +74,7 @@ export interface CreateTaskRunOptions {
   taskRunId?: string;
   sessionId?: string;
   rootRunId?: string;
-  request: TaskRequest;
+  contract: TaskContract;
   budget: TaskAttemptBudget;
 }
 
@@ -116,22 +127,22 @@ export class TaskRunStore {
       const taskRunId = options.taskRunId ?? randomUUID();
       assertTaskRunId(taskRunId);
       validateBudget(options.budget);
-      const objective = publicText(options.request.objective);
-      if (!objective) throw new Error("Task objective cannot be empty.");
+      const contract = cloneContract(options.contract);
+      contract.objective = publicText(contract.objective);
+      validateContract(contract);
       const now = new Date().toISOString();
       const snapshot: TaskRunSnapshot = {
         version: taskRunVersion,
         taskRunId,
         sessionId: optionalPublicText(options.sessionId),
         rootRunId: optionalPublicText(options.rootRunId),
-        objective,
-        acceptanceCriteria: cloneCriteria(options.request.acceptanceCriteria),
-        pendingTodo: publicStringList(options.request.pendingTodo ?? []),
+        contract,
         budget: cloneBudget(options.budget),
         status: "queued",
         createdAt: now,
         updatedAt: now,
         attempts: [],
+        evidence: [],
         terminalReason: undefined,
         recovered: undefined
       };
@@ -201,6 +212,10 @@ export class TaskRunStore {
       attempt.finishReason = optionalPublicText(result.finishReason);
       attempt.error = optionalPublicText(result.error);
       attempt.toolEvidence = cloneToolEvidence(result.toolEvidence ?? []);
+      snapshot.evidence = mergeEvidence(
+        snapshot.evidence,
+        collectAttemptEvidence(attempt)
+      );
     });
   }
 
@@ -210,13 +225,33 @@ export class TaskRunStore {
     evidence: AcceptanceEvidence[]
   ): Promise<TaskRunSnapshot> {
     return await this.mutate(taskRunId, (snapshot) => {
-      requiredAttempt(snapshot, attemptId).verifierEvidence = cloneAcceptanceEvidence(evidence);
+      const attempt = requiredAttempt(snapshot, attemptId);
+      attempt.verifierEvidence = cloneAcceptanceEvidence(evidence);
+      const parentEvidenceIds = attempt.toolEvidence.map((item) => toolEvidenceId(attemptId, item));
+      snapshot.evidence = mergeEvidence(
+        snapshot.evidence,
+        collectVerificationEvidence(attemptId, attempt.verifierEvidence, parentEvidenceIds)
+      );
     });
   }
 
-  async setPendingTodo(taskRunId: string, pendingTodo: string[]): Promise<TaskRunSnapshot> {
+  async updateContract(taskRunId: string, contract: TaskContract): Promise<TaskRunSnapshot> {
     return await this.mutate(taskRunId, (snapshot) => {
-      snapshot.pendingTodo = publicStringList(pendingTodo);
+      snapshot.contract = cloneContract(contract);
+    });
+  }
+
+  async recordCleanup(
+    taskRunId: string,
+    cleanup: TaskCleanupPlan,
+    evidence: TaskEvidence[]
+  ): Promise<TaskRunSnapshot> {
+    return await this.mutate(taskRunId, (snapshot) => {
+      snapshot.contract.cleanup = cloneCleanup(cleanup);
+      const processEvidenceIds = snapshot.evidence
+        .filter((item) => item.kind === "tool" && readString(item.details, "tool") === "start_process")
+        .map((item) => item.id);
+      snapshot.evidence = mergeEvidence(snapshot.evidence, attachCleanupLineage(evidence, processEvidenceIds));
     });
   }
 
@@ -400,10 +435,10 @@ function parseSnapshot(value: unknown, expectedTaskRunId: string): TaskRunSnapsh
 function validateSnapshot(snapshot: TaskRunSnapshot): void {
   if (!isRecord(snapshot) || snapshot.version !== taskRunVersion) throw new Error("Unsupported task record version.");
   assertTaskRunId(snapshot.taskRunId);
-  if (typeof snapshot.objective !== "string" || !snapshot.objective.trim()) throw new Error("Task record objective is invalid.");
-  if (!Array.isArray(snapshot.acceptanceCriteria) || !Array.isArray(snapshot.pendingTodo) || !Array.isArray(snapshot.attempts)) {
+  if (!Array.isArray(snapshot.attempts) || !Array.isArray(snapshot.evidence)) {
     throw new Error("Task record lists are invalid.");
   }
+  validateContract(snapshot.contract);
   validateBudget(snapshot.budget);
   if (!isTaskStatus(snapshot.status)) throw new Error("Task record status is invalid.");
   if (!isTimestamp(snapshot.createdAt) || !isTimestamp(snapshot.updatedAt)) throw new Error("Task record timestamps are invalid.");
@@ -414,6 +449,7 @@ function validateSnapshot(snapshot: TaskRunSnapshot): void {
     if (!Number.isSafeInteger(attempt.runtimeSteps) || attempt.runtimeSteps < 0) throw new Error("Task attempt step count is invalid.");
     if (!Array.isArray(attempt.toolEvidence) || !Array.isArray(attempt.verifierEvidence)) throw new Error("Task attempt evidence is invalid.");
   }
+  for (const evidence of snapshot.evidence) validateTaskEvidence(evidence);
 }
 
 function validateBudget(budget: TaskAttemptBudget): void {
@@ -443,22 +479,16 @@ function requiredAttempt(snapshot: TaskRunSnapshot, attemptId: string): DurableT
 function cloneSnapshot(snapshot: TaskRunSnapshot): TaskRunSnapshot {
   return {
     ...snapshot,
-    acceptanceCriteria: cloneCriteria(snapshot.acceptanceCriteria),
-    pendingTodo: [...snapshot.pendingTodo],
+    contract: cloneContract(snapshot.contract),
     budget: cloneBudget(snapshot.budget),
     attempts: snapshot.attempts.map((attempt) => ({
       ...attempt,
       usage: cloneUsage(attempt.usage),
       toolEvidence: cloneToolEvidence(attempt.toolEvidence),
       verifierEvidence: cloneAcceptanceEvidence(attempt.verifierEvidence)
-    }))
+    })),
+    evidence: cloneTaskEvidence(snapshot.evidence)
   };
-}
-
-function cloneCriteria(criteria: TaskRequest["acceptanceCriteria"]): TaskRequest["acceptanceCriteria"] {
-  const cloned = redactSensitiveValue(criteria);
-  if (!Array.isArray(cloned)) throw new Error("Task acceptance criteria must be an array.");
-  return cloned as TaskRequest["acceptanceCriteria"];
 }
 
 function cloneToolEvidence(evidence: TaskToolEvidence[]): TaskToolEvidence[] {
@@ -469,6 +499,64 @@ function cloneToolEvidence(evidence: TaskToolEvidence[]): TaskToolEvidence[] {
 function cloneAcceptanceEvidence(evidence: AcceptanceEvidence[]): AcceptanceEvidence[] {
   const cloned = redactSensitiveValue(evidence);
   return Array.isArray(cloned) ? cloned as AcceptanceEvidence[] : [];
+}
+
+function cloneContract(contract: TaskContract): TaskContract {
+  const cloned = redactSensitiveValue(contract);
+  if (!isRecord(cloned)) throw new Error("Task contract must be an object.");
+  return cloned as unknown as TaskContract;
+}
+
+function cloneCleanup(cleanup: TaskCleanupPlan): TaskCleanupPlan {
+  const cloned = redactSensitiveValue(cleanup);
+  if (!isRecord(cloned)) throw new Error("Task cleanup must be an object.");
+  return cloned as unknown as TaskCleanupPlan;
+}
+
+function cloneTaskEvidence(evidence: TaskEvidence[]): TaskEvidence[] {
+  const cloned = redactSensitiveValue(evidence);
+  return Array.isArray(cloned) ? cloned as TaskEvidence[] : [];
+}
+
+function mergeEvidence(current: TaskEvidence[], additions: TaskEvidence[]): TaskEvidence[] {
+  const byId = new Map(current.map((item) => [item.id, item]));
+  for (const evidence of additions) byId.set(evidence.id, evidence);
+  return cloneTaskEvidence([...byId.values()]);
+}
+
+function validateContract(contract: TaskContract): void {
+  if (!isRecord(contract) || typeof contract.objective !== "string" || !contract.objective.trim()) {
+    throw new Error("Task contract is invalid.");
+  }
+  if (contract.taskType !== "conversation" && contract.taskType !== "code_change" && contract.taskType !== "launch") {
+    throw new Error("Task contract type is invalid.");
+  }
+  if (contract.verificationMode !== "model_only" && contract.verificationMode !== "deterministic") {
+    throw new Error("Task contract verification mode is invalid.");
+  }
+  if (!Array.isArray(contract.constraints) || !Array.isArray(contract.artifacts) || !Array.isArray(contract.acceptanceCriteria) || !Array.isArray(contract.plan) || !Array.isArray(contract.pendingTodo)) {
+    throw new Error("Task contract lists are invalid.");
+  }
+  if (!isRecord(contract.cleanup) || !Array.isArray(contract.cleanup.processIds) || !Array.isArray(contract.cleanup.evidenceIds)) {
+    throw new Error("Task contract cleanup is invalid.");
+  }
+  for (const item of contract.plan) {
+    if (!isRecord(item) || typeof item.id !== "string" || !item.id || typeof item.description !== "string" || typeof item.required !== "boolean" || !Array.isArray(item.evidenceIds)) {
+      throw new Error("Task plan item is invalid.");
+    }
+    if (!["pending", "in_progress", "completed", "blocked", "skipped"].includes(String(item.status))) {
+      throw new Error("Task plan item status is invalid.");
+    }
+  }
+}
+
+function validateTaskEvidence(evidence: TaskEvidence): void {
+  if (!isRecord(evidence) || typeof evidence.id !== "string" || !evidence.id || !["agent", "tool", "verification", "cleanup"].includes(String(evidence.kind))) {
+    throw new Error("Task evidence is invalid.");
+  }
+  if (!Array.isArray(evidence.parentEvidenceIds) || typeof evidence.summary !== "string" || !isTimestamp(evidence.observedAt)) {
+    throw new Error("Task evidence fields are invalid.");
+  }
 }
 
 function cloneBudget(budget: TaskAttemptBudget): TaskAttemptBudget {
@@ -483,14 +571,6 @@ function cloneBudget(budget: TaskAttemptBudget): TaskAttemptBudget {
 
 function cloneUsage(usage: SessionUsage | undefined): SessionUsage | undefined {
   return usage === undefined ? undefined : { ...usage };
-}
-
-function publicStringList(values: string[]): string[] {
-  if (!Array.isArray(values)) throw new Error("Task TODO list must be an array.");
-  return values.map((value) => {
-    if (typeof value !== "string") throw new Error("Task TODO entries must be strings.");
-    return publicText(value);
-  });
 }
 
 function publicText(value: string): string {
@@ -569,4 +649,8 @@ function isSymlinkError(error: unknown): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readString(value: unknown, key: string): string | undefined {
+  return isRecord(value) && typeof value[key] === "string" ? value[key] : undefined;
 }

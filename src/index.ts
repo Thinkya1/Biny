@@ -10,7 +10,7 @@ export type { AgentTurnOutcome, AgentTurnStatus, AgentTurnStopReason } from "./a
 export * from "./harness/TaskAttemptLoop.js";
 export * from "./harness/AgentAttemptExecutor.js";
 export * from "./harness/AcceptanceVerifier.js";
-export * from "./harness/TaskRequestFactory.js";
+export * from "./harness/TaskContractFactory.js";
 export * from "./harness/TaskRunStore.js";
 export * from "./harness/types.js";
 export * from "./runtime/RootRunLedger.js";

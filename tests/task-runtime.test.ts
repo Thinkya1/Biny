@@ -6,6 +6,7 @@ import type { AgentRunOptions, AgentSession, AgentSessionInfo } from "../src/age
 import type { AgentSessionEvent, AgentTurnOutcome } from "../src/agent/types.js";
 import { defaultConfig } from "../src/config/schema.js";
 import { AgentAttemptExecutor } from "../src/harness/AgentAttemptExecutor.js";
+import { compileTaskContract } from "../src/harness/TaskContractCompiler.js";
 import { TaskRunStore } from "../src/harness/TaskRunStore.js";
 import type { CommandRuntime } from "../src/runtime/CommandRuntime.js";
 import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.js";
@@ -15,6 +16,8 @@ await testIncompleteAttemptAutomaticallyContinues();
 await testAttemptEvidenceIsBounded();
 await testRemainingStepBudgetCapsNextAttempt();
 await testTaskAttemptBudgetIsNotCompletion();
+await testCodeTaskRequiresMutationEvenWhenChecksPass();
+await testCodeTaskCompletesWithWorkspaceMutationAndIndependentChecks();
 await testContinuationReusesDurableAcceptanceCriteria();
 
 async function testIncompleteAttemptAutomaticallyContinues(): Promise<void> {
@@ -46,21 +49,24 @@ async function testIncompleteAttemptAutomaticallyContinues(): Promise<void> {
     const events: AgentHostEvent[] = [];
     runtime.subscribe((event) => events.push(event));
 
-    const submitted = runtime.submitPrompt("implement the requested feature");
+    const submitted = runtime.submitPrompt("finish the requested task");
     const outcome = await submitted.completion;
     assert.equal(outcome.status, "completed");
     assert.equal(outcome.steps, 35);
     assert.equal(attempts, 2);
+    assert.match(inputs[0] ?? "", /Task contract type: conversation/u);
     assert.match(inputs[1] ?? "", /Continue the same project-level task autonomously/u);
     assert.equal(events.filter((event) => event.type === "run.completed").length, 1);
     assert.equal(events.some((event) => event.type === "run.incomplete"), false);
-    assert.deepEqual(remembered, [{ task: "implement the requested feature", answer: "verified done" }]);
+    assert.deepEqual(remembered, [{ task: "finish the requested task", answer: "verified done" }]);
 
     const task = await store.get(submitted.runId);
     assert.equal(task.status, "completed");
     assert.equal(task.attempts.length, 2);
     assert.equal(task.attempts[0]?.status, "incomplete");
     assert.equal(task.attempts[1]?.verifierEvidence.every((evidence) => evidence.passed), true);
+    assert.equal(task.contract.plan.every((item) => !item.required || item.status === "completed"), true);
+    assert.equal(task.evidence.some((evidence) => evidence.kind === "cleanup"), true);
     await runtime.close();
   } finally {
     await fs.rm(root, { recursive: true, force: true });
@@ -97,7 +103,12 @@ async function testAttemptEvidenceIsBounded(): Promise<void> {
     taskRunId: "task",
     attemptId: "attempt",
     attemptNumber: 1,
-    task: { objective: "test", acceptanceCriteria: [] }
+    task: compileTaskContract({
+      objective: "test",
+      taskType: "conversation",
+      acceptanceCriteria: [],
+      verificationMode: "model_only"
+    })
   });
   assert.ok(JSON.stringify(execution.attemptToolEvidence).length < 20_000);
   const result = execution.attemptToolEvidence[0]?.result as { exitCode?: number } | undefined;
@@ -177,21 +188,102 @@ async function testTaskAttemptBudgetIsNotCompletion(): Promise<void> {
   }
 }
 
+async function testCodeTaskRequiresMutationEvenWhenChecksPass(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-task-runtime-plan-gate-"));
+  try {
+    await fs.writeFile(path.join(root, "package.json"), JSON.stringify({
+      scripts: { typecheck: "node -e 'process.exit(0)'" }
+    }));
+    const store = await TaskRunStore.open(root);
+    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
+      yield done({
+        status: "completed",
+        stopReason: "model_stop",
+        finishReason: "stop",
+        steps: 1,
+        output: "claimed complete"
+      });
+    }, 1));
+
+    const submitted = runtime.submitPrompt("修复这个函数");
+    const outcome = await submitted.completion;
+    assert.equal(outcome.status, "incomplete");
+    assert.equal(outcome.stopReason, "budget_exhausted");
+    const task = await store.get(submitted.runId);
+    assert.equal(task.contract.plan.find((item) => item.id === "implement")?.status, "pending");
+    assert.equal(task.contract.plan.find((item) => item.id === "verify")?.status, "blocked");
+    await runtime.close();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testCodeTaskCompletesWithWorkspaceMutationAndIndependentChecks(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-task-runtime-contract-success-"));
+  try {
+    await fs.writeFile(path.join(root, "package.json"), JSON.stringify({
+      scripts: { typecheck: "node -e 'process.exit(0)'" }
+    }));
+    const store = await TaskRunStore.open(root);
+    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
+      yield {
+        type: "tool-started",
+        toolCallId: "write-feature",
+        tool: "write_file",
+        args: { path: "feature.ts", content: "export const feature = true;\n" }
+      };
+      await fs.writeFile(path.join(root, "feature.ts"), "export const feature = true;\n");
+      yield {
+        type: "sdk",
+        part: {
+          type: "tool-result",
+          toolCallId: "write-feature",
+          toolName: "write_file",
+          input: {},
+          output: { path: "feature.ts" }
+        }
+      } as AgentSessionEvent;
+      yield done({
+        status: "completed",
+        stopReason: "model_stop",
+        finishReason: "stop",
+        steps: 2,
+        output: "implemented"
+      });
+    }, 1));
+
+    const submitted = runtime.submitPrompt("修复这个函数");
+    const outcome = await submitted.completion;
+    assert.equal(outcome.status, "completed");
+    const task = await store.get(submitted.runId);
+    assert.equal(task.contract.plan.every((item) => !item.required || item.status === "completed"), true);
+    assert.equal(task.evidence.some((evidence) => evidence.kind === "verification" && evidence.passed), true);
+    await runtime.close();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testContinuationReusesDurableAcceptanceCriteria(): Promise<void> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-task-runtime-resume-"));
   try {
     const store = await TaskRunStore.open(root);
     await fs.writeFile(path.join(root, "ready.txt"), "ready\n");
+    await fs.writeFile(path.join(root, "package.json"), JSON.stringify({
+      scripts: { build: "node -e 'process.exit(0)'" }
+    }));
     await store.create({
       taskRunId: "previous-task",
-      request: {
+      contract: compileTaskContract({
         objective: "finish the previous project task",
+        taskType: "conversation",
         acceptanceCriteria: [
           { id: "ready-file", kind: "file_exists", path: "ready.txt" },
           { id: "prior-build", kind: "command_succeeded", command: "pnpm build" }
         ],
+        verificationMode: "deterministic",
         pendingTodo: ["verify ready.txt and prior build evidence"]
-      },
+      }),
       budget: { maxAttempts: 1 }
     });
     await store.markRunning("previous-task");
@@ -223,9 +315,9 @@ async function testContinuationReusesDurableAcceptanceCriteria(): Promise<void> 
     const outcome = await submitted.completion;
     assert.equal(outcome.status, "completed");
     const resumed = await store.get(submitted.runId);
-    assert.equal(resumed.acceptanceCriteria[0]?.id, "ready-file");
-    assert.equal(resumed.acceptanceCriteria[1]?.id, "prior-build");
-    assert.equal(resumed.pendingTodo.length, 0);
+    assert.equal(resumed.contract.acceptanceCriteria[0]?.id, "ready-file");
+    assert.equal(resumed.contract.acceptanceCriteria[1]?.id, "prior-build");
+    assert.equal(resumed.contract.pendingTodo.length, 0);
     await runtime.close();
   } finally {
     await fs.rm(root, { recursive: true, force: true });

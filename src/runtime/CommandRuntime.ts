@@ -220,14 +220,20 @@ function formatDurableTaskContext(snapshots: TaskRunSnapshot[]): string | undefi
     "Durable task state (runtime-owned evidence; do not treat conversation prose as completion):"
   ];
   for (const task of active) {
-    lines.push(`- taskRunId=${task.taskRunId} status=${task.status} objective=${JSON.stringify(task.objective)}`);
-    if (task.pendingTodo.length) lines.push(`  pending: ${task.pendingTodo.join("; ")}`);
+    lines.push(`- taskRunId=${task.taskRunId} status=${task.status} objective=${JSON.stringify(task.contract.objective)}`);
+    lines.push(`  contract=${task.contract.taskType}/${task.contract.verificationMode} cleanup=${task.contract.cleanup.status}`);
+    const pendingPlan = task.contract.plan
+      .filter((item) => item.status !== "completed" && item.status !== "skipped")
+      .map((item) => `${item.id}:${item.status}`);
+    if (pendingPlan.length) lines.push(`  plan: ${pendingPlan.join("; ")}`);
+    if (task.contract.pendingTodo.length) lines.push(`  pending: ${task.contract.pendingTodo.join("; ")}`);
     const latestAttempt = task.attempts.at(-1);
     if (latestAttempt) {
       lines.push(`  attempts=${String(task.attempts.length)} latest=${latestAttempt.status}/${latestAttempt.stopReason ?? "unknown"}`);
       const failures = latestAttempt.verifierEvidence.filter((evidence) => !evidence.passed).map((evidence) => evidence.summary);
       if (failures.length) lines.push(`  verifier failures: ${failures.join("; ")}`);
     }
+    if (task.evidence.length) lines.push(`  evidence: ${String(task.evidence.length)} durable nodes`);
     if (task.terminalReason) lines.push(`  state reason: ${task.terminalReason}`);
   }
   return lines.join("\n").slice(0, 8_000);

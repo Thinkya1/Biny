@@ -2,13 +2,13 @@ import type { AgentRunOptions, AgentSession } from "../agent/AgentSession.js";
 import type { AgentSessionEvent, AgentTurnOutcome } from "../agent/types.js";
 import { redactSecrets, redactSensitiveValue } from "../utils/secrets.js";
 import type { TaskAttemptContext } from "./TaskAttemptLoop.js";
-import type { AgentAttemptExecution, TaskRequest, TaskToolEvidence } from "./types.js";
+import type { AgentAttemptExecution, TaskContract, TaskToolEvidence } from "./types.js";
 
 export interface AgentAttemptExecutorOptions {
   agent: AgentSession;
-  runOptions(context: TaskAttemptContext<TaskRequest>): AgentRunOptions;
+  runOptions(context: TaskAttemptContext<TaskContract>): AgentRunOptions;
   initialEvidence?: TaskToolEvidence[];
-  onEvent?(event: AgentSessionEvent, context: TaskAttemptContext<TaskRequest>): void;
+  onEvent?(event: AgentSessionEvent, context: TaskAttemptContext<TaskContract>): void;
 }
 
 /** Runs one bounded model/tool attempt while retaining evidence across continuations. */
@@ -19,7 +19,7 @@ export class AgentAttemptExecutor {
     this.accumulatedEvidence = [...(options.initialEvidence ?? [])];
   }
 
-  async execute(context: TaskAttemptContext<TaskRequest>): Promise<AgentAttemptExecution> {
+  async execute(context: TaskAttemptContext<TaskContract>): Promise<AgentAttemptExecution> {
     const prompt = attemptPrompt(context);
     const evidence = new Map<string, TaskToolEvidence>();
     let outcome: AgentTurnOutcome | undefined;
@@ -57,14 +57,7 @@ export class AgentAttemptExecutor {
         streamFailure = redactSecrets(event.message);
       } else if (event.type === "done") {
         terminalEvents += 1;
-        outcome = event.outcome ?? {
-          status: "completed",
-          stopReason: "model_stop",
-          finishReason: "stop",
-          steps: 1,
-          output: event.content,
-          usage: event.usage
-        };
+        outcome = event.outcome;
       }
     }
 
@@ -136,16 +129,40 @@ function compactValue(value: unknown, depth: number): unknown {
   return String(value);
 }
 
-function attemptPrompt(context: TaskAttemptContext<TaskRequest>): string {
-  if (context.attemptNumber === 1) return context.task.objective;
-  const criteria = context.task.acceptanceCriteria.map((criterion) => `- ${criterion.description ?? criterion.id}`).join("\n");
+function attemptPrompt(context: TaskAttemptContext<TaskContract>): string {
+  const criteria = context.task.acceptanceCriteria
+    .map((criterion) => `- ${JSON.stringify(criterion)}`)
+    .join("\n");
+  const contract = formatTaskContract(context.task);
+  if (context.attemptNumber === 1) {
+    return [
+      context.task.objective,
+      "",
+      "This is a verifier-driven task. Complete the objective and satisfy every acceptance criterion below.",
+      contract,
+      criteria,
+      "Do not claim completion until the workspace and the required checks are actually in a passing state."
+    ].join("\n");
+  }
   const feedback = context.feedback ?? "The previous bounded attempt did not reach verified completion.";
   return [
     "Continue the same project-level task autonomously.",
     "Do not ask the user to say continue, and do not repeat work already proven successful.",
     `Original objective: ${context.task.objective}`,
     `Previous attempt feedback: ${feedback}`,
+    contract,
     criteria ? `Acceptance criteria still apply:\n${criteria}` : "Reach a genuine terminal result before stopping.",
     "Inspect current workspace and managed-process state, complete the remaining work, and verify it."
   ].join("\n\n");
+}
+
+function formatTaskContract(contract: TaskContract): string {
+  const plan = contract.plan
+    .map((item) => `- [${item.status}] ${item.description}${item.required ? " (required)" : ""}`)
+    .join("\n");
+  return [
+    `Task contract type: ${contract.taskType}.`,
+    `Constraints:\n${contract.constraints.map((constraint) => `- ${constraint}`).join("\n")}`,
+    `Current plan:\n${plan}`
+  ].join("\n");
 }
