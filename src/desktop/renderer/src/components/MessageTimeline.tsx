@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
 import { copyToClipboard } from "../copyToClipboard.js";
 import { listChangedFiles, type TimelineReasoningStep, type TimelineStep, type TimelineTurn } from "../sessionTimeline.js";
+import { reasoningDetailText } from "../reasoningPresentation.js";
 import { CopyButton } from "./CopyButton.js";
 import { Icon } from "./Icon.js";
 import { ToolActivity } from "./ToolActivity.js";
@@ -222,7 +223,10 @@ function ReasoningStepView({ expanded, onToggle, running, step }: {
   running: boolean;
   step: TimelineReasoningStep;
 }): React.JSX.Element {
-  const text = step.content.trim() || step.status || "暂无可展开的思考内容";
+  // The status is a label for the disclosure row, not the model's reasoning
+  // content. Providers that do not return reasoning deltas must not make
+  // statuses such as “分析完成” look like generated content.
+  const text = reasoningDetailText(step);
   const label = step.durationMs !== undefined
     ? `思考了 ${formatThinkingDuration(step.durationMs)}`
     : step.completed

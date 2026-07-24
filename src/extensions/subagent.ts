@@ -117,7 +117,7 @@ export async function runSubagentTask(
       "Return concise grounded findings with exact paths, changes, and validation evidence."
     ].join("\n"),
     stopWhen: [stepCountIs(subagentStepBudget(task, settings.maxSteps)), costBudgetStop],
-    maxRetries: 0,
+    maxRetries: modelSettings.maxRetries,
     providerOptions: modelSettings.providerOptions,
     reasoning: modelSettings.reasoning,
     timeout: modelSettings.timeoutMs,

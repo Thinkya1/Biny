@@ -1075,6 +1075,7 @@ button:disabled { opacity: 0.42; }
 .file-panel-menu { display: flex; width: 100%; flex-direction: column; gap: 5px; }
 .file-panel-menu-item { display: flex; width: 100%; height: 40px; align-items: center; gap: 10px; padding: 0 11px; border-radius: 8px; color: var(--text); background: var(--surface-soft); text-align: left; font-size: 12px; transition: background 150ms ease, transform 150ms ease; }
 .file-panel-menu-item:hover { background: var(--surface-hover); transform: translateY(-1px); }
+.file-panel-menu-item--files { position: relative; top: 6px; }
 .file-panel-menu-icon { display: grid; width: 17px; height: 17px; flex: 0 0 17px; place-items: center; color: var(--text-secondary); }
 .file-panel-menu-item kbd { margin-left: auto; padding: 2px 7px; border-radius: 6px; color: var(--text-secondary); background: var(--surface-selected); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .file-browser-panel { display: flex; flex-direction: column; }

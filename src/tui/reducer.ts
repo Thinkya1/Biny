@@ -15,6 +15,7 @@ import type {
   ActiveTranscriptItem,
   AssistantTranscriptItem,
   NotificationTranscriptItem,
+  ReasoningTranscriptItem,
   ToolTranscriptItem,
   TranscriptItem,
   TranscriptState,
@@ -148,23 +149,34 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
           content: event.content
         })
       };
+    case "reasoning.delta":
+      return {
+        ...state,
+        status: "thinking",
+        transcript: updateReasoningDelta(state.transcript, event.content)
+      };
+    case "reasoning.completed":
+      return {
+        ...state,
+        transcript: commitReasoning(state.transcript)
+      };
     case "assistant.delta":
       return {
         ...state,
         status: "thinking",
-        transcript: updateAssistantDelta(state.transcript, event.content)
+        transcript: updateAssistantDelta(commitReasoning(state.transcript), event.content)
       };
     case "assistant.completed":
       return {
         ...state,
         status: "completed",
-        transcript: commitAssistant(state.transcript, event.content)
+        transcript: commitAssistant(commitReasoning(state.transcript), event.content)
       };
     case "tool.call.started":
       return {
         ...state,
         status: "running",
-        transcript: startTool(state.transcript, event)
+        transcript: startTool(commitReasoning(state.transcript), event)
       };
     case "tool.call.progress":
       return {
@@ -233,6 +245,33 @@ function updateAssistantDelta(transcript: TranscriptState, content: string): Tra
   const item = active[index] as AssistantTranscriptItem;
   active[index] = { ...item, content: `${item.content}${content}` };
   return { ...transcript, active };
+}
+
+function updateReasoningDelta(transcript: TranscriptState, content: string): TranscriptState {
+  if (!content) return transcript;
+  const index = transcript.active.findIndex((item) => item.kind === "reasoning");
+  if (index === -1) {
+    return {
+      ...transcript,
+      active: [
+        ...transcript.active,
+        { id: nextTranscriptId(transcript, "reasoning"), kind: "reasoning", content }
+      ]
+    };
+  }
+  const active = [...transcript.active];
+  const item = active[index] as ReasoningTranscriptItem;
+  active[index] = { ...item, content: `${item.content}${content}` };
+  return { ...transcript, active };
+}
+
+function commitReasoning(transcript: TranscriptState): TranscriptState {
+  const index = transcript.active.findIndex((item) => item.kind === "reasoning");
+  if (index === -1) return transcript;
+  const item = transcript.active[index];
+  const active = transcript.active.filter((_, itemIndex) => itemIndex !== index);
+  if (!item || item.kind !== "reasoning" || !item.content) return { ...transcript, active };
+  return { committed: [...transcript.committed, item], active };
 }
 
 function commitAssistant(transcript: TranscriptState, content: string): TranscriptState {
@@ -355,6 +394,10 @@ function finalizeActiveCells(
   if (transcript.active.length === 0) return transcript;
   const committed = [...transcript.committed];
   for (const item of transcript.active) {
+    if (item.kind === "reasoning") {
+      if (item.content) committed.push(item);
+      continue;
+    }
     if (item.kind === "assistant") {
       if (item.content) committed.push(item);
       continue;

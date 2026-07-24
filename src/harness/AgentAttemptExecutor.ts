@@ -7,6 +7,7 @@ import type { AgentAttemptExecution, TaskContract, TaskToolEvidence } from "./ty
 export interface AgentAttemptExecutorOptions {
   agent: AgentSession;
   runOptions(context: TaskAttemptContext<TaskContract>): AgentRunOptions;
+  prompt?(context: TaskAttemptContext<TaskContract>): string;
   initialEvidence?: TaskToolEvidence[];
   onEvent?(event: AgentSessionEvent, context: TaskAttemptContext<TaskContract>): void;
 }
@@ -20,7 +21,7 @@ export class AgentAttemptExecutor {
   }
 
   async execute(context: TaskAttemptContext<TaskContract>): Promise<AgentAttemptExecution> {
-    const prompt = attemptPrompt(context);
+    const prompt = this.options.prompt?.(context) ?? attemptPrompt(context);
     const evidence = new Map<string, TaskToolEvidence>();
     let outcome: AgentTurnOutcome | undefined;
     let terminalEvents = 0;
@@ -57,7 +58,16 @@ export class AgentAttemptExecutor {
         streamFailure = redactSecrets(event.message);
       } else if (event.type === "done") {
         terminalEvents += 1;
-        outcome = event.outcome;
+        // Older embedders emitted only the terminal text. Treat that shape as
+        // a successful terminal stop so host event tests and lightweight
+        // integrations remain compatible with the durable executor.
+        outcome = event.outcome ?? {
+          status: "completed",
+          stopReason: "model_stop",
+          steps: 0,
+          output: event.content,
+          usage: event.usage
+        };
       }
     }
 

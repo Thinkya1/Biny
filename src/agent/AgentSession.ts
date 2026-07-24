@@ -35,6 +35,8 @@ import { createSdkTelemetry } from "../observability/telemetry.js";
 import { createSessionUsage, formatUsageSummary, summarizeUsage, type UsageModelInfo } from "../observability/usage.js";
 import type { SessionUsage } from "../session/metadata.js";
 import { AsyncEventQueue } from "../runtime/AsyncEventQueue.js";
+import { modelContextBudget } from "../ai/capabilities.js";
+import { modelCapabilities } from "../ai/capabilities.js";
 
 export interface AgentSessionOptions {
   workspaceRoot: string;
@@ -59,6 +61,13 @@ export interface AgentRunOptions {
   maxSteps?: number;
   /** A task harness may defer success memory until external acceptance checks pass. */
   deferSuccessfulMemory?: boolean;
+  attachments?: AgentAttachment[];
+}
+
+export interface AgentAttachment {
+  name: string;
+  mimeType: string;
+  data: string;
 }
 
 export interface AgentSessionInfo {
@@ -109,7 +118,7 @@ export class AgentSession {
     };
     const telemetry = (functionId: string) => createSdkTelemetry(options.config, persistenceRoot, functionId);
     const localMemory = options.config.context.memory.enabled
-      ? new LocalMemory(persistenceRoot, getModel, onUsage, telemetry)
+      ? new LocalMemory(persistenceRoot, getModel, onUsage, telemetry, () => options.modelManager?.getModelSettings().maxRetries ?? 0)
       : undefined;
     this.contextMemory = new ContextMemory(
       getModel,
@@ -118,7 +127,20 @@ export class AgentSession {
       options.config.context.maxInputTokens,
       options.config.context.instructionsMaxBytes,
       onUsage,
-      telemetry
+      telemetry,
+      () => {
+        const activeModel = options.config.models[options.config.defaultModel];
+        if (!activeModel) {
+          return {
+            modelAlias: options.config.defaultModel,
+            contextWindow: options.config.context.maxInputTokens,
+            maxInputTokens: options.config.context.maxInputTokens,
+            maxOutputTokens: undefined
+          };
+        }
+        return modelContextBudget(activeModel, options.config.context.maxInputTokens, options.config.defaultModel);
+      },
+      () => options.modelManager?.getModelSettings().maxRetries ?? 0
     );
     this.recorder = options.recorder;
   }
@@ -184,7 +206,8 @@ export class AgentSession {
       messages = await this.contextMemory.prepareTurn(
         input,
         systemPrompt,
-        abortSignal
+        abortSignal,
+        supportedAttachments(this.options.config, runOptions.attachments)
       );
     } catch (error) {
       recordUserMessage();
@@ -229,7 +252,7 @@ export class AgentSession {
       tools: coordinator.createTools(),
       allowSystemInMessages: true,
       stopWhen: stepCountIs(maxSteps),
-      maxRetries: 0,
+      maxRetries: settings?.maxRetries ?? 0,
       providerOptions: settings?.providerOptions,
       reasoning: settings?.reasoning,
       timeout: settings?.timeoutMs,
@@ -429,7 +452,7 @@ export class AgentSession {
         messages,
         allowSystemInMessages: true,
         abortSignal,
-        maxRetries: 0,
+        maxRetries: this.options.modelManager?.getModelSettings().maxRetries ?? 0,
         providerOptions: this.options.modelManager?.getModelSettings().providerOptions,
         reasoning: this.options.modelManager?.getModelSettings().reasoning,
         timeout: this.options.modelManager?.getModelSettings().timeoutMs,
@@ -874,4 +897,16 @@ function isTimeoutFailure(error: unknown): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function supportedAttachments(config: AgentConfig, attachments: AgentAttachment[] | undefined): AgentAttachment[] {
+  if (!attachments?.length) return [];
+  const model = config.models[config.defaultModel];
+  if (!model) return [];
+  const capabilities = modelCapabilities(model);
+  return attachments.filter((attachment) => {
+    if (attachment.mimeType.startsWith("image/")) return capabilities.vision;
+    if (attachment.mimeType.startsWith("audio/")) return capabilities.audio;
+    return capabilities.vision;
+  });
 }

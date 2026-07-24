@@ -65,7 +65,8 @@ export const modelProviderSchema = z.enum([
   "openai-compatible"
 ]);
 
-export const reasoningEffortSchema = z.enum(["high", "max"]);
+export const providerProtocolSchema = z.enum(["anthropic", "openai-compatible"]);
+export const reasoningEffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]);
 
 const thinkingSchema = z.object({
   enabled: z.boolean().default(true),
@@ -74,9 +75,11 @@ const thinkingSchema = z.object({
 
 const providerConfigSchema = z.object({
   type: modelProviderSchema,
+  protocol: providerProtocolSchema.optional(),
   baseUrl: z.string().url().optional(),
   apiKey: z.string().min(1).optional(),
   apiKeyEnv: z.string().min(1).optional(),
+  requiresApiKey: z.boolean().optional(),
   authMode: z.enum(["api-key", "oauth-bearer"]).optional(),
   oauth: z.object({
     provider: z.enum(["claude-code", "openai-codex"]),
@@ -84,7 +87,19 @@ const providerConfigSchema = z.object({
     expiresAt: z.number().int().positive(),
     accountId: z.string().min(1).optional()
   }).optional(),
-  timeoutMs: z.number().int().min(1_000).max(600_000).optional()
+  timeoutMs: z.number().int().min(1_000).max(600_000).optional(),
+  retry: z.object({
+    maxAttempts: z.number().int().min(1).max(6).default(3),
+    initialDelayMs: z.number().int().min(0).max(30_000).default(250),
+    maxDelayMs: z.number().int().min(0).max(120_000).default(4_000)
+  }).optional(),
+  modelsEndpoint: z.string().url().optional(),
+  compatibility: z.object({
+    supportsDeveloperRole: z.boolean().optional(),
+    supportsReasoning: z.boolean().optional(),
+    supportsVision: z.boolean().optional(),
+    maxTokensField: z.enum(["max_tokens", "max_completion_tokens"]).optional()
+  }).optional()
 }).superRefine((provider, context) => {
   if (provider.type === "openai-compatible" && !provider.baseUrl) {
     context.addIssue({
@@ -220,7 +235,9 @@ const webSchema = z.object({
 
 const modelThinkingSchema = z.object({
   efforts: z.array(reasoningEffortSchema).min(1).default(["high", "max"]),
-  defaultEffort: reasoningEffortSchema.default("high")
+  defaultEffort: reasoningEffortSchema.default("high"),
+  mapping: z.record(reasoningEffortSchema, z.string().min(1)).optional(),
+  budgetTokens: z.record(reasoningEffortSchema, z.number().int().min(256).max(131_072)).optional()
 }).superRefine((thinking, context) => {
   if (!thinking.efforts.includes(thinking.defaultEffort)) {
     context.addIssue({
@@ -237,8 +254,17 @@ const modelAliasSchema = z.object({
   displayName: z.string().min(1).optional(),
   description: z.string().min(1).optional(),
   supportsTools: z.boolean().optional(),
+  capabilities: z.object({
+    tools: z.boolean().optional(),
+    reasoning: z.boolean().optional(),
+    vision: z.boolean().optional(),
+    audio: z.boolean().optional(),
+    streaming: z.boolean().optional()
+  }).optional(),
+  contextWindow: z.number().int().min(4_096).max(2_000_000).optional(),
   maxOutputTokens: z.number().int().min(1).max(131_072).optional(),
   thinking: modelThinkingSchema.optional(),
+  reasoning: modelThinkingSchema.optional(),
   pricing: modelPricingSchema.optional()
 });
 
@@ -284,14 +310,22 @@ const canonicalConfigSchema = z.object({
     // configured effort maps to its native SDK options.
   }
 
-  if (config.thinking.enabled && activeModel?.thinking === undefined) {
+  const activeReasoning = activeModel ? activeModel.reasoning ?? activeModel.thinking : undefined;
+  if (config.thinking.enabled && activeReasoning === undefined) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["thinking", "enabled"],
       message: `Model ${config.defaultModel} does not support thinking controls.`
     });
   }
-  if (config.thinking.enabled && activeModel?.thinking && !activeModel.thinking.efforts.includes(config.thinking.effort)) {
+  if (config.thinking.enabled && activeModel?.capabilities?.reasoning === false) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["thinking", "enabled"],
+      message: `Model ${config.defaultModel} does not expose reasoning capability metadata.`
+    });
+  }
+  if (config.thinking.enabled && activeReasoning && !activeReasoning.efforts.includes(config.thinking.effort)) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["thinking", "effort"],
@@ -394,7 +428,9 @@ export const defaultConfig: AgentConfig = {
       displayName: "DeepSeek V4 Flash",
       description: "Fast and affordable model for everyday work.",
       supportsTools: true,
-      thinking: { efforts: ["high", "max"], defaultEffort: "high" }
+      capabilities: { tools: true, reasoning: true, streaming: true },
+      contextWindow: 128_000,
+      thinking: { efforts: ["high", "max"], defaultEffort: "high", mapping: { high: "high", max: "max" }, budgetTokens: { high: 4_096, max: 8_192 } }
     },
     "deepseek-v4-pro": {
       provider: "deepseek",
@@ -402,7 +438,9 @@ export const defaultConfig: AgentConfig = {
       displayName: "DeepSeek V4 Pro",
       description: "Frontier model for complex coding, research, and real-world work.",
       supportsTools: true,
-      thinking: { efforts: ["high", "max"], defaultEffort: "high" }
+      capabilities: { tools: true, reasoning: true, streaming: true },
+      contextWindow: 128_000,
+      thinking: { efforts: ["high", "max"], defaultEffort: "high", mapping: { high: "high", max: "max" }, budgetTokens: { high: 4_096, max: 8_192 } }
     }
   },
   thinking: { enabled: true, effort: "high" },

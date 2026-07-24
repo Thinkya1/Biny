@@ -7,6 +7,10 @@ import {
 import { createModelSettings, resolveModelConfig, type ModelSettings } from "./factory.js";
 import { providerProfile } from "./profiles.js";
 import type { LanguageModel } from "ai";
+import { fetchModelCatalog } from "../ai/modelCatalog.js";
+import { modelCapabilities, modelContextBudget, modelReasoningConfig } from "../ai/capabilities.js";
+import { providerDefinition } from "../ai/provider.js";
+import type { ModelCatalogEntry } from "../ai/types.js";
 
 export type ThinkingSelection = "off" | ReasoningEffort;
 
@@ -18,6 +22,8 @@ export interface ModelChoice {
   providerType: string;
   model: string;
   supportsTools?: boolean;
+  capabilities?: ReturnType<typeof modelCapabilities>;
+  contextWindow?: number;
   efforts: ReasoningEffort[];
   defaultThinking: ThinkingSelection;
 }
@@ -28,6 +34,8 @@ export interface ModelRuntimeInfo {
   modelLabel: string;
   reasoningLabel: string;
   thinking: ThinkingSelection;
+  contextWindow?: number;
+  maxInputTokens?: number;
 }
 
 /** Keeps one validated AI SDK model while the selected provider changes. */
@@ -56,6 +64,21 @@ export class ModelManager {
 
   getModelSettings(): ModelSettings {
     return this.activeSettings;
+  }
+
+  getContextBudget(): ReturnType<typeof modelContextBudget> {
+    const resolved = resolveModelConfig(this.config);
+    return modelContextBudget(resolved.model, this.config.context.maxInputTokens, resolved.alias);
+  }
+
+  async refreshModelCatalog(providerAlias = resolveModelConfig(this.config).providerAlias): Promise<ModelCatalogEntry[]> {
+    const provider = this.config.providers[providerAlias];
+    if (!provider) throw new Error(`Unknown provider alias: ${providerAlias}`);
+    return await fetchModelCatalog({
+      alias: providerAlias,
+      config: provider,
+      definition: providerDefinition(provider.type)
+    });
   }
 
   async switchModel(alias: string, thinking?: ThinkingSelection): Promise<ModelRuntimeInfo> {
@@ -99,6 +122,8 @@ export function listModelChoices(config: AgentConfig): ModelChoice[] {
     if (seenModels.has(modelKey)) return [];
     seenModels.add(modelKey);
     const provider = config.providers[model.provider];
+    const capabilities = modelCapabilities(model);
+    const reasoning = modelReasoningConfig(model);
     return [{
       alias,
       displayName: model.displayName ?? model.model,
@@ -106,9 +131,11 @@ export function listModelChoices(config: AgentConfig): ModelChoice[] {
       provider: model.provider,
       providerType: provider?.type ?? model.provider,
       model: model.model,
-      supportsTools: model.supportsTools,
-      efforts: [...(model.thinking?.efforts ?? [])],
-      defaultThinking: model.thinking?.defaultEffort ?? "off"
+      supportsTools: capabilities.tools,
+      capabilities,
+      contextWindow: model.contextWindow,
+      efforts: [...(reasoning?.efforts ?? [])],
+      defaultThinking: reasoning?.defaultEffort ?? "off"
     }];
   });
 }
@@ -124,7 +151,7 @@ export function hasUsableModelConfiguration(config: AgentConfig, alias = config.
   const profile = providerProfile(provider.type);
   const endpoint = provider.baseUrl ?? profile.baseUrl;
   if (!endpoint) return false;
-  if (!profile.requiresApiKey) return true;
+  if (!(provider.requiresApiKey ?? profile.requiresApiKey)) return true;
   const envName = provider.apiKeyEnv ?? profile.apiKeyEnv;
   return Boolean(provider.apiKey || (envName && process.env[envName]));
 }
@@ -136,8 +163,10 @@ export function modelRuntimeInfo(config: AgentConfig): ModelRuntimeInfo {
     modelAlias: resolved.alias,
     provider: resolved.provider.type,
     modelLabel: formatModelLabel(resolved.provider.type, resolved.model.model),
-    reasoningLabel: thinking === "off" ? "Off" : thinking === "max" ? "Max" : "High",
-    thinking
+    reasoningLabel: thinking === "off" ? "Off" : formatReasoningLabel(thinking),
+    thinking,
+    contextWindow: resolved.model.contextWindow,
+    maxInputTokens: modelContextBudget(resolved.model, config.context.maxInputTokens, resolved.alias).maxInputTokens
   };
 }
 
@@ -150,10 +179,10 @@ export function resolveThinkingSelection(
   if (!model) throw new Error(`Unknown model alias: ${alias}`);
   if (requested === undefined) {
     if (alias === config.defaultModel) return config.thinking.enabled ? config.thinking.effort : "off";
-    return model.thinking?.defaultEffort ?? "off";
+    return modelReasoningConfig(model)?.defaultEffort ?? "off";
   }
   if (requested === "off") return "off";
-  if (!model.thinking?.efforts.includes(requested)) {
+  if (!modelReasoningConfig(model)?.efforts.includes(requested)) {
     throw new Error(`Model ${alias} does not support ${requested} thinking effort.`);
   }
   return requested;
@@ -162,8 +191,12 @@ export function resolveThinkingSelection(
 export function parseThinkingSelection(value: string | undefined): ThinkingSelection | undefined {
   if (value === undefined) return undefined;
   const normalized = value.toLowerCase();
-  if (normalized === "off" || normalized === "high" || normalized === "max") return normalized;
-  throw new Error(`Unknown thinking effort: ${value}. Use off, high, or max.`);
+  if (["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(normalized)) return normalized as ThinkingSelection;
+  throw new Error(`Unknown thinking effort: ${value}. Use off, minimal, low, medium, high, xhigh, or max.`);
+}
+
+function formatReasoningLabel(thinking: Exclude<ThinkingSelection, "off">): string {
+  return thinking === "xhigh" ? "XHigh" : thinking[0]?.toUpperCase() + thinking.slice(1);
 }
 
 function formatModelLabel(provider: string, model: string): string {

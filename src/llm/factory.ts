@@ -12,6 +12,9 @@ import { createMoonshotAI } from "@ai-sdk/moonshotai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { LanguageModel } from "ai";
+import { modelCapabilities, nativeReasoningEffort, reasoningBudgetTokens } from "../ai/capabilities.js";
+import { providerProtocol } from "../ai/provider.js";
+import { createRetryFetch } from "../ai/retry.js";
 import { providerProfile } from "./profiles.js";
 
 export interface ResolvedModelConfig {
@@ -27,6 +30,8 @@ export interface ModelSettings {
   reasoning?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
   timeoutMs?: number;
   maxOutputTokens?: number;
+  maxRetries: number;
+  contextWindow: number | undefined;
 }
 
 /** Build the Vercel AI SDK model used by every runtime surface. */
@@ -38,19 +43,27 @@ export function createModelSettings(config: AgentConfig, alias = config.defaultM
   const resolved = resolveModelConfig(config, alias);
   const profile = providerProfile(resolved.provider.type);
   const apiKey = resolveApiKey(resolved.provider.apiKey, resolved.provider.apiKeyEnv, profile.apiKeyEnv);
-  if (profile.requiresApiKey && !apiKey) {
+  if ((resolved.provider.requiresApiKey ?? profile.requiresApiKey) && !apiKey) {
     throw new Error(missingKeyMessage(resolved.providerAlias, resolved.provider.apiKeyEnv, profile.apiKeyEnv));
   }
 
   const baseUrl = resolved.provider.baseUrl ?? profile.baseUrl;
   if (!baseUrl) throw new Error(`No model endpoint configured. Set providers.${resolved.providerAlias}.baseUrl.`);
+  const capabilities = modelCapabilities(resolved.model);
+  const enabled = config.thinking.enabled && capabilities.reasoning;
+  const effort = enabled ? config.thinking.effort : undefined;
+  const retry = resolved.provider.retry ?? { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0 };
 
   return {
-    model: createLanguageModel(resolved.provider.type, baseUrl, apiKey, resolved.model.model),
-    providerOptions: createProviderOptions(resolved.provider.type, config),
-    reasoning: config.thinking.enabled ? config.thinking.effort === "max" ? "xhigh" : "high" : "none",
+    model: createLanguageModel(resolved.provider.type, providerProtocol(resolved.provider, profile), baseUrl, apiKey, resolved.model.model, resolved.provider, createRetryFetch(retry)),
+    providerOptions: createProviderOptions(resolved.provider.type, resolved.provider, resolved.model, enabled, effort),
+    reasoning: enabled ? effort === "max" ? "xhigh" : effort : "none",
     timeoutMs: resolved.provider.timeoutMs,
-    maxOutputTokens: resolved.model.maxOutputTokens
+    maxOutputTokens: resolved.model.maxOutputTokens,
+    // HTTP retries are performed by the provider fetch wrapper below. Keep
+    // AI SDK-level retries disabled to avoid multiplying attempts.
+    maxRetries: 0,
+    contextWindow: resolved.model.contextWindow
   };
 }
 
@@ -75,13 +88,24 @@ function missingKeyMessage(providerAlias: string, configuredEnv: string | undefi
     : `No model available. Set providers.${providerAlias}.apiKey in agent.config.json.`;
 }
 
-function createLanguageModel(providerType: AgentConfig["providers"][string]["type"], baseUrl: string, apiKey: string | undefined, modelId: string): LanguageModel {
-  if (providerType === "openai") return createOpenAI({ baseURL: baseUrl, apiKey }).chat(modelId);
-  if (providerType === "anthropic") return createAnthropic({ baseURL: baseUrl, apiKey }).languageModel(modelId);
+function createLanguageModel(
+  providerType: AgentConfig["providers"][string]["type"],
+  protocol: "anthropic" | "openai-compatible",
+  baseUrl: string,
+  apiKey: string | undefined,
+  modelId: string,
+  provider: ProviderConfig,
+  fetch: typeof globalThis.fetch
+): LanguageModel {
+  if (providerType === "openai") return createOpenAI({ baseURL: baseUrl, apiKey, fetch }).chat(modelId);
+  if (providerType === "anthropic" || protocol === "anthropic" && providerType !== "claude-subscription") {
+    return createAnthropic({ baseURL: baseUrl, apiKey, fetch }).languageModel(modelId);
+  }
   if (providerType === "claude-subscription") {
     return createAnthropic({
       baseURL: baseUrl,
       authToken: apiKey,
+      fetch,
       headers: claudeSubscriptionHeaders()
     }).languageModel(modelId);
   }
@@ -89,18 +113,21 @@ function createLanguageModel(providerType: AgentConfig["providers"][string]["typ
     return createOpenAI({
       baseURL: baseUrl,
       apiKey,
+      fetch,
       headers: openAiCodexHeaders(apiKey)
     }).responses(modelId);
   }
-  if (providerType === "deepseek") return createDeepSeek({ baseURL: baseUrl, apiKey }).languageModel(modelId);
-  if (providerType === "kimi") return createMoonshotAI({ baseURL: baseUrl, apiKey }).languageModel(modelId);
-  if (providerType === "qwen") return createAlibaba({ baseURL: baseUrl, apiKey }).languageModel(modelId);
+  if (providerType === "deepseek") return createDeepSeek({ baseURL: baseUrl, apiKey, fetch }).languageModel(modelId);
+  if (providerType === "kimi") return createMoonshotAI({ baseURL: baseUrl, apiKey, fetch }).languageModel(modelId);
+  if (providerType === "qwen") return createAlibaba({ baseURL: baseUrl, apiKey, fetch }).languageModel(modelId);
 
   const compatible = createOpenAICompatible({
     name: providerType,
     baseURL: baseUrl,
     apiKey,
-    includeUsage: true
+    fetch,
+    includeUsage: true,
+    transformRequestBody: createCompatibilityTransform(provider.compatibility)
   });
   return compatible.languageModel(modelId);
 }
@@ -145,20 +172,26 @@ function extractOpenAiAccountId(token: string): string | undefined {
   }
 }
 
-function createProviderOptions(providerType: AgentConfig["providers"][string]["type"], config: AgentConfig): Record<string, any> | undefined {
-  const enabled = config.thinking.enabled;
-  const effort = config.thinking.effort;
-  const budgetTokens = effort === "max" ? 8_192 : 4_096;
+function createProviderOptions(
+  providerType: AgentConfig["providers"][string]["type"],
+  provider: ProviderConfig,
+  model: ModelAliasConfig,
+  enabled: boolean,
+  effort: AgentConfig["thinking"]["effort"] | undefined
+): Record<string, any> | undefined {
+  if (provider.compatibility?.supportsReasoning === false) return undefined;
+  const nativeEffort = effort === undefined ? undefined : nativeReasoningEffort(model, effort);
+  const budgetTokens = effort === undefined ? 4_096 : reasoningBudgetTokens(model, effort);
   if (providerType === "deepseek") {
     return {
       deepseek: {
         thinking: { type: enabled ? "enabled" : "disabled" },
-        reasoningEffort: enabled ? effort : undefined
+        reasoningEffort: enabled ? nativeEffort : undefined
       }
     };
   }
-  if (providerType === "openai" || providerType === "openai-codex") return { openai: { reasoningEffort: enabled ? effort : "none" } };
-  if (providerType === "anthropic" || providerType === "claude-subscription") {
+  if (providerType === "openai" || providerType === "openai-codex") return { openai: { reasoningEffort: enabled ? nativeEffort : "none" } };
+  if (provider.protocol === "anthropic" || providerType === "anthropic" || providerType === "claude-subscription") {
     return { anthropic: { thinking: enabled ? { type: "enabled", budgetTokens } : { type: "disabled" } } };
   }
   if (providerType === "qwen") return { alibaba: { enableThinking: enabled, thinkingBudget: enabled ? budgetTokens : undefined } };
@@ -166,4 +199,18 @@ function createProviderOptions(providerType: AgentConfig["providers"][string]["t
     return { moonshotai: { thinking: { type: enabled ? "enabled" : "disabled", budgetTokens: enabled ? budgetTokens : undefined } } };
   }
   return undefined;
+}
+
+function createCompatibilityTransform(
+  compatibility: ProviderConfig["compatibility"]
+): ((body: Record<string, any>) => Record<string, any>) | undefined {
+  if (!compatibility?.supportsDeveloperRole && compatibility?.maxTokensField !== "max_completion_tokens") return undefined;
+  return (body) => {
+    const messages = compatibility.supportsDeveloperRole === false && Array.isArray(body.messages)
+      ? body.messages.map((message: any) => message?.role === "developer" ? { ...message, role: "system" } : message)
+      : body.messages;
+    if (compatibility.maxTokensField !== "max_completion_tokens") return { ...body, messages };
+    const { max_tokens, ...rest } = body;
+    return { ...rest, messages, max_tokens: undefined, max_completion_tokens: max_tokens };
+  };
 }

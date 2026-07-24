@@ -6,6 +6,7 @@
  */
 export const greeting = "hello";
 
+export * from "./ai/index.js";
 export type { AgentTurnOutcome, AgentTurnStatus, AgentTurnStopReason } from "./agent/types.js";
 export * from "./harness/TaskAttemptLoop.js";
 export * from "./harness/AgentAttemptExecutor.js";

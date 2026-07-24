@@ -21,6 +21,11 @@ export interface AssistantTranscriptItem extends TranscriptItemBase {
   content: string;
 }
 
+export interface ReasoningTranscriptItem extends TranscriptItemBase {
+  kind: "reasoning";
+  content: string;
+}
+
 export interface NotificationTranscriptItem extends TranscriptItemBase {
   kind: "notification";
   content: string;
@@ -55,15 +60,16 @@ export interface ToolTranscriptItem extends TranscriptItemBase {
 
 export type TranscriptItem =
   | UserTranscriptItem
+  | ReasoningTranscriptItem
   | AssistantTranscriptItem
   | ToolTranscriptItem
   | NotificationTranscriptItem
   | ErrorTranscriptItem;
 
-export type ActiveTranscriptItem = AssistantTranscriptItem | ToolTranscriptItem;
+export type ActiveTranscriptItem = ReasoningTranscriptItem | AssistantTranscriptItem | ToolTranscriptItem;
 
 export interface TranscriptState {
-  // committed 只保存已完成单元；active 中的 assistant/tool 允许按 id 原地更新。
+  // committed 只保存已完成单元；active 中的 reasoning/assistant/tool 允许按 id 原地更新。
   committed: TranscriptItem[];
   active: ActiveTranscriptItem[];
 }

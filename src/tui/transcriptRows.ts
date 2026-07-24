@@ -15,7 +15,7 @@ import {
 import type { ToolTranscriptItem, ToolTranscriptStatus, TranscriptItem, TranscriptState } from "./types.js";
 
 export type TranscriptDisplayRow =
-  | { kind: "message"; id: string; itemKind: "user" | "assistant" | "notification" | "error"; prefix: string; text: string; tone?: "muted" | "success" | "warning" }
+  | { kind: "message"; id: string; itemKind: "user" | "reasoning" | "assistant" | "notification" | "error"; prefix: string; text: string; tone?: "muted" | "success" | "warning" }
   | { kind: "tool-title"; id: string; status: ToolTranscriptStatus; marker: string; title: string; gap: string; duration: string }
   | { kind: "tool-output"; id: string; status: ToolTranscriptStatus; prefix: string; text: string; omitted: boolean }
   | { kind: "spacer"; id: string };
@@ -66,7 +66,7 @@ export function formatToolDuration(durationMs: number | undefined): string {
 
 function rowsForItem(item: TranscriptItem, width: number, expanded: boolean): TranscriptDisplayRow[] {
   if (item.kind === "tool") return toolRows(item, width, expanded);
-  const prefix = item.kind === "user" ? "› " : item.kind === "notification" ? "• " : item.kind === "error" ? "Error " : "";
+  const prefix = item.kind === "user" ? "› " : item.kind === "reasoning" ? "∴ " : item.kind === "notification" ? "• " : item.kind === "error" ? "Error " : "";
   const visiblePrefix = terminalWidth(prefix) < width ? prefix : "";
   const contentWidth = Math.max(1, width - terminalWidth(visiblePrefix));
   const lines = wrapTerminalLines(normalizeOutput(item.content), contentWidth);

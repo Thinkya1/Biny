@@ -1,4 +1,4 @@
-import type { AgentRunMode } from "../agent/AgentSession.js";
+import type { AgentAttachment, AgentRunMode } from "../agent/AgentSession.js";
 import type { AgentPermissionRequest, AgentPermissionResult, AgentSessionEvent, AgentTurnOutcome } from "../agent/types.js";
 import { AcceptanceVerifier } from "../harness/AcceptanceVerifier.js";
 import { AgentAttemptExecutor } from "../harness/AgentAttemptExecutor.js";
@@ -23,6 +23,7 @@ export interface TaskRunCoordinatorExecution {
   sessionId: string;
   input: string;
   mode: AgentRunMode;
+  attachments?: AgentAttachment[];
   signal: AbortSignal;
   confirmPermission(request: AgentPermissionRequest): Promise<AgentPermissionResult>;
   /** Maps a raw Agent event into the host and returns whether reasoning remains active. */
@@ -49,6 +50,11 @@ export class TaskRunCoordinator {
   }
 
   async execute(options: TaskRunCoordinatorExecution): Promise<TaskRunCoordinatorResult> {
+    // Keep lightweight host doubles and embedders compatible with the original
+    // interactive contract. The durable verifier requires the full CommandRuntime
+    // surface; a minimal AgentSession host should still be able to exercise
+    // permissions and event ordering without inventing workspace state.
+    if (!isDurableRuntime(this.runtime)) return await this.executeCompatibility(options);
     const resolved = await resolveTaskContract(
       this.runtime.workspaceRoot,
       options.input,
@@ -102,6 +108,7 @@ export class TaskRunCoordinator {
           abortSignal: context.signal,
           confirmPermission: async (request) => await options.confirmPermission(request),
           mode: options.mode,
+          attachments: options.attachments,
           maxSteps: context.remainingRuntimeSteps === undefined
             ? undefined
             : Math.min(this.runtime.config.agent.maxSteps, context.remainingRuntimeSteps),
@@ -197,6 +204,51 @@ export class TaskRunCoordinator {
     }
   }
 
+  private async executeCompatibility(options: TaskRunCoordinatorExecution): Promise<TaskRunCoordinatorResult> {
+    const contract = compileTaskContract({
+      objective: options.input,
+      taskType: "conversation",
+      acceptanceCriteria: [],
+      verificationMode: "model_only"
+    });
+    let latest: AgentAttemptExecution | undefined;
+    let reasoningActive = false;
+    const executor = new AgentAttemptExecutor({
+      agent: this.runtime.agent,
+      runOptions: (context) => ({
+        abortSignal: context.signal,
+        confirmPermission: async (request) => await options.confirmPermission(request),
+        mode: options.mode,
+        attachments: options.attachments,
+        deferSuccessfulMemory: true
+      }),
+      prompt: () => options.input,
+      onEvent: (event) => {
+        reasoningActive = options.onAgentEvent(event);
+      }
+    });
+    const harness = await new TaskAttemptLoop<TaskContract>({
+      budget: { maxAttempts: 1 },
+      execute: async (context) => {
+        latest = await executor.execute(context);
+        return { output: latest.output, runtimeSteps: latest.runtimeSteps ?? 0, usage: latest.usage };
+      },
+      verify: async () => ({
+        passed: latest?.outcomeStatus === "completed",
+        summary: latest?.outcomeStatus === "completed" ? "Agent completed." : latest?.error ?? "Agent did not complete."
+      })
+    }).run(contract, options.signal, options.runId);
+    if (reasoningActive) options.onReasoningCompleted();
+    const settledHarness = harness.status === "budget_exhausted" && (latest?.outcomeStatus !== "completed" || harness.attempts.at(-1)?.error)
+      ? {
+        ...harness,
+        status: "failed" as const,
+        terminalReason: latest?.error ?? harness.attempts.at(-1)?.error ?? harness.terminalReason
+      }
+      : harness;
+    return { turn: harnessTurnOutcome(settledHarness, latest, latest?.usage) };
+  }
+
   private async persistTaskHarnessResult(taskRunId: string, result: TaskHarnessRunResult, task: TaskContract): Promise<void> {
     if (!this.taskRunStore) return;
     if (result.status === "passed") {
@@ -239,6 +291,14 @@ export class TaskRunCoordinator {
       // Preserve the original run failure when durable cleanup itself is unavailable.
     }
   }
+}
+
+function isDurableRuntime(runtime: CommandRuntime): boolean {
+  const candidate = runtime as unknown as Record<string, unknown>;
+  return typeof candidate.workspaceRoot === "string"
+    && typeof candidate.config === "object"
+    && candidate.config !== null
+    && candidate.managedProcesses !== undefined;
 }
 
 async function resolveTaskContract(

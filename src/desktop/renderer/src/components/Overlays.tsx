@@ -304,6 +304,10 @@ interface CatalogModel {
   id: string;
   displayName: string;
   supportsThinking: boolean;
+  supportsVision?: boolean;
+  supportsAudio?: boolean;
+  contextWindow?: number;
+  maxOutputTokens?: number;
 }
 
 interface ProviderCatalogItem {
@@ -318,6 +322,7 @@ interface ProviderCatalogItem {
   baseUrl: string;
   requiresApiKey: boolean;
   models: CatalogModel[];
+  protocol?: DesktopModelConfigurationInput["protocol"];
   iconTone: string;
   apiKeyUrl?: string;
 }
@@ -335,15 +340,18 @@ interface ApiProviderDefinition {
   modelId: string;
   modelDisplayName: string;
   supportsThinking: boolean;
+  supportsVision?: boolean;
+  supportsAudio?: boolean;
+  protocol?: DesktopModelConfigurationInput["protocol"];
   apiKeyUrl?: string;
 }
 
 function apiProvider(definition: ApiProviderDefinition): ProviderCatalogItem {
-  const { modelId, modelDisplayName, supportsThinking, apiKeyUrl, ...provider } = definition;
+  const { modelId, modelDisplayName, supportsThinking, supportsVision, supportsAudio, apiKeyUrl, ...provider } = definition;
   return {
     ...provider,
     connectionMode: "api",
-    models: modelId ? [{ id: modelId, displayName: modelDisplayName, supportsThinking }] : [],
+    models: modelId ? [{ id: modelId, displayName: modelDisplayName, supportsThinking, supportsVision, supportsAudio }] : [],
     apiKeyUrl: apiKeyUrl ?? providerApiKeyUrl(definition.id)
   };
 }
@@ -375,17 +383,17 @@ function providerApiKeyUrl(providerId: string): string | undefined {
 }
 
 const providerCatalog: ProviderCatalogItem[] = [
-  apiProvider({ id: "kimi-coding-plan", value: "kimi", label: "Kimi Coding Plan", description: "月之暗面 · Anthropic 兼容", badge: "Coding", categories: ["推荐", "模型计划"], baseUrl: "https://api.kimi.com/coding/v1", requiresApiKey: true, iconTone: "moonshot", modelId: "kimi-k2.5", modelDisplayName: "Kimi K2.5", supportsThinking: true }),
-  apiProvider({ id: "minimax-coding-plan", value: "openai-compatible", label: "MiniMax Coding Plan", description: "MiniMax Coding 套餐 · Anthropic 兼容", badge: "Coding", categories: ["模型计划"], baseUrl: "https://api.minimax.io/anthropic", requiresApiKey: true, iconTone: "minimax", modelId: "MiniMax-M3", modelDisplayName: "MiniMax M3", supportsThinking: true }),
+  apiProvider({ id: "kimi-coding-plan", value: "kimi", label: "Kimi Coding Plan", description: "月之暗面 · Anthropic 兼容", badge: "Coding", categories: ["推荐", "模型计划"], baseUrl: "https://api.kimi.com/coding/v1", requiresApiKey: true, iconTone: "moonshot", modelId: "kimi-k2.5", modelDisplayName: "Kimi K2.5", supportsThinking: true, protocol: "anthropic" }),
+  apiProvider({ id: "minimax-coding-plan", value: "openai-compatible", label: "MiniMax Coding Plan", description: "MiniMax Coding 套餐 · Anthropic 兼容", badge: "Coding", categories: ["模型计划"], baseUrl: "https://api.minimax.io/anthropic", requiresApiKey: true, iconTone: "minimax", modelId: "MiniMax-M3", modelDisplayName: "MiniMax M3", supportsThinking: true, protocol: "anthropic" }),
   apiProvider({ id: "deepseek", value: "deepseek", label: "DeepSeek", description: "DeepSeek 官方接入", badge: "API", categories: ["推荐", "API"], baseUrl: "https://api.deepseek.com", requiresApiKey: true, iconTone: "deepseek", modelId: "deepseek-v4-flash", modelDisplayName: "DeepSeek V4 Flash", supportsThinking: true }),
   apiProvider({ id: "moonshot", value: "kimi", label: "Moonshot", description: "Moonshot 官方接入", badge: "API", categories: ["API"], baseUrl: "https://api.moonshot.cn/v1", requiresApiKey: true, iconTone: "moonshot", modelId: "kimi-k2.5", modelDisplayName: "Kimi K2.5", supportsThinking: true }),
   apiProvider({ id: "zai-coding-plan", value: "openai-compatible", label: "Z.AI Coding Plan", description: "智谱 · OpenAI 兼容", badge: "Coding", categories: ["模型计划"], baseUrl: "https://api.z.ai/api/coding/paas/v4", requiresApiKey: true, iconTone: "zai", modelId: "glm-5", modelDisplayName: "GLM-5", supportsThinking: true }),
-  apiProvider({ id: "MiniMax", value: "openai-compatible", label: "MiniMax", description: "MiniMax · Anthropic 兼容", badge: "API", categories: ["API"], baseUrl: "https://api.minimax.io/anthropic/v1", requiresApiKey: true, iconTone: "minimax", modelId: "MiniMax-M3", modelDisplayName: "MiniMax M3", supportsThinking: true }),
-  apiProvider({ id: "MiniMax-cn", value: "openai-compatible", label: "MiniMax 中国站", description: "MiniMax 中国站 · Anthropic 兼容", badge: "API", categories: ["API"], baseUrl: "https://api.minimaxi.com/anthropic/v1", requiresApiKey: true, iconTone: "minimax", modelId: "MiniMax-M3", modelDisplayName: "MiniMax M3", supportsThinking: true }),
+  apiProvider({ id: "MiniMax", value: "openai-compatible", label: "MiniMax", description: "MiniMax · Anthropic 兼容", badge: "API", categories: ["API"], baseUrl: "https://api.minimax.io/anthropic/v1", requiresApiKey: true, iconTone: "minimax", modelId: "MiniMax-M3", modelDisplayName: "MiniMax M3", supportsThinking: true, protocol: "anthropic" }),
+  apiProvider({ id: "MiniMax-cn", value: "openai-compatible", label: "MiniMax 中国站", description: "MiniMax 中国站 · Anthropic 兼容", badge: "API", categories: ["API"], baseUrl: "https://api.minimaxi.com/anthropic/v1", requiresApiKey: true, iconTone: "minimax", modelId: "MiniMax-M3", modelDisplayName: "MiniMax M3", supportsThinking: true, protocol: "anthropic" }),
   apiProvider({ id: "siliconflow", value: "openai-compatible", label: "SiliconFlow", description: "硅基流动多模型 API，支持精确模型 ID。", badge: "聚合", categories: ["推荐", "聚合服务"], baseUrl: "https://api.siliconflow.cn/v1", requiresApiKey: true, iconTone: "siliconflow", modelId: "deepseek-ai/DeepSeek-V3", modelDisplayName: "DeepSeek V3", supportsThinking: false }),
-  apiProvider({ id: "anthropic", value: "anthropic", label: "Anthropic", description: "Anthropic 官方接入", badge: "API", categories: ["推荐", "API"], baseUrl: "https://api.anthropic.com", requiresApiKey: true, iconTone: "anthropic", modelId: "claude-sonnet-4-5", modelDisplayName: "Claude Sonnet 4.5", supportsThinking: true }),
-  apiProvider({ id: "openai", value: "openai", label: "OpenAI", description: "OpenAI 官方接入", badge: "API", categories: ["推荐", "API"], baseUrl: "https://api.openai.com/v1", requiresApiKey: true, iconTone: "openai", modelId: "gpt-5.2", modelDisplayName: "GPT-5.2", supportsThinking: true }),
-  apiProvider({ id: "google", value: "gemini", label: "Google Gemini", description: "Google AI Studio 接入", badge: "API", categories: ["推荐", "API"], baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", requiresApiKey: true, iconTone: "gemini", modelId: "gemini-3.5-flash", modelDisplayName: "Gemini 3.5 Flash", supportsThinking: false }),
+  apiProvider({ id: "anthropic", value: "anthropic", label: "Anthropic", description: "Anthropic 官方接入", badge: "API", categories: ["推荐", "API"], baseUrl: "https://api.anthropic.com", requiresApiKey: true, iconTone: "anthropic", modelId: "claude-sonnet-4-5", modelDisplayName: "Claude Sonnet 4.5", supportsThinking: true, supportsVision: true }),
+  apiProvider({ id: "openai", value: "openai", label: "OpenAI", description: "OpenAI 官方接入", badge: "API", categories: ["推荐", "API"], baseUrl: "https://api.openai.com/v1", requiresApiKey: true, iconTone: "openai", modelId: "gpt-5.2", modelDisplayName: "GPT-5.2", supportsThinking: true, supportsVision: true }),
+  apiProvider({ id: "google", value: "gemini", label: "Google Gemini", description: "Google AI Studio 接入", badge: "API", categories: ["推荐", "API"], baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", requiresApiKey: true, iconTone: "gemini", modelId: "gemini-3.5-flash", modelDisplayName: "Gemini 3.5 Flash", supportsThinking: false, supportsVision: true }),
   apiProvider({ id: "xai", value: "openai-compatible", label: "xAI", description: "xAI 官方接入，Grok 系列模型", badge: "API", categories: ["API"], baseUrl: "https://api.x.ai/v1", requiresApiKey: true, iconTone: "xai", modelId: "grok-4.5", modelDisplayName: "Grok 4.5", supportsThinking: true }),
   apiProvider({ id: "zai", value: "openai-compatible", label: "Z.AI", description: "智谱官方接入，GLM 系列模型", badge: "API", categories: ["API"], baseUrl: "https://api.z.ai/api/paas/v4", requiresApiKey: true, iconTone: "zai", modelId: "glm-5.2", modelDisplayName: "GLM-5.2", supportsThinking: true }),
   apiProvider({ id: "xiaomi", value: "openai-compatible", label: "Xiaomi", description: "小米官方接入，MiMo 系列模型", badge: "API", categories: ["API"], baseUrl: "https://api.xiaomimimo.com/v1", requiresApiKey: true, iconTone: "xiaomi", modelId: "mimo-v2.5", modelDisplayName: "MiMo-V2.5", supportsThinking: true }),
@@ -518,7 +526,9 @@ function mergeAvailableModels(catalogModels: CatalogModel[], configuredModels: M
     ...configuredModels.map((model) => ({
       id: model.model,
       displayName: model.displayName,
-      supportsThinking: model.efforts.length > 0
+      supportsThinking: model.efforts.length > 0,
+      supportsVision: model.capabilities?.vision,
+      supportsAudio: model.capabilities?.audio,
     })),
     ...catalogModels.filter((model) => !configuredIds.has(model.id))
   ];
@@ -619,12 +629,18 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
       displayName: catalogModel?.displayName ?? modelId,
       providerAlias,
       providerType: provider.value,
+      protocol: provider.protocol,
       model: modelId,
       baseUrl,
       apiKey: apiKey || undefined,
       apiKeyEnv: undefined,
+      requiresApiKey: provider.requiresApiKey,
       supportsTools: true,
-      supportsThinking: catalogModel?.supportsThinking ?? false
+      supportsThinking: catalogModel?.supportsThinking ?? false,
+      supportsVision: catalogModel?.supportsVision,
+      supportsAudio: catalogModel?.supportsAudio,
+      contextWindow: catalogModel?.contextWindow,
+      maxOutputTokens: catalogModel?.maxOutputTokens
     };
   };
 
@@ -705,6 +721,7 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
   const detailCatalog = detailGroup ? catalogForConnection(detailGroup) ?? {
     id: "custom",
     value: "openai-compatible" as const,
+    protocol: undefined,
     label: detailGroup.provider,
     description: detailGroup.providerType,
     badge: "API",
@@ -729,12 +746,15 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
       displayName: active.displayName,
       providerAlias: detailGroup.provider,
       providerType: detailCatalog.value,
+      protocol: detailCatalog.protocol,
       model: active.model,
       baseUrl: detailBaseUrl.trim() || detailCatalog.baseUrl || undefined,
       apiKey: detailApiKey.trim(),
       apiKeyEnv: undefined,
       supportsTools: active.supportsTools !== false,
-      supportsThinking: active.efforts.length > 0
+      supportsThinking: active.efforts.length > 0,
+      supportsVision: active.capabilities?.vision,
+      supportsAudio: active.capabilities?.audio
     });
     setDetailApiKey("");
   };
@@ -748,12 +768,15 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
       displayName: active.displayName,
       providerAlias: detailGroup.provider,
       providerType: detailCatalog.value,
+      protocol: detailCatalog.protocol,
       model: active.model,
       baseUrl: detailBaseUrl.trim() || detailCatalog.baseUrl || undefined,
       apiKey: undefined,
       apiKeyEnv: undefined,
       supportsTools: active.supportsTools !== false,
-      supportsThinking: active.efforts.length > 0
+      supportsThinking: active.efforts.length > 0,
+      supportsVision: active.capabilities?.vision,
+      supportsAudio: active.capabilities?.audio
     });
   };
 
@@ -764,12 +787,15 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
       displayName: catalogModel.displayName,
       providerAlias: detailGroup.provider,
       providerType: detailCatalog.value,
+      protocol: detailCatalog.protocol,
       model: catalogModel.id,
       baseUrl: detailBaseUrl.trim() || detailCatalog.baseUrl || undefined,
       apiKey: undefined,
       apiKeyEnv: undefined,
       supportsTools: true,
-      supportsThinking: catalogModel.supportsThinking
+      supportsThinking: catalogModel.supportsThinking,
+      supportsVision: catalogModel.supportsVision,
+      supportsAudio: catalogModel.supportsAudio
     });
   };
 
@@ -788,12 +814,15 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
     displayName: detailActive.displayName,
     providerAlias: detailGroup.provider,
     providerType: detailCatalog.value,
+    protocol: detailCatalog.protocol,
     model: detailActive.model,
     baseUrl: detailBaseUrl.trim() || detailCatalog.baseUrl || undefined,
     apiKey: detailApiKey.trim() || undefined,
     apiKeyEnv: undefined,
     supportsTools: detailActive.supportsTools !== false,
-    supportsThinking: detailActive.efforts.length > 0
+    supportsThinking: detailActive.efforts.length > 0,
+    supportsVision: detailActive.capabilities?.vision,
+    supportsAudio: detailActive.capabilities?.audio
   } : undefined;
 
   const deleteConnection = async (): Promise<void> => {

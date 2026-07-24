@@ -454,7 +454,7 @@ function FilePanelMenu({ onOpenFiles, onOpenTerminal, onPanelNotice }: { onOpenF
   return (
     <div className="file-panel-menu">
       {items.map((item) => (
-        <button key={item.label} className="file-panel-menu-item" onClick={item.onClick} type="button">
+        <button key={item.label} className={`file-panel-menu-item${item.label === "文件" ? " file-panel-menu-item--files" : ""}`} onClick={item.onClick} type="button">
           <span className="file-panel-menu-icon"><Icon name={item.icon} size={15} /></span>
           <span>{item.label}</span>
           {item.shortcut ? <kbd>{item.shortcut}</kbd> : null}

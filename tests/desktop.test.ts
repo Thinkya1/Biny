@@ -29,6 +29,7 @@ import {
   replaceNavigation
 } from "../src/desktop/renderer/src/navigationHistory.js";
 import { activeTimelineTool, buildSessionTimeline, listChangedFiles, listTimelineFiles, timelineToolEntries } from "../src/desktop/renderer/src/sessionTimeline.js";
+import { reasoningDetailText } from "../src/desktop/renderer/src/reasoningPresentation.js";
 import type { TimelineTool } from "../src/desktop/renderer/src/sessionTimeline.js";
 import { highlightWorkspaceFile } from "../src/desktop/renderer/src/syntaxHighlight.js";
 import { workspaceFileMarker } from "../src/desktop/renderer/src/workspaceFileMarker.js";
@@ -73,6 +74,7 @@ testHistoricalEmptyAssistantDoesNotEraseReply();
 testChangedFileProjection();
 testLiveTimelineProjection();
 testLiveReasoningAndSkillProjection();
+testReasoningDetailDoesNotUseCompletionStatusAsContent();
 testDesktopNavigationHistory();
 testPendingPermissionToolSelection();
 
@@ -918,6 +920,11 @@ function testLiveReasoningAndSkillProjection(): void {
   assert.deepEqual(timeline[0]?.skills, ["programmatic-tools"]);
   assert.equal(timeline[0]?.reasoning, "先拆分问题。");
   assert.equal(timeline[0]?.reasoningDurationMs, 1_512);
+}
+
+function testReasoningDetailDoesNotUseCompletionStatusAsContent(): void {
+  assert.equal(reasoningDetailText({ content: "  先检查入口。  " }), "先检查入口。");
+  assert.equal(reasoningDetailText({ content: "" }), "该模型未返回可展示的思考内容");
 }
 
 function testDesktopNavigationHistory(): void {

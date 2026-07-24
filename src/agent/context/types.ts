@@ -38,6 +38,9 @@ export interface WorkspaceTurnData {
 export interface ContextBudgetStatus {
   maxTokens: number;
   usedTokens: number;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  modelAlias?: string;
   omitted: string[];
   autoCompacted: boolean;
   source?: "estimated" | "provider";

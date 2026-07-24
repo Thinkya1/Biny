@@ -9,6 +9,7 @@ import { PermissionPrompt } from "../src/tui/components/PermissionPrompt.js";
 import { TranscriptViewer, transcriptViewerPage } from "../src/tui/components/TranscriptViewer.js";
 import { diffLineStyle } from "../src/tui/diffLines.js";
 import { createInitialTuiState, tuiReducer } from "../src/tui/state.js";
+import { agentEventToRuntimeEvents } from "../src/tui/runtime/agentEventAdapter.js";
 import { sessionEventsToTranscript } from "../src/tui/sessionTranscript.js";
 import {
   clampTerminalLines,
@@ -42,6 +43,7 @@ async function main(): Promise<void> {
   testClampTerminalLines();
   testTranscriptUsesIndependentItemKinds();
   testRuntimeStatusEventsReachFooterState();
+  testReasoningStreamingRendersContent();
   testIncompleteSessionStaysDistinctFromCompletion();
   testAbortedSessionStaysDistinctFromCompletion();
   testAssistantStreamingUpdatesOneActiveCell();
@@ -364,6 +366,30 @@ function testRuntimeStatusEventsReachFooterState(): void {
   assert.equal(state.status, "running");
 }
 
+function testReasoningStreamingRendersContent(): void {
+  let state = createInitialTuiState("/workspace");
+  state = tuiReducer(state, { type: "user.message", content: "inspect" });
+  state = tuiReducer(state, { type: "reasoning.delta", content: "先检查" });
+  state = tuiReducer(state, { type: "reasoning.delta", content: "入口文件。" });
+  assert.deepEqual(state.transcript.active.map((item) => item.kind), ["reasoning"]);
+  assert.equal(state.transcript.active[0]?.content, "先检查入口文件。");
+
+  state = tuiReducer(state, { type: "reasoning.completed", status: "分析完成" });
+  assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["user", "reasoning"]);
+  assert.equal(state.transcript.committed[1]?.content, "先检查入口文件。");
+  assert.match(transcriptRowsForDisplay(state.transcript, 80).map(rowText).join("\n"), /先检查入口文件。/u);
+
+  const runtimeEvents = agentEventToRuntimeEvents({
+    sessionId: "session",
+    runId: "run",
+    timestamp: "2026-07-24T00:00:00.000Z",
+    type: "reasoning.delta",
+    messageId: "message",
+    content: "继续验证。"
+  });
+  assert.deepEqual(runtimeEvents, [{ type: "reasoning.delta", content: "继续验证。" }]);
+}
+
 function testIncompleteSessionStaysDistinctFromCompletion(): void {
   let state = createInitialTuiState("/workspace");
   state = tuiReducer(state, { type: "user.message", content: "finish the project" });
@@ -670,12 +696,13 @@ function testErrorFinalizesActiveCells(): void {
 function testSessionReplayUsesToolItems(): void {
   const items = sessionEventsToTranscript([
     { type: "user_message", content: "read", time: "2026-07-12T00:00:00.000Z" },
-    { type: "tool_call", toolCallId: "read-1", tool: "read_file", args: { path: "README.md" }, time: "2026-07-12T00:00:01.000Z" },
+    { type: "tool_call", toolCallId: "read-1", tool: "read_file", args: { path: "README.md" }, reasoningContent: "先读取 README。", time: "2026-07-12T00:00:01.000Z" },
     { type: "tool_result", toolCallId: "read-1", tool: "read_file", result: { path: "README.md", content: "line 1\nline 2" }, time: "2026-07-12T00:00:03.500Z" },
     { type: "assistant_message", content: "done" }
   ] as SessionEvent[]);
-  assert.deepEqual(items.map((item) => item.kind), ["user", "tool", "assistant"]);
-  const tool = items[1] as ToolTranscriptItem;
+  assert.deepEqual(items.map((item) => item.kind), ["user", "reasoning", "tool", "assistant"]);
+  assert.equal(items[1]?.content, "先读取 README。");
+  const tool = items[2] as ToolTranscriptItem;
   assert.equal(tool.title, "Read README.md");
   assert.equal(tool.output, "line 1\nline 2");
   assert.equal(tool.durationMs, 2_500);

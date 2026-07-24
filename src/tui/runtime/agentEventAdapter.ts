@@ -14,7 +14,7 @@ export function agentEventToRuntimeEvents(event: AgentHostEvent): RuntimeEvent[]
     case "reasoning.started":
       return [{ type: "runtime.status", status: "thinking" }];
     case "reasoning.delta":
-      return [];
+      return [{ type: "reasoning.delta", content: event.content }];
     case "tool.started":
       return [{
         type: "tool.call.started",
@@ -67,8 +67,9 @@ export function agentEventToRuntimeEvents(event: AgentHostEvent): RuntimeEvent[]
       ];
     case "run.failed":
       return [{ type: "session.error", sessionId: event.sessionId, message: event.error }];
-    case "reasoning.status":
     case "reasoning.completed":
+      return [{ type: "reasoning.completed", status: event.status }];
+    case "reasoning.status":
     case "command.started":
     case "command.output":
     case "command.completed":

@@ -27,6 +27,7 @@ import {
 } from "./SubagentTaskManager.js";
 import { ManagedProcessService } from "./ManagedProcessService.js";
 import { TaskRunStore, type TaskRunSnapshot } from "../harness/TaskRunStore.js";
+import { modelReasoningConfig } from "../ai/capabilities.js";
 
 export interface CommandRuntime {
   workspaceRoot: string;
@@ -244,11 +245,12 @@ function subagentModelSettings(config: AgentConfig, modelManager: ModelManager):
   if (!alias) return modelManager.getModelSettings();
   const model = config.models[alias];
   if (!model) throw new Error(`Unknown subagent model alias: ${alias}`);
+  const reasoning = modelReasoningConfig(model);
   const modelConfig = {
     ...config,
     defaultModel: alias,
-    thinking: model.thinking
-      ? { enabled: true, effort: model.thinking.defaultEffort }
+    thinking: reasoning
+      ? { enabled: true, effort: reasoning.defaultEffort }
       : { enabled: false, effort: "high" as const }
   };
   return createModelSettings(modelConfig, alias);

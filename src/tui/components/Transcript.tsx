@@ -69,11 +69,15 @@ function TranscriptRow({ row }: { row: TranscriptDisplayRow }): React.ReactEleme
 
   const prefixColor = row.itemKind === "user"
     ? tuiColors.accent
+    : row.itemKind === "reasoning"
+      ? tuiColors.textMuted
     : row.itemKind === "error"
       ? tuiColors.error
       : notificationColor(row.tone);
   const bodyColor = row.itemKind === "user"
     ? tuiColors.textStrong
+    : row.itemKind === "reasoning"
+      ? tuiColors.textDim
     : row.itemKind === "error"
       ? tuiColors.error
       : row.itemKind === "notification"
@@ -82,7 +86,7 @@ function TranscriptRow({ row }: { row: TranscriptDisplayRow }): React.ReactEleme
   return (
     <Text>
       <Text color={prefixColor} bold={row.itemKind === "user" || row.itemKind === "error"}>{row.prefix}</Text>
-      <MarkdownText line={row.text} muted={row.itemKind === "notification" && row.tone !== "warning" && row.tone !== "success"} color={bodyColor} />
+      <MarkdownText line={row.text} muted={row.itemKind === "reasoning" || row.itemKind === "notification" && row.tone !== "warning" && row.tone !== "success"} color={bodyColor} />
     </Text>
   );
 }

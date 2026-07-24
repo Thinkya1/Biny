@@ -12,6 +12,7 @@ import {
   type SaveDialogOptions
 } from "electron";
 import { z } from "zod";
+import { modelProviderSchema, providerProtocolSchema, reasoningEffortSchema } from "../../../config/schema.js";
 import type { DesktopBootstrap, DesktopSessionMenuAction, DesktopThemePreference } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
 import { DesktopAgentManager } from "./DesktopAgentManager.js";
@@ -31,20 +32,25 @@ const promptSchema = z.string().min(1).max(1_000_000);
 const userMessageIndexSchema = z.number().int().nonnegative();
 const titleSchema = z.string().trim().min(1).max(120);
 const permissionModeSchema = z.enum(["ask", "read-only", "auto", "full-access"]);
-const thinkingSchema = z.enum(["off", "high", "max"]);
-const modelProviderSchema = z.enum(["deepseek", "openai", "anthropic", "claude-subscription", "openai-codex", "gemini", "kimi", "qwen", "ollama", "openai-compatible"]);
+const thinkingSchema = z.union([z.literal("off"), reasoningEffortSchema]);
 const modelLoginProviderSchema = z.enum(["claude-code", "openai-codex"]);
 const modelConfigurationSchema = z.object({
   alias: idSchema,
   displayName: z.string().trim().min(1).max(120),
   providerAlias: idSchema,
   providerType: modelProviderSchema,
+  protocol: providerProtocolSchema.optional(),
   model: z.string().trim().min(1).max(240),
   baseUrl: z.string().url().optional(),
   apiKey: z.string().min(1).max(4_000).optional(),
   apiKeyEnv: z.string().trim().min(1).max(120).optional(),
+  requiresApiKey: z.boolean().optional(),
   supportsTools: z.boolean(),
-  supportsThinking: z.boolean()
+  supportsThinking: z.boolean(),
+  supportsVision: z.boolean().optional(),
+  supportsAudio: z.boolean().optional(),
+  contextWindow: z.number().int().min(4_096).max(2_000_000).optional(),
+  maxOutputTokens: z.number().int().min(1).max(131_072).optional()
 });
 const runModeSchema = z.enum(["chat", "plan"]);
 const permissionResultSchema = z.object({

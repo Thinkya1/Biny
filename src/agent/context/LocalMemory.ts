@@ -40,7 +40,8 @@ export class LocalMemory {
     private readonly workspaceRoot: string,
     private readonly getModel: () => LanguageModel,
     private readonly onUsage: ModelUsageObserver = () => undefined,
-    private readonly telemetry?: (functionId: string) => TelemetryOptions
+    private readonly telemetry?: (functionId: string) => TelemetryOptions,
+    private readonly getMaxRetries: () => number = () => 0
   ) {}
 
   async findRelevant(query: string, paths: string[], limit = 3, signal?: AbortSignal): Promise<MemoryMatch[]> {
@@ -152,7 +153,7 @@ export class LocalMemory {
         model: this.getModel(),
         allowSystemInMessages: true,
         abortSignal: signal,
-        maxRetries: 0,
+        maxRetries: this.getMaxRetries(),
         timeout: memoryModelTimeoutMs,
         output: Output.object({
           schema: memoryEntrySchema,

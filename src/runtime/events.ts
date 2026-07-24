@@ -20,6 +20,8 @@ export type RuntimeEvent =
   | { type: "error.message"; message: string }
   | { type: "system.message"; content: string }
   | { type: "user.message"; content: string }
+  | { type: "reasoning.delta"; content: string }
+  | { type: "reasoning.completed"; status: string }
   | { type: "assistant.delta"; content: string }
   | { type: "assistant.completed"; content: string }
   | { type: "tool.call.started"; toolCallId?: string; tool: string; args: unknown; description?: string; display?: ToolInputDisplay }

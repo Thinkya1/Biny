@@ -7,6 +7,8 @@ import { formatRepoMapCandidates, WorkspaceContext } from "./WorkspaceContext.js
 import type { CompactionResult, CompactionStatus, ContextBudgetStatus, ContextStatus, LoadedInstruction, MemoryMatch, RecentWorkspaceActivity, WorkspaceTurnData } from "./types.js";
 import type { ModelUsageObserver } from "../../observability/usage.js";
 import type { SessionContextState } from "../../session/metadata.js";
+import type { ModelContextBudget } from "../../ai/types.js";
+import type { AgentAttachment } from "../AgentSession.js";
 
 const retainedHistoryTokens = 5_000;
 const summaryTokens = 2_800;
@@ -27,6 +29,8 @@ export class ContextMemory {
   private lastCompactedAt: string | undefined;
   private lastBudget: ContextBudgetStatus;
   private memoryTopics: string[] = [];
+  private readonly resolveBudget: () => ModelContextBudget;
+  private readonly getMaxRetries: () => number;
 
   constructor(
     private readonly getModel: () => LanguageModel,
@@ -35,16 +39,36 @@ export class ContextMemory {
     private readonly maxTokens: number,
     private readonly instructionMaxBytes: number,
     private readonly onUsage: ModelUsageObserver = () => undefined,
-    private readonly telemetry?: (functionId: string) => TelemetryOptions
+    private readonly telemetry?: (functionId: string) => TelemetryOptions,
+    getBudgetLimits?: () => ModelContextBudget,
+    getMaxRetries: () => number = () => 0
   ) {
-    this.lastBudget = { maxTokens, usedTokens: 0, omitted: [], autoCompacted: false, source: "estimated", measuredAt: undefined };
+    this.resolveBudget = getBudgetLimits ?? (() => ({
+      contextWindow: maxTokens,
+      maxInputTokens: maxTokens,
+      maxOutputTokens: undefined,
+      modelAlias: undefined
+    }));
+    this.getMaxRetries = getMaxRetries;
+    const budget = this.currentBudget();
+    this.lastBudget = {
+      maxTokens: budget.maxInputTokens,
+      usedTokens: 0,
+      contextWindow: budget.contextWindow,
+      maxOutputTokens: budget.maxOutputTokens,
+      modelAlias: budget.modelAlias,
+      omitted: [],
+      autoCompacted: false,
+      source: "estimated",
+      measuredAt: undefined
+    };
   }
 
   async initialize(): Promise<void> {
     await this.workspace.initialize();
   }
 
-  async prepareTurn(input: string, systemPrompt: string, signal?: AbortSignal): Promise<ModelMessage[]> {
+  async prepareTurn(input: string, systemPrompt: string, signal?: AbortSignal, attachments: AgentAttachment[] = []): Promise<ModelMessage[]> {
     signal?.throwIfAborted();
     await this.flush(signal);
     signal?.throwIfAborted();
@@ -55,6 +79,7 @@ export class ContextMemory {
     const memoryMatches = await this.findRelevantMemory(input, [...workspace.explicitPaths, ...workspace.recentActivity.paths], signal);
     signal?.throwIfAborted();
     this.memoryTopics = [...new Set(memoryMatches.map((match) => match.topic))];
+    const budget = this.currentBudget();
     const assembly = assembleContext(
       systemPrompt,
       input,
@@ -62,10 +87,16 @@ export class ContextMemory {
       workspace,
       this.summary,
       memoryMatches,
-      this.maxTokens,
-      compaction.compacted
+      budget.maxInputTokens,
+      compaction.compacted,
+      attachments
     );
-    this.lastBudget = assembly.budget;
+    this.lastBudget = {
+      ...assembly.budget,
+      contextWindow: budget.contextWindow,
+      maxOutputTokens: budget.maxOutputTokens,
+      modelAlias: budget.modelAlias
+    };
     return assembly.messages;
   }
 
@@ -74,6 +105,7 @@ export class ContextMemory {
   }
 
   getBudget(): ContextBudgetStatus {
+    this.syncBudgetMetadata();
     return cloneBudget(this.lastBudget);
   }
 
@@ -140,7 +172,7 @@ export class ContextMemory {
     this.compactedMessages = contextState?.compactedMessages ?? 0;
     this.lastCompactedAt = contextState?.lastCompactedAt;
     this.memoryTopics = [...(contextState?.memoryTopics ?? [])];
-    this.lastBudget = budget === undefined ? estimateRestoredBudget(this.history, this.maxTokens) : normalizeRestoredBudget(budget, this.maxTokens);
+    this.lastBudget = budget === undefined ? estimateRestoredBudget(this.history, this.currentBudget()) : normalizeRestoredBudget(budget, this.currentBudget());
     this.workspace.restoreFromHistory(messages);
   }
 
@@ -170,6 +202,7 @@ export class ContextMemory {
 
   async status(): Promise<ContextStatus> {
     await this.initialize();
+    this.syncBudgetMetadata();
     const workspace = this.workspace.status();
     return {
       loadedInstructions: workspace.loadedInstructions,
@@ -195,6 +228,7 @@ export class ContextMemory {
       "Context",
       "",
       `Budget: ${String(status.budget.usedTokens)}/${String(status.budget.maxTokens)} ${status.budget.source === "provider" ? "provider tokens" : "estimated tokens"}`,
+      ...(status.budget.contextWindow ? [`Model context: ${String(status.budget.contextWindow)} tokens${status.budget.modelAlias ? ` (${status.budget.modelAlias})` : ""}`] : []),
       `Auto compacted this turn: ${status.budget.autoCompacted ? "yes" : "no"}`,
       `Snapshot: ${status.snapshotRefreshedAt ?? "not loaded"}${status.snapshotDirty ? " (dirty)" : ""}`,
       `RepoMap: ${String(status.repoMapEntries)} entries, ${status.repoMapRefreshedAt ?? "not loaded"}${status.repoMapDirty ? " (dirty)" : ""}`,
@@ -214,7 +248,7 @@ export class ContextMemory {
 
   private async compactIfNeeded(signal?: AbortSignal): Promise<CompactionResult> {
     signal?.throwIfAborted();
-    if (estimateMessageTokens(this.history) <= Math.floor(this.maxTokens * 0.45)) {
+    if (estimateMessageTokens(this.history) <= Math.floor(this.inputBudget() * 0.45)) {
       return { compacted: false, compactedMessageCount: 0, summary: this.summary };
     }
     return await this.compact(undefined, signal);
@@ -239,7 +273,7 @@ export class ContextMemory {
         model: this.getModel(),
         allowSystemInMessages: true,
         abortSignal: signal,
-        maxRetries: 0,
+        maxRetries: this.getMaxRetries(),
         output: Output.object({
           schema: summarySchema,
           name: "coding-session-summary",
@@ -280,14 +314,45 @@ export class ContextMemory {
   }
 
   private refreshEstimatedBudget(): void {
+    const budget = this.currentBudget();
     const summaryTokens = this.summary ? estimateTokens(this.summary) + 4 : 0;
     const usedTokens = estimateMessageTokens(this.history) + summaryTokens;
     this.lastBudget = {
       ...this.lastBudget,
+      maxTokens: budget.maxInputTokens,
+      contextWindow: budget.contextWindow,
+      maxOutputTokens: budget.maxOutputTokens,
+      modelAlias: budget.modelAlias,
       usedTokens,
       source: "estimated",
       measuredAt: undefined
     };
+  }
+
+  private syncBudgetMetadata(): void {
+    const budget = this.currentBudget();
+    this.lastBudget = {
+      ...this.lastBudget,
+      maxTokens: budget.maxInputTokens,
+      contextWindow: budget.contextWindow,
+      maxOutputTokens: budget.maxOutputTokens,
+      modelAlias: budget.modelAlias
+    };
+  }
+
+  private currentBudget(): ModelContextBudget {
+    const budget = this.resolveBudget();
+    if (!Number.isSafeInteger(budget.contextWindow) || budget.contextWindow < 1) {
+      throw new RangeError("Model contextWindow must be a positive token count.");
+    }
+    if (!Number.isSafeInteger(budget.maxInputTokens) || budget.maxInputTokens < 1) {
+      throw new RangeError("Model maxInputTokens must be a positive token count.");
+    }
+    return budget;
+  }
+
+  private inputBudget(): number {
+    return this.currentBudget().maxInputTokens;
   }
 }
 
@@ -367,24 +432,30 @@ function cloneBudget(budget: ContextBudgetStatus): ContextBudgetStatus {
   return { ...budget, omitted: [...budget.omitted] };
 }
 
-function normalizeRestoredBudget(budget: ContextBudgetStatus, maxTokens: number): ContextBudgetStatus {
+function normalizeRestoredBudget(budget: ContextBudgetStatus, limits: ModelContextBudget): ContextBudgetStatus {
   const source = budget.source ?? "estimated";
   return {
     ...budget,
-    maxTokens,
-    usedTokens: source === "provider" ? Math.max(0, budget.usedTokens) : Math.min(maxTokens, Math.max(0, budget.usedTokens)),
+    maxTokens: limits.maxInputTokens,
+    contextWindow: limits.contextWindow,
+    maxOutputTokens: limits.maxOutputTokens,
+    modelAlias: limits.modelAlias,
+    usedTokens: source === "provider" ? Math.max(0, budget.usedTokens) : Math.min(limits.maxInputTokens, Math.max(0, budget.usedTokens)),
     omitted: [...budget.omitted],
     source,
     measuredAt: budget.measuredAt
   };
 }
 
-function estimateRestoredBudget(history: ModelMessage[], maxTokens: number): ContextBudgetStatus {
+function estimateRestoredBudget(history: ModelMessage[], limits: ModelContextBudget): ContextBudgetStatus {
   const estimatedTokens = estimateMessageTokens(history);
   return {
-    maxTokens,
-    usedTokens: Math.min(maxTokens, estimatedTokens),
-    omitted: estimatedTokens > maxTokens ? ["older conversation messages"] : [],
+    maxTokens: limits.maxInputTokens,
+    contextWindow: limits.contextWindow,
+    maxOutputTokens: limits.maxOutputTokens,
+    modelAlias: limits.modelAlias,
+    usedTokens: Math.min(limits.maxInputTokens, estimatedTokens),
+    omitted: estimatedTokens > limits.maxInputTokens ? ["older conversation messages"] : [],
     autoCompacted: false,
     source: "estimated",
     measuredAt: undefined
@@ -404,7 +475,8 @@ function assembleContext(
   summary: string | undefined,
   memoryMatches: MemoryMatch[],
   maxTokens: number,
-  autoCompacted: boolean
+  autoCompacted: boolean,
+  attachments: AgentAttachment[]
 ): ContextAssembly {
   const omitted: string[] = [];
   const task = input.trim() || "(empty task)";
@@ -443,7 +515,18 @@ function assembleContext(
   if (selectedHistory.length < history.filter((message) => message.role !== "system").length) omitted.push("older conversation messages");
 
   addSystem("RepoMap candidates", `RepoMap candidates:\n${formatRepoMapCandidates(workspace.repoMapCandidates)}`, false);
-  const messages = [...systemMessages, ...selectedHistory, { role: "user" as const, content: taskContent }];
+  const userContent = attachments.length
+    ? [
+      { type: "text" as const, text: taskContent },
+      ...attachments.map((attachment) => ({
+        type: "file" as const,
+        data: { type: "data" as const, data: attachment.data },
+        mediaType: attachment.mimeType,
+        filename: attachment.name
+      }))
+    ]
+    : taskContent;
+  const messages = [...systemMessages, ...selectedHistory, { role: "user" as const, content: userContent }];
   return {
     messages,
     budget: { maxTokens, usedTokens: estimateMessageTokens(messages), omitted, autoCompacted, source: "estimated", measuredAt: undefined }
@@ -553,5 +636,15 @@ function groupConversationTurns(messages: ModelMessage[]): ModelMessage[][] {
 }
 
 function messageTokenCost(message: ModelMessage): number {
-  return estimateTokens(messageText(message)) + estimateTokens(messageReasoning(message)) + 4;
+  return estimateTokens(messageText(message)) + estimateTokens(messageReasoning(message)) + estimateMediaTokens(message) + 4;
+}
+
+function estimateMediaTokens(message: ModelMessage): number {
+  if (typeof message.content === "string") return 0;
+  return message.content.reduce((total, part) => {
+    if (part.type !== "file") return total;
+    if (part.mediaType.startsWith("image/")) return total + 1_024;
+    if (part.mediaType.startsWith("audio/")) return total + 2_048;
+    return total + 512;
+  }, 0);
 }

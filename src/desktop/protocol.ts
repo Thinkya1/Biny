@@ -150,12 +150,18 @@ export interface DesktopModelConfigurationInput {
   displayName: string;
   providerAlias: string;
   providerType: ModelProvider;
+  protocol?: "anthropic" | "openai-compatible";
   model: string;
   baseUrl?: string;
   apiKey?: string;
   apiKeyEnv?: string;
+  requiresApiKey?: boolean;
   supportsTools: boolean;
   supportsThinking: boolean;
+  supportsVision?: boolean;
+  supportsAudio?: boolean;
+  contextWindow?: number;
+  maxOutputTokens?: number;
 }
 
 export type DesktopModelLoginProvider = "claude-code" | "openai-codex";

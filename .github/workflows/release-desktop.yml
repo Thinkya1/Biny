@@ -29,6 +29,12 @@ jobs:
           - runner: macos-15-intel
             arch: x64
     runs-on: ${{ matrix.runner }}
+    env:
+      CSC_LINK: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+      CSC_KEY_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,6 +56,14 @@ jobs:
         run: |
           package_version="$(node -p "require('./package.json').version")"
           test "${RELEASE_TAG#v}" = "$package_version"
+
+      - name: Verify macOS signing configuration
+        run: |
+          test -n "$CSC_LINK" || { echo "Missing MACOS_CERTIFICATE_BASE64" >&2; exit 1; }
+          test -n "$CSC_KEY_PASSWORD" || { echo "Missing MACOS_CERTIFICATE_PASSWORD" >&2; exit 1; }
+          test -n "$APPLE_ID" || { echo "Missing APPLE_ID" >&2; exit 1; }
+          test -n "$APPLE_APP_SPECIFIC_PASSWORD" || { echo "Missing APPLE_APP_SPECIFIC_PASSWORD" >&2; exit 1; }
+          test -n "$APPLE_TEAM_ID" || { echo "Missing APPLE_TEAM_ID" >&2; exit 1; }
 
       - name: Build macOS package
         run: |

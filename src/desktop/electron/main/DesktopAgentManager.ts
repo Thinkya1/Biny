@@ -1,5 +1,6 @@
-import type { AgentRunMode } from "../../../agent/AgentSession.js";
+import type { AgentAttachment, AgentRunMode } from "../../../agent/AgentSession.js";
 import { promises as fs } from "node:fs";
+import path from "node:path";
 import { generateText } from "ai";
 import { configSchema, type AgentConfig } from "../../../config/schema.js";
 import type { AgentConfigStore } from "../../../config/store.js";
@@ -127,7 +128,9 @@ export class DesktopAgentManager {
     }
     const info = runtime.getInfo();
     const prompt = withAttachmentReferences(input, attachments);
-    const submitted = runtime.submitPrompt(prompt, mode);
+    const project = this.projects.requireProject(projectId);
+    const nativeAttachments = await loadNativeAttachments(this.projects.attachmentsRoot(project), attachments);
+    const submitted = runtime.submitPrompt(prompt, mode, nativeAttachments);
     await this.state.setSelectedSession(projectId, info.sessionId);
     this.observeRunCompletion(projectId, submitted.completion);
     return {
@@ -170,7 +173,8 @@ export class DesktopAgentManager {
     const nextRuntime = await this.ensureRuntime(projectId);
     const info = nextRuntime.getInfo();
     const prompt = withAttachmentReferences(input, attachments);
-    const submitted = nextRuntime.submitPrompt(prompt, mode);
+    const nativeAttachments = await loadNativeAttachments(this.projects.attachmentsRoot(project), attachments);
+    const submitted = nextRuntime.submitPrompt(prompt, mode, nativeAttachments);
     this.observeRunCompletion(projectId, submitted.completion);
     return {
       sessionId: info.sessionId,
@@ -298,7 +302,7 @@ export class DesktopAgentManager {
     const profile = providerProfile(provider.type);
     const envName = provider.apiKeyEnv ?? profile.apiKeyEnv;
     const hasKey = Boolean(provider.apiKey || (envName && process.env[envName]));
-    if (profile.requiresApiKey && !hasKey) {
+    if ((provider.requiresApiKey ?? profile.requiresApiKey) && !hasKey) {
       return { ok: false, message: envName ? `缺少 API Key。请填写密钥，或设置环境变量 ${envName}。` : "缺少 API Key。请先填写密钥后再测试。" };
     }
     const started = Date.now();
@@ -308,6 +312,7 @@ export class DesktopAgentManager {
         model: settings.model,
         prompt: "ping",
         maxOutputTokens: 16,
+        maxRetries: settings.maxRetries,
         temperature: 0
       });
       const latencyMs = Date.now() - started;
@@ -330,9 +335,11 @@ export class DesktopAgentManager {
     const profile = providerProfile(input.providerType);
     const provider = {
       type: input.providerType,
+      protocol: input.protocol,
       baseUrl: input.baseUrl ?? existingProvider?.baseUrl ?? profile.baseUrl,
       apiKey: input.apiKey ?? existingProvider?.apiKey,
       apiKeyEnv: input.apiKeyEnv ?? existingProvider?.apiKeyEnv ?? profile.apiKeyEnv,
+      requiresApiKey: input.requiresApiKey,
       authMode: existingProvider?.authMode,
       oauth: existingProvider?.oauth,
       timeoutMs: existingProvider?.timeoutMs
@@ -351,6 +358,14 @@ export class DesktopAgentManager {
           model: input.model,
           displayName: input.displayName,
           supportsTools: input.supportsTools,
+          capabilities: {
+            tools: input.supportsTools,
+            reasoning: input.supportsThinking,
+            vision: input.supportsVision,
+            audio: input.supportsAudio
+          },
+          contextWindow: input.contextWindow,
+          maxOutputTokens: input.maxOutputTokens,
           thinking: input.supportsThinking ? { efforts: ["high", "max"], defaultEffort: "high" } : undefined
         }
       },
@@ -641,4 +656,23 @@ function withAttachmentReferences(input: string, attachments: DesktopAttachment[
     "Attached files (read them with read_file using these @attachments/ paths):",
     ...attachments.map((attachment) => `- ${attachment.path} (${attachment.mimeType || "unknown type"}, ${String(attachment.size)} bytes)`)
   ].join("\n");
+}
+
+async function loadNativeAttachments(root: string, attachments: DesktopAttachment[]): Promise<AgentAttachment[]> {
+  const normalizedRoot = path.resolve(root);
+  const native: AgentAttachment[] = [];
+  for (const attachment of attachments) {
+    if (!attachment.mimeType.startsWith("image/") && !attachment.mimeType.startsWith("audio/")) continue;
+    const relative = attachment.path.replace(/^@attachments\//u, "");
+    if (!relative || relative.includes("/") || relative.includes("\\")) continue;
+    const filePath = path.resolve(normalizedRoot, relative);
+    if (filePath !== normalizedRoot && !filePath.startsWith(`${normalizedRoot}${path.sep}`)) continue;
+    try {
+      const bytes = await fs.readFile(filePath);
+      native.push({ name: attachment.name, mimeType: attachment.mimeType, data: bytes.toString("base64") });
+    } catch {
+      // The textual attachment reference remains available to the agent.
+    }
+  }
+  return native;
 }

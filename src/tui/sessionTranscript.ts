@@ -20,11 +20,13 @@ export function sessionEventsToTranscript(events: SessionEvent[]): TranscriptIte
     }
 
     if (event.type === "assistant_message") {
+      appendReasoning(items, event.reasoningContent, index);
       if (event.content) items.push({ id: replayId("assistant", index), kind: "assistant", content: event.content });
       continue;
     }
 
     if (event.type === "tool_call") {
+      appendReasoning(items, event.reasoningContent, index);
       pendingTools.push(createRunningToolItem({
         id: replayId(`tool-${event.tool}`, index),
         toolCallId: event.toolCallId,
@@ -63,6 +65,11 @@ export function sessionEventsToTranscript(events: SessionEvent[]): TranscriptIte
     items.push(completeToolItem({ ...pending, startedAtMs: undefined }, { error: "Interrupted before completion." }, "skipped"));
   }
   return items;
+}
+
+function appendReasoning(items: TranscriptItem[], content: string | undefined, index: number): void {
+  if (!content) return;
+  items.push({ id: replayId("reasoning", index), kind: "reasoning", content });
 }
 
 function findPendingTool(pending: ToolTranscriptItem[], toolCallId: string | undefined, tool: string): number {

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AgentRunMode, AgentSessionInfo, ResumedAgentSession } from "../agent/AgentSession.js";
+import type { AgentAttachment, AgentRunMode, AgentSessionInfo, ResumedAgentSession } from "../agent/AgentSession.js";
 import type { AgentPermissionResult, AgentSessionEvent, AgentTurnOutcome } from "../agent/types.js";
 import type { ContextStatus } from "../agent/context/types.js";
 import type { ExtensionSection } from "../extensions/report.js";
@@ -54,6 +54,7 @@ export interface InteractiveAgentRuntimeOptions {
 
 interface QueuedAgentRun extends ActiveRunSnapshot {
   queuedAtMs: number;
+  attachments: AgentAttachment[];
 }
 
 interface PendingPermission extends PendingPermissionSnapshot {
@@ -141,7 +142,7 @@ export class InteractiveAgentRuntime {
     return await this.runMaintenanceOperation("refresh_model", async () => await this.commandRuntime.agent.refreshModelFromDisk());
   }
 
-  submitPrompt(input: string, mode: AgentRunMode = "chat"): SubmittedAgentRun {
+  submitPrompt(input: string, mode: AgentRunMode = "chat", attachments: AgentAttachment[] = []): SubmittedAgentRun {
     if (this.closed) throw new Error("Agent runtime is closed.");
     if (this.activeOperation) throw new Error(`Cannot submit a prompt while ${publicOperationName(this.activeOperation)} is running.`);
     if (!input.trim()) throw new Error("Agent prompt cannot be empty.");
@@ -155,6 +156,7 @@ export class InteractiveAgentRuntime {
       messageId,
       input,
       mode,
+      attachments: attachments.map((attachment) => ({ ...attachment })),
       status: "queued",
       startedAt: new Date(queuedAtMs).toISOString(),
       queuedAtMs
@@ -301,8 +303,8 @@ export class InteractiveAgentRuntime {
       permissionMode: this.getPermissionMode(),
       activeOperation: this.activeOperation === "permission" ? undefined : this.activeOperation,
       activeRun: this.rootRunScheduler.activeRun
-        ? { ...this.rootRunScheduler.activeRun }
-        : this.directRun ? { ...this.directRun } : undefined,
+        ? publicRunSnapshot(this.rootRunScheduler.activeRun)
+        : this.directRun ? publicRunSnapshot(this.directRun) : undefined,
       pendingPermission: this.pendingPermission ? {
         sessionId: this.pendingPermission.sessionId,
         runId: this.pendingPermission.runId,
@@ -541,6 +543,7 @@ export class InteractiveAgentRuntime {
         sessionId: run.sessionId,
         input: run.input,
         mode: run.mode,
+        attachments: run.attachments,
         signal,
         confirmPermission: async (request) => await this.waitForPermission(run, request),
         onAgentEvent: (event) => {
@@ -996,6 +999,11 @@ export class InteractiveAgentRuntime {
       startedAt: new Date().toISOString()
     };
   }
+}
+
+function publicRunSnapshot(run: ActiveRunSnapshot & { attachments?: AgentAttachment[] }): ActiveRunSnapshot {
+  const { attachments: _attachments, ...snapshot } = run;
+  return snapshot;
 }
 
 export async function createInteractiveAgentRuntime(workspaceRoot: string, options?: CommandRuntimeOptions): Promise<InteractiveAgentRuntime> {

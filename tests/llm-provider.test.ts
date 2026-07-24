@@ -234,6 +234,7 @@ async function testAnthropicMessagesAndToolSchema(): Promise<void> {
           inputSchema: jsonSchema({ type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false })
         }
       },
+      maxOutputTokens: 4_096,
       maxRetries: 0
     });
     assert.equal(request?.url, "https://api.anthropic.com/v1/messages");
