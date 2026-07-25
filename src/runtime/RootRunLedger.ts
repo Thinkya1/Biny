@@ -38,6 +38,10 @@ const runFileSuffix = ".json";
 const sessionLeasePrefix = "session-";
 const sessionLeaseSuffix = ".lock";
 
+// TODO(concurrency): the lock currently protects one Session from a second
+// Desktop/CLI/TUI runtime. When shared live-session clients are implemented,
+// replace this rejection path with host election plus client attachment.
+
 export type RootRunLedgerStatus = "queued" | "running" | "completed" | "incomplete" | "failed" | "aborted";
 
 export interface RootRunLedgerTransition {

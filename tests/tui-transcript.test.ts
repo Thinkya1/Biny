@@ -18,12 +18,19 @@ import {
   truncateToTerminalWidth,
   wrapTerminalLines
 } from "../src/tui/terminalText.js";
-import { transcriptRowsForDisplay, visibleTranscriptRows, type TranscriptDisplayRow } from "../src/tui/transcriptRows.js";
+import {
+  sliceTranscriptRows,
+  transcriptRowsForDisplay,
+  transcriptScrollMaxOffset,
+  visibleTranscriptRows,
+  type TranscriptDisplayRow
+} from "../src/tui/transcriptRows.js";
 import { latestExpandableTranscript } from "../src/tui/transcriptViewer.js";
 import type { PermissionChoice, ToolTranscriptItem } from "../src/tui/types.js";
 import type { ModelChoice } from "../src/llm/ModelManager.js";
 import { statusBarLayout } from "../src/tui/components/StatusBar.js";
 import { Welcome } from "../src/tui/components/Welcome.js";
+import { tuiColors } from "../src/tui/theme/index.js";
 import { CHAT_SLASH_COMMANDS } from "../src/cli/commands/chatSlash.js";
 import { isConcurrentTuiSlashCommand, TUI_SLASH_COMMANDS } from "../src/tui/slashCommands.js";
 import {
@@ -364,6 +371,19 @@ function testRuntimeStatusEventsReachFooterState(): void {
   assert.equal(state.status, "thinking");
   state = tuiReducer(state, { type: "runtime.status", status: "running" });
   assert.equal(state.status, "running");
+  state = tuiReducer(state, { type: "runtime.queue.updated", queuedCount: 2 });
+  assert.equal(state.queuedCount, 2);
+  assert.deepEqual(agentEventToRuntimeEvents({
+    type: "run.queued",
+    sessionId: "session",
+    runId: "run-2",
+    timestamp: "2026-07-24T00:00:00.000Z",
+    messageId: "message-2",
+    input: "follow up",
+    mode: "chat",
+    position: 2,
+    queueLength: 2
+  }), [{ type: "runtime.queue.updated", queuedCount: 2 }]);
 }
 
 function testReasoningStreamingRendersContent(): void {
@@ -377,7 +397,14 @@ function testReasoningStreamingRendersContent(): void {
   state = tuiReducer(state, { type: "reasoning.completed", status: "分析完成" });
   assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["user", "reasoning"]);
   assert.equal(state.transcript.committed[1]?.content, "先检查入口文件。");
-  assert.match(transcriptRowsForDisplay(state.transcript, 80).map(rowText).join("\n"), /先检查入口文件。/u);
+  // Completed thinking collapses by default (Grok-style block header).
+  assert.match(transcriptRowsForDisplay(state.transcript, 80).map(rowText).join("\n"), /Thought/u);
+  const reasoningId = state.transcript.committed[1]?.id;
+  assert.ok(reasoningId);
+  assert.match(
+    transcriptRowsForDisplay(state.transcript, 80, undefined, new Set([reasoningId])).map(rowText).join("\n"),
+    /先检查入口文件。/u
+  );
 
   const runtimeEvents = agentEventToRuntimeEvents({
     sessionId: "session",
@@ -733,6 +760,30 @@ function testViewportKeepsLatestRowsVisible(): void {
   assert.deepEqual(latest.map(rowText), ["• line 4", "• line 5"]);
   const scrolled = visibleTranscriptRows(transcript, { width: 20, height: 2, scrollOffset: 2, followLatest: false });
   assert.deepEqual(scrolled.map(rowText), ["• line 2", "• line 3"]);
+  // Resume-style long history: page-up offset must reveal older rows.
+  const long = {
+    committed: Array.from({ length: 30 }, (_, index) => ({
+      id: `assistant-${String(index)}`,
+      kind: "assistant" as const,
+      content: `turn ${String(index)}`
+    })),
+    active: []
+  };
+  const bottom = visibleTranscriptRows(long, { width: 40, height: 5, scrollOffset: 0, followLatest: true }).map(rowText).join("\n");
+  assert.match(bottom, /turn 29/);
+  const older = visibleTranscriptRows(long, { width: 40, height: 5, scrollOffset: 10, followLatest: false }).map(rowText).join("\n");
+  assert.match(older, /turn 2[0-4]/);
+  assert.doesNotMatch(older, /turn 29/);
+  const top = visibleTranscriptRows(long, { width: 40, height: 5, scrollOffset: 10_000, followLatest: false }).map(rowText).join("\n");
+  assert.match(top, /turn 0/);
+  assert.doesNotMatch(top, /turn 29/);
+
+  // Scroll must only slice precomputed rows (no re-wrap) and clamp offset.
+  const layout = transcriptRowsForDisplay(long, 40);
+  assert.equal(transcriptScrollMaxOffset(layout.length, 5), Math.max(0, layout.length - 5));
+  const sliced = sliceTranscriptRows(layout, { height: 5, scrollOffset: 10, followLatest: false });
+  assert.equal(sliced.length, 5);
+  assert.deepEqual(sliced.map((row) => row.id), layout.slice(layout.length - 5 - 10, layout.length - 10).map((row) => row.id));
 }
 
 function testTranscriptDoesNotClipLongOutput(): void {
@@ -773,7 +824,7 @@ function testFooterContainsOnlyRuntimeSummary(): void {
   const plan = statusBarLayout({ modelLabel: "deepseek-v4-pro", status: "idle", mode: "plan", width: 100 });
   const planText = `${plan.model}${plan.context}${plan.status}${plan.gap}${plan.shortcuts}`;
   assert.match(planText, /Plan mode/);
-  assert.match(planText, /shift\+tab to cycle/);
+  assert.match(planText, /↑\/↓ history|pgup|shift\+↑|scroll|shift\+tab/u);
 
   const narrow = statusBarLayout({ modelLabel: "very-long-model-name", status: "idle", mode: "chat", width: 12 });
   assert.equal(terminalWidth(`${narrow.model}${narrow.context}${narrow.status}${narrow.gap}${narrow.shortcuts}`) <= 12, true);
@@ -798,7 +849,7 @@ function testTranscriptComponentRendersToolHierarchy(): void {
     transcript,
     width: 40
   }), { columns: 40 }));
-  assert.match(output, /• Ran tests\s+1\.2s/);
+  assert.match(output, /[✓•] Ran tests\s+1\.2s/u);
   assert.match(output, /└ tests passed/);
   assert.match(output, /… 1 more/);
   for (const line of output.split("\n")) assert.equal(terminalWidth(line) <= 40, true);
@@ -830,15 +881,15 @@ function testTranscriptViewerFitsNarrowViewport(): void {
 }
 
 function testDiffUsesForegroundSemanticColors(): void {
-  assert.deepEqual(diffLineStyle("+new code"), { color: "#4EC87E" });
-  assert.deepEqual(diffLineStyle("-old code"), { color: "#E85454" });
+  assert.deepEqual(diffLineStyle("+new code"), { color: tuiColors.success });
+  assert.deepEqual(diffLineStyle("-old code"), { color: tuiColors.error });
   assert.equal("backgroundColor" in (diffLineStyle("+new code") ?? {}), false);
   assert.equal("fillBackground" in (diffLineStyle("+new code") ?? {}), false);
 }
 
 function rowText(row: TranscriptDisplayRow): string {
   if (row.kind === "message") return `${row.prefix}${row.text}`;
-  if (row.kind === "tool-title") return `${row.marker}${row.title}${row.gap}${row.duration}`;
+  if (row.kind === "tool-title" || row.kind === "block-header") return `${row.marker}${row.title}${row.gap}${row.duration}`;
   if (row.kind === "tool-output") return `${row.prefix}${row.text}`;
   return "";
 }

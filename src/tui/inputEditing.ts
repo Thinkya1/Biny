@@ -15,7 +15,7 @@ export type InputEditAction =
   | { type: "delete-after" };
 
 export interface InputLineSegment {
-  prefix: "> " | "  ";
+  prefix: "❯ " | "  ";
   before: string;
   after: string;
   hasCursor: boolean;
@@ -79,7 +79,7 @@ export function inputLineSegments(text: string, cursor: number): InputLineSegmen
     segments.push({
       before: line.slice(0, cursorInLine),
       after: hasCursor ? line.slice(cursorInLine) : "",
-      prefix: index === 0 ? "> " : "  ",
+      prefix: index === 0 ? "❯ " : "  ",
       hasCursor
     });
     lineStartIndex = lineEndIndex + 1;

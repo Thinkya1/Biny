@@ -36,6 +36,7 @@ async function startDesktopApplication(): Promise<void> {
   const desktopRoot = path.join(legacyDataRoot, "workspaces", "default");
   const storage = new DesktopUserDataStore(desktopRoot);
   await storage.initialize();
+  await storage.ensureGlobalData();
   await storage.migrateLegacyState(path.join(legacyDataRoot, "desktop-state.json"), path.join(desktopRoot, "desktop-state.json"));
   const state = new DesktopStateStore(path.join(desktopRoot, "desktop-state.json"));
   await state.load();

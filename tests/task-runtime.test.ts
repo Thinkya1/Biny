@@ -16,6 +16,7 @@ await testIncompleteAttemptAutomaticallyContinues();
 await testAttemptEvidenceIsBounded();
 await testRemainingStepBudgetCapsNextAttempt();
 await testTaskAttemptBudgetIsNotCompletion();
+await testBudgetExhaustionPreservesAgentFailure();
 await testCodeTaskRequiresMutationEvenWhenChecksPass();
 await testCodeTaskCompletesWithWorkspaceMutationAndIndependentChecks();
 await testContinuationReusesDurableAcceptanceCriteria();
@@ -54,7 +55,7 @@ async function testIncompleteAttemptAutomaticallyContinues(): Promise<void> {
     assert.equal(outcome.status, "completed");
     assert.equal(outcome.steps, 35);
     assert.equal(attempts, 2);
-    assert.match(inputs[0] ?? "", /Task contract type: conversation/u);
+    assert.equal(inputs[0], "finish the requested task");
     assert.match(inputs[1] ?? "", /Continue the same project-level task autonomously/u);
     assert.equal(events.filter((event) => event.type === "run.completed").length, 1);
     assert.equal(events.some((event) => event.type === "run.incomplete"), false);
@@ -182,6 +183,31 @@ async function testTaskAttemptBudgetIsNotCompletion(): Promise<void> {
     const task = await store.get(submitted.runId);
     assert.equal(task.status, "budget_exhausted");
     assert.match(task.terminalReason ?? "", /budget exhausted/iu);
+    await runtime.close();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testBudgetExhaustionPreservesAgentFailure(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-task-runtime-failure-detail-"));
+  try {
+    const store = await TaskRunStore.open(root);
+    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
+      yield done({
+        status: "failed",
+        stopReason: "provider_error",
+        finishReason: "error",
+        steps: 2,
+        output: "",
+        error: "Upstream stream reset before the terminal response."
+      });
+    }, 1));
+
+    const outcome = await runtime.submitPrompt("回答这个问题").completion;
+    assert.equal(outcome.status, "incomplete");
+    assert.equal(outcome.stopReason, "budget_exhausted");
+    assert.equal(outcome.error, "Upstream stream reset before the terminal response.");
     await runtime.close();
   } finally {
     await fs.rm(root, { recursive: true, force: true });

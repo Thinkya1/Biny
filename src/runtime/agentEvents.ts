@@ -23,6 +23,15 @@ export interface RunStartedEvent extends AgentEventBase {
   skills: string[];
 }
 
+export interface RunQueuedEvent extends AgentEventBase {
+  type: "run.queued";
+  messageId: string;
+  input: string;
+  mode: AgentRunMode;
+  position: number;
+  queueLength: number;
+}
+
 export interface AgentRunModel {
   alias: string;
   provider: string;
@@ -32,6 +41,8 @@ export interface AgentRunModel {
 
 export type AgentHostEvent =
   | RunStartedEvent
+  | RunQueuedEvent
+  | (AgentEventBase & { type: "run.queue.updated"; queueLength: number })
   | (AgentEventBase & { type: "message.user"; messageId: string; content: string })
   | (AgentEventBase & { type: "assistant.delta"; messageId: string; content: string })
   | (AgentEventBase & { type: "assistant.completed"; messageId: string; content: string })

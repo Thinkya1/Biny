@@ -37,6 +37,7 @@ export function createInitialTuiState(workspaceRoot: string): TuiState {
     sessionFile: "",
     viewingSessionId: undefined,
     status: "idle",
+    queuedCount: 0,
     turnStartedAt: undefined,
     lastWorkedMs: undefined,
     transcript: { committed: [], active: [] },
@@ -57,6 +58,7 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
         sessionFile: event.sessionFile,
         viewingSessionId: event.sessionId,
         status: "idle",
+        queuedCount: 0,
         turnStartedAt: undefined,
         lastWorkedMs: undefined
       };
@@ -64,6 +66,8 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
       return { ...state, provider: event.provider, modelLabel: event.modelLabel, reasoningLabel: event.reasoningLabel };
     case "runtime.status":
       return { ...state, status: event.status };
+    case "runtime.queue.updated":
+      return { ...state, queuedCount: event.queuedCount };
     case "session.completed": {
       const transcript = finalizeActiveCells(state.transcript, "skipped", "Interrupted before completion.");
       return {
@@ -255,13 +259,22 @@ function updateReasoningDelta(transcript: TranscriptState, content: string): Tra
       ...transcript,
       active: [
         ...transcript.active,
-        { id: nextTranscriptId(transcript, "reasoning"), kind: "reasoning", content }
+        {
+          id: nextTranscriptId(transcript, "reasoning"),
+          kind: "reasoning",
+          content,
+          startedAtMs: Date.now()
+        }
       ]
     };
   }
   const active = [...transcript.active];
   const item = active[index] as ReasoningTranscriptItem;
-  active[index] = { ...item, content: `${item.content}${content}` };
+  active[index] = {
+    ...item,
+    content: `${item.content}${content}`,
+    startedAtMs: item.startedAtMs ?? Date.now()
+  };
   return { ...transcript, active };
 }
 
@@ -271,7 +284,17 @@ function commitReasoning(transcript: TranscriptState): TranscriptState {
   const item = transcript.active[index];
   const active = transcript.active.filter((_, itemIndex) => itemIndex !== index);
   if (!item || item.kind !== "reasoning" || !item.content) return { ...transcript, active };
-  return { committed: [...transcript.committed, item], active };
+  const durationMs = item.startedAtMs === undefined
+    ? item.durationMs
+    : Math.max(0, Date.now() - item.startedAtMs);
+  const committed: ReasoningTranscriptItem = {
+    id: item.id,
+    kind: "reasoning",
+    content: item.content,
+    durationMs,
+    startedAtMs: undefined
+  };
+  return { committed: [...transcript.committed, committed], active };
 }
 
 function commitAssistant(transcript: TranscriptState, content: string): TranscriptState {
@@ -395,7 +418,17 @@ function finalizeActiveCells(
   const committed = [...transcript.committed];
   for (const item of transcript.active) {
     if (item.kind === "reasoning") {
-      if (item.content) committed.push(item);
+      if (!item.content) continue;
+      const durationMs = item.startedAtMs === undefined
+        ? item.durationMs
+        : Math.max(0, Date.now() - item.startedAtMs);
+      committed.push({
+        id: item.id,
+        kind: "reasoning",
+        content: item.content,
+        durationMs,
+        startedAtMs: undefined
+      });
       continue;
     }
     if (item.kind === "assistant") {

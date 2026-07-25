@@ -61,6 +61,10 @@ export interface AgentRunOptions {
   maxSteps?: number;
   /** A task harness may defer success memory until external acceptance checks pass. */
   deferSuccessfulMemory?: boolean;
+  /** Public session message when the model input is an internal task-attempt prompt. */
+  sessionUserMessage?: string;
+  /** Whether this attempt should append a user message to the visible session transcript. */
+  recordSessionUserMessage?: boolean;
   attachments?: AgentAttachment[];
 }
 
@@ -165,9 +169,10 @@ export class AgentSession {
     const recordUserMessage = (): void => {
       if (userMessageRecorded) return;
       userMessageRecorded = true;
+      if (runOptions.recordSessionUserMessage === false) return;
       this.recorder.record({
         type: "user_message",
-        content: input,
+        content: runOptions.sessionUserMessage ?? input,
         skills: this.options.skillPaths,
         contextUsage: this.contextMemory.getBudget(),
         contextState: this.contextMemory.persistedState(),

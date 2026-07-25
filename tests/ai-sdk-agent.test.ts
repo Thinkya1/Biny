@@ -16,6 +16,7 @@ import type { Tool } from "../src/tools/types.js";
 
 async function main(): Promise<void> {
   await testAgentStreamsFinalAnswer();
+  await testInternalAttemptPersistsOnlyPublicPrompt();
   await testAgentRunsToolAndKeepsSessionEvents();
   await testPlanModeExposesOnlyReadTools();
   await testInvalidToolInputUsesCoordinatorValidation();
@@ -409,6 +410,31 @@ async function testAgentRunsToolAndKeepsSessionEvents(): Promise<void> {
     const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; contextUsage?: { usedTokens?: number } });
     assert.deepEqual(sessionEvents.map((event) => event.type), ["user_message", "tool_call", "tool_result", "assistant_message"]);
     assert.equal(typeof sessionEvents[0]?.contextUsage?.usedTokens, "number");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanup(agent, true);
+  }
+}
+
+async function testInternalAttemptPersistsOnlyPublicPrompt(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (): Promise<Response> => sseResponse([
+    { choices: [{ index: 0, delta: { content: "done" }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    "[DONE]"
+  ])) as typeof fetch;
+
+  const { agent, cleanup, sessionFile } = await createAgent();
+  try {
+    await collect(agent.run("internal verifier prompt", {
+      sessionUserMessage: "用户原始提示词",
+      confirmPermission: async () => ({ approved: true, scope: "once" })
+    }));
+    await agent.close();
+    const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; content?: string });
+    assert.equal(sessionEvents[0]?.type, "user_message");
+    assert.equal(sessionEvents[0]?.content, "用户原始提示词");
+    assert.doesNotMatch(sessionEvents[0]?.content ?? "", /internal verifier prompt/u);
   } finally {
     globalThis.fetch = originalFetch;
     await cleanup(agent, true);

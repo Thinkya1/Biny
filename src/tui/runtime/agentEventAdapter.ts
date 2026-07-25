@@ -5,6 +5,10 @@ export function agentEventToRuntimeEvents(event: AgentHostEvent): RuntimeEvent[]
   switch (event.type) {
     case "run.started":
       return [{ type: "runtime.status", status: "thinking" }];
+    case "run.queued":
+      return [{ type: "runtime.queue.updated", queuedCount: event.queueLength }];
+    case "run.queue.updated":
+      return [{ type: "runtime.queue.updated", queuedCount: event.queueLength }];
     case "message.user":
       return [{ type: "user.message", content: event.content }];
     case "assistant.delta":

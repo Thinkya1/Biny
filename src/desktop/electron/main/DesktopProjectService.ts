@@ -199,9 +199,7 @@ export class DesktopProjectService {
 
   async saveAttachment(project: DesktopProject, name: string, mimeType: string, bytes: Uint8Array): Promise<DesktopAttachment> {
     const safeName = sanitizeFileName(name);
-    await this.storage.ensureProjectData(project);
-    const directory = this.storage.attachmentsRoot(project);
-    await fs.mkdir(directory, { recursive: true });
+    const directory = await this.storage.ensureAttachmentsRoot(project);
     const fileName = `${String(Date.now())}-${randomBytes(3).toString("hex")}-${safeName}`;
     const filePath = path.join(directory, fileName);
     await fs.writeFile(filePath, bytes);
@@ -279,8 +277,14 @@ export class DesktopProjectService {
     return project;
   }
 
+  /** Project-local persistence root (`<project>/.agent`), shared with TUI/CLI. */
   async dataRoot(project: DesktopProject): Promise<string> {
     return await this.storage.ensureProjectData(project);
+  }
+
+  /** Global (non-project) persistence root under desktop userData. */
+  async globalDataRoot(): Promise<string> {
+    return await this.storage.ensureGlobalData();
   }
 
   attachmentsRoot(project: DesktopProject): string {

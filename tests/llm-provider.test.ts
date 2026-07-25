@@ -125,7 +125,7 @@ async function testReasoningControlsForOtherProviders(): Promise<void> {
 }
 
 async function testProviderMappingsUseNativeSdkModels(): Promise<void> {
-  const cases: Array<{ type: ModelProvider; provider: string; baseUrl?: string; key?: string }> = [
+  const cases: Array<{ type: ModelProvider; provider: string; baseUrl?: string; key?: string; apiBackend?: "chat_completions" | "responses" }> = [
     { type: "openai", provider: "openai.chat", key: "key" },
     { type: "anthropic", provider: "anthropic.messages", key: "key" },
     { type: "claude-subscription", provider: "anthropic.messages", key: "oauth-token" },
@@ -135,11 +135,12 @@ async function testProviderMappingsUseNativeSdkModels(): Promise<void> {
     { type: "qwen", provider: "alibaba.chat", key: "key" },
     { type: "gemini", provider: "gemini.chat", key: "key" },
     { type: "ollama", provider: "ollama.chat" },
-    { type: "openai-compatible", provider: "openai-compatible.chat", baseUrl: "https://compat.example/v1", key: "key" }
+    { type: "openai-compatible", provider: "openai-compatible.chat", baseUrl: "https://compat.example/v1", key: "key" },
+    { type: "openai-compatible", provider: "openai.responses", baseUrl: "https://relay.example/v1", key: "key", apiBackend: "responses" }
   ];
 
   for (const item of cases) {
-    const config = configFor({ type: item.type, apiKey: item.key, baseUrl: item.baseUrl });
+    const config = configFor({ type: item.type, apiKey: item.key, baseUrl: item.baseUrl, apiBackend: item.apiBackend });
     const model = createLanguageModelForConfig(config);
     assert.equal(model.provider, item.provider);
     assert.equal(model.modelId, "test-model");
@@ -297,6 +298,7 @@ function configFor(options: {
   apiKey?: string;
   apiKeyEnv?: string;
   baseUrl?: string;
+  apiBackend?: "chat_completions" | "responses";
   model?: string;
   thinking?: { efforts: ["high", "max"] | ["high"] | ["max"]; defaultEffort: "high" | "max" };
   globalThinking?: { enabled: boolean; effort: "high" | "max" };
@@ -305,7 +307,8 @@ function configFor(options: {
     type: options.type,
     apiKey: options.apiKey,
     apiKeyEnv: options.apiKeyEnv,
-    baseUrl: options.baseUrl
+    baseUrl: options.baseUrl,
+    apiBackend: options.apiBackend
   };
   const modelThinking = options.type === "deepseek"
     ? options.thinking ?? { efforts: ["high", "max"] as ["high", "max"], defaultEffort: "high" as const }

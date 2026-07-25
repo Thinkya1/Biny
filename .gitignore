@@ -12,3 +12,8 @@ PROJECT_DESCRIPTION.local.md
 TODO.local.md
 ARCHITECTURE.local.md
 /.agents
+
+# Local agent evaluation runs and reports
+/jobs/
+/reports/
+/scripts/evals/

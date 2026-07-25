@@ -4,8 +4,8 @@
  * 这个组件把 Ink 界面、TUI runtime、reducer、输入框、权限提示、会话选择器和 transcript 展示串在一起。
  * 它负责处理全局快捷键、slash command、plan 模式、session 恢复和退出摘要，但不直接执行工具。
  */
-import React, { useCallback, useEffect, useReducer, useRef, useState } from "react";
-import { Box, Text, useApp, useInput, useWindowSize } from "ink";
+import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { Box, Text, useApp, useInput } from "ink";
 import type { PermissionMode } from "../permission/PermissionManager.js";
 import { parseThinkingSelection, type ModelChoice, type ThinkingSelection } from "../llm/ModelManager.js";
 import type { SessionSummary } from "../session/events.js";
@@ -16,7 +16,8 @@ import { Header } from "./components/Header.js";
 import { Welcome } from "./components/Welcome.js";
 import { Transcript } from "./components/Transcript.js";
 import { InputBox } from "./components/InputBox.js";
-import { StatusBar } from "./components/StatusBar.js";
+import { PromptInfo } from "./components/PromptInfo.js";
+import { ShortcutsBar } from "./components/ShortcutsBar.js";
 import { PermissionPrompt } from "./components/PermissionPrompt.js";
 import { PermissionModePicker } from "./components/PermissionModePicker.js";
 import { SessionPicker, sessionPickerPageSize } from "./components/SessionPicker.js";
@@ -25,11 +26,23 @@ import { HelpDialog } from "./components/HelpDialog.js";
 import { ModelPicker } from "./components/ModelPicker.js";
 import { createTuiRuntime, type TuiRuntime } from "./runtime/createTuiRuntime.js";
 import type { PermissionChoice } from "./types.js";
-import { isConcurrentTuiSlashCommand, TUI_SLASH_COMMANDS } from "./slashCommands.js";
+import { TUI_SLASH_COMMANDS } from "./slashCommands.js";
 import { sessionEventsToTranscript } from "./sessionTranscript.js";
 import { appendInputHistory, loadInputHistory } from "./inputHistory.js";
 import { latestExpandableTranscript, type ExpandableTranscript } from "./transcriptViewer.js";
+import {
+  foldableTranscriptItems,
+  transcriptRowsForDisplay,
+  transcriptScrollMaxOffset
+} from "./transcriptRows.js";
+import { isMouseReport, parseMouseWheelDirection } from "./mouseWheel.js";
 import { tuiColors } from "./theme/index.js";
+import { useDebouncedWindowSize } from "./useDebouncedWindowSize.js";
+
+/** Coalesce wheel/arrow scroll bursts into one paint. */
+const scrollThrottleMs = 48;
+/** Lines moved per wheel tick / Shift+↑↓ (page keys still jump a full viewport). */
+const scrollLineStep = 1;
 
 export interface AppProps {
   workspaceRoot: string;
@@ -59,10 +72,17 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
   const [transcriptViewer, setTranscriptViewer] = useState<ExpandableTranscript | undefined>(undefined);
   const [helpDialog, setHelpDialog] = useState<{ message?: string } | undefined>(undefined);
   const [contextUsage, setContextUsage] = useState<{ usedTokens?: number; maxTokens?: number; source?: "estimated" | "provider" }>({});
+  const [scrollOffset, setScrollOffset] = useState(0);
+  const [followLatest, setFollowLatest] = useState(true);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
   const runtimeRef = useRef<TuiRuntime | undefined>(undefined);
   const exitingRef = useRef(false);
+  const scrollOffsetRef = useRef(0);
+  const queuedScrollOffsetRef = useRef(0);
+  const scrollFlushTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const app = useApp();
-  const { columns, rows } = useWindowSize();
+  // 拖拽窗口时不要每个 SIGWINCH 都 relayout；与 inkTerminal 的 settle 对齐。
+  const { columns, rows } = useDebouncedWindowSize();
 
   const refreshContextUsage = useCallback(async (runtime = runtimeRef.current): Promise<void> => {
     if (!runtime) return;
@@ -121,9 +141,103 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
     };
   }, [refreshContextUsage, workspaceRoot]);
 
+  // session picker 在原始 session 列表上做即时过滤，不改变源列表。
+  const filteredSessionPicker = sessionPicker
+    ? {
+      ...sessionPicker,
+      sessions: filterSessions(sessionPicker.sessions, sessionPicker.query)
+    }
+    : undefined;
+  const hasToolCalls = [...state.transcript.committed, ...state.transcript.active].some((item) => item.kind === "tool");
+  const overlayOpen = Boolean(filteredSessionPicker || transcriptViewer || helpDialog || modelPicker || permissionModePicker);
+  const isWelcomeVisible = !overlayOpen && !state.permission && state.transcript.committed.length === 0 && state.transcript.active.length === 0;
+  // 占满视口但留 1 行余量，避免部分终端写满最后一格时额外滚一行，把整帧推进 scrollback。
+  const viewColumns = Math.max(1, columns);
+  const viewRows = Math.max(1, rows - 1);
+  // top(1) + input(~2) + promptInfo(1) + shortcuts(1) ≈ 5，剩余给主内容区。
+  const mainWidth = viewColumns;
+  const mainHeight = Math.max(1, viewRows - 5);
+  const scrolledAway = !followLatest && scrollOffset > 0;
+
+  // 内容 wrap 只在 transcript / 宽度 / 折叠态变化时做一次；滚动只改 offset。
+  const layoutRows = useMemo(
+    () => transcriptRowsForDisplay(state.transcript, mainWidth, undefined, expandedIds),
+    [expandedIds, mainWidth, state.transcript]
+  );
+  const scrollMaxOffset = transcriptScrollMaxOffset(layoutRows.length, mainHeight);
+
+  const flushQueuedScroll = useCallback((): void => {
+    scrollFlushTimerRef.current = undefined;
+    const next = queuedScrollOffsetRef.current;
+    scrollOffsetRef.current = next;
+    setScrollOffset(next);
+    setFollowLatest(next === 0);
+  }, []);
+
+  const scrollTranscript = useCallback((direction: 1 | -1, unit: "page" | "line" = "page"): void => {
+    if (scrollMaxOffset === 0) return;
+    // 滚轮会连发：line 模式在节流窗口内只吃一步，避免 offset 被事件风暴累飞。
+    if (unit === "line" && scrollFlushTimerRef.current !== undefined) return;
+    const step = unit === "page" ? Math.max(1, mainHeight) : scrollLineStep;
+    const base = queuedScrollOffsetRef.current;
+    const next = direction > 0
+      ? Math.min(scrollMaxOffset, base + step)
+      : Math.max(0, base - step);
+    if (next === base) return;
+    queuedScrollOffsetRef.current = next;
+    // 合并到一帧再 setState，避免每次全屏 Ink 重绘。
+    if (scrollFlushTimerRef.current !== undefined) return;
+    scrollFlushTimerRef.current = setTimeout(flushQueuedScroll, scrollThrottleMs);
+  }, [flushQueuedScroll, mainHeight, scrollMaxOffset]);
+
+  const resetTranscriptScroll = useCallback((): void => {
+    if (scrollFlushTimerRef.current !== undefined) {
+      clearTimeout(scrollFlushTimerRef.current);
+      scrollFlushTimerRef.current = undefined;
+    }
+    queuedScrollOffsetRef.current = 0;
+    scrollOffsetRef.current = 0;
+    setFollowLatest(true);
+    setScrollOffset(0);
+  }, []);
+
+  useEffect(() => () => {
+    if (scrollFlushTimerRef.current !== undefined) clearTimeout(scrollFlushTimerRef.current);
+  }, []);
+
+  // 布局变矮时夹紧 offset，避免空白视口。
+  useEffect(() => {
+    if (scrollOffsetRef.current <= scrollMaxOffset) return;
+    queuedScrollOffsetRef.current = scrollMaxOffset;
+    scrollOffsetRef.current = scrollMaxOffset;
+    setScrollOffset(scrollMaxOffset);
+    setFollowLatest(scrollMaxOffset === 0);
+  }, [scrollMaxOffset]);
+
+  const toggleLatestFoldable = useCallback((): void => {
+    const foldables = foldableTranscriptItems(state.transcript);
+    const latest = foldables[foldables.length - 1];
+    if (!latest) return;
+    setExpandedIds((current) => {
+      const next = new Set(current);
+      if (next.has(latest.id)) next.delete(latest.id);
+      else next.add(latest.id);
+      return next;
+    });
+  }, [state.transcript]);
+
   useInput((input, key) => {
-    // App 级快捷键只处理全局动作：详情、取消和退出。
+    // App 级快捷键：详情、折叠、取消和退出。滚动由 InputBox 回调统一处理，避免双触发。
     const isBusy = state.status === "thinking" || state.status === "running" || state.status === "waiting_permission";
+    // 鼠标报告（SGR/X10）：Ink 会剥掉 CSI 前导 ESC，序列形如 `[<64;x;yM`。
+    // 滚轮滚聊天；其它点击/拖拽直接吞掉，防止漏到输入框。
+    if (isMouseReport(input)) {
+      if (!overlayOpen && !permissionModePicker) {
+        const wheel = parseMouseWheelDirection(input);
+        if (wheel !== undefined) scrollTranscript(wheel, "line");
+      }
+      return;
+    }
     if (modelPicker && !(key.ctrl && input === "c")) return;
     if (key.ctrl && input.toLowerCase() === "o") {
       const expandable = latestExpandableTranscript(state.transcript);
@@ -153,17 +267,23 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
         return;
       }
       void closeAndExit();
+      return;
+    }
+    if (overlayOpen || permissionModePicker || state.permission) return;
+    if (key.ctrl && input.toLowerCase() === "g") {
+      resetTranscriptScroll();
+      return;
+    }
+    if (key.ctrl && input.toLowerCase() === "e") {
+      toggleLatestFoldable();
     }
   });
 
   const sendPrompt = (value: string): void => {
-    // 输入提交后按 slash、plan mode、chat mode 三条路径分发。
+    // 输入提交后按 slash、plan mode、chat mode 三条路径分发；运行中普通消息交给
+    // runtime 的串行队列，按 Pi 的 follow-up 语义等待当前 turn 结束后执行。
     setPreviewMode(undefined);
-    const busy = state.status === "thinking" || state.status === "running";
-    if (busy && !isConcurrentTuiSlashCommand(value)) {
-      dispatch({ type: "system.message", content: "当前暂不支持 Ctrl-S 注入；请等待当前轮次结束，或按 Esc / Ctrl+C 中断。" });
-      return;
-    }
+    resetTranscriptScroll();
     if (value.trim().startsWith("/")) {
       void handleSlashCommand(value).catch((error) => {
         setTranscriptViewer({ title: "Command Error", content: error instanceof Error ? error.message : String(error) });
@@ -200,19 +320,6 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
     runtimeRef.current?.answerPermission(choice);
   };
 
-  // session picker 在原始 session 列表上做即时过滤，不改变源列表。
-  const filteredSessionPicker = sessionPicker
-    ? {
-      ...sessionPicker,
-      sessions: filterSessions(sessionPicker.sessions, sessionPicker.query)
-    }
-    : undefined;
-  const hasToolCalls = [...state.transcript.committed, ...state.transcript.active].some((item) => item.kind === "tool");
-  const overlayOpen = Boolean(filteredSessionPicker || transcriptViewer || helpDialog || modelPicker || permissionModePicker);
-  const isWelcomeVisible = !overlayOpen && !state.permission && state.transcript.committed.length === 0 && state.transcript.active.length === 0;
-  const mainWidth = Math.max(1, columns);
-  const mainHeight = Math.max(1, rows - 5);
-
   const togglePlanMode = (): void => {
     // Plan mode 是会话级 UI 模式；当前提示词和只读工具集由 runtime 按 mode 装配。
     setPreviewMode(undefined);
@@ -226,16 +333,16 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
 
   if (startupError) {
     return (
-      <Box flexDirection="column">
+      <Box flexDirection="column" width={viewColumns} height={viewRows} overflow="hidden">
         <Text color={tuiColors.error}>TUI startup failed: {startupError}</Text>
       </Box>
     );
   }
 
   return (
-    <Box flexDirection="column" width="100%">
-      <Header sessionId={state.sessionId} viewingSessionId={state.viewingSessionId} cwd={state.cwd} />
-      <Box flexDirection="column" width="100%">
+    <Box flexDirection="column" width={viewColumns} height={viewRows} overflow="hidden">
+      <Header sessionId={state.sessionId} viewingSessionId={state.viewingSessionId} cwd={state.cwd} width={viewColumns} />
+      <Box flexDirection="column" width={viewColumns} flexGrow={1} flexShrink={1} overflow="hidden">
         {transcriptViewer ? (
           <TranscriptViewer
             transcript={transcriptViewer}
@@ -310,15 +417,20 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
             onToggleDetails={() => dispatch({ type: "permission.details.toggled" })}
           />
         ) : isWelcomeVisible ? (
-          <Welcome cwd={state.cwd} />
+          <Welcome cwd={state.cwd} width={mainWidth} />
         ) : (
           <Transcript
             transcript={state.transcript}
             width={mainWidth}
+            height={mainHeight}
+            scrollOffset={scrollOffset}
+            followLatest={followLatest}
+            expandedIds={expandedIds}
+            layoutRows={layoutRows}
           />
         )}
       </Box>
-      <Box flexShrink={0} width="100%">
+      <Box flexShrink={0} width={viewColumns}>
         <InputBox
           disabled={state.status === "waiting_permission" || permissionModePicker || overlayOpen}
           disabledPlaceholder={permissionModePicker ? "choose a permission mode" : overlayOpen ? "close overlay to continue" : undefined}
@@ -334,19 +446,29 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
           }}
           onTogglePlanMode={togglePlanMode}
           onPreviewCommand={previewSlashCommand}
+          onScrollTranscript={overlayOpen ? undefined : scrollTranscript}
           onExit={() => {
             void closeAndExit();
           }}
         />
       </Box>
-      <StatusBar
+      <PromptInfo
         modelLabel={state.modelLabel}
+        permissionMode={permissionMode}
+        mode={previewMode ?? mode}
         contextUsedTokens={contextUsage.usedTokens}
         contextMaxTokens={contextUsage.maxTokens}
         contextSource={contextUsage.source}
         status={state.status}
+        queuedCount={state.queuedCount}
+        width={viewColumns}
+      />
+      <ShortcutsBar
+        status={state.status}
+        queuedCount={state.queuedCount}
         mode={previewMode ?? mode}
-        width={columns}
+        scrolled={scrolledAway}
+        width={viewColumns}
       />
     </Box>
   );
@@ -369,6 +491,8 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
 
     if (command === "/clear") {
       dispatch({ type: "transcript.cleared" });
+      setExpandedIds(new Set());
+      resetTranscriptScroll();
       return;
     }
 
@@ -556,6 +680,9 @@ export function App({ workspaceRoot, onExitSummary }: AppProps): React.ReactElem
       viewingSessionId: resumed.sessionId,
       items: sessionEventsToTranscript(resumed.events)
     });
+    // 恢复后贴底显示最新消息；用 PgUp / Shift+↑ 向上翻历史。
+    setExpandedIds(new Set());
+    resetTranscriptScroll();
     await refreshContextUsage(runtime);
     setMode("chat");
   }

@@ -68,15 +68,22 @@ export const Composer = memo(function Composer({
 
   useEffect(() => {
     if (!menu) return;
+    // Only the open popover and its trigger count as "inside". Clicks on the
+    // chat textarea or other composer chrome should dismiss the menu.
+    const isInsideOpenMenu = (target: EventTarget | null): boolean => {
+      if (!(target instanceof Element)) return false;
+      if (target.closest(".composer-popover")) return true;
+      return Boolean(target.closest(`[data-composer-menu="${menu}"]`));
+    };
     const close = (event: PointerEvent): void => {
-      if (composerRef.current?.contains(event.target as Node)) return;
+      if (isInsideOpenMenu(event.target)) return;
       setMenu(null);
     };
     const escape = (event: KeyboardEvent): void => {
       if (event.key === "Escape") setMenu(null);
     };
     const focus = (event: FocusEvent): void => {
-      if (composerRef.current?.contains(event.target as Node)) return;
+      if (isInsideOpenMenu(event.target)) return;
       setMenu(null);
     };
     window.addEventListener("pointerdown", close);
@@ -206,7 +213,7 @@ export const Composer = memo(function Composer({
             />
             <button aria-label="添加附件" className="composer-icon-button" disabled={!project || busy || modelSetupRequired} onClick={() => fileInputRef.current?.click()} type="button"><Icon name="paperclip" /></button>
             <div className="composer-menu-anchor">
-              <button className="composer-select" disabled={!project || modelSetupRequired} onClick={() => setMenu(menu === "permission" ? null : "permission")} type="button">
+              <button className="composer-select" data-composer-menu="permission" disabled={!project || modelSetupRequired} onClick={() => setMenu(menu === "permission" ? null : "permission")} type="button">
                 <span>{permissionLabel(permissionMode)}</span><Icon name="chevron" size={12} />
               </button>
               <PermissionMenu
@@ -222,7 +229,7 @@ export const Composer = memo(function Composer({
           </div>
           <div className="composer-actions-right">
             <div className="composer-menu-anchor">
-              <button className="model-trigger" disabled={!project || !models.length || modelSetupRequired} onClick={() => setMenu(menu === "model" ? null : "model")} type="button">
+              <button className="model-trigger" data-composer-menu="model" disabled={!project || !models.length || modelSetupRequired} onClick={() => setMenu(menu === "model" ? null : "model")} type="button">
                 {selectedModel ? <span className="model-trigger-brand"><ProviderBrandGlyph type={selectedModel.providerType} /></span> : null}
                 <span>{runtimeInfo?.modelLabel ?? selectedModel?.displayName ?? "选择模型"}</span>
                 {runtimeInfo?.reasoningLabel && runtimeInfo.reasoningLabel !== "Off" ? <small>{runtimeInfo.reasoningLabel}</small> : null}

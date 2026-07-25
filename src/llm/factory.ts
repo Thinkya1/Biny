@@ -117,6 +117,9 @@ function createLanguageModel(
       headers: openAiCodexHeaders(apiKey)
     }).responses(modelId);
   }
+  if (providerType === "openai-compatible" && provider.apiBackend === "responses") {
+    return createOpenAI({ baseURL: baseUrl, apiKey, fetch }).responses(modelId);
+  }
   if (providerType === "deepseek") return createDeepSeek({ baseURL: baseUrl, apiKey, fetch }).languageModel(modelId);
   if (providerType === "kimi") return createMoonshotAI({ baseURL: baseUrl, apiKey, fetch }).languageModel(modelId);
   if (providerType === "qwen") return createAlibaba({ baseURL: baseUrl, apiKey, fetch }).languageModel(modelId);

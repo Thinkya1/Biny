@@ -20,9 +20,12 @@ import {
   type SlashMenuState
 } from "../../cli/prompt/slashMenu.js";
 import { editInputText, inputLineSegments, type InputEditAction } from "../inputEditing.js";
+import { isMouseReport } from "../mouseWheel.js";
 import { tuiColors } from "../theme/index.js";
 
 const slashMenuVisibleRows = 6;
+
+export type TranscriptScrollUnit = "page" | "line";
 
 export interface InputBoxProps {
   // disabled 表示权限等待中；busy 表示 agent 正在思考或执行工具。
@@ -37,10 +40,30 @@ export interface InputBoxProps {
   onToggleToolDetails: () => void;
   onTogglePlanMode: () => void;
   onPreviewCommand: (commandName: string | undefined) => void;
+  /**
+   * direction > 0 看更早内容（向上滚），< 0 看更新内容。
+   * 聊天滚动：PageUp/PageDown、Shift+↑/↓、Ctrl+↑/↓、鼠标滚轮（SGR）。
+   * 空输入 ↑/↓：浏览输入历史（上次用户消息），不是滚聊天。
+   */
+  onScrollTranscript?: (direction: 1 | -1, unit: TranscriptScrollUnit) => void;
   onExit: () => void;
 }
 
-export function InputBox({ disabled, disabledPlaceholder, busy, hasToolCalls, slashCommands, initialHistory, onSubmit, onHistoryAppend, onToggleToolDetails, onTogglePlanMode, onPreviewCommand, onExit }: InputBoxProps): React.ReactElement {
+export function InputBox({
+  disabled,
+  disabledPlaceholder,
+  busy,
+  hasToolCalls,
+  slashCommands,
+  initialHistory,
+  onSubmit,
+  onHistoryAppend,
+  onToggleToolDetails,
+  onTogglePlanMode,
+  onPreviewCommand,
+  onScrollTranscript,
+  onExit
+}: InputBoxProps): React.ReactElement {
   // InputBox 自己维护正在编辑的文本、slash 菜单状态和本地历史游标。
   const [text, setText] = useState("");
   const [cursor, setCursor] = useState(0);
@@ -64,6 +87,24 @@ export function InputBox({ disabled, disabledPlaceholder, busy, hasToolCalls, sl
   }, [disabled, menuClosed, menu, onPreviewCommand, slashCommands, text]);
 
   useInput((input, key) => {
+    // 鼠标报告（SGR/X10）由 App 统一处理滚动；这里只吞掉，避免 Ink 剥 ESC 后的
+    // 序列（如 `[<64;x;yM`）被当成普通字符插入输入框。
+    if (isMouseReport(input)) return;
+    // 聊天滚动（不占用普通 ↑/↓，那些留给输入历史）。
+    if (onScrollTranscript) {
+      if (key.pageUp || key.pageDown) {
+        onScrollTranscript(key.pageUp ? 1 : -1, "page");
+        return;
+      }
+      if (key.shift && (key.upArrow || key.downArrow)) {
+        onScrollTranscript(key.upArrow ? 1 : -1, "line");
+        return;
+      }
+      if (key.ctrl && (key.upArrow || key.downArrow)) {
+        onScrollTranscript(key.upArrow ? 1 : -1, "line");
+        return;
+      }
+    }
     if (disabled) return;
     if (key.shift && key.tab) {
       // Shift+Tab 在 chat/plan 模式间切换。
@@ -98,6 +139,15 @@ export function InputBox({ disabled, disabledPlaceholder, busy, hasToolCalls, sl
     }
     if (key.ctrl && input.toLowerCase() === "k") {
       applyEdit({ type: "delete-after" });
+      return;
+    }
+    // Ctrl+P / Ctrl+N 与空输入 ↑/↓ 同为输入历史。
+    if (key.ctrl && input.toLowerCase() === "p") {
+      recallHistory(-1);
+      return;
+    }
+    if (key.ctrl && input.toLowerCase() === "n") {
+      recallHistory(1);
       return;
     }
     if (key.escape && shouldShowSlashPalette(text)) {
@@ -169,16 +219,16 @@ export function InputBox({ disabled, disabledPlaceholder, busy, hasToolCalls, sl
       updateText(next);
       return;
     }
-    if (!text && (key.upArrow || key.downArrow)) {
-      // 输入框为空时，上下键在历史记录中移动。
-      recallHistory(key.upArrow ? -1 : 1);
-      return;
-    }
     if (!menuClosed && shouldShowSlashPalette(text) && (key.upArrow || key.downArrow)) {
       // slash 菜单打开时，上下键移动菜单选中项。
       if (matchingSlashCommands(text, slashCommands).length > 0) {
         setMenu((current) => moveSlashSelection(current, slashCommands, key.upArrow ? -1 : 1));
       }
+      return;
+    }
+    if (!text && (key.upArrow || key.downArrow)) {
+      // 空输入 ↑/↓：查询上次用户输入（shell 习惯），不是滚聊天。
+      recallHistory(key.upArrow ? -1 : 1);
       return;
     }
     if (key.ctrl || key.meta || key.upArrow || key.downArrow) return;
@@ -189,22 +239,35 @@ export function InputBox({ disabled, disabledPlaceholder, busy, hasToolCalls, sl
   const showMenu = !disabled && !menuClosed && shouldShowSlashPalette(text);
   const rows = showMenu ? visibleSlashRows(menu, slashCommands) : [];
 
+  const prefixColor = disabled
+    ? tuiColors.textMuted
+    : busy
+      ? tuiColors.accentRunning
+      : tuiColors.primary;
+
   return (
-    <Box flexDirection="column" width="100%">
+    <Box flexDirection="column" width="100%" flexShrink={0}>
       {showMenu ? <SlashPalette rows={rows} selected={menu.selected} /> : null}
-      <Box borderStyle="single" borderColor={disabled ? tuiColors.border : busy ? tuiColors.warning : tuiColors.primary} paddingX={1} width="100%">
-        <Box flexDirection="column">
+      <Box
+        borderStyle="single"
+        borderColor={disabled ? tuiColors.promptBorder : busy ? tuiColors.accentRunning : tuiColors.promptBorderFocus}
+        borderTop={false}
+        borderLeft={false}
+        borderRight={false}
+        width="100%"
+      >
+        <Box flexDirection="column" width="100%">
           {disabled ? (
             <Text>
-              <Text color={tuiColors.textDim}>{"> "}</Text>
-              <Text color={tuiColors.textDim}>{disabledPlaceholder ?? "waiting for permission..."}</Text>
+              <Text color={tuiColors.textMuted}>{"❯ "}</Text>
+              <Text color={tuiColors.textMuted}>{disabledPlaceholder ?? "waiting for permission..."}</Text>
             </Text>
           ) : inputLineSegments(text, cursor).map((line, index) => (
             <Text key={String(index)}>
-              <Text color={tuiColors.primary}>{line.prefix}</Text>
-              <Text>{line.before}</Text>
-              {line.hasCursor ? <Text color={tuiColors.primary}>█</Text> : null}
-              <Text>{line.after}</Text>
+              <Text color={prefixColor}>{line.prefix}</Text>
+              <Text color={tuiColors.text}>{line.before}</Text>
+              {line.hasCursor ? <Text color={prefixColor}>█</Text> : null}
+              <Text color={tuiColors.text}>{line.after}</Text>
             </Text>
           ))}
         </Box>

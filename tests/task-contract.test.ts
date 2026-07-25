@@ -5,6 +5,7 @@ import { judgeTaskTerminal } from "../src/harness/TaskDecisionEngine.js";
 import { advanceTaskPlan } from "../src/harness/TaskPlanner.js";
 
 await testCodeContractRequiresImplementationAndCleanup();
+await testCommandEvidenceCanAdvanceImplementationPlan();
 await testCleanupStopsOnlyTaskOwnedProcesses();
 
 async function testCodeContractRequiresImplementationAndCleanup(): Promise<void> {
@@ -53,4 +54,25 @@ async function testCleanupStopsOnlyTaskOwnedProcesses(): Promise<void> {
   assert.deepEqual(stopped, ["process-1"]);
   assert.equal(result.cleanup.status, "completed");
   assert.equal(result.evidence[0]?.kind, "cleanup");
+}
+
+async function testCommandEvidenceCanAdvanceImplementationPlan(): Promise<void> {
+  const contract = compileTaskContract({
+    objective: "deduplicate the input file",
+    taskType: "code_change",
+    acceptanceCriteria: [{ id: "changed", kind: "workspace_changed", baselineDigest: "before" }],
+    verificationMode: "deterministic"
+  });
+  const plan = advanceTaskPlan(contract.plan, {
+    taskType: contract.taskType,
+    attemptId: "attempt-1",
+    toolEvidence: [{
+      toolCallId: "command-1",
+      tool: "run_command",
+      args: { command: "awk '!seen[$0]++' input.txt > output.txt" },
+      result: { status: "completed", exitCode: 0 },
+      observedAt: new Date().toISOString()
+    }]
+  });
+  assert.equal(plan.find((item) => item.id === "implement")?.status, "completed");
 }

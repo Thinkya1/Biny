@@ -341,6 +341,7 @@ async function testWorkspaceDirectoryListing(): Promise<void> {
     const root = await projects.listWorkspaceDirectory(project, ".");
     assert.equal(root.path, ".");
     assert.deepEqual(root.entries.map((entry) => ({ name: entry.name, path: entry.path, kind: entry.kind })), [
+      { name: ".agent", path: ".agent", kind: "directory" },
       { name: "src", path: "src", kind: "directory" },
       { name: "README.md", path: "README.md", kind: "file" }
     ]);
@@ -490,9 +491,10 @@ async function testDesktopModelConfiguration(): Promise<void> {
     await projects.listSessions(project, undefined, new Map());
     const attachment = await projects.saveAttachment(project, "notes.txt", "text/plain", new TextEncoder().encode("desktop only"));
     assert.match(attachment.path, /^@attachments\//);
-    await access(path.join(desktopRoot, "projects", project.id, ".agent", "sessions"));
+    // Project sessions live in the workspace; attachments stay under desktop userData.
+    await access(path.join(workspaceRoot, ".agent", "sessions"));
+    await access(path.join(desktopRoot, "projects", project.id, ".agent", "attachments"));
     await assert.rejects(access(path.join(workspaceRoot, "agent.config.json")));
-    await assert.rejects(access(path.join(workspaceRoot, ".agent")));
     await agents.closeAll();
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
@@ -677,8 +679,6 @@ async function testLegacyDesktopDataMigration(): Promise<void> {
     const config = structuredClone(defaultConfig);
     config.defaultModel = "deepseek-v4-pro";
     await saveConfig(projectRoot, config);
-    await ensureAgentDirs(projectRoot);
-    await writeFile(sessionFilePath(projectRoot, "legacy-session"), `${JSON.stringify({ type: "user_message", content: "keep me" })}\n`);
 
     const storage = new DesktopUserDataStore(desktopRoot);
     await storage.initialize();
@@ -719,12 +719,27 @@ async function testLegacyDesktopDataMigration(): Promise<void> {
     assert.equal(migratedState.sessionMetadata[`${stateProject.id}:state-session`]?.pinned, true);
 
     await storage.migrateLegacyConfig([project], configStore);
-    const projectDataRoot = storage.projectRoot(project);
-    await mkdir(path.join(projectDataRoot, ".agent"), { recursive: true });
-    await storage.ensureProjectData(project);
+
+    // Old desktop builds stored project sessions under userData; open should copy them into the project.
+    const desktopProjectRoot = storage.projectDesktopRoot(project);
+    await mkdir(desktopProjectRoot, { recursive: true });
+    await ensureAgentDirs(desktopProjectRoot);
+    const legacySessionBody = `${JSON.stringify({ type: "user_message", content: "keep me" })}\n`;
+    await writeFile(sessionFilePath(desktopProjectRoot, "legacy-session"), legacySessionBody);
+    await mkdir(path.join(desktopProjectRoot, ".agent", "attachments"), { recursive: true });
+    await writeFile(path.join(desktopProjectRoot, ".agent", "attachments", "note.txt"), "attachment stays desktop-only\n");
+
+    const dataRoot = await storage.ensureProjectData(project);
+    assert.equal(dataRoot, path.resolve(projectRoot));
+    assert.equal(await readFile(sessionFilePath(projectRoot, "legacy-session"), "utf8"), legacySessionBody);
+    await assert.rejects(access(path.join(projectRoot, ".agent", "attachments", "note.txt")));
+    await access(path.join(desktopProjectRoot, ".agent", "attachments", "note.txt"));
+
+    const globalRoot = await storage.ensureGlobalData();
+    assert.equal(globalRoot, path.join(desktopRoot, "global"));
+    await access(path.join(globalRoot, ".agent", "sessions"));
 
     assert.equal((await configStore.load()).defaultModel, "deepseek-v4-pro");
-    assert.equal(await readFile(sessionFilePath(projectDataRoot, "legacy-session"), "utf8"), await readFile(sessionFilePath(projectRoot, "legacy-session"), "utf8"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
     await rm(desktopRoot, { recursive: true, force: true });

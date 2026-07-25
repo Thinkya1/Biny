@@ -104,7 +104,7 @@ Renderer 对 `assistant.delta` 和命令输出按 animation frame 合并更新�
 - 两端继续使用同一套 replay 逻辑恢复工具 ID、sequence、上下文摘要和 usage。
 - Main 是运行状态的唯一事实来源。Renderer 重建后通过 `bootstrap`、workspace snapshot 和缓存的实时事件重新获取状态。
 - Desktop 与 TUI/CLI 可以同时打开同一个项目；执行锁落在 `<project>/.agent/runs/session-<sessionId>.lock`，同一 Session 同一时刻只能有一个执行者，不同 Session 可以并行执行。
-- 同一 Session 被另一端执行时，当前端仍可查看历史，但发送任务、恢复、模型切换、权限修改、压缩和计划等会修改会话的操作会收到 Session 占用提示。
+- 当前阶段按 Pi 的单进程、单 AgentSession 模型运行：同一 Session 被另一端执行时，第二个运行时会收到 Session 占用提示，暂不支持跨进程 attach 到实时执行。TODO：引入 SessionHost 后再支持多客户端共同挂载同一 Session。
 - 切换页面不会中止任务；同一端对同一 Session 的补充要求仍进入本地 runtime 队列。
 - 停止按钮调用 runtime 的 `AbortController`，并拒绝正在等待的权限请求，不只是停止 UI 渲染。
 - 权限请求保存在 Main runtime snapshot 中，切换会话或 Renderer 刷新不会丢失。

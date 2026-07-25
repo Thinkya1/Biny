@@ -113,7 +113,9 @@ export class TaskRunCoordinator {
           maxSteps: context.remainingRuntimeSteps === undefined
             ? undefined
             : Math.min(this.runtime.config.agent.maxSteps, context.remainingRuntimeSteps),
-          deferSuccessfulMemory: true
+          deferSuccessfulMemory: true,
+          sessionUserMessage: options.input,
+          recordSessionUserMessage: context.attemptNumber === 1
         }),
         onEvent: (event) => {
           reasoningActive = options.onAgentEvent(event);
@@ -384,7 +386,7 @@ function harnessTurnOutcome(
   };
   if (harness.status === "passed") return { status: "completed", stopReason: "model_stop", ...common };
   if (harness.status === "budget_exhausted") {
-    return { status: "incomplete", stopReason: "budget_exhausted", ...common, error: harness.terminalReason };
+    return { status: "incomplete", stopReason: "budget_exhausted", ...common, error: latest?.error ?? harness.terminalReason };
   }
   if (harness.status === "aborted") return { status: "aborted", stopReason: "aborted", ...common, error: harness.terminalReason };
   if (latest?.outcomeStatus === "incomplete") {

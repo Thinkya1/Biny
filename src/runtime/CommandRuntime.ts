@@ -31,7 +31,7 @@ import { modelReasoningConfig } from "../ai/capabilities.js";
 
 export interface CommandRuntime {
   workspaceRoot: string;
-  /** Location that owns durable runtime/session state. Desktop may isolate it from the workspace. */
+  /** Location that owns durable runtime/session state. Project work uses the workspace; desktop may pass a global root for non-project sessions. */
   persistenceRoot: string;
   config: AgentConfig;
   agent: AgentSession;
@@ -56,7 +56,7 @@ export interface CommandRuntimeOptions {
 }
 
 export async function createCommandRuntime(workspaceRoot: string, options: CommandRuntimeOptions = {}): Promise<CommandRuntime> {
-  // CLI keeps data in the workspace. Desktop passes an isolated persistence root.
+  // Project sessions default to the workspace (`.agent/sessions`). Callers may override for non-project/global storage.
   const persistenceRoot = options.persistenceRoot ?? workspaceRoot;
   const configStore = options.configStore ?? createFileConfigStore(persistenceRoot);
   const config = await configStore.load();

@@ -756,12 +756,15 @@ async function testQueuedPromptEventOrdering(): Promise<void> {
   await waitUntil(() => runtime.getSnapshot().activeRun?.runId === first.runId);
   const second = runtime.submitPrompt("queued prompt");
   assert.equal(events.some((event) => event.type === "message.user" && event.runId === second.runId), false);
+  const queued = events.find((event) => event.type === "run.queued" && event.runId === second.runId);
+  assert.equal(queued?.type === "run.queued" ? queued.queueLength : undefined, 1);
 
   firstGate.resolve();
   await Promise.all([first.completion, second.completion]);
   const firstCompleted = events.findIndex((event) => event.type === "run.completed" && event.runId === first.runId);
   const secondMessage = events.findIndex((event) => event.type === "message.user" && event.runId === second.runId);
   assert.ok(firstCompleted >= 0 && secondMessage > firstCompleted);
+  assert.equal(events.some((event) => event.type === "run.queue.updated" && event.runId === second.runId && event.queueLength === 0), true);
   await runtime.close();
 }
 

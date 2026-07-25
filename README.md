@@ -195,7 +195,7 @@ biny run "总结当前项目并指出最重要的风险"
 <project>/.agent/            runs、tasks、logs、memory 等运行时数据
 ```
 
-Desktop 与 TUI/CLI 可以同时打开同一个项目；执行互斥按 Session 生效：同一个 Session 同一时刻只能由一个运行时执行，其他运行时仍可查看项目和会话，切换到其他 Session 后可以并行执行。占用中的 Session 会返回明确的占用提示，不应手动删除其锁文件。
+Desktop 与 TUI/CLI 可以同时打开同一个项目；当前按 Pi 的单进程、单 AgentSession 模型运行，执行互斥按 Session 生效：同一个 Session 同一时刻只能由一个运行时执行，另一个运行时会返回明确的占用提示，不应手动删除其锁文件。不同 Session 可以并行执行。TODO：后续引入 SessionHost 后再支持 Desktop/TUI 跨进程共同挂载同一 live Session。
 
 **桌面端全局数据**仍在用户数据目录：
 

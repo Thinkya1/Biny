@@ -57,6 +57,7 @@ export interface InteractiveAgentRuntimeOptions {
 
 interface QueuedAgentRun extends ActiveRunSnapshot {
   queuedAtMs: number;
+  wasQueued: boolean;
   attachments: AgentAttachment[];
 }
 
@@ -171,11 +172,23 @@ export class InteractiveAgentRuntime {
       attachments: attachments.map((attachment) => ({ ...attachment })),
       status: "queued",
       startedAt: new Date(queuedAtMs).toISOString(),
-      queuedAtMs
+      queuedAtMs,
+      wasQueued: this.rootRunScheduler.activeRun !== undefined || this.rootRunScheduler.queueLength > 0
     };
     try {
       this.admitRootRun(run);
       const submitted = this.rootRunScheduler.submit(run);
+      if (submitted.queued) {
+        this.events.emit({
+          ...this.eventBase(run),
+          type: "run.queued",
+          messageId: run.messageId,
+          input: run.input,
+          mode: run.mode,
+          position: this.rootRunScheduler.queueLength,
+          queueLength: this.rootRunScheduler.queueLength
+        });
+      }
       const releaseWhenIdle = (): void => {
         this.releaseSessionLeaseIfIdle();
       };
@@ -226,7 +239,16 @@ export class InteractiveAgentRuntime {
       this.pendingPermission = undefined;
       return true;
     }
-    return this.rootRunScheduler.cancel(runId, "Cancelled before execution.");
+    const queued = this.rootRunScheduler.queuedRuns.find((run) => run.runId === runId);
+    const cancelled = this.rootRunScheduler.cancel(runId, "Cancelled before execution.");
+    if (cancelled && queued) {
+      this.events.emit({
+        ...this.eventBase(queued),
+        type: "run.queue.updated",
+        queueLength: this.rootRunScheduler.queueLength
+      });
+    }
+    return cancelled;
   }
 
   answerPermission(requestId: string, result: PermissionResult): void {
@@ -597,6 +619,13 @@ export class InteractiveAgentRuntime {
     run.status = "thinking";
     run.startedAt = new Date(startedAtMs).toISOString();
     this.startRootRun(run);
+    if (run.wasQueued) {
+      this.events.emit({
+        ...this.eventBase(run),
+        type: "run.queue.updated",
+        queueLength: this.rootRunScheduler.queueLength
+      });
+    }
     this.commandRuntime.setSubagentParentRunId(run.runId);
     this.tools.clear();
     this.permissionRequestIds.clear();

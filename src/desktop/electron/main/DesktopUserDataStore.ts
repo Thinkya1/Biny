@@ -1,11 +1,17 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { CONFIG_FILE, loadConfig } from "../../../config/loader.js";
-import { agentDir } from "../../../session/store.js";
+import { agentDir, ensureAgentDirs } from "../../../session/store.js";
 import type { DesktopProject } from "../../protocol.js";
 import { DesktopConfigStore } from "./DesktopConfigStore.js";
 
-/** Owns all desktop-generated data below Electron's userData directory. */
+/**
+ * Owns desktop-only data under Electron's userData directory:
+ * config, credentials, UI state, attachments, and non-project sessions.
+ *
+ * Project sessions / runs / memory live in `<project>/.agent` so Desktop and
+ * TUI share the same history for a given workspace.
+ */
 export class DesktopUserDataStore {
   constructor(readonly root: string) {}
 
@@ -13,12 +19,18 @@ export class DesktopUserDataStore {
     await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
   }
 
-  projectRoot(project: DesktopProject): string {
+  /** Desktop-only root for a project (attachments + pre-unification session leftovers). */
+  projectDesktopRoot(project: DesktopProject): string {
     return path.join(this.root, "projects", projectStorageId(project.id));
   }
 
+  /** Global root for sessions that are not tied to an opened project. */
+  globalRoot(): string {
+    return path.join(this.root, "global");
+  }
+
   attachmentsRoot(project: DesktopProject): string {
-    return path.join(agentDir(this.projectRoot(project)), "attachments");
+    return path.join(agentDir(this.projectDesktopRoot(project)), "attachments");
   }
 
   async migrateLegacyState(legacyPath: string, destinationPath: string): Promise<void> {
@@ -62,15 +74,35 @@ export class DesktopUserDataStore {
     }
   }
 
+  /**
+   * Ensures project session storage lives under the project path and returns that root.
+   * One-time migration copies leftover userData project agent files (except attachments)
+   * into `<project>/.agent` when the destination file is missing.
+   */
   async ensureProjectData(project: DesktopProject): Promise<string> {
-    const targetRoot = this.projectRoot(project);
+    const targetRoot = path.resolve(project.path);
+    await ensureAgentDirs(targetRoot);
+
+    const legacyAgentDirectory = agentDir(this.projectDesktopRoot(project));
     const targetAgentDirectory = agentDir(targetRoot);
-    await fs.mkdir(targetRoot, { recursive: true, mode: 0o700 });
-    const legacyAgentDirectory = agentDir(project.path);
     if (await exists(legacyAgentDirectory) && path.resolve(legacyAgentDirectory) !== path.resolve(targetAgentDirectory)) {
-      await mergeDirectory(legacyAgentDirectory, targetAgentDirectory);
+      await mergeDirectory(legacyAgentDirectory, targetAgentDirectory, new Set(["attachments"]));
     }
     return targetRoot;
+  }
+
+  /** Ensures the global (non-project) session root exists and returns it. */
+  async ensureGlobalData(): Promise<string> {
+    const targetRoot = this.globalRoot();
+    await fs.mkdir(targetRoot, { recursive: true, mode: 0o700 });
+    await ensureAgentDirs(targetRoot);
+    return targetRoot;
+  }
+
+  async ensureAttachmentsRoot(project: DesktopProject): Promise<string> {
+    const directory = this.attachmentsRoot(project);
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    return directory;
   }
 }
 
@@ -88,9 +120,10 @@ async function exists(filePath: string): Promise<boolean> {
   }
 }
 
-async function mergeDirectory(source: string, destination: string): Promise<void> {
+async function mergeDirectory(source: string, destination: string, skipNames = new Set<string>()): Promise<void> {
   await fs.mkdir(destination, { recursive: true, mode: 0o700 });
   for (const entry of await fs.readdir(source, { withFileTypes: true })) {
+    if (skipNames.has(entry.name)) continue;
     const sourcePath = path.join(source, entry.name);
     const destinationPath = path.join(destination, entry.name);
     if (entry.isDirectory()) {

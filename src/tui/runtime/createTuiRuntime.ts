@@ -84,8 +84,14 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
       return info;
     },
     async sendPrompt(prompt: string, mode: AgentRunMode = "chat"): Promise<AgentRunOutcome> {
-      const info = await host.refreshModelFromDisk();
-      emitModelChanged(info);
+      // Follow Pi's single AgentSession model: a prompt submitted while the
+      // session is running enters the runtime queue. Refreshing model config
+      // is a maintenance operation and would incorrectly reject that follow-up.
+      const snapshot = host.getSnapshot();
+      if (!snapshot.activeRun && snapshot.queuedRuns.length === 0 && !snapshot.activeOperation) {
+        const info = await host.refreshModelFromDisk();
+        emitModelChanged(info);
+      }
       return await host.submitPrompt(prompt, mode).completion;
     },
     async resumeSession(session: string): Promise<ResumedAgentSession> {

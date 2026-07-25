@@ -23,7 +23,11 @@ const mutationTools = new Set([
   "multi_edit",
   "apply_patch",
   "delete_file",
-  "move_file"
+  "move_file",
+  // A successful shell command can mutate files through redirection, sed, awk,
+  // generators, or build scripts. The independent workspace predicate remains
+  // the source of truth for whether a change actually happened.
+  "run_command"
 ]);
 
 /** Creates a small, stable plan that task execution can update from evidence. */

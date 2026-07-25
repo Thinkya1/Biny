@@ -140,6 +140,9 @@ function compactValue(value: unknown, depth: number): unknown {
 }
 
 function attemptPrompt(context: TaskAttemptContext<TaskContract>): string {
+  if (context.task.verificationMode === "model_only" && context.attemptNumber === 1) {
+    return context.task.objective;
+  }
   const criteria = context.task.acceptanceCriteria
     .map((criterion) => `- ${JSON.stringify(criterion)}`)
     .join("\n");

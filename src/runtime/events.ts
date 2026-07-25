@@ -13,6 +13,7 @@ export type RuntimeEvent =
   | { type: "session.started"; sessionId: string; sessionFile: string; cwd: string; provider: string; modelLabel: string; reasoningLabel: string }
   | { type: "model.changed"; provider: string; modelLabel: string; reasoningLabel: string }
   | { type: "runtime.status"; status: RuntimeStatus }
+  | { type: "runtime.queue.updated"; queuedCount: number }
   | { type: "session.completed"; sessionId: string }
   | { type: "session.incomplete"; sessionId: string; message: string }
   | { type: "session.aborted"; sessionId: string; message: string }

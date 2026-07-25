@@ -1,12 +1,18 @@
 export interface ColorPalette {
   primary: string;
   accent: string;
+  accentAssistant: string;
+  accentThinking: string;
+  accentTool: string;
+  accentRunning: string;
   text: string;
   textStrong: string;
   textDim: string;
   textMuted: string;
   border: string;
   borderFocus: string;
+  promptBorder: string;
+  promptBorderFocus: string;
   success: string;
   warning: string;
   error: string;
@@ -19,56 +25,69 @@ export interface ColorPalette {
   roleUser: string;
 }
 
+/** GrokNight-inspired neutral dark palette with magenta accents. */
 export const darkColors: ColorPalette = {
-  primary: "#4FA8FF",
-  accent: "#5BC0BE",
+  primary: "#bb9af7",
+  accent: "#7dcfff",
+  accentAssistant: "#bb9af7",
+  accentThinking: "#bb9af7",
+  accentTool: "#787878",
+  accentRunning: "#bb9af7",
 
-  text: "#E0E0E0",
-  textStrong: "#F5F5F5",
-  textDim: "#888888",
-  textMuted: "#6B6B6B",
+  text: "#e1e1e1",
+  textStrong: "#f3f3f3",
+  textDim: "#c8c8c8",
+  textMuted: "#6c6c6c",
 
-  border: "#5A5A5A",
-  borderFocus: "#E8A838",
+  border: "#5a5a5a",
+  borderFocus: "#e0af68",
+  promptBorder: "#323237",
+  promptBorderFocus: "#505058",
 
-  success: "#4EC87E",
-  warning: "#E8A838",
-  error: "#E85454",
+  success: "#9ece6a",
+  warning: "#e0af68",
+  error: "#f7768e",
 
-  diffAdded: "#4EC87E",
-  diffRemoved: "#E85454",
-  diffAddedStrong: "#7AD99B",
-  diffRemovedStrong: "#F08585",
-  diffGutter: "#6B6B6B",
-  diffMeta: "#888888",
+  diffAdded: "#9ece6a",
+  diffRemoved: "#f7768e",
+  diffAddedStrong: "#b9f27c",
+  diffRemovedStrong: "#ff9eae",
+  diffGutter: "#6c6c6c",
+  diffMeta: "#787878",
 
-  roleUser: "#FFCB6B"
+  roleUser: "#c8c8c8"
 };
 
 export const lightColors: ColorPalette = {
-  primary: "#1565C0",
-  accent: "#00838F",
+  primary: "#7c3aed",
+  accent: "#0284c7",
+  accentAssistant: "#7c3aed",
+  accentThinking: "#7c3aed",
+  accentTool: "#64748b",
+  accentRunning: "#7c3aed",
 
-  text: "#1A1A1A",
-  textStrong: "#1A1A1A",
-  textDim: "#454545",
-  textMuted: "#5F5F5F",
+  text: "#1a1a1a",
+  textStrong: "#0f0f0f",
+  textDim: "#3f3f46",
+  textMuted: "#71717a",
 
-  border: "#737373",
-  borderFocus: "#92660A",
+  border: "#a1a1aa",
+  borderFocus: "#b45309",
+  promptBorder: "#d4d4d8",
+  promptBorderFocus: "#a1a1aa",
 
-  success: "#0E7A38",
-  warning: "#92660A",
-  error: "#B91C1C",
+  success: "#15803d",
+  warning: "#b45309",
+  error: "#be123c",
 
-  diffAdded: "#0E7A38",
-  diffRemoved: "#B91C1C",
-  diffAddedStrong: "#0E7A38",
-  diffRemovedStrong: "#B91C1C",
-  diffGutter: "#737373",
-  diffMeta: "#5F5F5F",
+  diffAdded: "#15803d",
+  diffRemoved: "#be123c",
+  diffAddedStrong: "#15803d",
+  diffRemovedStrong: "#be123c",
+  diffGutter: "#a1a1aa",
+  diffMeta: "#71717a",
 
-  roleUser: "#9A4A00"
+  roleUser: "#52525b"
 };
 
 export type ResolvedTheme = "dark" | "light";

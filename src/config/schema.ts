@@ -94,6 +94,7 @@ const providerConfigSchema = z.object({
     maxDelayMs: z.number().int().min(0).max(120_000).default(4_000)
   }).optional(),
   modelsEndpoint: z.string().url().optional(),
+  apiBackend: z.enum(["chat_completions", "responses"]).optional(),
   compatibility: z.object({
     supportsDeveloperRole: z.boolean().optional(),
     supportsReasoning: z.boolean().optional(),

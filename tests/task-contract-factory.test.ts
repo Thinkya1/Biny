@@ -7,6 +7,7 @@ import { createTaskContract } from "../src/harness/TaskContractFactory.js";
 await testLaunchTaskGetsProjectAcceptanceCriteria();
 await testCodeTaskGetsDeterministicChecks();
 await testOrdinaryChatHasNoInventedCriteria();
+await testReadOnlyInstructionDoesNotBecomeCodeTask();
 
 async function testLaunchTaskGetsProjectAcceptanceCriteria(): Promise<void> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-task-request-"));
@@ -55,6 +56,23 @@ async function testOrdinaryChatHasNoInventedCriteria(): Promise<void> {
     const contract = await createTaskContract(root, "解释一下这个函数");
     assert.deepEqual(contract.acceptanceCriteria, []);
     assert.equal(contract.verificationMode, "model_only");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testReadOnlyInstructionDoesNotBecomeCodeTask(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-task-request-read-only-"));
+  try {
+    for (const objective of [
+      "读取 README.md，给出项目用途和一个风险。不要修改文件。",
+      "读取 src/change.js，用中文解释它做了什么，并指出一个潜在边界情况。不要修改文件。"
+    ]) {
+      const contract = await createTaskContract(root, objective);
+      assert.equal(contract.taskType, "conversation");
+      assert.equal(contract.verificationMode, "model_only");
+      assert.deepEqual(contract.acceptanceCriteria, []);
+    }
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

@@ -226,7 +226,10 @@ export function Workspace({
   }, [directoryStates, expandedDirectories, loadDirectory]);
 
   return (
-    <main className="workspace">
+    <main
+      className={`workspace${filePanelOpen ? " is-file-panel-open" : ""}`}
+      style={{ "--workspace-file-panel-width": filePanelOpen ? `${filePanelWidth}px` : "0px" } as React.CSSProperties}
+    >
       <section className="workspace-conversation">
         <header className="workspace-toolbar">
           <div className="toolbar-left">
@@ -324,13 +327,12 @@ function FilePanelResizer({ width, onWidthChange, onResizeStart, onResizeEnd }: 
     onResizeStart();
     const workspace = event.currentTarget.closest(".workspace");
     const workspaceWidth = workspace instanceof HTMLElement ? workspace.clientWidth : window.innerWidth;
-    const overlay = window.matchMedia("(max-width: 900px)").matches;
     const startX = event.clientX;
     const startWidth = event.currentTarget.parentElement?.getBoundingClientRect().width ?? width;
     let currentWidth = startWidth;
     let active = true;
     const move = (moveEvent: PointerEvent): void => {
-      currentWidth = clampFilePanelWidth(startWidth + startX - moveEvent.clientX, workspaceWidth, overlay);
+      currentWidth = clampFilePanelWidth(startWidth + startX - moveEvent.clientX, workspaceWidth, false);
       onWidthChange(currentWidth);
     };
     const stop = (): void => {

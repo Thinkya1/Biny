@@ -24,6 +24,10 @@ export interface AssistantTranscriptItem extends TranscriptItemBase {
 export interface ReasoningTranscriptItem extends TranscriptItemBase {
   kind: "reasoning";
   content: string;
+  /** Wall-clock start while streaming; cleared once committed with durationMs. */
+  startedAtMs?: number;
+  /** Elapsed thinking time after completion. */
+  durationMs?: number;
 }
 
 export interface NotificationTranscriptItem extends TranscriptItemBase {
@@ -100,6 +104,7 @@ export interface TuiState {
   sessionFile: string;
   viewingSessionId?: string;
   status: RuntimeStatus;
+  queuedCount: number;
   turnStartedAt?: number;
   lastWorkedMs?: number;
   transcript: TranscriptState;
