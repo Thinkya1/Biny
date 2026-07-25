@@ -55,6 +55,7 @@ export class TaskRunCoordinator {
     // surface; a minimal AgentSession host should still be able to exercise
     // permissions and event ordering without inventing workspace state.
     if (!isDurableRuntime(this.runtime)) return await this.executeCompatibility(options);
+    await this.taskRunStore?.recoverInterruptedRuns(options.sessionId);
     const resolved = await resolveTaskContract(
       this.runtime.workspaceRoot,
       options.input,

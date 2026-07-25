@@ -186,16 +186,29 @@ biny run "总结当前项目并指出最重要的风险"
 
 ## 模型与数据
 
-桌面端通过“设置 → 模型”管理连接、默认模型和密钥。API key 与 OAuth 凭据由 macOS 系统钥匙串保护；模型设置、会话、附件和运行记录保存在用户数据目录，项目文件夹不会被桌面端写入这些应用数据。
+桌面端通过“设置 → 模型”管理连接、默认模型和密钥。API key 与 OAuth 凭据由 macOS 系统钥匙串保护。
+
+**项目会话**（Desktop 与 TUI/CLI 共用）写在打开的项目目录：
+
+```text
+<project>/.agent/sessions/   项目问答历史
+<project>/.agent/            runs、tasks、logs、memory 等运行时数据
+```
+
+Desktop 与 TUI/CLI 可以同时打开同一个项目；执行互斥按 Session 生效：同一个 Session 同一时刻只能由一个运行时执行，其他运行时仍可查看项目和会话，切换到其他 Session 后可以并行执行。占用中的 Session 会返回明确的占用提示，不应手动删除其锁文件。
+
+**桌面端全局数据**仍在用户数据目录：
 
 ```text
 ~/Library/Application Support/Biny/workspaces/default/
-  agent.config.json       模型设置（不含密钥）
-  credentials.json        经系统保护的凭据
-  projects/<project-id>/  会话、附件、记忆、任务、托管进程和运行记录
+  agent.config.json                 模型设置（不含密钥）
+  credentials.json                  经系统保护的凭据
+  desktop-state.json                项目列表与窗口 UI 状态
+  global/.agent/sessions/           非项目会话
+  projects/<project-id>/.agent/attachments/  桌面端附件（不写入项目）
 ```
 
-升级后，旧版桌面端的配置和会话会自动复制到新位置，原文件会保留。CLI/TUI 仍使用当前工作区中的 `agent.config.json` 和 `.agent/`；它们与桌面端数据相互隔离。CLI/TUI 建议只在配置中填写 `apiKeyEnv`，把真实 key 放进环境变量；`biny doctor` 会提示 inline key 风险，但不会输出 key 内容。配置文件按 `0600` 保存并采用原子替换，符号链接或硬链接配置会被拒绝。
+升级后，旧版桌面端写在用户数据目录下的项目会话会在打开项目时合并到 `<project>/.agent/`（目标已有文件优先）；附件与模型配置仍留在用户数据目录。CLI/TUI 建议只在配置中填写 `apiKeyEnv`，把真实 key 放进环境变量；`biny doctor` 会提示 inline key 风险，但不会输出 key 内容。配置文件按 `0600` 保存并采用原子替换，符号链接或硬链接配置会被拒绝。
 
 ## 当前边界
 

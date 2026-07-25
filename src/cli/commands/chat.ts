@@ -32,7 +32,7 @@ export async function chatCommand(workspaceRoot: string, options: ChatCommandOpt
   const host = new InteractiveAgentRuntime(runtime, { runLedger: ledger, taskRunStore: runtime.taskRuns });
   try {
     if (options.continue || options.session) {
-      const resumed = await runtime.agent.resume(options.session);
+      const resumed = await host.resumeSession(options.session ?? "latest");
       console.log(`Resumed: ${resumed.filePath}`);
     }
     await runChatLoop(runtime, host);
@@ -71,7 +71,7 @@ async function handleInputLine(runtime: CommandRuntime, host: InteractiveAgentRu
   if (!text) return true;
   try {
     return await withCliAbortSignal(async (signal) => {
-      if (text.startsWith("/")) return await executeChatSlashCommand(runtime, text, signal);
+      if (text.startsWith("/")) return await executeChatSlashCommand(runtime, text, signal, host);
       const submitted = host.submitPrompt(text);
       const onAbort = (): void => {
         host.cancelRun(submitted.runId);

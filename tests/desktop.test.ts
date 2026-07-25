@@ -9,6 +9,7 @@ import type { AgentSessionEvent } from "../src/agent/types.js";
 import type { ContextStatus } from "../src/agent/context/types.js";
 import type { CommandRuntime } from "../src/runtime/CommandRuntime.js";
 import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.js";
+import { RootRunLedger } from "../src/runtime/RootRunLedger.js";
 import type { AgentHostEvent } from "../src/runtime/agentEvents.js";
 import { saveConfig } from "../src/config/loader.js";
 import { createFileConfigStore } from "../src/config/store.js";
@@ -57,6 +58,7 @@ testWorkspaceFileMarkers();
 await testFilePanelSizing();
 await testDesktopThemePreference();
 await testDesktopModelConfiguration();
+await testDesktopReportsRuntimeLeaseConflict();
 await testDesktopCredentialsAreSeparated();
 await testDesktopRequiresModelConfiguration();
 await testWorkspaceSnapshotDoesNotReorderProjects();
@@ -493,6 +495,34 @@ async function testDesktopModelConfiguration(): Promise<void> {
     await assert.rejects(access(path.join(workspaceRoot, ".agent")));
     await agents.closeAll();
   } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
+  }
+}
+
+async function testDesktopReportsRuntimeLeaseConflict(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-runtime-lease-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-runtime-lease-data-"));
+  let owner: RootRunLedger | undefined;
+  try {
+    const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
+    const project = await projects.createProject(workspaceRoot);
+    owner = await RootRunLedger.open(workspaceRoot);
+    const recorder = new SessionRecorder(workspaceRoot, "session-owner");
+    recorder.record({ type: "user_message", content: "owner session" });
+    await recorder.close();
+    await state.setSelectedSession(project.id, "session-owner");
+    owner.acquireSession("session-owner");
+    const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
+    await assert.rejects(
+      () => agents.setPermissionMode(project.id, "read-only"),
+      new RegExp(`当前项目正在被另一个 Biny/CLI 会话占用（进程 ${String(process.pid)}）`)
+    );
+    const snapshot = await agents.workspaceSnapshot(project.id);
+    assert.match(snapshot.runtimeError ?? "", /请先退出该会话，或切换到其他项目后重试/u);
+    await agents.closeAll();
+  } finally {
+    owner?.close();
     await rm(workspaceRoot, { recursive: true, force: true });
     await rm(desktopRoot, { recursive: true, force: true });
   }

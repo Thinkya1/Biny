@@ -30,13 +30,13 @@ Preload / contextBridge
   │ ipcRenderer.invoke + 只读事件订阅
   ▼
 Electron Main
-  ├── DesktopUserDataStore（用户级工作区、项目数据迁移）
+  ├── DesktopUserDataStore（配置/附件/非项目会话、旧项目会话迁回项目目录）
   ├── DesktopConfigStore（模型设置与受系统保护的凭据）
   ├── DesktopStateStore（项目、窗口、侧栏、会话 UI 元数据）
-  ├── DesktopProjectService（Git、会话文件、附件、系统打开）
+  ├── DesktopProjectService（Git、项目会话文件、附件、系统打开）
   └── DesktopAgentManager
         ▼
-      InteractiveAgentRuntime
+      InteractiveAgentRuntime（persistenceRoot = 项目路径）
         ▼
       CommandRuntime → AgentSession → Provider / Tool / Permission / Context / Session
 ```
@@ -56,19 +56,29 @@ Electron Main
 - UI：`setSidebarWidth`、`setFilePanelWidth`、`onMenuAction`
 - 事件：`onAgentEvent`
 
-`resolveDroppedFile` 只调用 Electron `webUtils.getPathForFile`，不授予 Renderer 通用文件系统权限。桌面端的配置、会话、附件和运行日志均写入应用用户数据目录；附件通过受限的 `@attachments/` 虚拟路径提供给 `read_file`，不会写进用户打开的项目目录。
+`resolveDroppedFile` 只调用 Electron `webUtils.getPathForFile`，不授予 Renderer 通用文件系统权限。桌面端的**项目会话**写入打开项目的 `.agent/sessions`（与 TUI/CLI 共用）；**配置、凭据、UI 状态、附件和非项目会话**仍在应用用户数据目录。附件通过受限的 `@attachments/` 虚拟路径提供给 `read_file`，不会写进用户打开的项目目录。
 
 ## 用户数据目录
 
-桌面端采用 Maka 式的用户级工作区：`app.getPath("userData")/workspaces/default`。在 macOS 上通常是 `~/Library/Application Support/Biny/workspaces/default`。
+桌面端用户级工作区：`app.getPath("userData")/workspaces/default`。在 macOS 上通常是 `~/Library/Application Support/Biny/workspaces/default`。
 
 - `agent.config.json`：模型、服务地址和默认模型等非敏感设置。
 - `credentials.json`：使用 Electron `safeStorage` 加密后的 API Key 与 OAuth refresh token；不会出现在 `agent.config.json` 中。
 - `desktop-state.json`：项目列表、窗口尺寸、面板宽度和会话 UI 元数据。
-- `projects/<project-id>/.agent/`：该项目的 session、附件、记忆、日志与 telemetry。
+- `global/.agent/sessions/`：非项目会话（不绑定某个打开的项目路径）。
+- `projects/<project-id>/.agent/attachments/`：该项目的桌面端附件（仍隔离在用户数据目录）。
+
+## 项目会话目录
+
+打开某个项目后，Desktop 与 TUI/CLI 使用同一套项目级持久化根：
+
+- `<project>/.agent/sessions/`：项目问答历史（两端共用）
+- `<project>/.agent/` 下的 runs、tasks、logs、memory、processes、telemetry：与会话配套的运行时数据
+
+首次打开项目时，若用户数据目录里仍有旧版 `projects/<project-id>/.agent/` 会话（不含 attachments），会**单向合并**到 `<project>/.agent/`：目标中已有的文件优先保留，缺失的旧文件被复制过来。之后新会话只写入项目目录。
 
 首次打开没有可用默认模型的项目时，桌面端会先进入模型配置页；只有默认模型具备有效凭据和服务地址后，才能开始任务。
-首次启动新版桌面端时，旧的 `desktop-state.json`、项目 `agent.config.json` 和 `.agent/` 数据会迁移到用户数据目录；已有目标数据会与旧数据合并，目标中的新文件优先，旧文件保留，以免迁移意外造成数据丢失。CLI/TUI 继续使用项目级配置与 session，和桌面端的数据相互隔离。
+旧的 `desktop-state.json` 与项目内 `agent.config.json` 仍可按既有逻辑迁入用户数据目录；桌面端模型配置以用户数据目录为准，不会把 API key 写回项目。
 
 ## Agent 事件协议
 
@@ -89,10 +99,13 @@ Renderer 对 `assistant.delta` 和命令输出按 animation frame 合并更新�
 
 ## 会话和运行状态
 
-- Desktop Agent 消息写入用户数据目录的 `projects/<project-id>/.agent/sessions/*.jsonl`，稳定事件类型没有变化。
-- CLI/TUI 的项目级会话与 Desktop 的用户级会话相互隔离；两者都继续使用同一套 replay 逻辑恢复工具 ID、sequence、上下文摘要和 usage。
+- Desktop 与 TUI/CLI 的项目会话都写入 `<project>/.agent/sessions/*.jsonl`，稳定事件类型没有变化；同一项目两端可见同一份历史。
+- 非项目会话保留在用户数据目录的 `global/.agent/sessions/`。
+- 两端继续使用同一套 replay 逻辑恢复工具 ID、sequence、上下文摘要和 usage。
 - Main 是运行状态的唯一事实来源。Renderer 重建后通过 `bootstrap`、workspace snapshot 和缓存的实时事件重新获取状态。
-- 每个打开项目最多持有一个运行实例；切换页面不会中止任务，补充要求进入同一 runtime 队列。
+- Desktop 与 TUI/CLI 可以同时打开同一个项目；执行锁落在 `<project>/.agent/runs/session-<sessionId>.lock`，同一 Session 同一时刻只能有一个执行者，不同 Session 可以并行执行。
+- 同一 Session 被另一端执行时，当前端仍可查看历史，但发送任务、恢复、模型切换、权限修改、压缩和计划等会修改会话的操作会收到 Session 占用提示。
+- 切换页面不会中止任务；同一端对同一 Session 的补充要求仍进入本地 runtime 队列。
 - 停止按钮调用 runtime 的 `AbortController`，并拒绝正在等待的权限请求，不只是停止 UI 渲染。
 - 权限请求保存在 Main runtime snapshot 中，切换会话或 Renderer 刷新不会丢失。
 

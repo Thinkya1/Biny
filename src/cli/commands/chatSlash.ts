@@ -1,4 +1,5 @@
 import type { CommandRuntime } from "../../runtime/CommandRuntime.js";
+import type { InteractiveAgentRuntime } from "../../runtime/InteractiveAgentRuntime.js";
 import { parseThinkingSelection } from "../../llm/ModelManager.js";
 import { formatSubagentTaskReport } from "../../runtime/subagentTaskReport.js";
 import type { SlashCommand } from "../prompt/slashMenu.js";
@@ -26,7 +27,7 @@ export const CHAT_SLASH_COMMANDS: SlashCommand[] = [
   { name: "/quit", description: "Exit chat", category: "system" }
 ];
 
-export async function executeChatSlashCommand(runtime: CommandRuntime, text: string, signal?: AbortSignal): Promise<boolean> {
+export async function executeChatSlashCommand(runtime: CommandRuntime, text: string, signal?: AbortSignal, host?: InteractiveAgentRuntime): Promise<boolean> {
   const agent = runtime.agent;
   const [command, ...args] = text.split(/\s+/);
 
@@ -73,7 +74,7 @@ export async function executeChatSlashCommand(runtime: CommandRuntime, text: str
         console.log("Usage: /subagent start <read-only task>");
         return true;
       }
-      const submitted = runtime.startSubagentTask(task);
+      const submitted = host?.startSubagentTask(task) ?? runtime.startSubagentTask(task);
       console.log(`Started subagent task ${submitted.taskId}. Use /subagent status or /subagent cancel ${submitted.taskId}.`);
       return true;
     }
@@ -106,7 +107,9 @@ export async function executeChatSlashCommand(runtime: CommandRuntime, text: str
     return true;
   }
   if (command === "/compact") {
-    console.log(await agent.compactConversation(args.join(" ").trim() || undefined, signal));
+    console.log(host
+      ? await host.compactConversation(args.join(" ").trim() || undefined)
+      : await agent.compactConversation(args.join(" ").trim() || undefined, signal));
     return true;
   }
   if (command === "/model") {
@@ -122,7 +125,7 @@ export async function executeChatSlashCommand(runtime: CommandRuntime, text: str
       console.log("Usage: /model <alias> [off|high|max]");
       return true;
     }
-    const info = await agent.switchModel(args[0], parseThinkingSelection(args[1]));
+    const info = await (host ?? agent).switchModel(args[0], parseThinkingSelection(args[1]));
     console.log(`Switched model: ${info.modelLabel} (thinking: ${info.reasoningLabel})`);
     return true;
   }
@@ -131,7 +134,7 @@ export async function executeChatSlashCommand(runtime: CommandRuntime, text: str
     return true;
   }
   if (command === "/permissions" || command === "/approvals") {
-    console.log(await agent.runPermissionCommand(args));
+    console.log(await (host ?? agent).runPermissionCommand(args));
     return true;
   }
   if (command === "/resume") {
@@ -139,7 +142,7 @@ export async function executeChatSlashCommand(runtime: CommandRuntime, text: str
       printSessionSummaries(await agent.listSessions());
       return true;
     }
-    const resumed = await agent.resume(args[0]);
+    const resumed = await (host ? host.resumeSession(args[0]) : agent.resume(args[0]));
     console.log(`Resumed session: ${resumed.filePath}`);
     return true;
   }
@@ -149,7 +152,9 @@ export async function executeChatSlashCommand(runtime: CommandRuntime, text: str
       console.log("Usage: /plan <task>");
       return true;
     }
-    console.log(await agent.createPlan(task, undefined, signal));
+    console.log(host
+      ? await host.createPlan(task, undefined, signal)
+      : await agent.createPlan(task, undefined, signal));
     return true;
   }
 

@@ -15,10 +15,13 @@ import { AgentEventBus } from "./AgentEventBus.js";
 import { createCommandRuntime, type CommandRuntime, type CommandRuntimeOptions } from "./CommandRuntime.js";
 import {
   SubagentTaskAbortedError,
-  type SubagentTaskSnapshot
+  type SubagentTaskRunOptions,
+  type SubagentTaskSnapshot,
+  type SubmittedSubagentTask
 } from "./SubagentTaskManager.js";
-import { RootRunLedger, type RootRunLedgerSnapshot, type RootRunLedgerStatus } from "./RootRunLedger.js";
+import { RootRunLedger, type RootRunLedgerSessionLease, type RootRunLedgerSnapshot, type RootRunLedgerStatus } from "./RootRunLedger.js";
 import { RootRunScheduler } from "./RootRunScheduler.js";
+import { resolveSessionFile, sessionIdFromFile } from "../session/store.js";
 import { TaskRunCoordinator } from "./TaskRunCoordinator.js";
 import type {
   ActiveRunSnapshot,
@@ -29,7 +32,7 @@ import type {
   RuntimeOperation
 } from "./agentEvents.js";
 
-type ExclusiveRuntimeOperation = RuntimeOperation | "permission";
+type ExclusiveRuntimeOperation = RuntimeOperation | "permission" | "plan";
 
 export interface SubmittedAgentRun {
   runId: string;
@@ -69,6 +72,11 @@ interface ActiveTool {
   commandStarted: boolean;
 }
 
+interface SessionLeaseState {
+  lease: RootRunLedgerSessionLease | undefined;
+  acquired: boolean;
+}
+
 /**
  * UI-independent interactive host for AgentSession. It owns run queuing,
  * permission waits and AbortController state while AgentSession continues to
@@ -80,9 +88,11 @@ export class InteractiveAgentRuntime {
   private readonly events = new AgentEventBus<AgentHostEvent>();
   private readonly rootRunScheduler: RootRunScheduler<QueuedAgentRun, AgentRunOutcome>;
   private readonly runLedger: RootRunLedger | undefined;
+  private sessionLease: RootRunLedgerSessionLease | undefined;
   private readonly taskRunCoordinator: TaskRunCoordinator;
   private readonly tools = new Map<string, ActiveTool>();
   private readonly permissionRequestIds = new Map<string, string>();
+  private backgroundSubagentCount = 0;
   private directRun: ActiveRunSnapshot | undefined;
   private pendingPermission: PendingPermission | undefined;
   private abortController: AbortController | undefined;
@@ -145,8 +155,10 @@ export class InteractiveAgentRuntime {
   submitPrompt(input: string, mode: AgentRunMode = "chat", attachments: AgentAttachment[] = []): SubmittedAgentRun {
     if (this.closed) throw new Error("Agent runtime is closed.");
     if (this.activeOperation) throw new Error(`Cannot submit a prompt while ${publicOperationName(this.activeOperation)} is running.`);
+    if (this.backgroundSubagentCount) throw new Error("Cannot submit a prompt while a subagent task is running for this session.");
     if (!input.trim()) throw new Error("Agent prompt cannot be empty.");
     const sessionId = this.getInfo().sessionId;
+    this.acquireSessionLease(sessionId);
     const runId = randomUUID();
     const messageId = randomUUID();
     const queuedAtMs = Date.now();
@@ -161,12 +173,17 @@ export class InteractiveAgentRuntime {
       startedAt: new Date(queuedAtMs).toISOString(),
       queuedAtMs
     };
-    this.admitRootRun(run);
     try {
+      this.admitRootRun(run);
       const submitted = this.rootRunScheduler.submit(run);
+      const releaseWhenIdle = (): void => {
+        this.releaseSessionLeaseIfIdle();
+      };
+      void submitted.completion.then(releaseWhenIdle, releaseWhenIdle);
       return { runId, messageId, queued: submitted.queued, completion: submitted.completion };
     } catch (error) {
       this.persistTerminalRun(run, "failed", 0, undefined, `Run admission rejected: ${errorMessage(error)}`);
+      this.releaseSessionLeaseIfIdle();
       throw error;
     }
   }
@@ -179,14 +196,18 @@ export class InteractiveAgentRuntime {
   }
 
   async waitForIdle(): Promise<void> {
-    while (this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength || this.directRun || this.activeOperation) {
-      if (this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength) {
-        await this.rootRunScheduler.waitForIdle();
-      } else if (this.activeOperationCompletion) {
-        await this.activeOperationCompletion;
-      } else {
-        await new Promise<void>((resolve) => queueMicrotask(resolve));
+    try {
+      while (this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength || this.directRun || this.activeOperation) {
+        if (this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength) {
+          await this.rootRunScheduler.waitForIdle();
+        } else if (this.activeOperationCompletion) {
+          await this.activeOperationCompletion;
+        } else {
+          await new Promise<void>((resolve) => queueMicrotask(resolve));
+        }
       }
+    } finally {
+      this.releaseSessionLeaseIfIdle();
     }
   }
 
@@ -225,7 +246,9 @@ export class InteractiveAgentRuntime {
   }
 
   async resumeSession(session: string): Promise<ResumedAgentSession> {
-    return await this.runMaintenanceOperation("resume", async () => await this.commandRuntime.agent.resume(session));
+    const filePath = await resolveSessionFile(this.commandRuntime.persistenceRoot, session);
+    const sessionId = sessionIdFromFile(filePath);
+    return await this.runMaintenanceOperation("resume", async () => await this.commandRuntime.agent.resume(session), undefined, sessionId);
   }
 
   async listSessions(): Promise<SessionSummary[]> {
@@ -262,6 +285,28 @@ export class InteractiveAgentRuntime {
     );
   }
 
+  startSubagentTask(task: string, options?: SubagentTaskRunOptions): SubmittedSubagentTask {
+    if (this.closed) throw new Error("Agent runtime is closed.");
+    if (this.activeOperation || this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength || this.directRun) {
+      throw new Error("Cannot start a background subagent while the runtime is busy.");
+    }
+    const leaseState = this.acquireSessionLease(this.getInfo().sessionId);
+    this.backgroundSubagentCount += 1;
+    try {
+      const submitted = this.commandRuntime.startSubagentTask(task, options);
+      const release = (): void => {
+        this.backgroundSubagentCount = Math.max(0, this.backgroundSubagentCount - 1);
+        this.releaseSessionLeaseIfIdle();
+      };
+      void submitted.completion.then(release, release);
+      return submitted;
+    } catch (error) {
+      this.backgroundSubagentCount = Math.max(0, this.backgroundSubagentCount - 1);
+      this.releaseSessionLease(leaseState);
+      throw error;
+    }
+  }
+
   async contextReport(): Promise<string> {
     return await this.commandRuntime.agent.contextReport();
   }
@@ -293,6 +338,16 @@ export class InteractiveAgentRuntime {
         this.events.emit({ ...this.eventBase(run), type: "compact.completed", summary, context });
         return summary;
       },
+      controller
+    );
+  }
+
+  async createPlan(task: string, onDelta?: (delta: string) => void, abortSignal?: AbortSignal): Promise<string> {
+    const controller = new AbortController();
+    const signal = abortSignal ? AbortSignal.any([abortSignal, controller.signal]) : controller.signal;
+    return await this.runMaintenanceOperation(
+      "plan",
+      async () => await this.commandRuntime.agent.createPlan(task, onDelta, signal),
       controller
     );
   }
@@ -350,6 +405,8 @@ export class InteractiveAgentRuntime {
       try {
         await this.commandRuntime.close();
       } finally {
+        this.sessionLease?.close();
+        this.sessionLease = undefined;
         this.runLedger?.close();
       }
     });
@@ -359,12 +416,14 @@ export class InteractiveAgentRuntime {
   private async runMaintenanceOperation<T>(
     operation: ExclusiveRuntimeOperation,
     execute: () => Promise<T>,
-    operationAbortController?: AbortController
+    operationAbortController?: AbortController,
+    sessionId = this.getInfo().sessionId
   ): Promise<T> {
     if (this.closed) throw new Error("Agent runtime is closed.");
-    if (this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength || this.directRun || this.activeOperation) {
+    if (this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength || this.directRun || this.activeOperation || this.backgroundSubagentCount) {
       throw new Error(`Cannot start ${publicOperationName(operation)} while the runtime is busy.`);
     }
+    const leaseState = this.acquireSessionLease(sessionId);
     this.activeOperation = operation;
     if (operationAbortController) this.abortController = operationAbortController;
     const execution = Promise.resolve().then(execute);
@@ -380,7 +439,33 @@ export class InteractiveAgentRuntime {
         this.activeOperationCompletion = undefined;
         this.activeOperation = undefined;
       }
+      this.releaseSessionLease(leaseState);
     }
+  }
+
+  private acquireSessionLease(sessionId: string): SessionLeaseState {
+    const current = this.sessionLease;
+    if (current?.sessionId === sessionId) return { lease: current, acquired: false };
+    current?.close();
+    this.sessionLease = undefined;
+    if (!this.runLedger) return { lease: undefined, acquired: false };
+    const lease = this.runLedger.acquireSession(sessionId);
+    this.sessionLease = lease;
+    return { lease, acquired: true };
+  }
+
+  private releaseSessionLease(state: SessionLeaseState): void {
+    if (!state.acquired || !state.lease || this.sessionLease !== state.lease) return;
+    state.lease.close();
+    this.sessionLease = undefined;
+  }
+
+  private releaseSessionLeaseIfIdle(): void {
+    if (this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength || this.directRun || this.activeOperation || this.backgroundSubagentCount) return;
+    const lease = this.sessionLease;
+    if (!lease) return;
+    lease.close();
+    this.sessionLease = undefined;
   }
 
   private async executeDirectSubagentTask(task: string, controller: AbortController): Promise<string> {
@@ -1075,6 +1160,7 @@ function publicOperationName(operation: ExclusiveRuntimeOperation): string {
   if (operation === "refresh_model") return "model refresh";
   if (operation === "resume") return "session resume";
   if (operation === "compact") return "conversation compaction";
+  if (operation === "plan") return "plan creation";
   return "a subagent task";
 }
 

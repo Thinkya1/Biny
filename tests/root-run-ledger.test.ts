@@ -9,7 +9,7 @@ import {
 } from "../src/runtime/RootRunLedger.js";
 
 await testLifecyclePersistsWithoutPromptText();
-await testSingleRuntimeLeaseAndCrashRecovery();
+await testSessionLeasesAndCrashRecovery();
 await testTerminalRecordsAreImmutable();
 
 async function testLifecyclePersistsWithoutPromptText(): Promise<void> {
@@ -17,6 +17,7 @@ async function testLifecyclePersistsWithoutPromptText(): Promise<void> {
   let ledger: RootRunLedger | undefined;
   try {
     ledger = await RootRunLedger.open(workspaceRoot);
+    const sessionLease = ledger.acquireSession("session-1");
     ledger.admit({
       runId: "run-lifecycle",
       sessionId: "session-1",
@@ -48,18 +49,23 @@ async function testLifecyclePersistsWithoutPromptText(): Promise<void> {
     const rawRecord = await readFile(path.join(ledger.directoryPath, "root-run-run-lifecycle.json"), "utf8");
     assert.equal(rawRecord.includes("opaque-root-run-secret"), false);
     assert.equal(rawRecord.includes("implement this"), false);
+    sessionLease.close();
   } finally {
     ledger?.close();
     await rm(workspaceRoot, { recursive: true, force: true });
   }
 }
 
-async function testSingleRuntimeLeaseAndCrashRecovery(): Promise<void> {
+async function testSessionLeasesAndCrashRecovery(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-root-run-recovery-"));
   let first: RootRunLedger | undefined;
+  let firstSessionLease: ReturnType<RootRunLedger["acquireSession"]> | undefined;
+  let otherSessionLease: ReturnType<RootRunLedger["acquireSession"]> | undefined;
   let recovered: RootRunLedger | undefined;
+  let recoveredSessionLease: ReturnType<RootRunLedger["acquireSession"]> | undefined;
   try {
     first = await RootRunLedger.open(workspaceRoot);
+    firstSessionLease = first.acquireSession("session-2");
     first.admit({
       runId: "run-interrupted",
       sessionId: "session-2",
@@ -69,16 +75,26 @@ async function testSingleRuntimeLeaseAndCrashRecovery(): Promise<void> {
       queuedAt: "2026-07-19T00:00:00.000Z"
     });
     first.start("run-interrupted", "2026-07-19T00:00:01.000Z");
-    await assert.rejects(async () => await RootRunLedger.open(workspaceRoot), RootRunLedgerLeaseError);
+    const concurrent = await RootRunLedger.open(workspaceRoot);
+    otherSessionLease = concurrent.acquireSession("session-3");
+    assert.ok(otherSessionLease);
+    await assert.rejects(async () => await concurrent.acquireSession("session-2"), RootRunLedgerLeaseError);
+    otherSessionLease.close();
+    concurrent.close();
 
+    firstSessionLease.close();
     first.close();
     first = undefined;
     recovered = await RootRunLedger.open(workspaceRoot);
+    recoveredSessionLease = recovered.acquireSession("session-2");
     const snapshot = recovered.getSnapshot("run-interrupted");
     assert.equal(snapshot.status, "aborted");
     assert.equal(snapshot.recovered, true);
     assert.match(snapshot.transitions.at(-1)?.reason ?? "", /Recovered after the previous interactive runtime/u);
   } finally {
+    recoveredSessionLease?.close();
+    firstSessionLease?.close();
+    otherSessionLease?.close();
     first?.close();
     recovered?.close();
     await rm(workspaceRoot, { recursive: true, force: true });
@@ -90,6 +106,7 @@ async function testTerminalRecordsAreImmutable(): Promise<void> {
   let ledger: RootRunLedger | undefined;
   try {
     ledger = await RootRunLedger.open(workspaceRoot);
+    const sessionLease = ledger.acquireSession("session-3");
     ledger.admit({
       runId: "run-terminal",
       sessionId: "session-3",
@@ -114,6 +131,7 @@ async function testTerminalRecordsAreImmutable(): Promise<void> {
       }),
       RootRunLedgerTerminalStateError
     );
+    sessionLease.close();
   } finally {
     ledger?.close();
     await rm(workspaceRoot, { recursive: true, force: true });

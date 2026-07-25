@@ -118,8 +118,30 @@ export class TaskRunStore {
       throw new Error("Task storage .agent/tasks must be a real directory, not a symbolic link.");
     }
     const store = new TaskRunStore(canonicalRoot, canonicalTasks, { device: stat.dev, inode: stat.ino });
-    await store.recoverInterruptedRuns();
     return store;
+  }
+
+  async recoverInterruptedRuns(sessionId?: string): Promise<void> {
+    const snapshots = await this.list();
+    for (const snapshot of snapshots) {
+      if (sessionId !== undefined && snapshot.sessionId !== sessionId) continue;
+      if (snapshot.status !== "queued" && snapshot.status !== "running") continue;
+      await this.mutate(snapshot.taskRunId, (current) => {
+        if (current.status !== "queued" && current.status !== "running") return;
+        if (sessionId !== undefined && current.sessionId !== sessionId) return;
+        const now = new Date().toISOString();
+        for (const attempt of current.attempts) {
+          if (attempt.status !== "running") continue;
+          attempt.status = "incomplete";
+          attempt.endedAt = now;
+          attempt.stopReason = "runtime_restart";
+          attempt.error = "Runtime stopped before the attempt reached a terminal result.";
+        }
+        current.status = "continuable";
+        current.recovered = true;
+        current.terminalReason = "Runtime restarted before the task completed; the task can be continued.";
+      });
+    }
   }
 
   async create(options: CreateTaskRunOptions): Promise<TaskRunSnapshot> {
@@ -287,27 +309,6 @@ export class TaskRunStore {
     }
     snapshots.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.taskRunId.localeCompare(left.taskRunId));
     return snapshots.map(cloneSnapshot);
-  }
-
-  private async recoverInterruptedRuns(): Promise<void> {
-    const snapshots = await this.list();
-    for (const snapshot of snapshots) {
-      if (snapshot.status !== "queued" && snapshot.status !== "running") continue;
-      await this.mutate(snapshot.taskRunId, (current) => {
-        if (current.status !== "queued" && current.status !== "running") return;
-        const now = new Date().toISOString();
-        for (const attempt of current.attempts) {
-          if (attempt.status !== "running") continue;
-          attempt.status = "incomplete";
-          attempt.endedAt = now;
-          attempt.stopReason = "runtime_restart";
-          attempt.error = "Runtime stopped before the attempt reached a terminal result.";
-        }
-        current.status = "continuable";
-        current.recovered = true;
-        current.terminalReason = "Runtime restarted before the task completed; the task can be continued.";
-      });
-    }
   }
 
   private async mutate(

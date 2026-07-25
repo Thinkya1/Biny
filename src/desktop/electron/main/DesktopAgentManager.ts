@@ -13,6 +13,7 @@ import {
   type AgentRunOutcome,
   type InteractiveAgentRuntime
 } from "../../../runtime/InteractiveAgentRuntime.js";
+import { RootRunLedgerLeaseError } from "../../../runtime/RootRunLedger.js";
 import type { AgentHostEvent } from "../../../runtime/agentEvents.js";
 import type {
   DesktopAttachment,
@@ -451,6 +452,11 @@ export class DesktopAgentManager {
     this.runtimeInitializations.set(projectId, initialization);
     try {
       return await initialization;
+    } catch (error) {
+      const message = formatRuntimeInitializationError(error);
+      this.runtimeErrors.set(projectId, message);
+      if (error instanceof RootRunLedgerLeaseError) throw new Error(message);
+      throw error;
     } finally {
       if (this.runtimeInitializations.get(projectId) === initialization) this.runtimeInitializations.delete(projectId);
     }
@@ -473,6 +479,7 @@ export class DesktopAgentManager {
     const project = this.projects.requireProject(projectId);
     if (project.missing) throw new Error(`Project path is unavailable: ${project.path}`);
     await this.refreshOAuthCredentials(projectId);
+    // Project sessions share `<project>/.agent` with TUI/CLI. Attachments stay in desktop userData.
     const persistenceRoot = await this.projects.dataRoot(project);
     const runtime = await createInteractiveAgentRuntime(project.path, {
       persistenceRoot,
@@ -503,6 +510,7 @@ export class DesktopAgentManager {
       this.emit(projectId, event);
     });
     this.runtimes.set(projectId, { runtime, unsubscribe });
+    this.runtimeErrors.delete(projectId);
     return runtime;
   }
 
@@ -627,6 +635,13 @@ function formatModelConnectionError(error: unknown): string {
     parts.push(cause.message);
   }
   return parts.filter(Boolean).join(" · ") || "连接失败";
+}
+
+function formatRuntimeInitializationError(error: unknown): string {
+  if (error instanceof RootRunLedgerLeaseError) {
+    return `当前项目正在被另一个 Biny/CLI 会话占用（进程 ${String(error.pid)}）。请先退出该会话，或切换到其他项目后重试。`;
+  }
+  return error instanceof Error ? error.message : String(error);
 }
 
 function compactJsonError(body: string): string | undefined {

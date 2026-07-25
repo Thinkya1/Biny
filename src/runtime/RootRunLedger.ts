@@ -35,7 +35,8 @@ const maxMessageChars = 4_000;
 const maxRunRecords = 10_000;
 const runFilePrefix = "root-run-";
 const runFileSuffix = ".json";
-const leaseFileName = "interactive-runtime.lock";
+const sessionLeasePrefix = "session-";
+const sessionLeaseSuffix = ".lock";
 
 export type RootRunLedgerStatus = "queued" | "running" | "completed" | "incomplete" | "failed" | "aborted";
 
@@ -89,6 +90,7 @@ interface RuntimeLease {
   version: typeof ledgerVersion;
   runtimeId: string;
   pid: number;
+  sessionId: string;
   createdAt: string;
 }
 
@@ -100,11 +102,35 @@ export class RootRunLedgerTerminalStateError extends Error {
   }
 }
 
-/** Raised when another live interactive runtime owns the same persistence root. */
+/** Raised when another live interactive runtime owns the same session. */
 export class RootRunLedgerLeaseError extends Error {
-  constructor(pid: number) {
-    super(`Interactive runtime ledger is already owned by process ${String(pid)}.`);
+  readonly pid: number;
+  readonly sessionId: string | undefined;
+
+  constructor(pid: number, sessionId?: string) {
+    super(sessionId
+      ? `Session ${sessionId} is already owned by process ${String(pid)}.`
+      : `Interactive runtime ledger is already owned by process ${String(pid)}.`);
     this.name = "RootRunLedgerLeaseError";
+    this.pid = pid;
+    this.sessionId = sessionId;
+  }
+}
+
+export class RootRunLedgerSessionLease {
+  private closed = false;
+
+  constructor(
+    private readonly ledger: RootRunLedger,
+    readonly sessionId: string,
+    private readonly identity: FileIdentity,
+    private readonly runtimeId: string
+  ) {}
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.ledger.releaseSessionLease(this.sessionId, this.runtimeId, this.identity);
   }
 }
 
@@ -117,8 +143,7 @@ export class RootRunLedger {
   readonly runtimeId: string;
   readonly directoryPath: string;
   private readonly directoryIdentity: FileIdentity;
-  private readonly leasePath: string;
-  private leaseIdentity: FileIdentity | undefined;
+  private readonly sessionLeases = new Map<string, { identity: FileIdentity; runtimeId: string }>();
   private closed = false;
 
   private constructor(
@@ -130,7 +155,6 @@ export class RootRunLedger {
     this.directoryPath = directoryPath;
     this.directoryIdentity = directoryIdentity;
     this.runtimeId = runtimeId;
-    this.leasePath = path.join(directoryPath, leaseFileName);
   }
 
   static async open(persistenceRoot: string): Promise<RootRunLedger> {
@@ -156,12 +180,34 @@ export class RootRunLedger {
       fileIdentity(runsStat),
       randomUUID()
     );
+    return ledger;
+  }
+
+  /** Acquire the exclusive execution lease for one session. */
+  acquireSession(sessionId: string): RootRunLedgerSessionLease {
+    this.assertOpen();
+    assertSessionId(sessionId);
+    if (this.sessionLeases.has(sessionId)) throw new Error(`Session ${sessionId} is already leased by this runtime.`);
+    const leasePath = this.sessionLeasePath(sessionId);
+    let identity: FileIdentity | undefined;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        identity = this.writeSessionLease(leasePath, sessionId);
+        break;
+      } catch (error) {
+        if (!isErrorCode(error, "EEXIST")) throw error;
+        const existingLease = this.readLease(leasePath, sessionId);
+        if (isProcessAlive(existingLease.pid)) throw new RootRunLedgerLeaseError(existingLease.pid, sessionId);
+        this.retireStaleLease(leasePath);
+      }
+    }
+    if (!identity) throw new Error(`Could not acquire the session lease for ${sessionId} after repeated lock races.`);
+    this.sessionLeases.set(sessionId, { identity, runtimeId: this.runtimeId });
     try {
-      ledger.acquireLease();
-      ledger.recoverInterruptedRuns();
-      return ledger;
+      this.recoverInterruptedRuns(sessionId);
+      return new RootRunLedgerSessionLease(this, sessionId, identity, this.runtimeId);
     } catch (error) {
-      ledger.close();
+      this.releaseSessionLease(sessionId, this.runtimeId, identity);
       throw error;
     }
   }
@@ -169,6 +215,7 @@ export class RootRunLedger {
   admit(admission: RootRunLedgerAdmission): RootRunLedgerSnapshot {
     this.assertOpen();
     assertRunId(admission.runId);
+    this.assertSessionLease(admission.sessionId);
     assertNonEmptyValue(admission.sessionId, "session id");
     assertNonEmptyValue(admission.messageId, "message id");
     assertTimestamp(admission.queuedAt, "queuedAt");
@@ -269,19 +316,8 @@ export class RootRunLedger {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    const leaseIdentity = this.leaseIdentity;
-    this.leaseIdentity = undefined;
-    if (!leaseIdentity) return;
-    try {
-      this.assertDirectoryBinding();
-      const currentIdentity = this.existingFileIdentity(this.leasePath);
-      if (!currentIdentity || !sameIdentity(currentIdentity, leaseIdentity)) return;
-      const lease = this.readLease();
-      if (lease.runtimeId !== this.runtimeId) return;
-      unlinkSync(this.leasePath);
-    } catch {
-      // Never unlink an unexpected replacement lock. A stale lock is safe and
-      // will be reclaimed only after its owner pid is no longer alive.
+    for (const [sessionId, lease] of this.sessionLeases) {
+      this.releaseSessionLease(sessionId, lease.runtimeId, lease.identity);
     }
   }
 
@@ -301,6 +337,7 @@ export class RootRunLedger {
     assertTimestamp(details.at, "transition timestamp");
     if (details.durationMs !== undefined) assertDuration(details.durationMs);
     const record = this.readRecord(runId);
+    this.assertSessionLease(record.sessionId);
     if (isTerminal(record.status)) throw new RootRunLedgerTerminalStateError(runId, record.status);
     if (nextStatus === "running" && record.status !== "queued") {
       throw new Error(`Root run ${runId} cannot start from ${record.status}.`);
@@ -324,8 +361,8 @@ export class RootRunLedger {
     return cloneSnapshot(updated);
   }
 
-  private recoverInterruptedRuns(): void {
-    for (const record of this.listSnapshots()) {
+  private recoverInterruptedRuns(sessionId: string): void {
+    for (const record of this.listSnapshots().filter((candidate) => candidate.sessionId === sessionId)) {
       if (isTerminal(record.status)) continue;
       const endedAt = new Date().toISOString();
       this.abort(record.runId, {
@@ -337,39 +374,25 @@ export class RootRunLedger {
     }
   }
 
-  private acquireLease(): void {
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      try {
-        this.leaseIdentity = this.writeNewLease();
-        return;
-      } catch (error) {
-        if (!isErrorCode(error, "EEXIST")) throw error;
-        const existingLease = this.readLease();
-        if (isProcessAlive(existingLease.pid)) throw new RootRunLedgerLeaseError(existingLease.pid);
-        this.retireStaleLease();
-      }
-    }
-    throw new Error("Could not acquire the interactive runtime ledger lease after repeated lock races.");
-  }
-
-  private writeNewLease(): FileIdentity {
+  private writeSessionLease(leasePath: string, sessionId: string): FileIdentity {
     this.assertDirectoryBinding();
     const content = Buffer.from(JSON.stringify({
       version: ledgerVersion,
       runtimeId: this.runtimeId,
       pid: process.pid,
+      sessionId,
       createdAt: new Date().toISOString()
     } satisfies RuntimeLease));
     let descriptor: number | undefined;
     try {
-      descriptor = openSync(this.leasePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+      descriptor = openSync(leasePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
       fchmodSync(descriptor, 0o600);
       writeAll(descriptor, content);
       fsyncSync(descriptor);
       const stat = fstatSync(descriptor);
-      assertSafeRegularFile(stat, leaseFileName, maxLeaseBytes);
+      assertSafeRegularFile(stat, path.basename(leasePath), maxLeaseBytes);
       const identity = fileIdentity(stat);
-      const pathIdentity = this.fileIdentityAtPath(this.leasePath);
+      const pathIdentity = this.fileIdentityAtPath(leasePath);
       if (!sameIdentity(identity, pathIdentity)) throw new Error("Interactive runtime lease changed during creation.");
       return identity;
     } finally {
@@ -377,28 +400,55 @@ export class RootRunLedger {
     }
   }
 
-  private retireStaleLease(): void {
-    const identity = this.fileIdentityAtPath(this.leasePath);
-    const stalePath = path.join(this.directoryPath, `.interactive-runtime-stale-${Date.now()}-${randomBytes(8).toString("hex")}.json`);
-    renameSync(this.leasePath, stalePath);
+  private retireStaleLease(leasePath: string): void {
+    const identity = this.fileIdentityAtPath(leasePath);
+    const stalePath = path.join(this.directoryPath, `.${path.basename(leasePath)}.stale-${Date.now()}-${randomBytes(8).toString("hex")}.json`);
+    renameSync(leasePath, stalePath);
     const movedIdentity = this.fileIdentityAtPath(stalePath);
     if (!sameIdentity(identity, movedIdentity)) {
       throw new Error("Interactive runtime lease changed while reclaiming a stale lock.");
     }
   }
 
-  private readLease(): RuntimeLease {
-    const value = parseJson(this.readSecureFile(this.leasePath, maxLeaseBytes), "interactive runtime lease");
+  private readLease(leasePath: string, expectedSessionId: string): RuntimeLease {
+    const value = parseJson(this.readSecureFile(leasePath, maxLeaseBytes), "interactive runtime lease");
     if (!isRecord(value)) throw new Error("Interactive runtime lease is malformed.");
     const version = value.version;
     const runtimeId = value.runtimeId;
     const pid = value.pid;
+    const sessionId = value.sessionId;
     const createdAt = value.createdAt;
-    if (version !== ledgerVersion || typeof runtimeId !== "string" || !runtimeId || typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0 || typeof createdAt !== "string") {
+    if (version !== ledgerVersion || typeof runtimeId !== "string" || !runtimeId || typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0 || typeof sessionId !== "string" || sessionId !== expectedSessionId || typeof createdAt !== "string") {
       throw new Error("Interactive runtime lease is malformed.");
     }
     assertTimestamp(createdAt, "lease createdAt");
-    return { version: ledgerVersion, runtimeId, pid, createdAt };
+    return { version: ledgerVersion, runtimeId, pid, sessionId, createdAt };
+  }
+
+  releaseSessionLease(sessionId: string, runtimeId: string, identity: FileIdentity): void {
+    const owned = this.sessionLeases.get(sessionId);
+    if (!owned || owned.runtimeId !== runtimeId || !sameIdentity(owned.identity, identity)) return;
+    this.sessionLeases.delete(sessionId);
+    try {
+      const leasePath = this.sessionLeasePath(sessionId);
+      const currentIdentity = this.existingFileIdentity(leasePath);
+      if (!currentIdentity || !sameIdentity(currentIdentity, identity)) return;
+      const lease = this.readLease(leasePath, sessionId);
+      if (lease.runtimeId !== runtimeId) return;
+      unlinkSync(leasePath);
+    } catch {
+      // Never unlink an unexpected replacement lock. A stale lock is safe and
+      // will be reclaimed only after its owner pid is no longer alive.
+    }
+  }
+
+  private sessionLeasePath(sessionId: string): string {
+    assertSessionId(sessionId);
+    return path.join(this.directoryPath, `${sessionLeasePrefix}${sessionId}${sessionLeaseSuffix}`);
+  }
+
+  private assertSessionLease(sessionId: string): void {
+    if (!this.sessionLeases.has(sessionId)) throw new Error(`Session ${sessionId} is not exclusively leased by this runtime.`);
   }
 
   private readRecord(runId: string): RootRunLedgerSnapshot {
@@ -737,6 +787,12 @@ function isRunRecordFileName(value: string): boolean {
 
 function assertRunId(runId: string): void {
   if (!/^[A-Za-z0-9_-]{1,128}$/u.test(runId)) throw new Error(`Invalid root run id: ${runId}`);
+}
+
+function assertSessionId(sessionId: string): void {
+  if (!sessionId || sessionId === "." || sessionId === ".." || sessionId.length > 512 || sessionId.includes("\0") || sessionId.includes("/") || sessionId.includes("\\")) {
+    throw new Error(`Invalid root run session id: ${sessionId}`);
+  }
 }
 
 function assertNonEmptyValue(value: string, name: string): void {

@@ -563,7 +563,7 @@ function LoadingState(): React.JSX.Element {
 }
 
 function RuntimeError({ error }: { error: string }): React.JSX.Element {
-  return <div className="runtime-error-state"><Icon name="warning" size={22} /><h2>Agent Runtime 无法启动</h2><p>{error}</p><small>桌面端使用与 CLI、TUI 相同的 Provider 配置，请先修复共享配置后重试。</small></div>;
+  return <div className="runtime-error-state"><Icon name="warning" size={22} /><h2>Agent Runtime 无法启动</h2><p>{error}</p><small>如果提示另一个 Biny/CLI 会话占用，请先退出该会话或切换项目；其他错误请检查共享配置后重试。</small></div>;
 }
 
 function UnavailableFeature({ feature }: { feature: string }): React.JSX.Element {

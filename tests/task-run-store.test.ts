@@ -28,6 +28,7 @@ async function testInterruptedTaskBecomesContinuable(): Promise<void> {
     await store.startAttempt("recoverable-task", { attemptId: "attempt-1", attemptNumber: 1 });
 
     const reopened = await TaskRunStore.open(root);
+    await reopened.recoverInterruptedRuns();
     const snapshot = await reopened.get("recoverable-task");
     assert.equal(snapshot.status, "continuable");
     assert.equal(snapshot.recovered, true);
