@@ -28,28 +28,38 @@ const agentSchema = z.object({
 
 const permissionSchema = z.object({
   mode: z.enum(["safe", "ask", "read-only", "auto", "full-access"]).default("ask"),
-  allowTools: z.array(z.string()).default(["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search"]),
+  allowTools: z.array(z.string()).default(["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search", "save_memory"]),
   allowPaths: z.array(z.string()).default([]),
   denyPaths: z.array(z.string()).default([".env", ".env.local", ".ssh/", "node_modules/"]),
   criticalAlwaysAsk: z.boolean().default(true)
 }).default({
   mode: "ask",
-  allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search"],
+  allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search", "save_memory"],
   allowPaths: [],
   denyPaths: [".env", ".env.local", ".ssh/", "node_modules/"],
   criticalAlwaysAsk: true
 });
 
 const contextSchema = z.object({
-  maxInputTokens: z.number().int().min(2_048).max(65_536).default(24_000),
+  // 不配置时按当前模型的上下文窗口自动推导；配置了就作为额外上限。
+  maxInputTokens: z.number().int().min(2_048).max(2_000_000).optional(),
+  // A turn retains this much cumulative tool output in model context. Later
+  // results are archived under .agent/tool-results with a bounded preview.
+  maxTurnToolResultBytes: z.number().int().min(1_024).max(16 * 1024 * 1024).default(128 * 1024),
   instructionsMaxBytes: z.number().int().min(1_024).max(131_072).default(32 * 1024),
   memory: z.object({
-    enabled: z.boolean().default(true)
-  }).default({ enabled: true })
+    enabled: z.boolean().default(true),
+    // 任务成功后是否自动抽取一条记忆；关闭后仍可检索与手动 save_memory。
+    autoRemember: z.boolean().default(true),
+    // 每回合自动注入上下文的最大记忆条数。
+    maxRecalled: z.number().int().min(1).max(20).default(3),
+    // 记忆抽取/整理使用的模型别名；缺省跟随会话模型。
+    model: z.string().min(1).optional()
+  }).default({ enabled: true, autoRemember: true, maxRecalled: 3, model: undefined })
 }).default({
-  maxInputTokens: 24_000,
+  maxTurnToolResultBytes: 128 * 1024,
   instructionsMaxBytes: 32 * 1024,
-  memory: { enabled: true }
+  memory: { enabled: true, autoRemember: true, maxRecalled: 3, model: undefined }
 });
 
 export const modelProviderSchema = z.enum([
@@ -140,12 +150,25 @@ const modelPricingSchema = z.object({
 });
 
 const mcpServerSchema = z.object({
-  command: z.string().min(1),
+  type: z.enum(["stdio", "http"]).optional(),
+  command: z.string().min(1).optional(),
   args: z.array(z.string()).default([]),
   env: z.record(z.string()).optional(),
   cwd: z.string().min(1).optional(),
   stderr: z.enum(["ignore", "inherit", "pipe"]).default("ignore"),
+  url: z.string().url().optional(),
+  headers: z.record(z.string()).optional(),
+  timeoutMs: z.number().int().min(1_000).max(600_000).optional(),
   enabled: z.boolean().default(true)
+}).superRefine((server, context) => {
+  // type 省略时按字段推断：有 url 走 http，否则走 stdio。
+  const transport = server.type ?? (server.url ? "http" : "stdio");
+  if (transport === "stdio" && !server.command) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["command"], message: "stdio MCP server requires a command" });
+  }
+  if (transport === "http" && !server.url) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["url"], message: "http MCP server requires a url" });
+  }
 });
 
 export const defaultSubagentAllowedTools = [
@@ -168,7 +191,7 @@ const subagentToolNameSchema = z.enum(defaultSubagentAllowedTools);
 
 const extensionsSchema = z.object({
   mcp: z.record(mcpServerSchema).default({}),
-  skills: z.array(z.string().trim().min(1)).max(32).default([".agent/skills"]),
+  skills: z.array(z.string().trim().min(1)).max(32).default([".biny/skills", ".agent/skills"]),
   plugins: z.array(z.string().trim().min(1)).max(32).default([]),
   subagent: z.object({
     enabled: z.boolean().default(true),
@@ -179,7 +202,9 @@ const extensionsSchema = z.object({
     timeoutMs: z.number().int().min(1_000).max(600_000).default(300_000),
     model: z.string().min(1).optional(),
     maxCostUsd: z.number().positive().max(100).optional(),
-    allowedTools: z.array(subagentToolNameSchema).min(1).default([...defaultSubagentAllowedTools])
+    allowedTools: z.array(subagentToolNameSchema).min(1).default([...defaultSubagentAllowedTools]),
+    // 具名子代理定义目录（workspace 相对路径）；全局 ~/.biny/agents 始终生效。
+    agentPaths: z.array(z.string().trim().min(1)).max(32).default([".biny/agents", ".agent/agents"])
   }).default({
     enabled: true,
     maxSteps: 16,
@@ -189,11 +214,12 @@ const extensionsSchema = z.object({
     timeoutMs: 300_000,
     model: undefined,
     maxCostUsd: undefined,
-    allowedTools: [...defaultSubagentAllowedTools]
+    allowedTools: [...defaultSubagentAllowedTools],
+    agentPaths: [".biny/agents", ".agent/agents"]
   })
 }).default({
   mcp: {},
-  skills: [".agent/skills"],
+  skills: [".biny/skills", ".agent/skills"],
   plugins: [],
   subagent: {
     enabled: true,
@@ -204,33 +230,109 @@ const extensionsSchema = z.object({
     timeoutMs: 300_000,
     model: undefined,
     maxCostUsd: undefined,
-    allowedTools: [...defaultSubagentAllowedTools]
+    allowedTools: [...defaultSubagentAllowedTools],
+    agentPaths: [".biny/agents", ".agent/agents"]
   }
 });
 
 const webSearchSchema = z.object({
   enabled: z.boolean().default(true),
-  provider: z.enum(["duckduckgo", "brave", "anysearch"]).default("anysearch"),
+  provider: z.enum(["duckduckgo", "tavily", "brave", "anysearch"]).default("anysearch"),
+  apiKey: z.string().min(1).optional(),
   apiKeyEnv: z.string().min(1).optional(),
   timeoutMs: z.number().int().min(1_000).max(60_000).default(10_000),
   maxResults: z.number().int().min(1).max(10).default(5)
 }).default({
   enabled: true,
   provider: "duckduckgo",
+  apiKey: undefined,
   apiKeyEnv: undefined,
   timeoutMs: 10_000,
   maxResults: 5
 });
 
+const webFetchSchema = z.object({
+  enabled: z.boolean().default(true),
+  timeoutMs: z.number().int().min(1_000).max(120_000).default(15_000),
+  maxBytes: z.number().int().min(1_024).max(32 * 1024 * 1024).default(2 * 1024 * 1024),
+  maxRedirects: z.number().int().min(0).max(10).default(5),
+  // 只在用户明确要抓本机开发服务时开启：关掉的是私网/环回/云元数据地址的防线。
+  allowPrivateNetwork: z.boolean().default(false)
+}).default({
+  enabled: true,
+  timeoutMs: 15_000,
+  maxBytes: 2 * 1024 * 1024,
+  maxRedirects: 5,
+  allowPrivateNetwork: false
+});
+
+const hookSchema = z.object({
+  command: z.string().min(1),
+  /** 只对这些工具触发；留空表示全部。 */
+  tools: z.array(z.string().min(1)).max(32).default([]),
+  /** 只对这些扩展名的目标路径触发；留空表示不按扩展名过滤。 */
+  extensions: z.array(z.string().min(1).startsWith(".")).max(32).default([]),
+  timeoutMs: z.number().int().min(1_000).max(600_000).default(60_000)
+});
+
+const hooksSchema = z.object({
+  /** 工具执行前触发；非零退出会阻止这次调用。 */
+  beforeTool: z.array(hookSchema).max(16).default([]),
+  /** 工具执行后触发；输出附在结果上，退出码不影响调用结果。 */
+  afterTool: z.array(hookSchema).max(16).default([])
+}).default({ beforeTool: [], afterTool: [] });
+
+const sandboxSchema = z.object({
+  /**
+   * `workspace-write`：命令仍以当前用户权限运行，但内核层面只允许写工作区、临时目录和常见
+   * 缓存目录。这是独立于命令字符串判定的第二道边界。目前只有 macOS 有实现。
+   */
+  mode: z.enum(["off", "workspace-write"]).default("off"),
+  allowNetwork: z.boolean().default(true)
+}).default({ mode: "off", allowNetwork: true });
+
+const checkpointsSchema = z.object({
+  /** 每个回合首次改动工作区前自动建一个快照，供 /undo 回退。仅在 git 仓库内生效。 */
+  enabled: z.boolean().default(true)
+}).default({ enabled: true });
+
+const diagnosticsSchema = z.object({
+  enabled: z.boolean().default(true),
+  /** 自动识别项目本地已安装的检查工具（目前是 TypeScript）；只用本地二进制，不联网安装。 */
+  autoDetect: z.boolean().default(true),
+  autoDetectTimeoutMs: z.number().int().min(1_000).max(600_000).default(120_000),
+  maxOutputBytes: z.number().int().min(256).max(1024 * 1024).default(8 * 1024),
+  commands: z.array(z.object({
+    extensions: z.array(z.string().min(1).startsWith(".")).min(1).max(16),
+    command: z.string().min(1),
+    timeoutMs: z.number().int().min(1_000).max(600_000).default(120_000)
+  })).max(8).default([])
+}).default({
+  enabled: true,
+  autoDetect: true,
+  autoDetectTimeoutMs: 120_000,
+  maxOutputBytes: 8 * 1024,
+  commands: []
+});
+
 const webSchema = z.object({
-  search: webSearchSchema
+  search: webSearchSchema,
+  fetch: webFetchSchema
 }).default({
   search: {
     enabled: true,
     provider: "anysearch",
+    apiKey: undefined,
     apiKeyEnv: undefined,
     timeoutMs: 10_000,
     maxResults: 5
+  },
+  fetch: {
+    enabled: true,
+    timeoutMs: 15_000,
+    maxBytes: 2 * 1024 * 1024,
+    maxRedirects: 5,
+    allowPrivateNetwork: false
   }
 });
 
@@ -280,6 +382,10 @@ const canonicalConfigSchema = z.object({
     ignore: z.array(z.string())
   }),
   context: contextSchema,
+  diagnostics: diagnosticsSchema,
+  checkpoints: checkpointsSchema,
+  sandbox: sandboxSchema,
+  hooks: hooksSchema,
   web: webSchema,
   telemetry: z.object({
     enabled: z.boolean().default(true),
@@ -350,6 +456,15 @@ const canonicalConfigSchema = z.object({
     }
   }
 
+  const memoryAlias = config.context.memory.model;
+  if (memoryAlias && !config.models[memoryAlias]) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["context", "memory", "model"],
+      message: `Unknown memory model alias: ${memoryAlias}`
+    });
+  }
+
   const subagentAlias = config.extensions.subagent.model;
   if (subagentAlias) {
     const subagentModel = config.models[subagentAlias];
@@ -397,6 +512,12 @@ export type ModelReasoningConfig = z.infer<typeof thinkingSchema>;
 export type ModelPricing = z.infer<typeof modelPricingSchema>;
 export type McpServerConfig = z.infer<typeof mcpServerSchema>;
 export type ExtensionsConfig = z.infer<typeof extensionsSchema>;
+export type HookConfig = z.infer<typeof hookSchema>;
+export type HooksConfig = z.infer<typeof hooksSchema>;
+export type SandboxConfig = z.infer<typeof sandboxSchema>;
+export type CheckpointsConfig = z.infer<typeof checkpointsSchema>;
+export type DiagnosticsConfig = z.infer<typeof diagnosticsSchema>;
+export type WebFetchConfig = z.infer<typeof webFetchSchema>;
 export type WebSearchConfig = z.infer<typeof webSearchSchema>;
 export type WebConfig = z.infer<typeof webSchema>;
 
@@ -457,7 +578,7 @@ export const defaultConfig: AgentConfig = {
   },
   permission: {
     mode: "ask",
-    allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search"],
+    allowTools: ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "web_search", "save_memory"],
     allowPaths: [],
     denyPaths: [".env", ".env.local", ".ssh/", "node_modules/"],
     criticalAlwaysAsk: true
@@ -465,24 +586,42 @@ export const defaultConfig: AgentConfig = {
   workspace: {
     ignore: defaultWorkspaceIgnore
   },
+  checkpoints: { enabled: true },
+  sandbox: { mode: "off", allowNetwork: true },
+  hooks: { beforeTool: [], afterTool: [] },
+  diagnostics: {
+    enabled: true,
+    autoDetect: true,
+    autoDetectTimeoutMs: 120_000,
+    maxOutputBytes: 8 * 1024,
+    commands: []
+  },
   context: {
-    maxInputTokens: 24_000,
+    maxTurnToolResultBytes: 128 * 1024,
     instructionsMaxBytes: 32 * 1024,
-    memory: { enabled: true }
+    memory: { enabled: true, autoRemember: true, maxRecalled: 3, model: undefined }
   },
   web: {
     search: {
       enabled: true,
       provider: "anysearch",
+      apiKey: undefined,
       apiKeyEnv: undefined,
       timeoutMs: 10_000,
       maxResults: 5
+    },
+    fetch: {
+      enabled: true,
+      timeoutMs: 15_000,
+      maxBytes: 2 * 1024 * 1024,
+      maxRedirects: 5,
+      allowPrivateNetwork: false
     }
   },
   telemetry: { enabled: true, recordInputs: false, recordOutputs: false },
   extensions: {
     mcp: {},
-    skills: [".agent/skills"],
+    skills: [".biny/skills", ".agent/skills"],
     plugins: [],
     subagent: {
       enabled: true,
@@ -493,7 +632,8 @@ export const defaultConfig: AgentConfig = {
       timeoutMs: 300_000,
       model: undefined,
       maxCostUsd: undefined,
-      allowedTools: [...defaultSubagentAllowedTools]
+      allowedTools: [...defaultSubagentAllowedTools],
+      agentPaths: [".biny/agents", ".agent/agents"]
     }
   }
 };
