@@ -20,6 +20,9 @@ import {
   sameOptionalFileSnapshot,
   type FileSnapshot
 } from "../tools/file/safeFileIo.js";
+import { readToolResultToolName } from "../tools/file/readToolResult.js";
+import { DiagnosticsRunner, formatDiagnostics } from "../tools/diagnostics.js";
+import { HookRunner } from "../tools/hooks.js";
 import { validateJsonSchema } from "../tools/schema.js";
 import { ToolScheduler } from "../tools/scheduler.js";
 import type {
@@ -32,6 +35,8 @@ import type {
   ToolSource
 } from "../tools/types.js";
 import { resolveWorkspacePath, toWorkspaceRelative } from "../workspace/resolvePath.js";
+import type { ReasoningBlock } from "../session/recorder.js";
+import { archiveToolResult, serializeToolResult, toolResultPreview } from "../session/toolResultArchive.js";
 import type { AgentPermissionRequest, AgentPermissionResult, AgentRuntimeContext, AgentSessionEvent } from "./types.js";
 
 interface ToolExecutionOutcome {
@@ -65,10 +70,14 @@ interface FailedPreparedToolCall {
 }
 
 const externalToolAbortDrainMs = 500;
+const maxArchivedPreviewCharacters = 8_192;
 
 export interface AgentStepContext {
   assistantContent?: string;
   reasoningContent?: string;
+  reasoningProviderOptions?: Record<string, unknown>;
+  /** Individually signed reasoning blocks for this step, in provider order. */
+  reasoningBlocks?: ReasoningBlock[];
 }
 
 export class SdkToolExecutionCoordinator {
@@ -80,6 +89,14 @@ export class SdkToolExecutionCoordinator {
   private readonly duplicateExecutionCounts = new Map<string, number>();
   private permissionTail: Promise<void> = Promise.resolve();
   private fallbackSequence = 0;
+  /** Bytes actually handed back to the model this turn; drives the budget. */
+  private inlineToolResultBytes = 0;
+  /** Bytes tools produced this turn, archived or not; reported for diagnostics. */
+  private producedToolResultBytes = 0;
+  private readonly diagnostics: DiagnosticsRunner | undefined;
+  private readonly hooks: HookRunner;
+  /** 本回合是否已建过快照；每回合只建一个，建在第一次真正改动之前。 */
+  private checkpointTaken = false;
 
   constructor(
     private readonly context: AgentRuntimeContext,
@@ -88,6 +105,10 @@ export class SdkToolExecutionCoordinator {
     private readonly getStepContext: () => AgentStepContext = () => ({}),
     private readonly allowedToolNames?: ReadonlySet<string>
   ) {
+    this.diagnostics = context.config.diagnostics.enabled
+      ? new DiagnosticsRunner(context.workspaceRoot, context.config.diagnostics)
+      : undefined;
+    this.hooks = new HookRunner(context.workspaceRoot, context.config.hooks);
     this.admissionScheduler = new ToolScheduler({
       maxConcurrency: context.config.agent.maxConcurrentTools,
       maxQueuedTasks: context.config.agent.maxQueuedToolCalls
@@ -141,7 +162,9 @@ export class SdkToolExecutionCoordinator {
         toolCallId,
         sequence,
         assistantContent: stepContext.assistantContent,
-        reasoningContent: stepContext.reasoningContent
+        reasoningContent: stepContext.reasoningContent,
+        reasoningProviderOptions: stepContext.reasoningProviderOptions,
+        reasoningBlocks: stepContext.reasoningBlocks
       });
       this.emit({ type: "tool-started", toolCallId, tool: toolName, args: input });
       return await this.finishSyntheticCall(call, sequence, { error: errorMessage }, errorMessage);
@@ -160,7 +183,9 @@ export class SdkToolExecutionCoordinator {
         toolCallId,
         sequence,
         assistantContent: this.getStepContext().assistantContent,
-        reasoningContent: this.getStepContext().reasoningContent
+        reasoningContent: this.getStepContext().reasoningContent,
+        reasoningProviderOptions: this.getStepContext().reasoningProviderOptions,
+        reasoningBlocks: this.getStepContext().reasoningBlocks
       });
       this.context.recorder.record({ type: "tool_result", tool: toolName, result, toolCallId, sequence });
       this.emit({ type: "error", message: result.error, recorded: true, fatal: false });
@@ -191,7 +216,9 @@ export class SdkToolExecutionCoordinator {
       toolCallId: call.id,
       sequence,
       assistantContent: stepContext.assistantContent,
-      reasoningContent: stepContext.reasoningContent
+      reasoningContent: stepContext.reasoningContent,
+      reasoningProviderOptions: stepContext.reasoningProviderOptions,
+      reasoningBlocks: stepContext.reasoningBlocks
     });
     let toolResultRecorded = false;
     const finish = async (result: unknown, errorMessage?: string): Promise<unknown> => {
@@ -305,18 +332,24 @@ export class SdkToolExecutionCoordinator {
               const approvedFile = permissionSnapshot.baseline && permissionSnapshot.targetPath
                 ? { path: permissionSnapshot.targetPath, snapshot: permissionSnapshot.baseline.snapshot }
                 : undefined;
+              const blocked = await this.runBeforeToolHooks(call.name, prepared.args, signal);
+              if (blocked) return blocked;
+              await this.ensureCheckpoint(toolDefinition.risk, call.name);
               return await this.executeResolvedTool(call, prepared.execution, source, signal, approvedFile);
             }
           });
           const result = attachPermissionPreview(outcome.result, outcome.permissionRequest ?? permissionRequest);
+          const diagnosed = await this.attachDiagnostics(toolDefinition.risk, prepared.args, result, outcome.errorMessage, signal);
+          const hooked = await this.attachAfterToolHooks(call.name, prepared.args, diagnosed, signal);
+          const modelResult = await this.applyToolResultBudget(call, sequence, hooked);
           toolResultRecorded = true;
-          this.context.recorder.record({ type: "tool_result", tool: call.name, result, toolCallId: call.id, sequence });
-          this.context.contextMemory?.observeToolResult(call.name, call.args, result);
+          this.context.recorder.record({ type: "tool_result", tool: call.name, result: modelResult, toolCallId: call.id, sequence });
+          this.context.contextMemory?.observeToolResult(call.name, call.args, modelResult);
           if (outcome.errorMessage) {
             this.context.recorder.record({ type: "error", message: outcome.errorMessage });
             this.emit({ type: "error", message: outcome.errorMessage, recorded: true, fatal: false });
           }
-          return result;
+          return modelResult;
         }
       });
     } catch (error) {
@@ -328,13 +361,158 @@ export class SdkToolExecutionCoordinator {
   }
 
   private async finishSyntheticCall(call: { id: string; name: string; args: unknown }, sequence: number, result: unknown, errorMessage?: string): Promise<unknown> {
-    this.context.recorder.record({ type: "tool_result", tool: call.name, result, toolCallId: call.id, sequence });
-    this.context.contextMemory?.observeToolResult(call.name, call.args, result);
+    const modelResult = await this.applyToolResultBudget(call, sequence, result);
+    this.context.recorder.record({ type: "tool_result", tool: call.name, result: modelResult, toolCallId: call.id, sequence });
+    this.context.contextMemory?.observeToolResult(call.name, call.args, modelResult);
     if (errorMessage) {
       this.context.recorder.record({ type: "error", message: errorMessage });
       this.emit({ type: "error", message: errorMessage, recorded: true, fatal: false });
     }
-    return result;
+    return modelResult;
+  }
+
+  /**
+   * The SDK retains every returned value until the ToolLoopAgent finishes the
+   * turn. Keep the first bounded slice of useful results inline, then preserve
+   * later outputs durably instead of letting ordinary repository inspection
+   * overflow the provider context window.
+   *
+   * The budget bounds what actually reaches the model, so an archived result's
+   * own envelope and preview are charged against it too. Once the budget is
+   * spent, later results collapse to a bare reference the model can reopen with
+   * `read_tool_result` — otherwise a long turn would still accumulate one
+   * preview per step and overflow the window it was meant to protect.
+   */
+  private async applyToolResultBudget(
+    call: { id: string; name: string },
+    sequence: number,
+    result: unknown
+  ): Promise<unknown> {
+    const budget = this.context.config.context.maxTurnToolResultBytes;
+    const output = serializeToolResult(result);
+    const resultBytes = Buffer.byteLength(output, "utf8");
+    this.producedToolResultBytes += resultBytes;
+    const remaining = Math.max(0, budget - this.inlineToolResultBytes);
+    if (resultBytes <= remaining || call.name === readToolResultToolName) {
+      this.inlineToolResultBytes += resultBytes;
+      return result;
+    }
+
+    const envelope = await this.archivedToolResultEnvelope(call, sequence, result, output, resultBytes, remaining);
+    this.inlineToolResultBytes += Buffer.byteLength(serializeToolResult(envelope), "utf8");
+    return envelope;
+  }
+
+  private async archivedToolResultEnvelope(
+    call: { id: string; name: string },
+    sequence: number,
+    result: unknown,
+    output: string,
+    resultBytes: number,
+    remaining: number
+  ): Promise<Record<string, unknown>> {
+    // 预算耗尽后连摘要都不再放行，只留引用；否则每步一个 preview 仍会把窗口撑爆。
+    const preview = toolResultPreview(output, Math.min(remaining, maxArchivedPreviewCharacters));
+    const shared = {
+      archived: true,
+      resultBytes,
+      producedResultBytes: this.producedToolResultBytes,
+      turnBudgetBytes: this.context.config.context.maxTurnToolResultBytes,
+      ...(preview ? { preview } : {})
+    };
+    try {
+      const archived = await archiveToolResult({
+        workspaceRoot: this.context.workspaceRoot,
+        sessionId: this.context.recorder.sessionId,
+        toolCallId: call.id,
+        sequence,
+        tool: call.name,
+        result,
+        output
+      });
+      return {
+        ...shared,
+        archivePath: archived.archivePath,
+        summary: `Tool result exceeded the ${String(this.context.config.context.maxTurnToolResultBytes)} byte turn output budget and was archived. Call read_tool_result with archivePath "${archived.archivePath}" to read it.`
+      };
+    } catch (error) {
+      return {
+        ...shared,
+        archiveError: formatToolError(call.name, error),
+        summary: "Tool result exceeded the turn output budget and could not be archived; it is not recoverable."
+      };
+    }
+  }
+
+  /**
+   * 执行前钩子。任一条非零退出就阻止这次调用，并把它的输出作为拒绝理由回给模型 —— 模型
+   * 需要知道为什么被拦，否则只会原样重试。
+   */
+  private async runBeforeToolHooks(tool: string, args: unknown, signal?: AbortSignal): Promise<ToolExecutionOutcome | undefined> {
+    if (!this.hooks.hasHooks("beforeTool")) return undefined;
+    const outcomes = await this.hooks.run("beforeTool", { tool, path: mutatedFilePath(args) ?? "" }, signal);
+    const failed = outcomes.find((outcome) => outcome.exitCode !== 0);
+    if (!failed) return undefined;
+    const message = `Blocked by a configured beforeTool hook (${failed.command}): ${failed.output || `exit ${String(failed.exitCode)}`}`;
+    return { result: { status: "blocked_by_hook", hook: failed.command, exitCode: failed.exitCode, output: failed.output }, errorMessage: message };
+  }
+
+  /** 执行后钩子的输出只作为附加信息；它的退出码不改变这次调用的成败。 */
+  private async attachAfterToolHooks(tool: string, args: unknown, result: unknown, signal?: AbortSignal): Promise<unknown> {
+    if (!this.hooks.hasHooks("afterTool")) return result;
+    try {
+      const outcomes = await this.hooks.run("afterTool", { tool, path: mutatedFilePath(args) ?? "" }, signal);
+      if (!outcomes.length) return result;
+      return typeof result === "object" && result !== null && !Array.isArray(result)
+        ? { ...result as Record<string, unknown>, hooks: outcomes }
+        : { result, hooks: outcomes };
+    } catch {
+      return result;
+    }
+  }
+
+  /**
+   * 本回合第一次真正改动工作区之前建一个快照。
+   *
+   * 建在权限通过之后、执行之前：用户拒绝的调用不该留下快照，而一旦要执行就必须先有退路。
+   * 建快照失败不能挡住工具执行 —— 没有 git 仓库是常态，为此拒绝干活是本末倒置。
+   */
+  private async ensureCheckpoint(risk: ToolRisk | undefined, toolName: string): Promise<void> {
+    if (this.checkpointTaken || risk !== "write" || !this.context.createCheckpoint) return;
+    this.checkpointTaken = true;
+    try {
+      await this.context.createCheckpoint(`before ${toolName}`);
+    } catch {
+      // 快照不可用时静默继续；/undo 会告诉用户没有可回退的点。
+    }
+  }
+
+  /**
+   * 写入类工具成功后跑一次项目自己的检查，把结果挂在该次工具结果上。
+   *
+   * 只在成功路径上跑：失败的编辑没改动文件，跑检查只是浪费时间并可能报告上一次的旧错误。
+   * 诊断自身出错也不能影响工具结果 —— 它是附加信息，不是这次调用的成败依据。
+   */
+  private async attachDiagnostics(
+    risk: ToolRisk | undefined,
+    args: unknown,
+    result: unknown,
+    errorMessage: string | undefined,
+    signal?: AbortSignal
+  ): Promise<unknown> {
+    if (!this.diagnostics || errorMessage || risk !== "write") return result;
+    const targetPath = mutatedFilePath(args);
+    if (!targetPath) return result;
+    try {
+      const outcome = await this.diagnostics.run(targetPath, signal);
+      if (!outcome) return result;
+      const diagnostics = formatDiagnostics(outcome);
+      return typeof result === "object" && result !== null && !Array.isArray(result)
+        ? { ...result as Record<string, unknown>, diagnostics }
+        : { result, diagnostics };
+    } catch {
+      return result;
+    }
   }
 
   private async prepareToolCall(
@@ -717,4 +895,15 @@ function attachToolSummary(result: unknown, durationMs: number): unknown {
   const stderr = typeof record.stderr === "string" ? record.stderr : "";
   const output = [stdout, stderr].filter(Boolean).join("\n");
   return { ...record, durationMs, outputLines: output ? output.split(/\r?\n/).length : undefined, truncated: false };
+}
+
+/** 写入类工具统一用 `path`（move_file 用 `from`/`to`）表达目标；取不到就不跑诊断。 */
+function mutatedFilePath(args: unknown): string | undefined {
+  if (typeof args !== "object" || args === null) return undefined;
+  const record = args as Record<string, unknown>;
+  for (const key of ["path", "to", "from"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return undefined;
 }
