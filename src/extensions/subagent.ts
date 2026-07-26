@@ -22,11 +22,13 @@ import type { ToolRegistry } from "../tools/registry.js";
 import { ToolScheduler } from "../tools/scheduler.js";
 import type { Tool, ToolExecution } from "../tools/types.js";
 import { filterProtectedGitDiff, isProtectedCredentialPath, redactSecrets } from "../utils/secrets.js";
+import { findSubagentDefinition, type SubagentDefinition } from "./agents.js";
 
 const subagentParameters = {
   type: "object" as const,
   properties: {
-    task: { type: "string" as const, description: "A focused repository task for the subagent, including implementation and finite validation when needed." }
+    task: { type: "string" as const, description: "A focused repository task for the subagent, including implementation and finite validation when needed." },
+    agent: { type: "string" as const, description: "Optional named subagent definition to run this task with (see the named subagents list). Omit for the default bounded subagent." }
   },
   required: ["task"],
   additionalProperties: false
@@ -53,32 +55,41 @@ const maxSubagentTextChars = 64_000;
 export interface SubagentOptions {
   workspaceRoot: string;
   config: AgentConfig;
-  getModelSettings: () => ModelSettings;
+  /** 不带别名时返回 subagent 默认模型设置；带别名时返回该模型别名的设置（用于具名定义的 model 覆盖）。 */
+  getModelSettings: (modelAlias?: string) => ModelSettings;
+  getAccessMode: () => SubagentAccessMode;
   getParentRunId?: () => string | undefined;
+  /** 每次委派时重新读取具名定义，允许会话期间编辑生效（对齐 pi）。 */
+  loadAgentDefinitions?: () => Promise<SubagentDefinition[]>;
   toolRegistry: ToolRegistry;
   onUsage?: ModelUsageObserver;
 }
 
-export function createSubagentTool(options: SubagentOptions, taskManager: SubagentTaskManager): Tool<{ task: string }, string> {
+export function createSubagentTool(options: SubagentOptions, taskManager: SubagentTaskManager): Tool<{ task: string; agent?: string }, string> {
   return {
     name: "delegate_task",
-    description: "Delegate a focused repository investigation, implementation, repair, or finite validation task to a bounded subagent.",
+    description: "Delegate a focused repository investigation, implementation, repair, or finite validation task to a bounded subagent. Pass agent to run a named subagent definition.",
     parameters: subagentParameters,
-    schema: z.object({ task: z.string().min(1).max(20_000) }),
+    schema: z.object({ task: z.string().min(1).max(20_000), agent: z.string().trim().min(1).max(64).optional() }),
     source: "subagent",
     capability: "subagent.workspace",
     risk: "execute",
     resolveExecution(args) {
       return {
         accesses: ToolAccesses.all(),
-        display: { kind: "generic", summary: "Delegate repository task", detail: args.task },
+        display: {
+          kind: "generic",
+          summary: args.agent ? `Delegate to subagent ${args.agent}` : "Delegate repository task",
+          detail: args.task
+        },
         description: "Runs a bounded workspace subagent with an explicit local-tool allowlist and restricted validation commands.",
         approvalRule: "delegate_task",
         async execute(context): Promise<string> {
           return await taskManager.run(args.task, {
             parentRunId: options.getParentRunId?.() ?? context.toolCallId,
             signal: context.signal,
-            accessMode: "workspace"
+            accessMode: options.getAccessMode(),
+            agent: args.agent
           });
         }
       };
@@ -91,18 +102,26 @@ export async function runSubagentTask(
   options: SubagentOptions,
   task: string,
   signal?: AbortSignal,
-  accessMode: SubagentAccessMode = "read-only"
+  accessMode: SubagentAccessMode = "read-only",
+  agentName?: string
 ): Promise<string> {
   const settings = options.config.extensions.subagent;
-  const modelSettings = options.getModelSettings();
+  const definition = await resolveSubagentDefinition(options, agentName);
+  const modelSettings = options.getModelSettings(definition?.model);
+  const modelAlias = definition?.model ?? settings.model ?? options.config.defaultModel;
   const scheduler = new ToolScheduler<unknown>({
     maxConcurrency: options.config.agent.maxConcurrentTools,
     maxQueuedTasks: options.config.agent.maxQueuedToolCalls
   });
-  const tools = createSubagentTools(options.toolRegistry, settings.allowedTools, { accessMode, scheduler });
+  // 具名定义的 tools 只做收窄：始终与全局 allowedTools 求交集，不能放宽安全边界。
+  const allowedTools = definition?.tools
+    ? settings.allowedTools.filter((toolName) => definition.tools?.includes(toolName))
+    : settings.allowedTools;
+  const tools = createSubagentTools(options.toolRegistry, allowedTools, { accessMode, scheduler });
   const costBudgetStop: StopCondition<ToolSet> = ({ steps }) => subagentCostBudgetReached(
     options.config,
-    steps.map((step) => step.usage)
+    steps.map((step) => step.usage),
+    modelAlias
   );
   const agent = new ToolLoopAgent<never, ToolSet>({
     model: modelSettings.model,
@@ -114,14 +133,16 @@ export async function runSubagentTask(
         : "Inspect the repository using only the available local read/search/git inspection tools.",
       "Never request secrets, credentials, environment files, agent.config.json, network access, long-running processes, or another subagent.",
       "Use run_command only for finite allowlisted build, test, lint, and typecheck commands.",
-      "Return concise grounded findings with exact paths, changes, and validation evidence."
+      "Return concise grounded findings with exact paths, changes, and validation evidence.",
+      // 具名定义的正文追加在守护约束之后：角色可以细化行为，但不能覆盖安全边界。
+      ...(definition ? ["", `Named subagent role "${definition.name}":`, definition.prompt] : [])
     ].join("\n"),
     stopWhen: [stepCountIs(subagentStepBudget(task, settings.maxSteps)), costBudgetStop],
     maxRetries: modelSettings.maxRetries,
     providerOptions: modelSettings.providerOptions,
     reasoning: modelSettings.reasoning,
     timeout: modelSettings.timeoutMs,
-    maxOutputTokens: subagentMaxOutputTokens(options.config, modelSettings.maxOutputTokens),
+    maxOutputTokens: subagentMaxOutputTokens(options.config, modelSettings.maxOutputTokens, modelAlias),
     telemetry: createSdkTelemetry(options.config, options.workspaceRoot, "biny.subagent"),
     onError: () => undefined
   } as ToolLoopAgentSettings<never, ToolSet> & { onError: () => undefined });
@@ -133,13 +154,35 @@ export async function runSubagentTask(
     result.steps
   ]);
   if (signal?.aborted) throw abortReason(signal);
-  const modelAlias = settings.model ?? options.config.defaultModel;
   await options.onUsage?.(usage, "subagent", modelAlias);
-  enforceSubagentCostBudget(options.config, usage);
+  enforceSubagentCostBudget(options.config, usage, modelAlias);
   if (finalStep.finishReason !== "stop") {
+    // 步数/成本预算把循环截停在「还想继续调用工具」的状态时，返回带明确标注的
+    // 部分结论，而不是把已完成的调查全部丢掉；其余异常收尾仍按失败抛出。
+    if (finalStep.finishReason === "tool-calls") {
+      return redactSecrets(formatPartialSubagentOutput(steps));
+    }
     throw new Error(`Subagent did not reach a terminal model stop after ${String(steps.length)} steps (finishReason=${finalStep.finishReason}).`);
   }
   return redactSecrets(text);
+}
+
+function formatPartialSubagentOutput(steps: ReadonlyArray<{ text: string }>): string {
+  const collected = steps.map((step) => step.text.trim()).filter(Boolean);
+  const note = `[Partial result: the bounded subagent budget ran out after ${String(steps.length)} steps while it was still requesting tools. Treat the findings below as incomplete; narrow the task or raise extensions.subagent.maxSteps for full coverage.]`;
+  if (!collected.length) return `${note}\n\n(The subagent produced no findings text before the budget ran out.)`;
+  return [note, ...collected].join("\n\n");
+}
+
+async function resolveSubagentDefinition(options: SubagentOptions, agentName?: string): Promise<SubagentDefinition | undefined> {
+  if (!agentName) return undefined;
+  const definitions = await options.loadAgentDefinitions?.() ?? [];
+  const definition = findSubagentDefinition(definitions, agentName);
+  if (!definition) {
+    const known = definitions.map((entry) => entry.name).join(", ") || "none";
+    throw new Error(`Unknown named subagent: ${agentName}. Available definitions: ${known}.`);
+  }
+  return definition;
 }
 
 export interface CreateSubagentToolsOptions {
@@ -195,10 +238,10 @@ export function subagentStepBudget(task: string, configuredMaximum: number): num
   return Math.min(configuredMaximum, 8);
 }
 
-export function enforceSubagentCostBudget(config: AgentConfig, usage: LanguageModelUsage): void {
+export function enforceSubagentCostBudget(config: AgentConfig, usage: LanguageModelUsage, modelAlias?: string): void {
   const budget = config.extensions.subagent.maxCostUsd;
   if (budget === undefined) return;
-  const alias = subagentModelAlias(config);
+  const alias = modelAlias ?? subagentModelAlias(config);
   const cost = calculateUsageCost(usageSnapshot(usage), config.models[alias]?.pricing);
   if (!cost.known || cost.costUsd === undefined) {
     throw new Error(`Cannot enforce the subagent cost stop threshold for ${alias}: model pricing is incomplete.`);
@@ -208,10 +251,10 @@ export function enforceSubagentCostBudget(config: AgentConfig, usage: LanguageMo
   }
 }
 
-export function subagentCostBudgetReached(config: AgentConfig, usages: readonly LanguageModelUsage[]): boolean {
+export function subagentCostBudgetReached(config: AgentConfig, usages: readonly LanguageModelUsage[], modelAlias?: string): boolean {
   const budget = config.extensions.subagent.maxCostUsd;
   if (budget === undefined) return false;
-  const alias = subagentModelAlias(config);
+  const alias = modelAlias ?? subagentModelAlias(config);
   const pricing = config.models[alias]?.pricing;
   let totalCostUsd = 0;
   for (const usage of usages) {
@@ -224,11 +267,11 @@ export function subagentCostBudgetReached(config: AgentConfig, usages: readonly 
   return totalCostUsd >= budget;
 }
 
-export function subagentMaxOutputTokens(config: AgentConfig, modelMaxOutputTokens?: number): number {
+export function subagentMaxOutputTokens(config: AgentConfig, modelMaxOutputTokens?: number, modelAlias?: string): number {
   const settings = config.extensions.subagent;
   const configuredLimit = Math.min(settings.maxOutputTokens, modelMaxOutputTokens ?? settings.maxOutputTokens);
   if (settings.maxCostUsd === undefined) return configuredLimit;
-  const outputPrice = config.models[subagentModelAlias(config)]?.pricing?.outputPerMillionTokens;
+  const outputPrice = config.models[modelAlias ?? subagentModelAlias(config)]?.pricing?.outputPerMillionTokens;
   if (outputPrice === undefined) throw new Error("Cannot derive the subagent output limit from the cost stop threshold: model output pricing is incomplete.");
   if (outputPrice === 0) return configuredLimit;
   const budgetTokenLimit = Math.max(1, Math.floor((settings.maxCostUsd * 1_000_000) / outputPrice));

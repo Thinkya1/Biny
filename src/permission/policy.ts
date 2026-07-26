@@ -11,6 +11,7 @@ import path from "node:path";
 
 export type ToolName =
   | "read_file"
+  | "read_tool_result"
   | "write_file"
   | "edit_file"
   | "multi_edit"
@@ -22,13 +23,16 @@ export type ToolName =
   | "grep_search"
   | "git_status"
   | "git_diff"
+  | "git_commit"
   | "run_command"
   | "start_process"
   | "process_status"
   | "read_process_output"
   | "stop_process"
   | "list_processes"
-  | "web_search";
+  | "web_search"
+  | "web_fetch"
+  | "update_todos";
 
 export interface AnalyzePermissionInput {
   toolName: string;
@@ -57,6 +61,16 @@ export function analyzePermissionRequest(input: AnalyzePermissionInput): Permiss
       actionType: "read",
       riskLevel: "low",
       reason: "searches or lists workspace files"
+    };
+  }
+
+  if (input.toolName === "git_commit") {
+    // 提交会改写仓库历史，且默认分支上不可静默撤销，始终按高风险确认。
+    return {
+      ...base(input),
+      actionType: "git",
+      riskLevel: "high",
+      reason: "creates a git commit in this repository"
     };
   }
 
@@ -123,12 +137,82 @@ export function analyzePermissionRequest(input: AnalyzePermissionInput): Permiss
     };
   }
 
+  if (input.toolName === "update_todos") {
+    // 只写会话自己的计划清单，不碰工作区，也不触发任何外部动作。
+    return {
+      ...base(input),
+      actionType: "read",
+      riskLevel: "low",
+      reason: "records the assistant's own plan for this session"
+    };
+  }
+
+  if (input.toolName === "web_fetch") {
+    // 目标地址已过私网/环回/云元数据校验，与 web_search 同级：只读、不改本地状态。
+    return {
+      ...base(input),
+      actionType: "read",
+      riskLevel: "low",
+      reason: "fetches a public web page without changing local state"
+    };
+  }
+
   if (input.toolName === "web_search") {
     return {
       ...base(input),
       actionType: "read",
       riskLevel: "low",
       reason: "searches the public web without changing local state"
+    };
+  }
+
+  if (input.toolName === "invoke_skill") {
+    // 技能文件在启动时已通过路径/软链/硬链校验，按内置只读工具放行。
+    return {
+      ...base(input),
+      actionType: "read",
+      riskLevel: "low",
+      reason: "loads validated local skill instructions"
+    };
+  }
+
+  if (input.toolName === "recall_memory") {
+    // 记忆检索只读取 .agent/memory 内经过校验的本地文件。
+    return {
+      ...base(input),
+      actionType: "read",
+      riskLevel: "low",
+      reason: "searches the durable local project memory store"
+    };
+  }
+
+  if (input.toolName === "save_memory") {
+    // 只写入 .agent/memory 存储（自动记忆抽取本就在无确认路径上写同一存储）。
+    return {
+      ...base(input),
+      actionType: "write",
+      riskLevel: "low",
+      reason: "saves a redacted note to the durable local project memory store"
+    };
+  }
+
+  if (input.toolName === "read_tool_result") {
+    // 归档引用只指向本会话自己产出的工具结果，取回不比原始调用多暴露任何东西。
+    return {
+      ...base(input),
+      actionType: "read",
+      riskLevel: "low",
+      reason: "reads a tool result this session archived out of context"
+    };
+  }
+
+  if (input.toolName === "mcp_list_resources" || input.toolName === "mcp_read_resource") {
+    // MCP resources 是协议层只读数据，与 web_search 同级放行。
+    return {
+      ...base(input),
+      actionType: "read",
+      riskLevel: "low",
+      reason: "reads read-only resources exposed by connected MCP servers"
     };
   }
 
