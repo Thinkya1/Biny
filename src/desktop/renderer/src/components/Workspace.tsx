@@ -1,3 +1,9 @@
+/**
+ * 主工作区：左侧对话时间线 + 右侧文件面板，中间是可拖动的分隔条。
+ *
+ * 面板宽度经 `clampFilePanelWidth` 收敛，和主进程用同一套上下限，保证拖动结果与重启后一致。
+ * 文件预览的高亮和类型角标都复用渲染层的公共模块。
+ */
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
 import type {
@@ -14,6 +20,7 @@ import { AppIcon } from "./AppIcon.js";
 import { CopyButton } from "./CopyButton.js";
 import { Icon } from "./Icon.js";
 import { MessageTimeline } from "./MessageTimeline.js";
+import { TerminalView } from "./TerminalView.js";
 
 interface WorkspaceProps {
   filePanelResizing: boolean;
@@ -25,7 +32,6 @@ interface WorkspaceProps {
   turns: TimelineTurn[];
   loading: boolean;
   runtimeError?: string;
-  unavailableFeature?: string;
   onOpenProject(): void;
   onFilePanelResizeEnd(width: number): void;
   onFilePanelResizeStart(): void;
@@ -34,7 +40,7 @@ interface WorkspaceProps {
   onListDirectory(path: string): Promise<DesktopWorkspaceDirectory>;
   onReadFile(path: string): Promise<DesktopWorkspaceFilePreview>;
   onOpenFile(path: string): void;
-  onOpenTerminal(): void;
+  onOpenExternal(url: string): void;
   onPanelNotice(message: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
   onRetry(input: string): void;
@@ -73,7 +79,6 @@ export function Workspace({
   turns,
   loading,
   runtimeError,
-  unavailableFeature,
   onOpenProject,
   onFilePanelResizeEnd,
   onFilePanelResizeStart,
@@ -82,7 +87,7 @@ export function Workspace({
   onListDirectory,
   onReadFile,
   onOpenFile,
-  onOpenTerminal,
+  onOpenExternal,
   onPanelNotice,
   onResolvePermission,
   onRetry,
@@ -100,6 +105,8 @@ export function Workspace({
   const [showJump, setShowJump] = useState(false);
   const [filePanelOpen, setFilePanelOpen] = useState(false);
   const [filePanelView, setFilePanelView] = useState<FilePanelView>("menu");
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalHeight, setTerminalHeight] = useState(240);
   const [preview, setPreview] = useState<FilePreviewState>();
   const [directoryStates, setDirectoryStates] = useState<Map<string, FileDirectoryState>>(new Map());
   const [expandedDirectories, setExpandedDirectories] = useState<Set<string>>(() => new Set());
@@ -119,7 +126,7 @@ export function Workspace({
 
   useLayoutEffect(() => {
     const container = scrollRef.current;
-    if (!container || unavailableFeature) return;
+    if (!container) return;
     const key = sessionId ?? `empty:${projectId ?? "none"}`;
     const saved = scrollPositions.get(key);
     container.scrollTop = saved ?? container.scrollHeight;
@@ -128,7 +135,7 @@ export function Workspace({
     return () => {
       scrollPositions.set(key, container.scrollTop);
     };
-  }, [projectId, sessionId, unavailableFeature]);
+  }, [projectId, sessionId]);
 
   useLayoutEffect(() => {
     const container = scrollRef.current;
@@ -177,6 +184,14 @@ export function Workspace({
     setFilePanelView("menu");
     setFilePanelOpen(true);
   }, []);
+
+  const toggleTerminalDock = useCallback((): void => {
+    if (!projectId) {
+      onPanelNotice("请先打开一个项目");
+      return;
+    }
+    setTerminalOpen((open) => !open);
+  }, [onPanelNotice, projectId]);
 
   const openFileBrowser = useCallback((): void => {
     previewRequestRef.current += 1;
@@ -227,8 +242,11 @@ export function Workspace({
 
   return (
     <main
-      className={`workspace${filePanelOpen ? " is-file-panel-open" : ""}`}
-      style={{ "--workspace-file-panel-width": filePanelOpen ? `${filePanelWidth}px` : "0px" } as React.CSSProperties}
+      className={`workspace${filePanelOpen ? " is-file-panel-open" : ""}${filePanelResizing ? " is-file-panel-resizing" : ""}`}
+      style={{
+        "--workspace-file-panel-width": filePanelOpen ? `${filePanelWidth}px` : "0px",
+        "--terminal-dock-height": terminalOpen && projectId ? `${String(terminalHeight)}px` : "0px"
+      } as React.CSSProperties}
     >
       <section className="workspace-conversation">
         <header className="workspace-toolbar">
@@ -237,6 +255,16 @@ export function Workspace({
           </div>
           <div className="toolbar-actions">
             {project ? <button aria-label="刷新项目状态" className="icon-button" onClick={onRefreshProject} type="button"><Icon name="branch" /></button> : null}
+            <button
+              aria-label={terminalOpen ? "关闭终端" : "打开终端"}
+              aria-pressed={terminalOpen}
+              className={`icon-button terminal-toggle${terminalOpen ? " is-active" : ""}`}
+              onClick={toggleTerminalDock}
+              title={terminalOpen ? "关闭终端" : "打开终端"}
+              type="button"
+            >
+              <Icon name="terminal" />
+            </button>
             <button
               aria-label={filePanelOpen ? "关闭右侧文件面板" : "打开右侧文件面板"}
               aria-pressed={filePanelOpen}
@@ -262,12 +290,13 @@ export function Workspace({
           }}
           ref={scrollRef}
         >
-          {unavailableFeature ? <UnavailableFeature feature={unavailableFeature} /> : loading ? <LoadingState /> : runtimeError ? <RuntimeError error={runtimeError} /> : turns.length && projectId ? (
+          {loading ? <LoadingState /> : runtimeError ? <RuntimeError error={runtimeError} /> : turns.length && projectId ? (
             <MessageTimeline
               onCreateBranch={onCreateBranch}
               onDeleteUserMessage={onDeleteUserMessage}
               onEditUserMessage={onEditUserMessage}
               onPreviewFile={previewFile}
+              onOpenExternal={onOpenExternal}
               onResolvePermission={onResolvePermission}
               onRollbackFiles={onRollbackFiles}
             onRetry={onRetry}
@@ -276,13 +305,21 @@ export function Workspace({
             turns={turns}
             />
           ) : <EmptyState onOpenProject={onOpenProject} project={project} />}
-          {!unavailableFeature ? <div className="composer-spacer" /> : null}
+          <div className="composer-spacer" />
         </div>
-        {!unavailableFeature ? (
-          <div className="composer-dock">
-            {showJump ? <button className="jump-bottom" onClick={jumpToBottom} type="button"><Icon name="arrow-up" size={13} /><span>回到底部</span></button> : null}
-            {children}
-          </div>
+        <div className="composer-dock">
+          {showJump ? <button className="jump-bottom" onClick={jumpToBottom} type="button"><Icon name="arrow-up" size={13} /><span>回到底部</span></button> : null}
+          {children}
+        </div>
+        {terminalOpen && projectId ? (
+          <section aria-label="内嵌终端" className="terminal-dock">
+            <TerminalDockResizer height={terminalHeight} onHeightChange={setTerminalHeight} />
+            <header className="terminal-dock-header">
+              <span className="terminal-dock-title"><Icon name="terminal" size={13} />终端</span>
+              <button aria-label="关闭终端" className="icon-button" onClick={() => setTerminalOpen(false)} title="关闭终端" type="button"><Icon name="close" size={14} /></button>
+            </header>
+            <TerminalView projectId={projectId} />
+          </section>
         ) : null}
       </section>
       <div
@@ -302,7 +339,10 @@ export function Workspace({
           expandedDirectories={expandedDirectories}
           onOpenFiles={openFileBrowser}
           onOpenFile={onOpenFile}
-          onOpenTerminal={onOpenTerminal}
+          onOpenTerminal={() => {
+            setFilePanelOpen(false);
+            if (!terminalOpen) toggleTerminalDock();
+          }}
           onPanelNotice={onPanelNotice}
           onPreviewFile={previewFile}
           onShowFiles={showFileBrowser}
@@ -313,6 +353,43 @@ export function Workspace({
         />
       </div>
     </main>
+  );
+}
+
+const minTerminalDockHeight = 120;
+
+function TerminalDockResizer({ height, onHeightChange }: { height: number; onHeightChange(height: number): void }): React.JSX.Element {
+  const startResize = (event: React.PointerEvent<HTMLDivElement>): void => {
+    event.preventDefault();
+    const conversation = event.currentTarget.closest(".workspace-conversation");
+    // 至少给消息区和输入框留出空间，终端最多占对话列高度减去这段余量。
+    const maxHeight = Math.max(minTerminalDockHeight, (conversation instanceof HTMLElement ? conversation.clientHeight : window.innerHeight) - 220);
+    const startY = event.clientY;
+    const startHeight = height;
+    let active = true;
+    const move = (moveEvent: PointerEvent): void => {
+      onHeightChange(Math.min(Math.max(startHeight + startY - moveEvent.clientY, minTerminalDockHeight), maxHeight));
+    };
+    const stop = (): void => {
+      if (!active) return;
+      active = false;
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop, { once: true });
+    window.addEventListener("pointercancel", stop, { once: true });
+  };
+  return (
+    <div
+      aria-label="调整终端高度"
+      aria-orientation="horizontal"
+      aria-valuenow={Math.round(height)}
+      className="terminal-dock-resizer"
+      onPointerDown={startResize}
+      role="separator"
+    />
   );
 }
 
@@ -568,6 +645,3 @@ function RuntimeError({ error }: { error: string }): React.JSX.Element {
   return <div className="runtime-error-state"><Icon name="warning" size={22} /><h2>Agent Runtime 无法启动</h2><p>{error}</p><small>如果提示另一个 Biny/CLI 会话占用，请先退出该会话或切换项目；其他错误请检查共享配置后重试。</small></div>;
 }
 
-function UnavailableFeature({ feature }: { feature: string }): React.JSX.Element {
-  return <div className="unavailable-state"><Icon name="spark" size={24} /><h1>{feature}</h1><p>此入口暂未实现。Biny 不会用模拟数据伪装可用结果。</p></div>;
-}

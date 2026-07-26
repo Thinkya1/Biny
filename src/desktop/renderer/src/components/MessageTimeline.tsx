@@ -1,12 +1,20 @@
+/**
+ * 对话时间线：逐轮渲染用户消息、思考过程、助手回复和工具活动。
+ *
+ * 数据由 `buildSessionTimeline` 算好，这里只做渲染和局部交互（展开思考、复制、编辑重发、
+ * 回滚文件等）。整体用 memo 包住，因为流式输出期间父组件会高频重渲染。
+ */
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
+import { splitAttachmentReferences, type AttachmentReference } from "../../../attachmentReferences.js";
 import { copyToClipboard } from "../copyToClipboard.js";
+import { useInlineImage } from "../inlineImage.js";
 import { listChangedFiles, type TimelineReasoningStep, type TimelineStep, type TimelineTurn } from "../sessionTimeline.js";
 import { reasoningDetailText } from "../reasoningPresentation.js";
+import { speak, speechSupported } from "../speech.js";
 import { CopyButton } from "./CopyButton.js";
 import { Icon } from "./Icon.js";
+import { MarkdownContent } from "./MarkdownContent.js";
 import { ToolActivity } from "./ToolActivity.js";
 
 interface MessageTimelineProps {
@@ -14,6 +22,7 @@ interface MessageTimelineProps {
   sessionId?: string;
   turns: TimelineTurn[];
   onPreviewFile(path: string): void;
+  onOpenExternal(url: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
   onRetry(input: string): void;
   onEditUserMessage(input: string, userMessageIndex: number): Promise<void>;
@@ -22,12 +31,13 @@ interface MessageTimelineProps {
   onDeleteUserMessage(turnId: string): void;
 }
 
-export const MessageTimeline = memo(function MessageTimeline({ projectId, sessionId, turns, onPreviewFile, onResolvePermission, onRetry, onEditUserMessage, onCreateBranch, onRollbackFiles, onDeleteUserMessage }: MessageTimelineProps): React.JSX.Element {
+export const MessageTimeline = memo(function MessageTimeline({ projectId, sessionId, turns, onPreviewFile, onOpenExternal, onResolvePermission, onRetry, onEditUserMessage, onCreateBranch, onRollbackFiles, onDeleteUserMessage }: MessageTimelineProps): React.JSX.Element {
   const [editing, setEditing] = useState<{ turnId: string; value: string; userMessageIndex: number }>();
 
   const startEditing = (turn: TimelineTurn): void => {
     if (turn.userMessageIndex === undefined) return;
-    setEditing({ turnId: turn.id, value: turn.user, userMessageIndex: turn.userMessageIndex });
+    // 编辑框里只放用户真正输入的那部分；附件清单是发送时补的，重发也带不回原来的附件。
+    setEditing({ turnId: turn.id, value: splitAttachmentReferences(turn.user).text, userMessageIndex: turn.userMessageIndex });
   };
 
   const submitEditing = async (): Promise<void> => {
@@ -49,6 +59,7 @@ export const MessageTimeline = memo(function MessageTimeline({ projectId, sessio
           onEditUserMessage={() => startEditing(turn)}
           onSubmitEdit={submitEditing}
           onPreviewFile={onPreviewFile}
+          onOpenExternal={onOpenExternal}
           onResolvePermission={onResolvePermission}
           onRollbackFiles={onRollbackFiles}
           onRetry={onRetry}
@@ -65,6 +76,7 @@ const Turn = memo(function Turn({
   turn,
   editing,
   onPreviewFile,
+  onOpenExternal,
   onResolvePermission,
   onRetry,
   onCancelEdit,
@@ -79,6 +91,7 @@ const Turn = memo(function Turn({
   turn: TimelineTurn;
   editing?: { value: string };
   onPreviewFile(path: string): void;
+  onOpenExternal(url: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
   onRetry(input: string): void;
   onCancelEdit(): void;
@@ -114,9 +127,12 @@ const Turn = memo(function Turn({
           onCancelEdit={onCancelEdit}
           onChangeEdit={onChangeEdit}
           onEdit={onEditUserMessage}
+          onOpenExternal={onOpenExternal}
+          onPreviewFile={onPreviewFile}
           onRegenerate={() => onRetry(turn.user)}
           onRollbackFiles={() => onRollbackFiles(turn)}
           onSubmitEdit={onSubmitEdit}
+          projectId={projectId}
         />
       ) : null}
       <div className="agent-response">
@@ -124,6 +140,7 @@ const Turn = memo(function Turn({
           <ExecutionTimeline
             expandedReasoning={expandedReasoning}
             onPreviewFile={onPreviewFile}
+            onOpenExternal={onOpenExternal}
             onResolvePermission={onResolvePermission}
             onToggleReasoning={toggleReasoning}
             projectId={projectId}
@@ -134,9 +151,16 @@ const Turn = memo(function Turn({
         ) : running && !turn.assistant ? (
           <div className="reasoning-row is-static"><span className="reasoning-pulse" /><span>{turn.status === "queued" ? "等待上一项任务完成" : "正在处理"}</span></div>
         ) : null}
-        {!executionSteps.some((step) => step.kind === "assistant") && turn.assistant ? <MarkdownContent content={turn.assistant} onPreviewFile={onPreviewFile} /> : null}
+        {!executionSteps.some((step) => step.kind === "assistant") && turn.assistant ? <MarkdownContent content={turn.assistant} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} /> : null}
 
-        {turn.assistant ? <AssistantActions content={turn.assistant} timestamp={turn.timestamp} /> : null}
+        {turn.assistant ? (
+          <AssistantActions
+            content={turn.assistant}
+            onCreateBranch={onCreateBranch}
+            onRegenerate={turn.user ? () => onRetry(turn.user) : undefined}
+            timestamp={turn.timestamp}
+          />
+        ) : null}
 
         {!running && turn.status !== "idle" && (turn.status !== "completed" || summary || turn.model) ? (
           <footer className={`run-result is-${turn.status}`}>
@@ -179,6 +203,7 @@ function fallbackExecutionSteps(turn: TimelineTurn): TimelineStep[] {
 function ExecutionTimeline({
   expandedReasoning,
   onPreviewFile,
+  onOpenExternal,
   onResolvePermission,
   onToggleReasoning,
   projectId,
@@ -188,6 +213,7 @@ function ExecutionTimeline({
 }: {
   expandedReasoning: Set<string>;
   onPreviewFile(path: string): void;
+  onOpenExternal(url: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
   onToggleReasoning(stepId: string): void;
   projectId: string;
@@ -206,20 +232,34 @@ function ExecutionTimeline({
       ) : null}
       {steps.map((step) => {
         if (step.kind === "reasoning") {
-          return <ReasoningStepView key={step.id} expanded={expandedReasoning.has(step.id)} onToggle={() => onToggleReasoning(step.id)} running={running} step={step} />;
+          return (
+            <ReasoningStepView
+              key={step.id}
+              expanded={expandedReasoning.has(step.id)}
+              onOpenExternal={onOpenExternal}
+              onPreviewFile={onPreviewFile}
+              onToggle={() => onToggleReasoning(step.id)}
+              projectId={projectId}
+              running={running}
+              step={step}
+            />
+          );
         }
         if (step.kind === "tool") {
-          return <div className="execution-tool-step" key={step.id}><ToolActivity onPreviewFile={onPreviewFile} onResolvePermission={onResolvePermission} projectId={projectId} tool={step.tool} /></div>;
+          return <ToolActivity key={step.id} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} onResolvePermission={onResolvePermission} projectId={projectId} tool={step.tool} />;
         }
-        return <div className="execution-assistant-step" key={step.id}><MarkdownContent content={step.content} onPreviewFile={onPreviewFile} /></div>;
+        return <div className="execution-assistant-step" key={step.id}><MarkdownContent content={step.content} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} /></div>;
       })}
     </div>
   );
 }
 
-function ReasoningStepView({ expanded, onToggle, running, step }: {
+function ReasoningStepView({ expanded, onOpenExternal, onPreviewFile, onToggle, projectId, running, step }: {
   expanded: boolean;
+  onOpenExternal(url: string): void;
+  onPreviewFile(path: string): void;
   onToggle(): void;
+  projectId: string;
   running: boolean;
   step: TimelineReasoningStep;
 }): React.JSX.Element {
@@ -239,7 +279,13 @@ function ReasoningStepView({ expanded, onToggle, running, step }: {
         <span>{label}</span>
         <span className={`reasoning-chevron${expanded ? " is-expanded" : ""}`}><Icon name="chevron" size={12} /></span>
       </button>
-      {expanded ? <div className="reasoning-detail"><div className="reasoning-detail-copy">{text}</div></div> : null}
+      {expanded ? (
+        <div className="reasoning-detail">
+          <div className="reasoning-detail-copy">
+            <MarkdownContent content={text} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} variant="is-compact" />
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -253,9 +299,12 @@ function UserMessage({
   onEdit,
   onCancelEdit,
   onChangeEdit,
+  onOpenExternal,
+  onPreviewFile,
   onRegenerate,
   onRollbackFiles,
-  onSubmitEdit
+  onSubmitEdit,
+  projectId
 }: {
   content: string;
   hasChangedFiles: boolean;
@@ -265,28 +314,16 @@ function UserMessage({
   onEdit(): void;
   onCancelEdit(): void;
   onChangeEdit(value: string): void;
+  onOpenExternal(url: string): void;
+  onPreviewFile(path: string): void;
   onRegenerate(): void;
   onRollbackFiles(): void;
   onSubmitEdit(): Promise<void>;
+  projectId: string;
 }): React.JSX.Element {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const actionsRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!menuOpen) return;
-    const closeOnOutsidePointer = (event: PointerEvent): void => {
-      if (!actionsRef.current?.contains(event.target as Node)) setMenuOpen(false);
-    };
-    const closeOnEscape = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") setMenuOpen(false);
-    };
-    window.addEventListener("pointerdown", closeOnOutsidePointer);
-    window.addEventListener("keydown", closeOnEscape);
-    return () => {
-      window.removeEventListener("pointerdown", closeOnOutsidePointer);
-      window.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [menuOpen]);
+  const { open: menuOpen, setOpen: setMenuOpen, containerRef: actionsRef } = useDismissableMenu();
+  // 发送时追加给模型的附件清单不该原样显示，拆出来渲染成附件卡片。
+  const message = useMemo(() => splitAttachmentReferences(content), [content]);
 
   if (editing) {
     return (
@@ -304,20 +341,23 @@ function UserMessage({
   const closeMenu = (): void => setMenuOpen(false);
   return (
     <div className="user-message">
-      <div className="user-bubble">{content}</div>
+      <div className="user-bubble">
+        {message.text ? <MarkdownContent content={message.text} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} /> : null}
+        {message.attachments.length ? <MessageAttachments attachments={message.attachments} projectId={projectId} /> : null}
+      </div>
       <div className={`user-message-actions${menuOpen ? " is-open" : ""}`} ref={actionsRef}>
-        <button aria-label="复制消息" className="user-message-action" onClick={() => copyText(content)} title="复制消息" type="button"><Icon name="copy" size={13} /></button>
+        <button aria-label="复制消息" className="user-message-action" onClick={() => copyText(message.text)} title="复制消息" type="button"><Icon name="copy" size={13} /></button>
         <button aria-label="重新生成" className="user-message-action" onClick={onRegenerate} title="重新生成" type="button"><Icon name="refresh" size={13} /></button>
         <button aria-label="编辑消息" className="user-message-action" onClick={onEdit} title="编辑消息" type="button"><Icon name="edit" size={13} /></button>
-        <button aria-expanded={menuOpen} aria-haspopup="menu" aria-label="更多消息操作" className="user-message-action" onClick={() => setMenuOpen((open) => !open)} title="更多" type="button"><Icon name="more" size={13} /></button>
+        <button aria-expanded={menuOpen} aria-haspopup="menu" aria-label="更多消息操作" className="user-message-action" onClick={() => setMenuOpen(!menuOpen)} title="更多" type="button"><Icon name="more" size={13} /></button>
         {menuOpen ? (
           <div className="user-message-menu" role="menu">
-            <button className="user-message-menu-item" onClick={() => { copyText(content); closeMenu(); }} role="menuitem" type="button"><Icon name="copy" size={14} /><span>复制为 Markdown</span></button>
-            <button className="user-message-menu-item" onClick={() => { copyText(plainTextFromMarkdown(content)); closeMenu(); }} role="menuitem" type="button"><Icon name="copy" size={14} /><span>复制为纯文本</span></button>
-            <button className="user-message-menu-item" onClick={() => { onCreateBranch(); closeMenu(); }} role="menuitem" type="button"><Icon name="branch" size={14} /><span>创建分支</span></button>
-            <button className="user-message-menu-item" disabled={!hasChangedFiles} onClick={() => { onRollbackFiles(); closeMenu(); }} role="menuitem" title={hasChangedFiles ? "回滚本条消息产生的文件修改" : "当前消息没有可回滚的文件修改"} type="button"><Icon name="arrow-left" size={14} /><span>回滚文件</span></button>
-            <div className="user-message-menu-separator" />
-            <button className="user-message-menu-item is-danger" onClick={() => { onDelete(); closeMenu(); }} role="menuitem" type="button"><Icon name="trash" size={14} /><span>删除消息</span></button>
+            <button className="message-menu-item" onClick={() => { copyText(message.text); closeMenu(); }} role="menuitem" type="button"><Icon name="copy" size={14} /><span>复制为 Markdown</span></button>
+            <button className="message-menu-item" onClick={() => { copyText(plainTextFromMarkdown(message.text)); closeMenu(); }} role="menuitem" type="button"><Icon name="copy" size={14} /><span>复制为纯文本</span></button>
+            <button className="message-menu-item" onClick={() => { onCreateBranch(); closeMenu(); }} role="menuitem" type="button"><Icon name="branch" size={14} /><span>创建分支</span></button>
+            <button className="message-menu-item" disabled={!hasChangedFiles} onClick={() => { onRollbackFiles(); closeMenu(); }} role="menuitem" title={hasChangedFiles ? "回滚本条消息产生的文件修改" : "当前消息没有可回滚的文件修改"} type="button"><Icon name="arrow-left" size={14} /><span>回滚文件</span></button>
+            <div className="message-menu-separator" />
+            <button className="message-menu-item is-danger" onClick={() => { onDelete(); closeMenu(); }} role="menuitem" type="button"><Icon name="trash" size={14} /><span>删除消息</span></button>
           </div>
         ) : null}
       </div>
@@ -397,80 +437,107 @@ function plainTextFromMarkdown(content: string): string {
 
 function formatThinkingDuration(durationMs: number): string {
   const seconds = durationMs / 1_000;
-  const precision = seconds < 10 ? 3 : seconds < 60 ? 1 : 0;
-  return `${seconds.toFixed(precision)} 秒`;
+  if (seconds >= 60) return `${String(Math.floor(seconds / 60))} 分 ${String(Math.round(seconds % 60))} 秒`;
+  return `${seconds.toFixed(seconds < 10 ? 2 : 1)} 秒`;
 }
 
-function MarkdownContent({ content, onPreviewFile }: { content: string; onPreviewFile(path: string): void }): React.JSX.Element {
+/** 助手回复下方的操作条：复制、朗读、重新生成，以及放次要操作的更多菜单。 */
+function AssistantActions({ content, timestamp, onCreateBranch, onRegenerate }: {
+  content: string;
+  timestamp?: string;
+  onCreateBranch(): void;
+  onRegenerate?(): void;
+}): React.JSX.Element {
+  const { open: menuOpen, setOpen: setMenuOpen, containerRef: actionsRef } = useDismissableMenu();
+  const [speaking, setSpeaking] = useState(false);
+  const stopSpeechRef = useRef<() => void>(undefined);
+
+  // 组件卸载（切会话、消息被折叠）时朗读要跟着停，否则声音会一直放到读完。
+  useEffect(() => () => stopSpeechRef.current?.(), []);
+
+  const toggleSpeech = (): void => {
+    if (speaking) {
+      stopSpeechRef.current?.();
+      return;
+    }
+    setSpeaking(true);
+    stopSpeechRef.current = speak(plainTextFromMarkdown(content), () => setSpeaking(false));
+  };
+
+  const closeMenu = (): void => setMenuOpen(false);
   return (
-    <div className="markdown-body">
-      <Markdown
-        components={{
-          a({ href, children }) {
-            const path = localPathFromHref(href);
-            return <a href={href} onClick={path ? (event) => { event.preventDefault(); onPreviewFile(path); } : undefined} rel="noreferrer" target={path ? undefined : "_blank"} title={path ? "在右侧预览" : undefined}>{children}</a>;
-          },
-          code({ className, children }) {
-            const text = String(children).replace(/\n$/, "");
-            const block = Boolean(className) || text.includes("\n");
-            if (block) return <code className={className}>{children}</code>;
-            const isPath = looksLikePath(text);
-            return <code className={isPath ? "inline-path" : undefined} onClick={() => { if (isPath) onPreviewFile(stripLineSuffix(text)); }} title={isPath ? "在右侧预览" : undefined}>{children}</code>;
-          },
-          pre({ children }) {
-            return <MarkdownCodeBlock>{children}</MarkdownCodeBlock>;
-          }
-        }}
-        remarkPlugins={[remarkGfm]}
-      >
-        {content}
-      </Markdown>
-    </div>
-  );
-}
-
-function MarkdownCodeBlock({ children }: { children: React.ReactNode }): React.JSX.Element {
-  const preRef = useRef<HTMLPreElement>(null);
-  const fallback = extractText(children).replace(/\n$/, "");
-  return (
-    <div className="markdown-code-block">
-      <CopyButton
-        className="copy-button markdown-code-copy"
-        label="复制代码"
-        resolveValue={() => {
-          const live = preRef.current?.innerText ?? preRef.current?.textContent ?? "";
-          return (live || fallback).replace(/\n$/, "");
-        }}
-        value={fallback}
-      />
-      <pre ref={preRef}>{children}</pre>
-    </div>
-  );
-}
-
-function localPathFromHref(href?: string): string | undefined {
-  if (!href || href.startsWith("#") || (/^[A-Za-z][A-Za-z\d+.-]*:/.test(href) && !href.startsWith("file://"))) return undefined;
-  const encoded = href.startsWith("file://") ? href.slice("file://".length) : href;
-  let decoded = encoded;
-  try {
-    decoded = decodeURIComponent(encoded);
-  } catch {
-    // Keep malformed local paths usable instead of breaking the whole message.
-  }
-  return looksLikePath(decoded) ? stripLineSuffix(decoded) : undefined;
-}
-
-function stripLineSuffix(path: string): string {
-  return path.replace(/(?::\d+){1,2}$/, "");
-}
-
-function AssistantActions({ content, timestamp }: { content: string; timestamp?: string }): React.JSX.Element {
-  return (
-    <div className="assistant-actions">
+    <div className={`assistant-actions${menuOpen ? " is-open" : ""}`} ref={actionsRef}>
       <CopyButton className="assistant-action" label="复制回复" size={13} value={content} />
+      {speechSupported() ? (
+        <button aria-label={speaking ? "停止朗读" : "朗读回复"} className={`assistant-action${speaking ? " is-active" : ""}`} onClick={toggleSpeech} title={speaking ? "停止朗读" : "朗读回复"} type="button"><Icon name={speaking ? "volume-off" : "volume"} size={13} /></button>
+      ) : null}
+      {onRegenerate ? (
+        <button aria-label="重新生成" className="assistant-action" onClick={onRegenerate} title="重新生成" type="button"><Icon name="refresh" size={13} /></button>
+      ) : null}
+      <button aria-expanded={menuOpen} aria-haspopup="menu" aria-label="更多回复操作" className="assistant-action" onClick={() => setMenuOpen(!menuOpen)} title="更多" type="button"><Icon name="more" size={13} /></button>
+      {menuOpen ? (
+        <div className="assistant-message-menu" role="menu">
+          <button className="message-menu-item" onClick={() => { copyText(content); closeMenu(); }} role="menuitem" type="button"><Icon name="copy" size={14} /><span>复制为 Markdown</span></button>
+          <button className="message-menu-item" onClick={() => { copyText(plainTextFromMarkdown(content)); closeMenu(); }} role="menuitem" type="button"><Icon name="copy" size={14} /><span>复制为纯文本</span></button>
+          <button className="message-menu-item" onClick={() => { onCreateBranch(); closeMenu(); }} role="menuitem" type="button"><Icon name="branch" size={14} /><span>创建分支</span></button>
+        </div>
+      ) : null}
       {timestamp ? <time className="assistant-time" dateTime={timestamp}>{formatMessageTime(timestamp)}</time> : null}
     </div>
   );
+}
+
+/** 用户消息里的附件：图片直接显示缩略图，其他类型退回成带文件名的卡片。 */
+function MessageAttachments({ attachments, projectId }: { attachments: AttachmentReference[]; projectId: string }): React.JSX.Element {
+  return (
+    <div className="message-attachments">
+      {attachments.map((attachment) => (
+        <AttachmentCard attachment={attachment} key={attachment.path} projectId={projectId} />
+      ))}
+    </div>
+  );
+}
+
+function AttachmentCard({ attachment, projectId }: { attachment: AttachmentReference; projectId: string }): React.JSX.Element {
+  const isImage = attachment.mimeType?.startsWith("image/") ?? false;
+  const source = useInlineImage(projectId, isImage ? attachment.path : "");
+  if (source) return <img alt={attachment.name} className="message-attachment-image" src={source} title={attachment.name} />;
+  return (
+    <div className="message-attachment" title={attachment.path}>
+      <Icon name={isImage ? "spark" : "file"} size={13} />
+      <span>{attachment.name}</span>
+    </div>
+  );
+}
+
+/**
+ * 悬浮菜单的开合：点到容器外面或按 Esc 就关。
+ *
+ * `containerRef` 要挂在同时包住触发按钮和菜单的那层容器上，否则点菜单项本身也会被当成外部点击。
+ */
+function useDismissableMenu(): {
+  open: boolean;
+  setOpen(open: boolean): void;
+  containerRef: React.RefObject<HTMLDivElement | null>;
+} {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      if (!containerRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("pointerdown", closeOnOutsidePointer);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnOutsidePointer);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+  return { open, setOpen, containerRef };
 }
 
 function turnSummary(turn: TimelineTurn): string {
@@ -505,15 +572,3 @@ function formatMessageTime(timestamp: string): string {
   return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
 }
 
-function looksLikePath(value: string): boolean {
-  return !value.includes(" ") && (/^(?:\.\/|\.\.\/|\/|[\w.-]+\/)/.test(value) || /\.[A-Za-z0-9]{1,8}(?::\d+)?$/.test(value));
-}
-
-function extractText(node: React.ReactNode): string {
-  if (typeof node === "string" || typeof node === "number") return String(node);
-  if (Array.isArray(node)) return node.map(extractText).join("");
-  if (node && typeof node === "object" && "props" in node) {
-    return extractText((node as React.ReactElement<{ children?: React.ReactNode }>).props.children);
-  }
-  return "";
-}

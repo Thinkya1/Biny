@@ -1,3 +1,12 @@
+/**
+ * 任务证据采集。
+ *
+ * 把运行期的原始观测（Agent 结束状态、每次工具调用、验收结果）转成带血缘关系的证据条目：
+ * `id` 是可复现的，`parentEvidenceIds` 记录「这条证据由哪些证据推导而来」，便于回溯为什么
+ * 判定通过或失败。
+ *
+ * 证据会落盘，所以 details 一律先做敏感信息脱敏。
+ */
 import { redactSensitiveValue } from "../utils/secrets.js";
 import type { AcceptanceEvidence, TaskEvidence, TaskToolEvidence } from "./types.js";
 
@@ -11,7 +20,7 @@ export interface AttemptEvidenceSource {
   toolEvidence: TaskToolEvidence[];
 }
 
-/** Converts raw runtime observations into durable, lineage-aware evidence. */
+/** 一次尝试的证据 = Agent 结束状态一条 + 每次工具调用一条。 */
 export function collectAttemptEvidence(attempt: AttemptEvidenceSource): TaskEvidence[] {
   return [agentOutcomeEvidence(attempt), ...attempt.toolEvidence.map((evidence) => toolEvidence(attempt.attemptId, evidence))];
 }
@@ -37,6 +46,7 @@ export function toolEvidenceId(attemptId: string, evidence: TaskToolEvidence): s
   return `attempt:${attemptId}:tool:${evidence.toolCallId}`;
 }
 
+/** 给清理证据补上父级血缘；用 Set 去重，避免多次挂接同一父证据。 */
 export function attachCleanupLineage(evidence: TaskEvidence[], parentEvidenceIds: string[]): TaskEvidence[] {
   return evidence.map((item) => ({
     ...item,
@@ -45,6 +55,7 @@ export function attachCleanupLineage(evidence: TaskEvidence[], parentEvidenceIds
 }
 
 function agentOutcomeEvidence(attempt: AttemptEvidenceSource): TaskEvidence {
+  // 只有「跑完 + 模型自己停下来」才算通过：跑到步数上限或被打断都不能当作正常收尾。
   const passed = attempt.status === "completed" && attempt.stopReason === "model_stop";
   return {
     id: `attempt:${attempt.attemptId}:agent:outcome`,
@@ -78,6 +89,7 @@ function toolEvidence(attemptId: string, evidence: TaskToolEvidence): TaskEviden
   };
 }
 
+/** 脱敏后若不再是对象（例如整体被替换成占位串），宁可不写 details。 */
 function redactRecord(value: Record<string, unknown>): Record<string, unknown> | undefined {
   const redacted = redactSensitiveValue(value);
   return isRecord(redacted) ? redacted : undefined;

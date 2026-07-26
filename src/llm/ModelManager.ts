@@ -24,8 +24,16 @@ export interface ModelChoice {
   supportsTools?: boolean;
   capabilities?: ReturnType<typeof modelCapabilities>;
   contextWindow?: number;
+  /** 单轮允许注入的输入 token 预算；界面用它做上下文用量的分母（运行时还没起来时也能算）。 */
+  maxInputTokens?: number;
   efforts: ReasoningEffort[];
   defaultThinking: ThinkingSelection;
+  /**
+   * False when the alias is configured but its provider has no usable endpoint
+   * or credential yet. Selecting it would fail on the first request, so every
+   * surface either hides it (desktop) or marks it unusable (TUI / CLI).
+   */
+  available: boolean;
 }
 
 export interface ModelRuntimeInfo {
@@ -82,14 +90,18 @@ export class ModelManager {
   }
 
   async switchModel(alias: string, thinking?: ThinkingSelection): Promise<ModelRuntimeInfo> {
-    const model = this.config.models[alias];
+    // 以盘上的配置为基准，而不是内存里的快照：同一份配置可能已被别的运行时改过
+    // （桌面端多项目共用配置、权限模式变更、OAuth token 刷新等），整份写回内存快照会把那些
+    // 改动覆盖掉。读不到就退回内存快照，行为与以前一致。
+    const persisted = await this.configStore.load().catch(() => this.config);
+    const model = persisted.models[alias];
     if (!model) throw new Error(`Unknown model alias: ${alias}`);
-    const selection = resolveThinkingSelection(this.config, alias, thinking);
+    const selection = resolveThinkingSelection(persisted, alias, thinking);
     const effort = selection === "off"
-      ? model.thinking?.defaultEffort ?? this.config.thinking.effort
+      ? model.thinking?.defaultEffort ?? persisted.thinking.effort
       : selection;
     const candidate = configSchema.parse({
-      ...this.config,
+      ...persisted,
       defaultModel: alias,
       thinking: { enabled: selection !== "off", effort }
     });
@@ -134,14 +146,16 @@ export function listModelChoices(config: AgentConfig): ModelChoice[] {
       supportsTools: capabilities.tools,
       capabilities,
       contextWindow: model.contextWindow,
+      maxInputTokens: modelContextBudget(model, config.context.maxInputTokens, alias).maxInputTokens,
       efforts: [...(reasoning?.efforts ?? [])],
-      defaultThinking: reasoning?.defaultEffort ?? "off"
+      defaultThinking: reasoning?.defaultEffort ?? "off",
+      available: hasUsableModelConfiguration(config, alias)
     }];
   });
 }
 
 export function listConfiguredModelChoices(config: AgentConfig): ModelChoice[] {
-  return listModelChoices(config).filter((model) => hasUsableModelConfiguration(config, model.alias));
+  return listModelChoices(config).filter((model) => model.available);
 }
 
 export function hasUsableModelConfiguration(config: AgentConfig, alias = config.defaultModel): boolean {

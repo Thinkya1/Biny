@@ -8,6 +8,7 @@
 - 除了包自身的 `index.ts` 外，其他 `index.ts` 文件应优先使用 `export * from "./module"`。
 - 不要过度封装，尤其是一两行的小函数，不要为了形式引入两层包装，直接内联即可。
 - 减少冗余；每个函数、文件和模块只承担一个清晰职责。不要把无关逻辑堆进同一文件，优先通过明确边界解耦。
+- 需要注释的地方要适当写注释，方便阅读：模块/文件顶部说明职责，复杂流程、非直观的分支、约束和坑点说明「为什么这么做」。注释使用中文，不要逐行翻译代码，也不要给显而易见的语句加注释。
 - 只有新增、删除或改变功能/用户可见行为时才更新 `PROJECT_DESCRIPTION.local.md`；纯重构、测试、格式化或其他非功能改动无需更新。
 - Git commit 提交信息使用中文；push 代码时也遵循这一约定。
 - 用户明确要求提交时，直接在 `main` 分支提交并 push，不创建 PR 分支。
@@ -20,19 +21,19 @@
 ## TUI 开发规范
 
 - 编写或修改 TUI 前，优先查看本地 `.agents/skills/write-tui/SKILL.md` 和 `.agents/skills/write-tui/DESIGN.md`。`.agents/` 是本地参考资料，已被 `.gitignore` 忽略，不要提交到 GitHub。
-- TUI 入口保持在 `src/tui/index.tsx`，CLI 只负责注册和启动 `tui` 命令，不要把 TUI 交互逻辑写进 `src/cli/commands/tui.ts`。
-- `src/tui/App.tsx` 负责组合 runtime、全局状态和顶层布局；复杂逻辑应继续下沉到 `src/tui/runtime/`、`src/tui/components/`、`src/tui/slashCommands.ts` 或独立工具函数。
-- `src/tui/runtime/` 负责把 Agent/Tool/Session 流程转换成 TUI 可消费事件；不要让 Ink 组件直接调用工具、写 session 或访问 provider。
+- 终端界面基于 `@earendil-works/pi-tui`，不使用 React/Ink。入口保持在 `src/tui/index.ts`，CLI 只负责注册和启动 `tui` 命令，不要把交互逻辑写进 `src/cli/commands/tui.ts`。
+- `src/tui/app.ts` 负责组合 runtime、全局状态和顶层布局；复杂逻辑应继续下沉到 `src/tui/runtime/`、`src/tui/components/`、`src/tui/slashCommands.ts` 或独立工具函数。
+- `src/tui/runtime/` 负责把 Agent/Tool/Session 流程转换成 TUI 可消费事件；不要让展示组件直接调用工具、写 session 或访问 provider。
 - `src/tui/components/` 只处理展示和本地键盘交互。组件可以触发回调，但不要直接读写 session 文件、直接执行工具或直接调用 provider。
-- Slash command 的声明集中维护，不要在多个组件里复制命令列表；命令执行不要使用 `console.log` / `console.error` 干扰 Ink 渲染，应通过 TUI 事件或状态展示。
-- 输入框必须稳定停留在底部。App 布局应保持：Header 固定高度，消息区域 `flexGrow`，InputBox 固定高度，StatusBar 固定高度。不要用大量空行、字符串空格或手动光标 escape 撑布局。
-- 输入框优先使用简单受控文本和同一行视觉光标；不要同时使用 Ink `useCursor` 和自定义光标，避免真实光标与视觉光标错位。
+- Slash command 的声明集中维护，不要在多个组件里复制命令列表；命令执行不要使用 `console.log` / `console.error` 干扰终端渲染，应通过 TUI 事件或状态展示。
+- 输入框必须稳定停留在底部，状态行在忙碌和空闲之间切换时行数不变。历史滚动交给终端自己的 scrollback，不要在应用内实现 viewport、滚动条或滚轮接管。
+- 输入框直接使用框架的 `Editor`，不要另写行内编辑、补全或历史；光标由框架的 CURSOR_MARKER 机制定位。
 - 空格键只能作为普通输入字符追加，不得触发选择、确认、滚动或布局变化。
 - TUI 运行期间不要直接向 stdout/stderr 打印日志。需要调试时写本地临时日志，并确保不提交。
 
 ## 颜色和交互约束
 
-- Biny 当前使用 Ink 的基础颜色即可；新增颜色时要保持语义清楚，不要在多个组件里散落魔法颜色。
-- 如果后续引入主题系统，颜色 token 应集中维护，组件不要绕过主题直接硬编码大量颜色。
+- 颜色统一走 `src/tui/theme/` 的 token：`tokens.ts` 定义 token，`palettes.ts` 给 dark / light 两套取值，组件只用 `theme.fg("<token>", text)`，不要写十六进制色值。
+- 新增颜色先补 token 并在两套调色板里各给一个值，不要绕过主题直接硬编码。
 - 键盘输入处理要区分普通可打印字符、功能键和控制键。普通字符统一走追加输入逻辑；功能键只处理明确需要的 Enter、Tab、Backspace、上下键、Ctrl+C。
 - 不要为了临时视觉效果写终端 escape 控制光标形状或位置，除非同时验证中文输入法、空格、Backspace、Enter 和 Ctrl+C。

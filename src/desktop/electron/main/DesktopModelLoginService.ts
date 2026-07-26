@@ -1,3 +1,13 @@
+/**
+ * 订阅制模型的 OAuth 登录（Claude 订阅、OpenAI Codex）。
+ *
+ * 走 PKCE 授权码流程，两家的回调方式不同：Claude 由用户把授权码粘回来，Codex 需要在本地
+ * 127.0.0.1:1455 起一个临时回调服务器接收重定向。
+ *
+ * 安全约束：`state` 用常量时间比较，防止时序侧信道；待处理的授权有 10 分钟有效期；本地回调
+ * 服务器只接受预期的 state，用完立即关闭。拿到的 token 由调用方交给 DesktopConfigStore
+ * 加密保存，这里不落盘。
+ */
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { DesktopModelLoginMethod, DesktopModelLoginProvider, DesktopModelLoginStartResult } from "../../protocol.js";
@@ -69,6 +79,7 @@ export class DesktopModelLoginService {
     return provider === "claude-code" ? await this.startClaudeAuthorization() : await this.startCodexAuthorization();
   }
 
+  /** 换取 token。provider 与待处理记录不匹配、记录不存在或已过期都直接失败，不做兜底重试。 */
   async complete(provider: DesktopModelLoginProvider, authRequestId: string, pastedAuthorization?: string): Promise<AuthenticatedModelLogin> {
     const pending = this.pending.get(authRequestId);
     if (!pending || pending.provider !== provider) throw new Error("授权会话不存在，请重新点击登录。");
@@ -90,8 +101,10 @@ export class DesktopModelLoginService {
     return await this.refreshCodexTokens(tokens);
   }
 
+  /** Claude 侧回调落在其官网页面上，拿不到重定向，只能让用户把授权码粘回来（paste-code）。 */
   private async startClaudeAuthorization(): Promise<DesktopModelLoginStartResult> {
     const verifier = base64url(randomBytes(32));
+    // Claude 的授权流要求 state 与 verifier 一致。
     const state = verifier;
     const url = new URL(CLAUDE_AUTHORIZE_ENDPOINT);
     url.searchParams.set("code", "true");
@@ -111,10 +124,15 @@ export class DesktopModelLoginService {
     }, "paste-code");
   }
 
+  /**
+   * Codex 的回调地址固定是 http://localhost:1455/auth/callback，所以必须先把本地服务器起好
+   * 再打开浏览器，否则回调会落空。
+   */
   private async startCodexAuthorization(): Promise<DesktopModelLoginStartResult> {
     const verifier = base64url(randomBytes(32));
     const state = base64url(randomBytes(16));
     const authRequestId = randomUUID();
+    // 回调是异步到达的，用一个 deferred 把它接到 complete() 里去等待。
     const callback = deferredCallback();
     const server = await startCodexCallbackServer(state, callback.resolve);
     const url = new URL(CODEX_AUTHORIZE_ENDPOINT);
@@ -169,6 +187,7 @@ export class DesktopModelLoginService {
       if (!models.length) throw new Error("Claude 账号没有返回可用模型。");
       return { provider: "claude-code", ...tokens, models };
     } finally {
+      // 成功与否都要清掉待处理记录：授权码是一次性的，留着只会造成误用。
       this.pending.delete(authRequestId);
     }
   }
@@ -345,10 +364,15 @@ function openAiCodexHeaders(accessToken: string): Record<string, string> {
   return headers;
 }
 
+/**
+ * 从 access token（JWT）里读出 ChatGPT 账号 id，请求 Codex 接口时要带上。
+ * 只解 payload、不验签：这里不是在做鉴权，签名由服务端校验；解析失败就当没有账号 id。
+ */
 function extractOpenAiAccountId(token: string): string | undefined {
   const payload = token.split(".")[1];
   if (!payload) return undefined;
   try {
+    // JWT 用的是 base64url 且省略了 padding，先补齐 `=` 再换回标准 base64 字符集。
     const padded = payload + "=".repeat((4 - (payload.length % 4)) % 4);
     const parsed = JSON.parse(Buffer.from(padded.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) as Record<string, unknown>;
     const nested = parsed["https://api.openai.com/auth"];
@@ -377,7 +401,9 @@ function pkceChallenge(verifier: string): string {
   return base64url(createHash("sha256").update(verifier, "utf8").digest());
 }
 
+/** state 校验用常量时间比较，避免通过比较耗时逐字节猜出正确值。 */
 function constantTimeEqual(left: string, right: string): boolean {
+  // timingSafeEqual 要求两个 Buffer 等长，长度不同只能先返回 false。
   if (left.length !== right.length) return false;
   return timingSafeEqual(Buffer.from(left), Buffer.from(right));
 }
@@ -388,6 +414,10 @@ function deferredCallback(): { promise: Promise<{ code: string; state: string } 
   return { promise, resolve };
 }
 
+/**
+ * 起本地回调服务器接收授权重定向。只绑定 127.0.0.1，且路径、code、state 三者都必须对得上
+ * 才认，任何不匹配的请求一律回 400，不透露任何信息。
+ */
 async function startCodexCallbackServer(expectedState: string, resolveCallback: (value: { code: string; state: string } | undefined) => void): Promise<Server> {
   return await new Promise<Server>((resolve, reject) => {
     const server = createServer((request, response) => {
@@ -412,6 +442,7 @@ async function startCodexCallbackServer(expectedState: string, resolveCallback: 
   });
 }
 
+/** 把错误响应压成一行短文本用于提示；服务商的错误体可能很长且带换行。 */
 async function compactResponse(response: Response): Promise<string> {
   const text = (await response.text().catch(() => "")).replace(/\s+/g, " ").trim();
   return text ? text.slice(0, 240) : "服务商未返回错误详情";

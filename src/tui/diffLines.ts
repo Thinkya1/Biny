@@ -3,14 +3,15 @@
  *
  * 只给真正的代码增删行上色，跳过 git diff 文件头 `+++` / `---`，避免头信息被误当成代码。
  */
-import { tuiColors } from "./theme/index.js";
+import type { ThemeColor } from "./theme/index.js";
 
-export type DiffLineColor = string | undefined;
+export type DiffLineColor = ThemeColor | undefined;
 
 export interface DiffLineStyle {
-  color?: string;
+  /** 主题 token，由渲染方决定怎么上色。 */
+  color?: ThemeColor;
   bold?: boolean;
-  dimColor?: boolean;
+  dim?: boolean;
 }
 
 export type DiffHeaderOperation = "Created" | "Edited" | "Deleted";
@@ -37,8 +38,8 @@ export interface KimiDiffCodeLine {
 
 export function diffLineColor(line: string): DiffLineColor {
   if (line.startsWith("+++") || line.startsWith("---")) return undefined;
-  if (line.startsWith("+")) return tuiColors.success;
-  if (line.startsWith("-")) return tuiColors.error;
+  if (line.startsWith("+")) return "toolDiffAdded";
+  if (line.startsWith("-")) return "toolDiffRemoved";
   return undefined;
 }
 
@@ -46,23 +47,23 @@ export function diffLineStyle(line: string): DiffLineStyle | undefined {
   const trimmed = line.trimStart();
   const rawSemantic = line.startsWith("  ") ? line.slice(2) : line;
 
-  if (parseKimiDiffHeader(line)) return { color: tuiColors.primary, bold: true };
-  if (parseDiffHeader(line)) return { color: tuiColors.primary, bold: true };
+  if (parseKimiDiffHeader(line)) return { color: "accent", bold: true };
+  if (parseDiffHeader(line)) return { color: "accent", bold: true };
   if (trimmed.startsWith("diff --git") || trimmed.startsWith("index ") || trimmed.startsWith("new file mode") || trimmed.startsWith("deleted file mode")) {
-    return { color: tuiColors.diffMeta, dimColor: true };
+    return { color: "toolDiffContext", dim: true };
   }
-  if (trimmed.startsWith("+++") || trimmed.startsWith("---") || trimmed.startsWith("@@")) return { color: tuiColors.diffMeta, dimColor: true };
+  if (trimmed.startsWith("+++") || trimmed.startsWith("---") || trimmed.startsWith("@@")) return { color: "toolDiffContext", dim: true };
   const kimiLine = parseKimiDiffCodeLine(line);
-  if (kimiLine?.prefix === "+") return { color: tuiColors.success };
-  if (kimiLine?.prefix === "-") return { color: tuiColors.error };
-  if (kimiLine?.prefix === " ") return { color: tuiColors.diffMeta, dimColor: true };
+  if (kimiLine?.prefix === "+") return { color: "toolDiffAdded" };
+  if (kimiLine?.prefix === "-") return { color: "toolDiffRemoved" };
+  if (kimiLine?.prefix === " ") return { color: "toolDiffContext", dim: true };
   const codeLine = parseDiffCodeLine(line);
-  if (codeLine?.prefix === "+") return { color: tuiColors.success };
-  if (codeLine?.prefix === "-") return { color: tuiColors.error };
-  if (codeLine?.prefix === " ") return { color: tuiColors.diffMeta, dimColor: true };
-  if (rawSemantic.startsWith("+")) return { color: tuiColors.success };
-  if (rawSemantic.startsWith("-")) return { color: tuiColors.error };
-  if (rawSemantic.startsWith(" ")) return { color: tuiColors.diffMeta, dimColor: true };
+  if (codeLine?.prefix === "+") return { color: "toolDiffAdded" };
+  if (codeLine?.prefix === "-") return { color: "toolDiffRemoved" };
+  if (codeLine?.prefix === " ") return { color: "toolDiffContext", dim: true };
+  if (rawSemantic.startsWith("+")) return { color: "toolDiffAdded" };
+  if (rawSemantic.startsWith("-")) return { color: "toolDiffRemoved" };
+  if (rawSemantic.startsWith(" ")) return { color: "toolDiffContext", dim: true };
   return undefined;
 }
 

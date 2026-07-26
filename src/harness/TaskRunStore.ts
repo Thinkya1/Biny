@@ -1,3 +1,14 @@
+/**
+ * 任务运行记录的持久化存储（`.agent/tasks/task-run-*.json`）。
+ *
+ * 存在的意义是「任务状态不能只活在内存和对话里」：对话被压缩、进程被重启之后，任务进度、
+ * 每次尝试和证据都要还能读回来，因此每次状态变更都立即整份落盘。
+ *
+ * 几条硬约束：
+ * - 写入串行化（`writeTail`），并在写前校验目录身份，避免并发写坏文件或被换成软链接写到别处；
+ * - 落盘前统一脱敏并限长，任务记录里不能出现明文凭据或超大文本；
+ * - 对外返回的都是深拷贝快照，调用方改了也不会污染磁盘上的真相。
+ */
 import { randomBytes, randomUUID } from "node:crypto";
 import { constants, promises as fs, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
@@ -94,7 +105,7 @@ interface DirectoryIdentity {
   inode: number;
 }
 
-/** Durable task truth that survives conversation compaction and process restarts. */
+/** 任务的持久化真相：跨对话压缩和进程重启依然可读。 */
 export class TaskRunStore {
   readonly directoryPath: string;
   private writeTail: Promise<void> = Promise.resolve();
@@ -107,6 +118,10 @@ export class TaskRunStore {
     this.directoryPath = directoryPath;
   }
 
+  /**
+   * 打开存储目录，并记下它的 device/inode 作为身份标识：后续每次写入都要核对，
+   * 防止运行期间 `.agent/tasks` 被替换成软链接或另一个目录而把记录写到工作区之外。
+   */
   static async open(persistenceRoot: string): Promise<TaskRunStore> {
     await ensureAgentDirs(persistenceRoot);
     const canonicalRoot = await fs.realpath(path.resolve(persistenceRoot));
@@ -121,6 +136,12 @@ export class TaskRunStore {
     return store;
   }
 
+  /**
+   * 启动时回收被打断的任务：还停在 queued/running 的记录说明上次进程没跑完，把其中 running
+   * 的尝试标成 incomplete，任务本身转成 `continuable`（可继续），而不是直接判失败。
+   *
+   * `mutate` 回调里会再判一次状态，因为 list 到写入之间状态可能已经被别处改过。
+   */
   async recoverInterruptedRuns(sessionId?: string): Promise<void> {
     const snapshots = await this.list();
     for (const snapshot of snapshots) {
@@ -311,6 +332,7 @@ export class TaskRunStore {
     return snapshots.map(cloneSnapshot);
   }
 
+  /** 读-改-写一体：整个过程在写锁内完成，回调拿到的是磁盘上的最新快照。 */
   private async mutate(
     taskRunId: string,
     update: (snapshot: TaskRunSnapshot) => void
@@ -326,6 +348,10 @@ export class TaskRunStore {
     });
   }
 
+  /**
+   * 串行化写入。把自己接到 `writeTail` 这条 promise 链的末尾：先等前一个写完，再执行自己，
+   * 结束时释放给下一个。这样并发调用会排队而不是同时改同一个文件。
+   */
   private async withWrite<T>(operation: () => Promise<T>): Promise<T> {
     const previous = this.writeTail;
     let release!: () => void;
@@ -340,6 +366,10 @@ export class TaskRunStore {
     }
   }
 
+  /**
+   * 读取一份记录。全程按「不跟随符号链接」打开，并在读前读后各校验一次文件身份，
+   * 确保读到的确实是目标文件本身，中途没被换掉。
+   */
   private async readSnapshot(taskRunId: string): Promise<TaskRunSnapshot> {
     await this.assertDirectoryBinding();
     const filePath = this.filePath(taskRunId);
@@ -363,6 +393,12 @@ export class TaskRunStore {
     }
   }
 
+  /**
+   * 原子写入：先写 0600 权限的临时文件并 fsync，再落到目标路径，中途断电也不会留下半份记录。
+   *
+   * 新建走 `link`（目标已存在会 EEXIST，天然防重复创建），更新走 `rename`，并先确认目标是
+   * 普通文件、非软链接、硬链接数为 1，避免写到别人手上的同一个 inode。
+   */
   private async writeSnapshot(snapshot: TaskRunSnapshot, create: boolean): Promise<void> {
     validateSnapshot(snapshot);
     await this.assertDirectoryBinding();
@@ -401,6 +437,7 @@ export class TaskRunStore {
       }
       await this.assertDirectoryBinding();
     } finally {
+      // 成功路径下临时文件已被移走/删除，这里只是兜底清理，失败可忽略。
       await handle?.close().catch(() => undefined);
       await fs.unlink(temporaryPath).catch(() => undefined);
     }
@@ -411,6 +448,7 @@ export class TaskRunStore {
     return path.join(this.directoryPath, `${taskFilePrefix}${taskRunId}${taskFileSuffix}`);
   }
 
+  /** 核对目录仍是打开时那一个（device + inode + realpath 三重比对）。 */
   private async assertDirectoryBinding(): Promise<void> {
     const stat = await fs.lstat(this.directoryPath);
     if (

@@ -1,3 +1,9 @@
+/**
+ * 应用菜单。
+ *
+ * 自定义菜单项统一转成 `DesktopMenuAction` 发给渲染进程处理，主进程这边不实现业务动作；
+ * 编辑、窗口、缩放等交给 Electron 的内置 role。
+ */
 import { app, BrowserWindow, Menu, type MenuItemConstructorOptions } from "electron";
 import type { DesktopMenuAction } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
@@ -6,6 +12,7 @@ export function installApplicationMenu(getWindow: () => BrowserWindow | undefine
   const send = (action: DesktopMenuAction): void => {
     const window = getWindow();
     if (!window) return;
+    // 窗口被隐藏时（关闭按钮只是隐藏）先显示出来，否则用户点了菜单看不到任何反应。
     if (!window.isVisible()) window.show();
     window.webContents.send(desktopIpc.menuAction, action);
   };

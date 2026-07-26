@@ -1,3 +1,12 @@
+/**
+ * 从自然语言目标推断任务契约。
+ *
+ * 两步：先按关键词判断任务类型（启动服务 / 改代码 / 纯对话），再扫描工作区里的 pom.xml、
+ * package.json，把能机器校验的东西编译成验收条件（构建、测试、typecheck、进程就绪探针）。
+ *
+ * 判定用中英文关键词表，是有意保守的启发式：识别不出就退回 `conversation` + 仅模型验收，
+ * 也就是回到普通对话的行为；宁可少判成项目任务，也不要给对话类问题套上一堆跑不通的检查。
+ */
 import { promises as fs, type Dirent } from "node:fs";
 import path from "node:path";
 import { compileTaskContract } from "./TaskContractCompiler.js";
@@ -10,11 +19,13 @@ const codeChangeIntentPattern = /(?:修改|改动|更改|实现|修复|增加|�
 const negatedCodeChangeIntentPattern = /(?:(?:不(?:要|必)?|无需|不需要|禁止|切勿)\s*(?:去\s*)?|(?:do\s+not|don't|without|no)\s+)(?:修改|改动|更改|实现|修复|增加|添加|删除|重构|编写|更新|替换|迁移|优化|开发|补全|完善|复制|移动|重命名|排序|去重|转换|解析|生成|清理|规范化|合并|导出|导入|提取|保留|implement|fix|add|remove|refactor|update|change|create|write|modify|improve|complete|copy|move|rename|sort|deduplicate|convert|parse|generate|clean|normalize|merge|export|import|extract)/igu;
 const fileReferencePattern = /(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]+/gu;
 
-/** Compiles deterministic acceptance predicates for project tasks. */
+/** 为项目型任务编译确定性验收条件；对话型任务只做模型验收。 */
 export async function createTaskContract(workspaceRoot: string, objective: string, ignore: string[] = []): Promise<TaskContract> {
   const trimmed = objective.trim();
   if (!trimmed) throw new Error("Task objective cannot be empty.");
   const isLaunchTask = launchIntentPattern.test(trimmed);
+  // 判断「是否要改代码」前先剔除两类干扰：否定说法（"不要修改…"）和文件名
+  // （`update.ts` 里的 update 不是动词），否则一句「看一下 update.ts，别改」会被判成改代码任务。
   const codeChangeIntent = trimmed.replace(negatedCodeChangeIntentPattern, "").replace(fileReferencePattern, " ");
   const isCodeTask = !isLaunchTask && codeChangeIntentPattern.test(codeChangeIntent);
   if (!isLaunchTask && !isCodeTask) {
@@ -32,6 +43,7 @@ export async function createTaskContract(workspaceRoot: string, objective: strin
   const mavenProjects = manifests.filter((filePath) => path.basename(filePath) === "pom.xml");
   const nodeProjects: NodeProject[] = [];
 
+  // 基线指纹必须在任务开始前算，之后才能证明这次尝试确实动过工作区。
   if (isCodeTask) {
     criteria.push({
       id: "workspace-changed",
@@ -172,6 +184,10 @@ interface NodeProject {
 
 type PackageManager = "pnpm" | "npm" | "yarn" | "bun";
 
+/**
+ * 读取一个 Node 项目的信息。package.json 读不到或格式不对就返回 undefined——推断失败只是
+ * 少生成几条验收条件，不该让整个任务起不来。
+ */
 async function readNodeProject(manifestPath: string, workspaceRoot: string): Promise<NodeProject | undefined> {
   try {
     const text = await readBoundedText(manifestPath, 512 * 1024);
@@ -198,6 +214,7 @@ async function readNodeProject(manifestPath: string, workspaceRoot: string): Pro
     return {
       directory,
       scripts,
+      // 前端判定看三处：有 vite 配置文件、依赖里有前端框架、或 dev 脚本用的是前端工具链。
       isFrontend: hasViteConfig
         || "vite" in dependencies
         || "react" in dependencies
@@ -215,6 +232,10 @@ async function mavenTestCommand(directory: string): Promise<string> {
   return (await firstExisting(directory, ["mvnw"])) ? "./mvnw test" : "mvn test";
 }
 
+/**
+ * 按 lock 文件判断包管理器。子包目录里通常没有 lock 文件（monorepo 只在仓库根有一份），
+ * 所以找不到时回到工作区根再判一次，最后兜底 npm。
+ */
 async function detectPackageManager(directory: string, workspaceRoot: string): Promise<PackageManager> {
   if (await firstExisting(directory, ["pnpm-lock.yaml"])) return "pnpm";
   if (await firstExisting(directory, ["yarn.lock"])) return "yarn";
@@ -228,6 +249,10 @@ function packageScriptCommand(packageManager: PackageManager, script: string): s
   return `${packageManager} run ${script}`;
 }
 
+/**
+ * 从 vite 配置里抠出端口和代理前缀，用来生成前端就绪探针。用正则而不是执行配置文件：
+ * 配置是 TS/JS 代码，跑它等于执行工作区里的任意代码。抠不到就用 vite 默认端口 5173。
+ */
 async function inferFrontendService(directory: string): Promise<{ port: number; proxyPrefix?: string }> {
   const configPath = await firstExisting(directory, [
     "vite.config.ts",
@@ -244,6 +269,11 @@ async function inferFrontendService(directory: string): Promise<{ port: number; 
   return { port: validPort(port) ? port : 5173, proxyPrefix };
 }
 
+/**
+ * 推断 Spring 服务的端口和一个可探测的 GET 路由：端口从 application.properties/yml 读，
+ * 路由从带 `@RestController` + `@GetMapping` 的类里取「类级 RequestMapping + 方法级 GetMapping」
+ * 拼成。带路径参数（`{id}`）的路由不能直接请求，会被 `normalizeRoute` 排除。
+ */
 async function inferJavaService(
   workspaceRoot: string,
   directory: string
@@ -308,6 +338,10 @@ async function discoverByExtension(
   return await walk(root, maxDepth, maxEntries, (entry) => entry.isFile() && entry.name.endsWith(extension));
 }
 
+/**
+ * 有界目录遍历：限深度、限条目数、跳过符号链接和构建目录，读不了的目录直接跳过。
+ * 结果排序后返回，保证同一个工作区每次生成的验收条件顺序一致。
+ */
 async function walk(
   root: string,
   maxDepth: number,
@@ -349,7 +383,7 @@ async function firstExisting(directory: string, names: string[]): Promise<string
     try {
       if ((await fs.stat(candidate)).isFile()) return candidate;
     } catch {
-      // Try the next conventional filename.
+      // 文件不存在，试下一个惯用名。
     }
   }
   return undefined;
@@ -364,11 +398,13 @@ function deduplicateCriteria(criteria: AcceptanceCriterion[]): AcceptanceCriteri
   });
 }
 
+/** 用路径拼稳定的条件 id：非法字符换成连字符，空路径（工作区根）记作 root。 */
 function criterionId(prefix: string, value: string): string {
   const suffix = value.replace(/[^A-Za-z0-9_-]+/gu, "-").replace(/^-|-$/gu, "") || "root";
   return `${prefix}-${suffix}`.slice(0, 128);
 }
 
+/** `npm init` 生成的占位 test 脚本必然失败，不能当成验收条件。 */
 function isPlaceholderTest(command: string | undefined): boolean {
   return !command || /no test specified|exit\s+1/iu.test(command);
 }

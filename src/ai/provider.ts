@@ -1,3 +1,10 @@
+/**
+ * 内置 provider 定义表。
+ *
+ * 每个 provider 的默认 base URL、读取 key 的环境变量名、鉴权方式和 reasoning 协议都集中在
+ * 这里；`openai-compatible` 是自建/中转端点的通用条目，没有默认地址，必须由配置提供。
+ * 只放默认值，不放任何真实凭据。
+ */
 import type { ModelProvider, ProviderConfig } from "../config/schema.js";
 import type { ProviderDefinition } from "./types.js";
 
@@ -90,6 +97,7 @@ export function providerDefinition(type: ModelProvider): ProviderDefinition {
   return definitions[type];
 }
 
+/** 配置可以覆盖协议：同一家服务商可能同时提供原生和 OpenAI 兼容两种端点。 */
 export function providerProtocol(config: ProviderConfig, definition: ProviderDefinition): ProviderDefinition["protocol"] {
   return config.protocol ?? definition.protocol;
 }

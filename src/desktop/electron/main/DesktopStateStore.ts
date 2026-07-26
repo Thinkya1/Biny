@@ -1,7 +1,15 @@
+/**
+ * 桌面端界面状态的持久化：项目列表、当前项目与会话、会话标题/置顶、侧栏与面板宽度、
+ * 主题偏好、窗口位置。
+ *
+ * 读取时逐字段校验并夹到合法范围，文件损坏则改名备份后回退默认值——界面状态不值得让应用
+ * 起不来。写入串行化，避免高频改动（拖动侧栏等）互相覆盖。
+ */
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { clampStoredFilePanelWidth, DEFAULT_FILE_PANEL_WIDTH } from "../../filePanelSizing.js";
-import type { DesktopProject, DesktopThemePreference } from "../../protocol.js";
+import { DEFAULT_FONT_PREFERENCE, normalizeFontPreference } from "../../fontPreference.js";
+import type { DesktopFontPreference, DesktopProject, DesktopThemePreference } from "../../protocol.js";
 
 interface DesktopSessionMetadata {
   title?: string;
@@ -24,6 +32,7 @@ interface PersistedDesktopState {
   sidebarWidth: number;
   filePanelWidth: number;
   themePreference: DesktopThemePreference;
+  fontPreference: DesktopFontPreference;
   windowBounds?: DesktopWindowBounds;
 }
 
@@ -36,6 +45,7 @@ const defaultState: PersistedDesktopState = {
   sidebarWidth: 216,
   filePanelWidth: DEFAULT_FILE_PANEL_WIDTH,
   themePreference: "system",
+  fontPreference: { ...DEFAULT_FONT_PREFERENCE },
   windowBounds: undefined
 };
 
@@ -57,10 +67,13 @@ export class DesktopStateStore {
         sidebarWidth: typeof raw.sidebarWidth === "number" ? clampSidebarWidth(raw.sidebarWidth) : 216,
         filePanelWidth: typeof raw.filePanelWidth === "number" ? clampStoredFilePanelWidth(raw.filePanelWidth) : DEFAULT_FILE_PANEL_WIDTH,
         themePreference: validThemePreference(raw.themePreference) ? raw.themePreference : "system",
+        fontPreference: normalizeFontPreference(raw.fontPreference),
         windowBounds: validWindowBounds(raw.windowBounds) ? raw.windowBounds : undefined
       };
     } catch (error) {
+      // 文件不存在是首次启动，保留默认状态即可。
       if (isNotFound(error)) return;
+      // 解析失败则把坏文件留档（便于事后排查），然后从默认状态重新开始。
       const corruptPath = `${this.filePath}.corrupt-${String(Date.now())}`;
       await fs.rename(this.filePath, corruptPath).catch(() => undefined);
       this.state = structuredClone(defaultState);
@@ -199,6 +212,15 @@ export class DesktopStateStore {
 
   async setThemePreference(theme: DesktopThemePreference): Promise<void> {
     this.state.themePreference = theme;
+    await this.save();
+  }
+
+  fontPreference(): DesktopFontPreference {
+    return { ...this.state.fontPreference };
+  }
+
+  async setFontPreference(font: DesktopFontPreference): Promise<void> {
+    this.state.fontPreference = normalizeFontPreference(font);
     await this.save();
   }
 

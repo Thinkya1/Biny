@@ -1,7 +1,19 @@
+/**
+ * 会话时间线构建。
+ *
+ * 把两路事件合成界面用的「一问一答」轮次：`events` 是已落盘的历史事件，`liveEvents` 是本轮
+ * 正在进行的实时事件。
+ *
+ * 关键难点是去重——实时事件先发出、随后才被写进 session，直接拼接会让同一轮出现两次。
+ * `historicalPrefix` 负责找出历史里与首条实时用户消息对应的那条，从那里截断。
+ *
+ * 这里只做数据整形，不含任何渲染逻辑，方便单独测试。
+ */
 import type { ToolInputDisplay, ToolUpdate } from "../../../tools/types.js";
 import type { AgentPermissionEventRequest, AgentRunModel, AgentHostEvent } from "../../../runtime/agentEvents.js";
 import type { SessionEvent } from "../../../session/recorder.js";
 import type { SessionUsage } from "../../../session/metadata.js";
+import { publicUserMessage } from "../../../session/publicMessage.js";
 
 export type TimelineRunStatus = "idle" | "queued" | "running" | "waiting_permission" | "completed" | "incomplete" | "aborted" | "failed";
 export type TimelineToolStatus = "waiting" | "running" | "success" | "failed" | "denied" | "aborted";
@@ -124,13 +136,21 @@ export interface TimelineChangedFile {
   status: "writing" | "completed";
 }
 
+/** 合成完整时间线；末尾过滤掉完全空的轮次（只有元信息、没有任何可展示内容）。 */
 export function buildSessionTimeline(events: SessionEvent[], liveEvents: AgentHostEvent[]): TimelineTurn[] {
   const history = historicalPrefix(events, liveEvents);
   const historicalTurns = buildHistoricalTurns(history);
+  // 实时轮次的用户消息序号要接着历史的算，「编辑消息」功能依赖这个序号定位。
   const historicalUserMessages = history.filter((event) => event.type === "user_message").length;
   return [...historicalTurns, ...buildLiveTurns(liveEvents, historicalUserMessages)].filter((turn) => turn.user || turn.assistant || turn.steps.length || turn.tools.length || turn.error);
 }
 
+/**
+ * 找出历史事件中应当保留的前缀，避免与实时事件重复。
+ *
+ * 做法是在历史里找与首条实时用户消息「内容相同且时间不早于它」的那一条，从该处截断；
+ * 找不到就整段保留。内容比较用 `publicUserMessage`，因为落盘的内容可能带 harness 脚手架。
+ */
 function historicalPrefix(events: SessionEvent[], liveEvents: AgentHostEvent[]): SessionEvent[] {
   const firstLiveUser = liveEvents.find((event) => event.type === "message.user");
   if (!firstLiveUser || firstLiveUser.type !== "message.user") return events;
@@ -139,10 +159,10 @@ function historicalPrefix(events: SessionEvent[], liveEvents: AgentHostEvent[]):
   let matchingIndex = -1;
   for (let index = 0; index < events.length; index += 1) {
     const event = events[index];
-    if (event?.type !== "user_message" || event.content !== firstLiveUser.content) continue;
+    if (event?.type !== "user_message" || publicUserMessage(event.content) !== publicUserMessage(firstLiveUser.content)) continue;
     const eventTimestamp = event.time ? Date.parse(event.time) : Number.NaN;
-    // The live event is emitted before AgentSession records the user message. An
-    // older identical prompt must therefore stay in the historical prefix.
+    // 实时事件先于 AgentSession 落盘发出，所以只有时间不早于它的记录才可能是「同一条」；
+    // 更早的同样内容（用户重复发过一次）必须留在历史里。
     if (!Number.isNaN(eventTimestamp) && eventTimestamp >= liveTimestamp) matchingIndex = index;
   }
   return matchingIndex >= 0 ? events.slice(0, matchingIndex) : events;
@@ -165,7 +185,7 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
     if (event.type === "user_message") {
       anonymousIndex += 1;
       current = emptyTurn(`history-${String(anonymousIndex)}`, event.time);
-      current.user = event.content;
+      current.user = publicUserMessage(event.content);
       current.userMessageIndex = userMessageIndex;
       userMessageIndex += 1;
       current.skills = skillNames(event.skills);
@@ -236,11 +256,19 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
   return turns;
 }
 
+/**
+ * 由实时事件构建轮次。
+ *
+ * 实时事件以 `runId` 归属轮次、以 `toolCallId` 归属工具，所以这里用 Map 建索引，`order`
+ * 单独记录出现顺序（Map 的插入序不适合在后续补写时依赖）。
+ * `activeReasoning` / `activeAssistant` 保存当前正在流式追加的步骤，增量内容要续写而不是新建。
+ */
 function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: number): TimelineTurn[] {
   const turns = new Map<string, TimelineTurn>();
   const order: string[] = [];
   const toolMaps = new Map<string, Map<string, TimelineTool>>();
   const activeReasoning = new Map<string, TimelineReasoningStep>();
+  const activeAssistant = new Map<string, TimelineAssistantStep>();
   let userMessageIndex = initialUserMessageIndex;
   const turnFor = (event: AgentHostEvent): TimelineTurn => {
     const current = turns.get(event.runId);
@@ -257,6 +285,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
     if (!tools) throw new Error("Timeline tool map is missing.");
     const current = tools.get(event.toolCallId);
     if (current) return current;
+    activeAssistant.delete(event.runId);
     const tool: TimelineTool = {
       id: event.toolCallId,
       tool: toolName,
@@ -307,15 +336,24 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
 
   const appendAssistant = (turn: TimelineTurn, content: string): void => {
     if (!content) return;
-    const previous = turn.steps.at(-1);
-    if (previous?.kind === "assistant") previous.content += content;
-    else turn.steps.push({ kind: "assistant", id: `${turn.id}:assistant:${String(turn.steps.filter((step) => step.kind === "assistant").length)}`, content });
+    const active = activeAssistant.get(turn.id);
+    if (active) {
+      active.content += content;
+      return;
+    }
+    const step: TimelineAssistantStep = {
+      kind: "assistant",
+      id: `${turn.id}:assistant:${String(turn.steps.filter((candidate) => candidate.kind === "assistant").length)}`,
+      content
+    };
+    turn.steps.push(step);
+    activeAssistant.set(turn.id, step);
   };
 
   for (const event of events) {
     const turn = turnFor(event);
     if (event.type === "message.user") {
-      turn.user = event.content;
+      turn.user = publicUserMessage(event.content);
       turn.userMessageIndex = userMessageIndex;
       userMessageIndex += 1;
       turn.status = "queued";
@@ -324,15 +362,18 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       turn.model = event.model;
       turn.skills = skillNames(event.skills);
     } else if (event.type === "assistant.delta") {
-      turn.assistant += event.content;
       finishReasoning(event.runId, event.timestamp);
       appendAssistant(turn, event.content);
     } else if (event.type === "assistant.completed") {
-      turn.assistant = event.content || turn.assistant;
       finishReasoning(event.runId, event.timestamp);
-      const previous = turn.steps.at(-1);
-      if (event.content && previous?.kind === "assistant") previous.content = event.content;
-      else appendAssistant(turn, event.content);
+      const active = activeAssistant.get(event.runId);
+      if (active) {
+        if (event.content) active.content = event.content;
+        activeAssistant.delete(event.runId);
+      } else if (event.content && latestAssistantContent(turn) !== event.content) {
+        appendAssistant(turn, event.content);
+        activeAssistant.delete(event.runId);
+      }
       turn.timestamp = event.timestamp;
     } else if (event.type === "reasoning.started") {
       startReasoning(event);
@@ -402,10 +443,8 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       tool.command ??= { command: event.command, cwd: event.cwd, stdout: "", stderr: "" };
       tool.command.exitCode = event.exitCode;
       tool.durationMs = event.durationMs;
-      if (event.exitCode !== undefined && event.exitCode !== 0) {
-        tool.status = "failed";
-        tool.error ??= `Command exited with code ${String(event.exitCode)}.`;
-      }
+      // 非零退出只标状态；「退出码 N」由展开视图的徽标表达，不再造一条冗余错误文案。
+      if (event.exitCode !== undefined && event.exitCode !== 0) tool.status = "failed";
     } else if (event.type === "command.failed") {
       const tool = toolFor(event, "run_command");
       tool.command ??= { command: event.command, cwd: event.cwd, stdout: "", stderr: "" };
@@ -457,7 +496,14 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       }
     }
   }
-  return order.map((runId) => turns.get(runId)).filter((turn): turn is TimelineTurn => Boolean(turn));
+  return order.map((runId) => turns.get(runId)).filter((turn): turn is TimelineTurn => Boolean(turn)).map((turn) => {
+    turn.assistant = turn.steps.filter((step): step is TimelineAssistantStep => step.kind === "assistant").map((step) => step.content).join("\n\n");
+    return turn;
+  });
+}
+
+function latestAssistantContent(turn: TimelineTurn): string | undefined {
+  return [...turn.steps].reverse().find((step): step is TimelineAssistantStep => step.kind === "assistant")?.content;
 }
 
 function emptyTurn(id: string, timestamp?: string): TimelineTurn {
@@ -482,6 +528,7 @@ function appendHistoricalAssistant(turn: TimelineTurn, content: string | undefin
   turn.steps.push({ kind: "assistant", id: `${turn.id}:assistant:${String(turn.steps.filter((step) => step.kind === "assistant").length)}`, content });
 }
 
+/** 追加思考内容。已经以同样内容结尾时跳过：session 里同一段思考可能被重复记录。 */
 function appendReasoning(existing: string, next: string | undefined): string {
   if (!next) return existing;
   if (!existing) return next;
@@ -489,6 +536,7 @@ function appendReasoning(existing: string, next: string | undefined): string {
   return `${existing}\n\n${next}`;
 }
 
+/** 技能路径转成去重后的展示名，界面上只显示名字而不是完整路径。 */
 function skillNames(paths: string[] | undefined): string[] {
   const names = (paths ?? []).map(skillName).filter(Boolean);
   return [...new Set(names)];
@@ -540,8 +588,9 @@ function resultFailed(result: unknown): boolean {
     || record.status === "denied";
 }
 
+// 只保留真实错误文本；「失败」本身由状态字形表达，不值得一段占位文案。
 function resultError(result: unknown): string | undefined {
-  return resultString(result, "error") ?? (resultFailed(result) ? "工具执行失败" : undefined);
+  return resultString(result, "error");
 }
 
 function resultString(result: unknown, key: string): string | undefined {
@@ -567,6 +616,9 @@ function historicalToolProjection(tool: string, args: unknown): { display?: Tool
       path: undefined,
       display: { kind: "file_io", operation: tool === "search_files" ? "search" : "grep", path: ".", detail: query }
     };
+  }
+  if (tool === "web_search") {
+    return { path: undefined, display: query ? { kind: "generic", summary: query, detail: args } : undefined };
   }
   if (tool === "list_files") return { path: undefined, display: { kind: "file_io", operation: "list", path: "." } };
   if (tool === "git_diff" || tool === "git_status") {

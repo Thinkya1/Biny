@@ -1,3 +1,12 @@
+/**
+ * 主窗口创建。
+ *
+ * 负责窗口尺寸的恢复与持久化、主题背景色同步、关闭行为（默认隐藏而不是退出）以及导航限制。
+ *
+ * 安全相关的三项配置是刻意的：contextIsolation + sandbox 打开、nodeIntegration 关闭，渲染
+ * 进程只能通过 preload 暴露的接口访问系统能力；同时禁止开新窗口、禁止导航到本地页面之外的
+ * 地址，避免页面被引导到外部站点。
+ */
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { BrowserWindow, nativeTheme, screen } from "electron";
@@ -6,9 +15,10 @@ import { DesktopStateStore } from "./DesktopStateStore.js";
 
 export type WindowCloseDecision = "hide" | "close" | "cancel";
 
+/** 窗口底色要和渲染层主题一致，否则加载过程中会闪一下白底。 */
 function themeBackgroundColor(preference: DesktopThemePreference = "system"): string {
   const dark = preference === "dark" || (preference === "system" && nativeTheme.shouldUseDarkColors);
-  return dark ? "#181818" : "#ffffff";
+  return dark ? "#15171c" : "#ffffff";
 }
 
 export function createDesktopWindow(
@@ -52,7 +62,9 @@ export function createDesktopWindow(
   let closePromptOpen = false;
   let boundsTimer: ReturnType<typeof setTimeout> | undefined;
   const saveBounds = (): void => {
+    // 最大化/全屏时的尺寸不能存：还原后会变成占满屏幕的「普通窗口」。
     if (window.isDestroyed() || window.isMaximized() || window.isFullScreen()) return;
+    // 拖动和缩放会高频触发，防抖后再落盘。
     if (boundsTimer) clearTimeout(boundsTimer);
     boundsTimer = setTimeout(() => {
       if (!window.isDestroyed()) void state.setWindowBounds(window.getBounds());
@@ -60,6 +72,8 @@ export function createDesktopWindow(
   };
   window.on("move", saveBounds);
   window.on("resize", saveBounds);
+  // 关闭要先问过上层（可能有任务在跑）：默认拦住，等决策回来再决定隐藏还是真的关。
+  // `allowClose` 用来放行决策后自己调的那次 close，`closePromptOpen` 防止反复弹询问。
   window.on("close", (event) => {
     if (allowClose) return;
     if (closePromptOpen) {
@@ -93,6 +107,10 @@ export function createDesktopWindow(
   return window;
 }
 
+/**
+ * 校验保存的窗口位置在当前显示器布局下仍然可见：外接屏拔掉后，旧坐标可能整块落在屏幕外，
+ * 窗口就再也找不回来了。要求与某个显示器至少有 120x80 的交集，否则丢弃坐标改用默认居中。
+ */
 function visibleBounds(bounds: ReturnType<DesktopStateStore["windowBounds"]>): ReturnType<DesktopStateStore["windowBounds"]> {
   if (!bounds) return undefined;
   const intersects = screen.getAllDisplays().some((display) => {

@@ -1,23 +1,40 @@
+/**
+ * 渲染进程根组件。
+ *
+ * 持有全部界面状态（项目、会话、时间线、浮层、布局尺寸），订阅主进程事件流并把状态分发给
+ * Sidebar / Workspace / Composer / Overlays。所有 IPC 调用都集中在这里，子组件只通过回调
+ * 表达意图。
+ *
+ * 事件通道是所有项目共用的，因此处理事件时必须先按 `projectId` 过滤，否则后台项目的输出会
+ * 串到当前界面上。
+ */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AgentRunMode } from "../../../agent/AgentSession.js";
+import type { ContextBudgetStatus, ContextStatus } from "../../../agent/context/types.js";
 import type { ModelRuntimeInfo, ThinkingSelection } from "../../../llm/ModelManager.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
 import type { AgentHostEvent } from "../../../runtime/agentEvents.js";
 import type { SessionEvent } from "../../../session/recorder.js";
+import { publicUserMessage } from "../../../session/publicMessage.js";
 import type {
   DesktopAgentEventEnvelope,
   DesktopAttachment,
+  DesktopFontPreference,
+  DesktopMemorySettings,
   DesktopMenuAction,
   DesktopModelConfigurationInput,
   DesktopModelLoginProvider,
   DesktopProject,
   DesktopSessionDocument,
   DesktopSessionSummary,
+  DesktopSlashResult,
   DesktopThemePreference,
+  DesktopWebSearchSettingsInput,
   DesktopWorkspaceDirectory,
   DesktopWorkspaceSnapshot
 } from "../../protocol.js";
 import { DEFAULT_FILE_PANEL_WIDTH } from "../../filePanelSizing.js";
+import { DEFAULT_FONT_PREFERENCE, SYSTEM_FONT_FAMILY } from "../../fontPreference.js";
 import {
   canNavigateBack,
   canNavigateForward,
@@ -29,9 +46,9 @@ import {
   type DesktopNavigationTarget
 } from "./navigationHistory.js";
 import { buildSessionTimeline, listChangedFiles, type TimelineTurn } from "./sessionTimeline.js";
-import { Composer } from "./components/Composer.js";
+import { Composer, type ContextUsage } from "./components/Composer.js";
 import { NavigationControls } from "./components/NavigationControls.js";
-import { RenameOverlay, SearchOverlay, SettingsOverlay, Toast } from "./components/Overlays.js";
+import { FeatureUnavailableOverlay, RenameOverlay, SearchOverlay, SettingsOverlay, SlashResultOverlay, Toast } from "./components/Overlays.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { Workspace } from "./components/Workspace.js";
 
@@ -57,12 +74,15 @@ export function App(): React.JSX.Element {
   const [filePanelWidth, setFilePanelWidth] = useState(DEFAULT_FILE_PANEL_WIDTH);
   const [filePanelResizing, setFilePanelResizing] = useState(false);
   const [themePreference, setThemePreference] = useState<DesktopThemePreference>("system");
+  const [fontPreference, setFontPreference] = useState<DesktopFontPreference>(DEFAULT_FONT_PREFERENCE);
   const [focusToken, setFocusToken] = useState(0);
   const [deletedUserMessages, setDeletedUserMessages] = useState<Set<string>>(() => new Set());
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [unavailableFeature, setUnavailableFeature] = useState<string>();
+  const [contextBudget, setContextBudget] = useState<ContextBudgetStatus>();
   const [renameTarget, setRenameTarget] = useState<RenameTarget>();
+  const [slashResult, setSlashResult] = useState<DesktopSlashResult>();
   const [toast, setToast] = useState<string>();
   const [navigation, setNavigation] = useState<DesktopNavigationState>(createNavigationState);
   const selectedRef = useRef<string | undefined>(undefined);
@@ -110,7 +130,8 @@ export function App(): React.JSX.Element {
     const request = loadRequestRef.current + 1;
     loadRequestRef.current = request;
     setSelectedSessionId(sessionId);
-    setUnavailableFeature(undefined);
+    // 上下文用量属于某一个会话，换会话就作废，等新会话跑出 context.updated 再显示。
+    setContextBudget(undefined);
     if (showLoader) setLoading(true);
     try {
       const nextDocument = await window.biny.openSession(projectId, sessionId);
@@ -159,6 +180,7 @@ export function App(): React.JSX.Element {
       setSidebarWidth(bootstrap.sidebarWidth);
       setFilePanelWidth(bootstrap.filePanelWidth ?? DEFAULT_FILE_PANEL_WIDTH);
       setThemePreference(bootstrap.themePreference ?? "system");
+      setFontPreference(bootstrap.fontPreference ?? DEFAULT_FONT_PREFERENCE);
       if (bootstrap.workspace) {
         mergeWorkspaceProject(bootstrap.workspace);
         const nextSessionId = bootstrap.selectedSessionId ?? bootstrap.workspace.selectedSessionId;
@@ -178,12 +200,14 @@ export function App(): React.JSX.Element {
     return () => { active = false; };
   }, [commitNavigation, mergeWorkspaceProject, openSession]);
 
+  // 事件流处理：事件先入队，按帧批量 flush。流式输出的事件非常密集，逐条 setState 会让界面卡顿。
   useEffect(() => {
     const refreshTimers = refreshTimersRef.current;
     const flushEvents = (): void => {
       eventFrameRef.current = undefined;
       const batch = eventQueueRef.current.splice(0);
       if (!batch.length) return;
+      // 用 ref 而不是闭包里的 state：这个回调只注册一次，闭包里的值会是旧的。
       const activeProjectId = projectRef.current;
       const projectBatch = activeProjectId ? batch.filter((envelope) => envelope.projectId === activeProjectId) : [];
       if (projectBatch.length) {
@@ -195,9 +219,15 @@ export function App(): React.JSX.Element {
             setDocument((current) => current?.session.id === currentSessionId
               ? { ...current, liveEvents: [...current.liveEvents, ...currentEvents] }
               : current);
+            // 上下文用量只认最后一条：一轮里会多次上报，界面只需要最新值。
+            const contextEvents = currentEvents.filter(hasContextStatus);
+            const latestContext = contextEvents[contextEvents.length - 1];
+            if (latestContext) setContextBudget(latestContext.context.budget);
           }
         }
       }
+      // 终态事件要触发一次项目刷新（分支、脏状态、会话摘要都可能变），这里对整批事件都处理，
+      // 包括非当前项目的：后台项目跑完了，侧栏也该更新。
       const completedProjects = new Map<string, string>();
       for (const envelope of batch) {
         if (envelope.event.type === "run.completed" || envelope.event.type === "run.incomplete" || envelope.event.type === "run.aborted" || envelope.event.type === "run.failed") {
@@ -207,6 +237,7 @@ export function App(): React.JSX.Element {
       for (const [projectId, sessionId] of completedProjects) scheduleRefresh(projectId, sessionId);
     };
 
+    /** 按项目防抖刷新：一轮结束往往连着来几个事件，没必要各刷一次。 */
     const scheduleRefresh = (projectId: string, sessionId: string): void => {
       const existing = refreshTimers.get(projectId);
       if (existing) clearTimeout(existing);
@@ -239,7 +270,6 @@ export function App(): React.JSX.Element {
   useEffect(() => window.biny.onMenuAction((action) => menuActionRef.current(action)), []);
 
   const openProject = useCallback(async (): Promise<void> => {
-    setUnavailableFeature(undefined);
     try {
       const snapshot = await window.biny.openProject();
       if (snapshot) {
@@ -252,7 +282,6 @@ export function App(): React.JSX.Element {
   }, [adoptWorkspace, commitNavigation]);
 
   const createEmptyProject = useCallback(async (): Promise<void> => {
-    setUnavailableFeature(undefined);
     try {
       const snapshot = await window.biny.createEmptyProject();
       if (snapshot) {
@@ -265,10 +294,7 @@ export function App(): React.JSX.Element {
   }, [adoptWorkspace]);
 
   const selectProject = useCallback(async (projectId: string): Promise<void> => {
-    if (projectId === projectRef.current) {
-      setUnavailableFeature(undefined);
-      return;
-    }
+    if (projectId === projectRef.current) return;
     setLoading(true);
     setDocument(undefined);
     try {
@@ -282,7 +308,6 @@ export function App(): React.JSX.Element {
   }, [adoptWorkspace, commitNavigation]);
 
   const newTask = useCallback(async (targetProjectId = projectRef.current): Promise<void> => {
-    setUnavailableFeature(undefined);
     const projectId = targetProjectId;
     if (!projectId) {
       await openProject();
@@ -354,6 +379,12 @@ export function App(): React.JSX.Element {
     }
     if (receipt.queued) setToast("补充要求已排入当前会话");
   }, [commitNavigation, document, workspace?.sessions]);
+
+  const runSlashCommand = useCallback(async (command: string): Promise<void> => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    setSlashResult(await window.biny.runSlashCommand(projectId, selectedRef.current, command));
+  }, []);
 
   const editPrompt = useCallback(async (
     input: string,
@@ -439,6 +470,20 @@ export function App(): React.JSX.Element {
     void window.biny.setThemePreference(theme).catch(() => undefined);
   }, []);
 
+  // 字号通过 --app-font-size 驱动样式表里的 --font-scale 等比缩放全部文字；
+  // 自定义字体族插到默认字体栈前面，缺字时仍能落到系统 CJK 字体。
+  useEffect(() => {
+    const style = window.document.documentElement.style;
+    style.setProperty("--app-font-size", String(fontPreference.size));
+    if (fontPreference.family === SYSTEM_FONT_FAMILY) style.removeProperty("--font-sans");
+    else style.setProperty("--font-sans", `"${fontPreference.family.replaceAll('"', "")}", var(--font-sans-stack)`);
+  }, [fontPreference]);
+
+  const changeFontPreference = useCallback((font: DesktopFontPreference): void => {
+    setFontPreference(font);
+    void window.biny.setFontPreference(font).catch(() => undefined);
+  }, []);
+
   const toggleProjectPinned = useCallback(async (projectId: string, pinned: boolean): Promise<void> => {
     try {
       mergeProjectSnapshot(await window.biny.setProjectPinned(projectId, pinned));
@@ -481,7 +526,11 @@ export function App(): React.JSX.Element {
     if (!projectId) return;
     const info = await window.biny.switchModel(projectId, alias, thinking);
     setWorkspace((current) => updateRuntimeInfo(current, info));
-  }, []);
+    // 切模型这一步可能刚刚把运行时创建出来，而界面手上的快照里还没有 runtime 字段，
+    // 此时 updateRuntimeInfo 无处可写，界面会继续显示旧模型，直到别的操作（例如改权限模式）
+    // 带回完整快照——看起来就像「一改权限模型就变了」。所以这里补一次完整刷新。
+    mergeProjectSnapshot(await window.biny.refreshProject(projectId));
+  }, [mergeProjectSnapshot]);
 
   const saveModelConfiguration = useCallback(async (configuration: DesktopModelConfigurationInput): Promise<void> => {
     const projectId = projectRef.current;
@@ -500,6 +549,72 @@ export function App(): React.JSX.Element {
     if (!projectId) throw new Error("请先打开一个项目。");
     mergeWorkspaceProject(await window.biny.removeModelConfiguration(projectId, alias));
   }, [mergeWorkspaceProject]);
+
+  const loadWebSearchSettings = useCallback(async () => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    const webSearchSettings = window.biny.webSearchSettings;
+    if (typeof webSearchSettings !== "function") throw new Error(desktopApiVersionMismatchMessage);
+    return await webSearchSettings(projectId);
+  }, []);
+
+  const saveWebSearchSettings = useCallback(async (input: DesktopWebSearchSettingsInput) => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    return await window.biny.saveWebSearchSettings(projectId, input);
+  }, []);
+
+  const loadMemoryOverview = useCallback(async () => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    const memoryOverview = window.biny.memoryOverview;
+    if (typeof memoryOverview !== "function") throw new Error(desktopApiVersionMismatchMessage);
+    return await memoryOverview(projectId);
+  }, []);
+
+  const saveMemorySettings = useCallback(async (input: DesktopMemorySettings) => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    return await window.biny.saveMemorySettings(projectId, input);
+  }, []);
+
+  const searchMemory = useCallback(async (query: string) => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    return await window.biny.searchMemory(projectId, query);
+  }, []);
+
+  const addMemoryEntry = useCallback(async (topic: string, note: string) => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    return await window.biny.addMemoryEntry(projectId, topic, note);
+  }, []);
+
+  const deleteMemoryEntry = useCallback(async (topic: string, index: number) => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    return await window.biny.deleteMemoryEntry(projectId, topic, index);
+  }, []);
+
+  const clearMemory = useCallback(async () => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    return await window.biny.clearMemory(projectId);
+  }, []);
+
+  const compactMemory = useCallback(async () => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    return await window.biny.compactMemory(projectId);
+  }, []);
+
+  const fetchModelCatalog = useCallback(async (providerAlias: string) => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("请先打开一个项目。");
+    const fetchCatalog = window.biny.fetchModelCatalog;
+    if (typeof fetchCatalog !== "function") throw new Error(desktopApiVersionMismatchMessage);
+    return await fetchCatalog(projectId, providerAlias);
+  }, []);
 
   const startModelLogin = useCallback(async (provider: DesktopModelLoginProvider) => {
     const projectId = projectRef.current;
@@ -571,6 +686,17 @@ export function App(): React.JSX.Element {
   const visibleTurns = useMemo(() => turns
     .map((turn) => deletedUserMessages.has(`${messageScope}:${turn.id}`) ? { ...turn, user: "" } : turn)
     .filter((turn) => turn.user || turn.assistant || turn.tools.length || turn.error), [deletedUserMessages, messageScope, turns]);
+  // 上下文用量：优先用运行时刚上报的实时值；重开会话或刚启动时运行时还没跑过一轮，
+  // 就退回会话里最后一次 provider 报告的输入 token 数——和运行时的 usedTokens 是同一个口径。
+  const contextUsage = useMemo<ContextUsage | undefined>(() => {
+    const info = workspace?.runtime?.info;
+    const models = workspace?.models ?? [];
+    const selectedModel = models.find((model) => model.alias === info?.modelAlias) ?? models[0];
+    const maxTokens = contextBudget?.maxTokens ?? info?.maxInputTokens ?? selectedModel?.maxInputTokens;
+    const usedTokens = contextBudget?.usedTokens ?? lastReportedInputTokens(document);
+    if (!maxTokens || !usedTokens) return undefined;
+    return { usedTokens, maxTokens };
+  }, [contextBudget, document, workspace?.models, workspace?.runtime?.info]);
   const clearToast = useCallback(() => setToast(undefined), []);
   const sessionSummary = workspace?.sessions.find((session) => session.id === selectedSessionId) ?? document?.session;
   const activeSessionId = workspace?.runtime?.activeRun?.sessionId ?? workspace?.runtime?.pendingPermission?.sessionId;
@@ -579,6 +705,7 @@ export function App(): React.JSX.Element {
   const composer = (
     <Composer
       activeElsewhere={activeElsewhere}
+      contextUsage={contextUsage}
       focusToken={focusToken}
       modelSetupRequired={Boolean(workspace?.requiresModelConfiguration)}
       models={workspace?.models ?? []}
@@ -586,8 +713,10 @@ export function App(): React.JSX.Element {
       onPermissionMode={setPermissionMode}
       onSaveAttachment={saveAttachment}
       onSend={sendPrompt}
+      onSlashCommand={runSlashCommand}
       onStop={async () => { const projectId = projectRef.current; if (projectId) await window.biny.cancelRun(projectId); }}
       onSwitchModel={switchModel}
+      onUnavailable={setUnavailableFeature}
       permissionMode={workspace?.runtime?.permissionMode ?? "ask"}
       project={workspace?.project}
       running={selectedRunning}
@@ -608,6 +737,7 @@ export function App(): React.JSX.Element {
         onRenameProject={renameProject}
         onReorderProjects={(projectIds) => void reorderProjects(projectIds)}
         onRevealProject={(projectId) => { void window.biny.revealProject(projectId).catch((error) => setToast(errorMessage(error))); }}
+        onOpenTerminalProject={(projectId) => { void window.biny.openProjectTerminal(projectId).catch((error) => setToast(errorMessage(error))); }}
         onSearch={() => setSearchOpen(true)}
         onSelectProject={(projectId) => void selectProject(projectId)}
         onSelectSession={(sessionId) => { const projectId = projectRef.current; if (projectId) void navigateToSession(projectId, sessionId); }}
@@ -637,12 +767,9 @@ export function App(): React.JSX.Element {
         onFilePanelResizeStart={() => setFilePanelResizing(true)}
         onFilePanelWidthChange={setFilePanelWidth}
         onOpenFile={openWorkspaceFile}
+        onOpenExternal={(url) => void window.biny.openExternal(url).catch((error) => setToast(errorMessage(error)))}
         onOpenProject={() => void openProject()}
         onListDirectory={listWorkspaceDirectory}
-        onOpenTerminal={() => {
-          const projectId = projectRef.current;
-          if (projectId) void window.biny.openProjectTerminal(projectId).catch((error) => setToast(errorMessage(error)));
-        }}
         onPanelNotice={setToast}
         onReadFile={readWorkspaceFile}
         onRefreshProject={() => { const projectId = projectRef.current; if (projectId) void window.biny.refreshProject(projectId).then(mergeWorkspaceProject).catch((error) => setToast(errorMessage(error))); }}
@@ -655,7 +782,6 @@ export function App(): React.JSX.Element {
         sessionId={selectedSessionId}
         sessionTitle={sessionSummary?.title}
         turns={visibleTurns}
-        unavailableFeature={unavailableFeature}
       >
         {composer}
       </Workspace>
@@ -685,13 +811,18 @@ export function App(): React.JSX.Element {
         modelSetupRequired={Boolean(workspace?.requiresModelConfiguration)}
         onClose={() => setSettingsOpen(false)}
         onSkipModelSetup={() => setSettingsOpen(false)}
-        onCompact={async () => { const projectId = projectRef.current; if (projectId) await window.biny.compact(projectId); }}
+        onLoadMemoryOverview={loadMemoryOverview}
+        onSaveMemorySettings={saveMemorySettings}
+        onSearchMemory={searchMemory}
+        onAddMemoryEntry={addMemoryEntry}
+        onDeleteMemoryEntry={deleteMemoryEntry}
+        onClearMemory={clearMemory}
+        onCompactMemory={compactMemory}
         onOpenExternal={async (url) => await window.biny.openExternal(url)}
-        onOpenTerminal={async () => { const projectId = projectRef.current; if (projectId) await window.biny.openProjectTerminal(projectId); }}
-        onPermissionMode={setPermissionMode}
-        onRemoveProject={async () => { const projectId = projectRef.current; if (projectId) await removeProject(projectId); setSettingsOpen(false); }}
-        onRevealProject={async () => { const projectId = projectRef.current; if (projectId) await window.biny.revealProject(projectId); }}
         onRemoveModelConfiguration={removeModelConfiguration}
+        onLoadWebSearchSettings={loadWebSearchSettings}
+        onSaveWebSearchSettings={saveWebSearchSettings}
+        onFetchModelCatalog={fetchModelCatalog}
         onStartModelLogin={startModelLogin}
         onCompleteModelLogin={completeModelLogin}
         onCancelModelLogin={cancelModelLogin}
@@ -699,8 +830,10 @@ export function App(): React.JSX.Element {
         onTestModelConfiguration={testModelConfiguration}
         onSwitchModel={switchModel}
         onThemePreference={changeThemePreference}
+        onFontPreference={changeFontPreference}
         open={settingsOpen}
         themePreference={themePreference}
+        fontPreference={fontPreference}
         version={version}
         workspace={workspace}
       />
@@ -723,6 +856,8 @@ export function App(): React.JSX.Element {
         }}
         open={Boolean(renameTarget)}
       />
+      <FeatureUnavailableOverlay feature={unavailableFeature} onClose={() => setUnavailableFeature(undefined)} />
+      <SlashResultOverlay onClose={() => setSlashResult(undefined)} result={slashResult} />
       <Toast message={toast} onClose={clearToast} />
     </div>
   );
@@ -732,13 +867,14 @@ function applyEventsToWorkspace(workspace: DesktopWorkspaceSnapshot, events: Age
   const sessions = [...workspace.sessions];
   let runtime = workspace.runtime ? { ...workspace.runtime, queuedRuns: [...workspace.runtime.queuedRuns] } : undefined;
   for (const event of events) {
+    const visibleInput = event.type === "message.user" ? publicUserMessage(event.content) : "";
     let session = sessions.find((candidate) => candidate.id === event.sessionId);
     if (!session && event.type === "message.user") {
-      session = syntheticSession(workspace.project.id, event.sessionId, event.content);
+      session = syntheticSession(workspace.project.id, event.sessionId, visibleInput);
       sessions.unshift(session);
     }
     if (session && event.type === "message.user") {
-      session = { ...session, title: session.title === "新任务" ? titleFromInput(event.content) : session.title, firstUserMessage: session.firstUserMessage || event.content, status: "running", updatedAt: event.timestamp };
+      session = { ...session, title: session.title === "新任务" ? titleFromInput(visibleInput) : session.title, firstUserMessage: session.firstUserMessage || visibleInput, status: "running", updatedAt: event.timestamp };
       replaceSession(sessions, session);
     }
     if (session && event.type === "run.started") {
@@ -781,6 +917,26 @@ function applyEventsToWorkspace(workspace: DesktopWorkspaceSnapshot, events: Age
     }
   }
   return { ...workspace, sessions: sessions.sort(sessionSort), runtime };
+}
+
+/**
+ * 会话里最后一次 provider 报告的输入 token 数。
+ *
+ * 运行时的 `usedTokens` 也是取自同一个 provider 用量，所以重开会话时用它回填不会算出另一套数字。
+ * 内部尝试（`auditOnly`）不算进来：界面展示的是公开对话的上下文。
+ */
+function lastReportedInputTokens(document?: DesktopSessionDocument): number | undefined {
+  if (!document) return undefined;
+  let latest: number | undefined;
+  for (const event of document.events) {
+    if (event.type !== "assistant_message" || event.auditOnly) continue;
+    if (event.usage?.inputTokens !== undefined) latest = event.usage.inputTokens;
+  }
+  return latest;
+}
+
+function hasContextStatus(event: AgentHostEvent): event is AgentHostEvent & { context: ContextStatus } {
+  return event.type === "context.updated" || event.type === "compact.completed";
 }
 
 function updateRuntimeInfo(workspace: DesktopWorkspaceSnapshot | undefined, info: ModelRuntimeInfo): DesktopWorkspaceSnapshot | undefined {

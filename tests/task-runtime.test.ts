@@ -13,6 +13,7 @@ import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.
 import type { AgentHostEvent } from "../src/runtime/agentEvents.js";
 
 await testIncompleteAttemptAutomaticallyContinues();
+await testInternalAttemptPromptStaysOutOfPublicMessage();
 await testAttemptEvidenceIsBounded();
 await testRemainingStepBudgetCapsNextAttempt();
 await testTaskAttemptBudgetIsNotCompletion();
@@ -26,10 +27,12 @@ async function testIncompleteAttemptAutomaticallyContinues(): Promise<void> {
   try {
     const store = await TaskRunStore.open(root);
     const inputs: string[] = [];
+    const modelInputs: Array<string | undefined> = [];
     const remembered: Array<{ task: string; answer: string }> = [];
     let attempts = 0;
-    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (input): AsyncGenerator<AgentSessionEvent> {
+    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (input, options): AsyncGenerator<AgentSessionEvent> {
       inputs.push(input);
+      modelInputs.push(options.modelInput);
       attempts += 1;
       yield done(attempts === 1
         ? {
@@ -56,7 +59,9 @@ async function testIncompleteAttemptAutomaticallyContinues(): Promise<void> {
     assert.equal(outcome.steps, 35);
     assert.equal(attempts, 2);
     assert.equal(inputs[0], "finish the requested task");
-    assert.match(inputs[1] ?? "", /Continue the same project-level task autonomously/u);
+    assert.equal(inputs[1], "finish the requested task");
+    assert.equal(modelInputs[0], "finish the requested task");
+    assert.match(modelInputs[1] ?? "", /Continue the same project-level task autonomously/u);
     assert.equal(events.filter((event) => event.type === "run.completed").length, 1);
     assert.equal(events.some((event) => event.type === "run.incomplete"), false);
     assert.deepEqual(remembered, [{ task: "finish the requested task", answer: "verified done" }]);
@@ -68,6 +73,37 @@ async function testIncompleteAttemptAutomaticallyContinues(): Promise<void> {
     assert.equal(task.attempts[1]?.verifierEvidence.every((evidence) => evidence.passed), true);
     assert.equal(task.contract.plan.every((item) => !item.required || item.status === "completed"), true);
     assert.equal(task.evidence.some((evidence) => evidence.kind === "cleanup"), true);
+    await runtime.close();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testInternalAttemptPromptStaysOutOfPublicMessage(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-task-runtime-public-input-"));
+  try {
+    const store = await TaskRunStore.open(root);
+    const calls: Array<{ input: string; modelInput?: string }> = [];
+    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (input, options): AsyncGenerator<AgentSessionEvent> {
+      calls.push({ input, modelInput: options.modelInput });
+      yield done({
+        status: "completed",
+        stopReason: "model_stop",
+        finishReason: "stop",
+        steps: 1,
+        output: "已处理"
+      });
+    }, 1));
+    const events: AgentHostEvent[] = [];
+    runtime.subscribe((event) => events.push(event));
+
+    await runtime.submitPrompt("修复这个函数").completion;
+
+    const userMessage = events.find((event): event is Extract<AgentHostEvent, { type: "message.user" }> => event.type === "message.user");
+    assert.equal(userMessage?.content, "修复这个函数");
+    assert.equal(calls[0]?.input, "修复这个函数");
+    assert.match(calls[0]?.modelInput ?? "", /This is a verifier-driven task/u);
+    assert.doesNotMatch(userMessage?.content ?? "", /verifier-driven|Task contract type|Current plan/u);
     await runtime.close();
   } finally {
     await fs.rm(root, { recursive: true, force: true });

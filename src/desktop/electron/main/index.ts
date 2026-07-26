@@ -1,3 +1,11 @@
+/**
+ * Electron 主进程入口。
+ *
+ * 按依赖顺序装配各服务（用户数据 → 状态 → 配置 → 项目 → agent 管理器），注册 IPC 和菜单，
+ * 最后创建窗口。只负责装配和生命周期，业务逻辑都在各自的服务里。
+ *
+ * 单实例锁：第二个实例直接退出，因为多个进程同时读写同一份桌面状态和 session 会互相覆盖。
+ */
 import path from "node:path";
 import { app, BrowserWindow, dialog, nativeImage, Notification, safeStorage, shell } from "electron";
 import type { DesktopBootstrap } from "../../protocol.js";
@@ -6,6 +14,7 @@ import { DesktopAgentManager } from "./DesktopAgentManager.js";
 import { DesktopConfigStore } from "./DesktopConfigStore.js";
 import { DesktopProjectService } from "./DesktopProjectService.js";
 import { DesktopStateStore } from "./DesktopStateStore.js";
+import { DesktopTerminalManager } from "./DesktopTerminalManager.js";
 import { DesktopUserDataStore } from "./DesktopUserDataStore.js";
 import { registerDesktopIpc } from "./ipc.js";
 import { installApplicationMenu } from "./menu.js";
@@ -40,6 +49,7 @@ async function startDesktopApplication(): Promise<void> {
   await storage.migrateLegacyState(path.join(legacyDataRoot, "desktop-state.json"), path.join(desktopRoot, "desktop-state.json"));
   const state = new DesktopStateStore(path.join(desktopRoot, "desktop-state.json"));
   await state.load();
+  // 凭据加解密委托给系统钥匙串（safeStorage），配置文件里不落明文 key。
   const configStore = new DesktopConfigStore(desktopRoot, {
     isAvailable: () => safeStorage.isEncryptionAvailable(),
     encrypt: (value) => safeStorage.encryptString(value).toString("base64"),
@@ -53,6 +63,7 @@ async function startDesktopApplication(): Promise<void> {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send(desktopIpc.event, { projectId, event });
     }
+    // 只有窗口不在前台时才发系统通知：界面上已经能看到权限询问就不用再打扰一次。
     if (event.type === "permission.requested" && (!mainWindow || !mainWindow.isFocused() || !mainWindow.isVisible()) && Notification.isSupported()) {
       new Notification({
         title: "Biny 等待权限",
@@ -61,10 +72,15 @@ async function startDesktopApplication(): Promise<void> {
       }).show();
     }
   }, async (url) => await shell.openExternal(url));
+  const terminals = new DesktopTerminalManager((event) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(desktopIpc.terminalEvent, event);
+  });
 
+  /** 渲染进程启动时拉取的一次性初始状态：项目列表、当前项目、布局尺寸等。 */
   const bootstrap = async (): Promise<DesktopBootstrap> => {
     const allProjects = await projects.refreshAllProjects();
     let activeProjectId = state.activeProjectId();
+    // 上次打开的项目可能已被删除或移走，此时回退到第一个可用项目。
     if (activeProjectId && !allProjects.some((project) => project.id === activeProjectId)) activeProjectId = undefined;
     activeProjectId ??= allProjects.at(0)?.id;
     if (activeProjectId !== state.activeProjectId()) await state.setActiveProject(activeProjectId);
@@ -78,7 +94,8 @@ async function startDesktopApplication(): Promise<void> {
       workspace,
       sidebarWidth: state.sidebarWidth(),
       filePanelWidth: state.filePanelWidth(),
-      themePreference: state.themePreference()
+      themePreference: state.themePreference(),
+      fontPreference: state.fontPreference()
     };
   };
 
@@ -110,7 +127,7 @@ async function startDesktopApplication(): Promise<void> {
     return mainWindow;
   };
 
-  registerDesktopIpc({ state, projects, agents, getWindow: () => mainWindow, bootstrap });
+  registerDesktopIpc({ state, projects, agents, terminals, getWindow: () => mainWindow, bootstrap });
   installApplicationMenu(() => mainWindow);
   createWindow();
 
@@ -148,6 +165,7 @@ async function startDesktopApplication(): Promise<void> {
         }
         agents.cancelAll();
       }
+      terminals.disposeAll();
       mainWindow?.destroy();
       try {
         await Promise.race([

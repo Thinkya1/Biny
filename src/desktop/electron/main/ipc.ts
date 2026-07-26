@@ -1,3 +1,11 @@
+/**
+ * 桌面端 IPC handler 注册。
+ *
+ * 每个 `desktopIpc` 通道在这里对应一个 handler。渲染进程虽然是自己的代码，但仍按不可信输入
+ * 对待：所有参数先过 zod schema 校验（长度、枚举、URL 协议等），再转交给对应服务。
+ *
+ * 这一层只做「校验 + 转发 + 系统对话框/菜单」，项目、会话、agent 的实际逻辑都在各服务里。
+ */
 import { spawn } from "node:child_process";
 import {
   BrowserWindow,
@@ -13,25 +21,32 @@ import {
 } from "electron";
 import { z } from "zod";
 import { modelProviderSchema, providerProtocolSchema, reasoningEffortSchema } from "../../../config/schema.js";
+import { clampFontSize } from "../../fontPreference.js";
 import type { DesktopBootstrap, DesktopSessionMenuAction, DesktopThemePreference } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
 import { DesktopAgentManager } from "./DesktopAgentManager.js";
 import { DesktopProjectService } from "./DesktopProjectService.js";
 import { DesktopStateStore } from "./DesktopStateStore.js";
+import { DesktopTerminalManager } from "./DesktopTerminalManager.js";
 
 interface IpcContext {
   state: DesktopStateStore;
   projects: DesktopProjectService;
   agents: DesktopAgentManager;
+  terminals: DesktopTerminalManager;
   getWindow(): BrowserWindow | undefined;
   bootstrap(): Promise<DesktopBootstrap>;
 }
 
+// 以下 schema 是渲染层参数的唯一入口校验，上限值都刻意给得比正常用法宽松，
+// 只用于挡住异常大的输入，不承担业务规则校验。
 const idSchema = z.string().min(1).max(240);
 const promptSchema = z.string().min(1).max(1_000_000);
 const userMessageIndexSchema = z.number().int().nonnegative();
 const titleSchema = z.string().trim().min(1).max(120);
 const permissionModeSchema = z.enum(["ask", "read-only", "auto", "full-access"]);
+const terminalSizeSchema = z.number().int().min(2).max(1_000);
+const terminalDataSchema = z.string().max(1_000_000);
 const thinkingSchema = z.union([z.literal("off"), reasoningEffortSchema]);
 const modelLoginProviderSchema = z.enum(["claude-code", "openai-codex"]);
 const modelConfigurationSchema = z.object({
@@ -50,7 +65,8 @@ const modelConfigurationSchema = z.object({
   supportsVision: z.boolean().optional(),
   supportsAudio: z.boolean().optional(),
   contextWindow: z.number().int().min(4_096).max(2_000_000).optional(),
-  maxOutputTokens: z.number().int().min(1).max(131_072).optional()
+  maxOutputTokens: z.number().int().min(1).max(131_072).optional(),
+  makeDefault: z.boolean().optional()
 });
 const runModeSchema = z.enum(["chat", "plan"]);
 const permissionResultSchema = z.object({
@@ -66,7 +82,28 @@ const attachmentSchema = z.object({
   mimeType: z.string().max(200),
   size: z.number().int().nonnegative().max(50 * 1024 * 1024)
 });
-const externalUrlSchema = z.string().url().refine((value) => new URL(value).protocol === "https:", "Only HTTPS links can be opened externally.");
+// 搜索结果与正文外链可能仍是 http://，交给系统浏览器打开是安全的；其余协议一律拒绝。
+const externalUrlSchema = z.string().url().refine((value) => {
+  const protocol = new URL(value).protocol;
+  return protocol === "https:" || protocol === "http:";
+}, "Only HTTP(S) links can be opened externally.");
+const webSearchSettingsSchema = z.object({
+  enabled: z.boolean(),
+  provider: z.enum(["duckduckgo", "tavily", "brave", "anysearch"]),
+  apiKey: z.string().max(4_000).optional(),
+  apiKeyEnv: z.string().trim().min(1).max(120).optional(),
+  timeoutMs: z.number().int().min(1_000).max(60_000),
+  maxResults: z.number().int().min(1).max(10)
+});
+const memorySettingsSchema = z.object({
+  enabled: z.boolean(),
+  autoRemember: z.boolean(),
+  maxRecalled: z.number().int().min(1).max(20),
+  model: z.string().trim().min(1).max(240).optional()
+});
+const memoryTopicSchema = z.string().trim().min(1).max(64);
+const memoryNoteSchema = z.string().trim().min(1).max(4_000);
+const memoryQuerySchema = z.string().trim().min(1).max(2_000);
 
 export function registerDesktopIpc(context: IpcContext): void {
   handle(desktopIpc.bootstrap, async () => await context.bootstrap());
@@ -147,6 +184,30 @@ export function registerDesktopIpc(context: IpcContext): void {
     child.unref();
   });
 
+  handle(desktopIpc.createTerminal, async (_event, projectId: unknown, cols: unknown, rows: unknown) => {
+    const project = context.projects.requireProject(idSchema.parse(projectId));
+    if (project.missing) throw new Error("项目目录不可用，无法打开终端。");
+    return await context.terminals.create(project.id, project.path, terminalSizeSchema.parse(cols), terminalSizeSchema.parse(rows));
+  });
+
+  // 键盘输入和窗口尺寸走 fire-and-forget 的 send 通道，省掉 invoke 往返延迟。
+  ipcMain.on(desktopIpc.writeTerminal, (_event, terminalId: unknown, data: unknown) => {
+    const parsedId = idSchema.safeParse(terminalId);
+    const parsedData = terminalDataSchema.safeParse(data);
+    if (parsedId.success && parsedData.success) context.terminals.write(parsedId.data, parsedData.data);
+  });
+
+  ipcMain.on(desktopIpc.resizeTerminal, (_event, terminalId: unknown, cols: unknown, rows: unknown) => {
+    const parsedId = idSchema.safeParse(terminalId);
+    const parsedCols = terminalSizeSchema.safeParse(cols);
+    const parsedRows = terminalSizeSchema.safeParse(rows);
+    if (parsedId.success && parsedCols.success && parsedRows.success) context.terminals.resize(parsedId.data, parsedCols.data, parsedRows.data);
+  });
+
+  handle(desktopIpc.disposeTerminal, async (_event, terminalId: unknown) => {
+    context.terminals.dispose(idSchema.parse(terminalId));
+  });
+
   handle(desktopIpc.startDraft, async (_event, projectId: unknown) => {
     return await context.agents.startDraft(idSchema.parse(projectId));
   });
@@ -223,6 +284,14 @@ export function registerDesktopIpc(context: IpcContext): void {
     await context.agents.cancelRun(idSchema.parse(projectId));
   });
 
+  handle(desktopIpc.runSlashCommand, async (_event, projectId: unknown, sessionId: unknown, command: unknown) => {
+    return await context.agents.runSlashCommand(
+      idSchema.parse(projectId),
+      sessionId === undefined ? undefined : idSchema.parse(sessionId),
+      z.string().trim().min(1).max(200).parse(command)
+    );
+  });
+
   handle(desktopIpc.resolvePermission, async (_event, projectId: unknown, requestId: unknown, result: unknown) => {
     await context.agents.resolvePermission(idSchema.parse(projectId), idSchema.parse(requestId), permissionResultSchema.parse(result));
   });
@@ -247,6 +316,10 @@ export function registerDesktopIpc(context: IpcContext): void {
     return await context.agents.removeModelConfiguration(idSchema.parse(projectId), idSchema.parse(alias));
   });
 
+  handle(desktopIpc.fetchModelCatalog, async (_event, projectId: unknown, providerAlias: unknown) => {
+    return await context.agents.fetchModelCatalog(idSchema.parse(projectId), idSchema.parse(providerAlias));
+  });
+
   handle(desktopIpc.startModelLogin, async (_event, projectId: unknown, provider: unknown) => {
     return await context.agents.startModelLogin(idSchema.parse(projectId), modelLoginProviderSchema.parse(provider));
   });
@@ -268,6 +341,42 @@ export function registerDesktopIpc(context: IpcContext): void {
     return await context.agents.compact(idSchema.parse(projectId), hint === undefined ? undefined : z.string().max(2_000).parse(hint));
   });
 
+  handle(desktopIpc.webSearchSettings, async (_event, projectId: unknown) => {
+    return await context.agents.webSearchSettings(idSchema.parse(projectId));
+  });
+
+  handle(desktopIpc.saveWebSearchSettings, async (_event, projectId: unknown, input: unknown) => {
+    return await context.agents.saveWebSearchSettings(idSchema.parse(projectId), webSearchSettingsSchema.parse(input));
+  });
+
+  handle(desktopIpc.memoryOverview, async (_event, projectId: unknown) => {
+    return await context.agents.memoryOverview(idSchema.parse(projectId));
+  });
+
+  handle(desktopIpc.saveMemorySettings, async (_event, projectId: unknown, input: unknown) => {
+    return await context.agents.saveMemorySettings(idSchema.parse(projectId), memorySettingsSchema.parse(input));
+  });
+
+  handle(desktopIpc.searchMemory, async (_event, projectId: unknown, query: unknown) => {
+    return await context.agents.searchMemory(idSchema.parse(projectId), memoryQuerySchema.parse(query));
+  });
+
+  handle(desktopIpc.addMemoryEntry, async (_event, projectId: unknown, topic: unknown, note: unknown) => {
+    return await context.agents.addMemoryEntry(idSchema.parse(projectId), memoryTopicSchema.parse(topic), memoryNoteSchema.parse(note));
+  });
+
+  handle(desktopIpc.deleteMemoryEntry, async (_event, projectId: unknown, topic: unknown, index: unknown) => {
+    return await context.agents.deleteMemoryEntry(idSchema.parse(projectId), memoryTopicSchema.parse(topic), z.number().int().nonnegative().parse(index));
+  });
+
+  handle(desktopIpc.clearMemory, async (_event, projectId: unknown) => {
+    return await context.agents.clearMemory(idSchema.parse(projectId));
+  });
+
+  handle(desktopIpc.compactMemory, async (_event, projectId: unknown) => {
+    return await context.agents.compactMemory(idSchema.parse(projectId));
+  });
+
   handle(desktopIpc.saveAttachment, async (_event, projectId: unknown, name: unknown, mimeType: unknown, bytes: unknown) => {
     if (!ArrayBuffer.isView(bytes) || bytes.byteLength > 25 * 1024 * 1024) throw new Error("Attachment is invalid or larger than 25 MB.");
     return await context.projects.saveAttachment(
@@ -281,6 +390,11 @@ export function registerDesktopIpc(context: IpcContext): void {
   handle(desktopIpc.readWorkspaceFile, async (_event, projectId: unknown, relativePath: unknown) => {
     const project = context.projects.requireProject(idSchema.parse(projectId));
     return await context.projects.readWorkspaceFile(project, z.string().min(1).max(2_000).parse(relativePath));
+  });
+
+  handle(desktopIpc.readInlineImage, async (_event, projectId: unknown, relativePath: unknown) => {
+    const project = context.projects.requireProject(idSchema.parse(projectId));
+    return await context.projects.readInlineImage(project, z.string().min(1).max(2_000).parse(relativePath));
   });
 
   handle(desktopIpc.listWorkspaceDirectory, async (_event, projectId: unknown, relativePath: unknown) => {
@@ -317,6 +431,13 @@ export function registerDesktopIpc(context: IpcContext): void {
     }
     return preference;
   });
+
+  handle(desktopIpc.setFontPreference, async (_event, font: unknown) => {
+    const parsed = z.object({ family: z.string().min(1).max(100), size: z.number().finite() }).parse(font);
+    const preference = { family: parsed.family, size: clampFontSize(parsed.size) };
+    await context.state.setFontPreference(preference);
+    return preference;
+  });
 }
 
 function applyNativeThemePreference(preference: DesktopThemePreference): void {
@@ -325,14 +446,21 @@ function applyNativeThemePreference(preference: DesktopThemePreference): void {
 
 function themeBackgroundColor(preference: DesktopThemePreference): string {
   const dark = preference === "dark" || (preference === "system" && nativeTheme.shouldUseDarkColors);
-  return dark ? "#181818" : "#ffffff";
+  return dark ? "#15171c" : "#ffffff";
 }
 
+/** 先移除同名 handler 再注册：重复注册会被 Electron 直接拒绝（开发期热重载会遇到）。 */
 function handle(channel: string, listener: Parameters<typeof ipcMain.handle>[1]): void {
   ipcMain.removeHandler(channel);
   ipcMain.handle(channel, listener);
 }
 
+/**
+ * 弹出会话右键菜单并返回用户选择。
+ *
+ * Electron 的菜单项 click 与关闭回调是分开的：click 只记下选择，等 popup 的 callback 触发
+ * （菜单真正关闭）才 resolve，所以直接点空白处关闭会得到 undefined。
+ */
 async function showSessionMenu(window: BrowserWindow | undefined, pinned: boolean): Promise<DesktopSessionMenuAction | undefined> {
   return await new Promise((resolve) => {
     let selected: DesktopSessionMenuAction | undefined;

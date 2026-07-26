@@ -1,3 +1,12 @@
+/**
+ * 桌面端专属数据目录（Electron userData 下）：配置、凭据、界面状态、附件，以及不属于任何
+ * 项目的会话。
+ *
+ * 属于项目的 session / run / 记忆仍然放在 `<项目>/.agent` 里，这样同一个工作区在桌面端和
+ * TUI 里看到的是同一份历史。
+ *
+ * 另外承担历史数据迁移：早期版本把状态和配置放在别的位置，这里负责搬过来并合并。
+ */
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { CONFIG_FILE, loadConfig } from "../../../config/loader.js";
@@ -5,13 +14,6 @@ import { agentDir, ensureAgentDirs } from "../../../session/store.js";
 import type { DesktopProject } from "../../protocol.js";
 import { DesktopConfigStore } from "./DesktopConfigStore.js";
 
-/**
- * Owns desktop-only data under Electron's userData directory:
- * config, credentials, UI state, attachments, and non-project sessions.
- *
- * Project sessions / runs / memory live in `<project>/.agent` so Desktop and
- * TUI share the same history for a given workspace.
- */
 export class DesktopUserDataStore {
   constructor(readonly root: string) {}
 
@@ -19,12 +21,12 @@ export class DesktopUserDataStore {
     await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
   }
 
-  /** Desktop-only root for a project (attachments + pre-unification session leftovers). */
+  /** 项目的桌面端专属目录：附件，以及统一到项目目录之前遗留的会话。 */
   projectDesktopRoot(project: DesktopProject): string {
     return path.join(this.root, "projects", projectStorageId(project.id));
   }
 
-  /** Global root for sessions that are not tied to an opened project. */
+  /** 未关联任何已打开项目的会话存放处。 */
   globalRoot(): string {
     return path.join(this.root, "global");
   }
@@ -33,6 +35,11 @@ export class DesktopUserDataStore {
     return path.join(agentDir(this.projectDesktopRoot(project)), "attachments");
   }
 
+  /**
+   * 迁移旧版桌面状态。目标不存在时直接拷贝；两边都有则按字段合并，
+   * 冲突时以新位置为准（`...legacyState, ...destinationState` 的顺序即此意），
+   * 项目列表和各类映射表则做并集，避免迁移把用户已有的项目弄丢。
+   */
   async migrateLegacyState(legacyPath: string, destinationPath: string): Promise<void> {
     if (!await exists(legacyPath)) return;
     await fs.mkdir(path.dirname(destinationPath), { recursive: true, mode: 0o700 });

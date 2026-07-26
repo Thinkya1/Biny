@@ -1,8 +1,17 @@
+/**
+ * 底部输入区：文本输入、附件、模式（chat/plan）、模型、思考级别、权限模式切换、上下文用量与
+ * slash 命令菜单。
+ *
+ * 只负责收集用户意图并回调，不直接调用 IPC，也不判断能不能发送——`running`、`activeElsewhere`、
+ * `modelSetupRequired` 等状态由上层传入。
+ */
 import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { AgentRunMode, AgentSessionInfo } from "../../../../agent/AgentSession.js";
 import type { ModelChoice, ThinkingSelection } from "../../../../llm/ModelManager.js";
 import type { PermissionMode } from "../../../../permission/PermissionManager.js";
 import type { DesktopAttachment, DesktopProject } from "../../../protocol.js";
+import { DESKTOP_SLASH_COMMANDS } from "../../../protocol.js";
+import { catalogForConnection } from "../providerCatalog.js";
 import { useClosingPresence } from "../useClosingPresence.js";
 import { Icon } from "./Icon.js";
 import { ProviderBrandGlyph } from "./ProviderBrandGlyph.js";
@@ -13,19 +22,28 @@ interface ComposerProps {
   runtimeInfo?: AgentSessionInfo;
   permissionMode: PermissionMode;
   models: ModelChoice[];
+  /** 已解析好的上下文用量；取不到真实数字时为空，此时不展示用量。 */
+  contextUsage?: ContextUsage;
   running: boolean;
   activeElsewhere: boolean;
   modelSetupRequired: boolean;
   focusToken: number;
   onOpenProject(): void;
   onSend(input: string, mode: AgentRunMode, attachments: DesktopAttachment[]): Promise<void>;
+  onSlashCommand(command: string): Promise<void>;
   onStop(): Promise<void>;
   onPermissionMode(mode: PermissionMode): Promise<void>;
   onSwitchModel(alias: string, thinking: ThinkingSelection): Promise<void>;
   onSaveAttachment(file: File): Promise<DesktopAttachment>;
+  onUnavailable(feature: string): void;
 }
 
-type ComposerMenu = "permission" | "model" | null;
+export interface ContextUsage {
+  usedTokens: number;
+  maxTokens: number;
+}
+
+type ComposerMenu = "permission" | "model" | "thinking" | null;
 
 const permissionOptions: Array<{ mode: PermissionMode; label: string; description: string; risk?: string }> = [
   { mode: "ask", label: "每次询问", description: "写入、执行和其他敏感操作会请求确认" },
@@ -40,16 +58,19 @@ export const Composer = memo(function Composer({
   runtimeInfo,
   permissionMode,
   models,
+  contextUsage,
   running,
   activeElsewhere,
   modelSetupRequired,
   focusToken,
   onOpenProject,
   onSend,
+  onSlashCommand,
   onStop,
   onPermissionMode,
   onSwitchModel,
-  onSaveAttachment
+  onSaveAttachment,
+  onUnavailable
 }: ComposerProps): React.JSX.Element {
   const [input, setInput] = useState("");
   const [mode, setMode] = useState<AgentRunMode>("chat");
@@ -57,6 +78,8 @@ export const Composer = memo(function Composer({
   const [menu, setMenu] = useState<ComposerMenu>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [slashDismissed, setSlashDismissed] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const composerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -103,9 +126,42 @@ export const Composer = memo(function Composer({
     textarea.style.height = `${String(Math.min(176, Math.max(46, textarea.scrollHeight)))}px`;
   }, [input]);
 
+  // 仅当整个输入还是一个未完成的 "/xxx" 词（无空白、无换行）时弹出命令菜单；
+  // "/ 开头的普通句子" 不应被劫持成命令。
+  const slashQuery = input.startsWith("/") && input.length > 0 && !/\s/.test(input) ? input : "";
+  const slashMatches = slashQuery && !slashDismissed
+    ? DESKTOP_SLASH_COMMANDS.filter((command) => command.name.startsWith(slashQuery))
+    : [];
+  const slashMenuOpen = slashMatches.length > 0 && !busy;
+
+  const runSlash = async (command: string): Promise<void> => {
+    if (!project || busy) return;
+    setInput("");
+    setError(undefined);
+    setBusy(true);
+    try {
+      await onSlashCommand(command);
+    } catch (slashError) {
+      setInput(command);
+      setError(errorMessage(slashError));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const submit = async (): Promise<void> => {
     const value = input.trim();
-    if (!project || !value || busy || activeElsewhere) return;
+    if (!project || !value || busy) return;
+    // 报告命令只在整条输入匹配时执行；/mcp reconnect 与 /memory 是允许带参数的
+    // 桌面端维护命令。其他以 / 开头的自然语言或多行内容仍按消息发送。
+    const slashCommand = DESKTOP_SLASH_COMMANDS.find((command) => command.name === value);
+    const mcpReconnect = /^\/mcp\s+reconnect\s+\S+$/i.test(value);
+    const memoryWithArgs = /^\/memory\s+(list|show|add|forget)(\s|$)/i.test(value);
+    if (slashCommand || mcpReconnect || memoryWithArgs) {
+      await runSlash(slashCommand?.name ?? value);
+      return;
+    }
+    if (activeElsewhere) return;
     setInput("");
     const sentAttachments = attachments;
     setAttachments([]);
@@ -145,9 +201,16 @@ export const Composer = memo(function Composer({
       : running
         ? "可以继续补充要求"
         : "描述你想完成的任务";
-  const selectedModel = models.find((model) => model.alias === runtimeInfo?.modelAlias) ?? models[0];
-  const currentAlias = runtimeInfo?.modelAlias ?? selectedModel?.alias;
+  // 运行时是懒创建的：没有 runtimeInfo 时退回配置里的首选模型（列表已按 defaultModel 排在最前）。
+  // 两种情况都用 ModelChoice 的 displayName 作为按钮文案，避免同一个模型在「有运行时 / 没运行时」
+  // 之间显示成两种名字，看起来像模型被切换了。
+  const activeModel = models.find((model) => model.alias === runtimeInfo?.modelAlias);
+  const selectedModel = activeModel ?? models[0];
+  const currentAlias = activeModel?.alias ?? selectedModel?.alias;
   const currentThinking = runtimeInfo?.thinking ?? selectedModel?.defaultThinking ?? "off";
+  const modelName = activeModel?.displayName ?? runtimeInfo?.modelLabel ?? selectedModel?.displayName ?? "选择模型";
+  const thinkingEfforts = selectedModel?.efforts ?? [];
+  const usage = formatContextUsage(contextUsage);
 
   return (
     <div
@@ -159,6 +222,12 @@ export const Composer = memo(function Composer({
       }}
       ref={composerRef}
     >
+      {project ? (
+        <div className="composer-context">
+          <button className="context-segment" onClick={onOpenProject} type="button"><Icon name="folder" size={15} /><span>{project.name}</span><Icon name="chevron" size={11} /></button>
+          {project.branch ? <span className="context-segment is-static"><Icon name="branch" size={14} /><span>{project.branch}</span></span> : null}
+        </div>
+      ) : null}
       <div className="composer-shell">
         {attachments.length ? (
           <div className="attachment-list">
@@ -172,14 +241,56 @@ export const Composer = memo(function Composer({
           </div>
         ) : null}
 
+        {slashMenuOpen ? (
+          <div className="composer-popover slash-menu" role="menu">
+            <div className="popover-heading">命令</div>
+            {slashMatches.map((command, index) => (
+              <button
+                className={`menu-option${index === slashIndex ? " is-selected" : ""}`}
+                key={command.name}
+                onClick={() => void runSlash(command.name)}
+                onMouseEnter={() => setSlashIndex(index)}
+                role="menuitem"
+                type="button"
+              >
+                <span className="menu-option-copy"><strong>{command.name}</strong><small>{command.description}</small></span>
+              </button>
+            ))}
+          </div>
+        ) : null}
         <textarea
           aria-label="任务输入"
           disabled={!project || activeElsewhere || modelSetupRequired}
-          onChange={(event) => setInput(event.target.value)}
+          onChange={(event) => {
+            setInput(event.target.value);
+            setSlashIndex(0);
+            setSlashDismissed(false);
+          }}
           onCompositionEnd={() => { composingRef.current = false; }}
           onCompositionStart={() => { composingRef.current = true; }}
           onKeyDown={(event) => {
-            if (event.key !== "Enter" || event.shiftKey || composingRef.current || event.nativeEvent.isComposing) return;
+            if (composingRef.current || event.nativeEvent.isComposing) return;
+            if (slashMenuOpen) {
+              if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                const step = event.key === "ArrowDown" ? 1 : -1;
+                setSlashIndex((current) => (current + step + slashMatches.length) % slashMatches.length);
+                return;
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setSlashDismissed(true);
+                return;
+              }
+              // 带修饰键的 Enter（如 Shift+Enter 换行）不触发命令执行。
+              if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey)) {
+                event.preventDefault();
+                const selected = slashMatches[Math.min(slashIndex, slashMatches.length - 1)];
+                if (selected) void runSlash(selected.name);
+                return;
+              }
+            }
+            if (event.key !== "Enter" || event.shiftKey) return;
             event.preventDefault();
             void submit();
           }}
@@ -226,18 +337,33 @@ export const Composer = memo(function Composer({
               />
             </div>
             <button className={`mode-toggle${mode === "plan" ? " is-active" : ""}`} disabled={modelSetupRequired} onClick={() => setMode(mode === "chat" ? "plan" : "chat")} title="规划模式只影响下一次运行" type="button">{mode === "plan" ? "规划" : "聊天"}</button>
+            {thinkingEfforts.length ? (
+              <div className="composer-menu-anchor">
+                <button className="composer-select thinking-trigger" data-composer-menu="thinking" disabled={!project || modelSetupRequired} onClick={() => setMenu(menu === "thinking" ? null : "thinking")} title="思考级别" type="button">
+                  <Icon name="brain" size={13} /><span>{thinkingLabel(currentThinking)}</span>
+                </button>
+                <ThinkingMenu
+                  current={currentThinking}
+                  efforts={thinkingEfforts}
+                  open={menu === "thinking"}
+                  onChange={(thinking) => {
+                    setMenu(null);
+                    if (currentAlias) void onSwitchModel(currentAlias, thinking).catch((modelError) => setError(errorMessage(modelError)));
+                  }}
+                />
+              </div>
+            ) : null}
+            <button aria-label="工具与技能" className="composer-icon-button" disabled={!project || modelSetupRequired} onClick={() => onUnavailable("工具与技能")} title="工具与技能" type="button"><Icon name="wrench" /></button>
           </div>
           <div className="composer-actions-right">
             <div className="composer-menu-anchor">
               <button className="model-trigger" data-composer-menu="model" disabled={!project || !models.length || modelSetupRequired} onClick={() => setMenu(menu === "model" ? null : "model")} type="button">
                 {selectedModel ? <span className="model-trigger-brand"><ProviderBrandGlyph type={selectedModel.providerType} /></span> : null}
-                <span>{runtimeInfo?.modelLabel ?? selectedModel?.displayName ?? "选择模型"}</span>
-                {runtimeInfo?.reasoningLabel && runtimeInfo.reasoningLabel !== "Off" ? <small>{runtimeInfo.reasoningLabel}</small> : null}
+                <span>{modelName}</span>
                 <Icon name="chevron" size={12} />
               </button>
               <ModelMenu
                 currentAlias={currentAlias}
-                currentThinking={currentThinking}
                 models={models}
                 open={menu === "model"}
                 onChange={(alias, thinking) => {
@@ -245,6 +371,12 @@ export const Composer = memo(function Composer({
                 }}
               />
             </div>
+            {usage ? (
+              <span className="context-usage" role="status">
+                <Icon name="timer" size={12} /><span>{usage.percent}%</span>
+                <span className="context-usage-tip">上下文使用量<strong>{usage.used} / {usage.max} tokens</strong></span>
+              </span>
+            ) : null}
             <button
               aria-label={running ? "暂停生成" : "发送任务"}
               className={`send-button${running ? " is-stop" : ""}`}
@@ -263,13 +395,6 @@ export const Composer = memo(function Composer({
         {error ? <div className="composer-error"><Icon name="warning" size={12} /><span>{error}</span><button onClick={() => setError(undefined)} type="button"><Icon name="close" size={11} /></button></div> : null}
         {running && input.trim() ? <div className="composer-hint">按 Enter 将补充要求排入当前会话；右侧按钮可暂停生成</div> : null}
       </div>
-
-      {project ? (
-        <div className="composer-context">
-          <button className="context-segment" onClick={onOpenProject} type="button"><Icon name="folder" size={15} /><span>{project.name}</span><Icon name="chevron" size={11} /></button>
-          {project.branch ? <span className="context-segment is-static"><Icon name="branch" size={14} /><span>{project.branch}</span></span> : null}
-        </div>
-      ) : null}
     </div>
   );
 });
@@ -294,35 +419,39 @@ function PermissionMenu({ mode, open, onChange }: { mode: PermissionMode; open: 
 function ModelMenu({
   models,
   currentAlias,
-  currentThinking,
   open,
   onChange
 }: {
   models: ModelChoice[];
   currentAlias?: string;
-  currentThinking: ThinkingSelection;
   open: boolean;
   onChange(alias: string, thinking: ThinkingSelection): void;
 }): React.JSX.Element | null {
   const presence = useClosingPresence(open);
   const [query, setQuery] = useState("");
-  const [thinkingOpen, setThinkingOpen] = useState(false);
   useEffect(() => {
-    if (!open) {
-      setQuery("");
-      setThinkingOpen(false);
-    }
+    if (!open) setQuery("");
   }, [open]);
   if (!presence.present) return null;
-  const current = models.find((model) => model.alias === currentAlias);
-  const efforts: ThinkingSelection[] = current ? ["off", ...current.efforts] : [];
   const normalizedQuery = query.trim().toLocaleLowerCase();
-  const groups = models.reduce<Array<{ key: string; label: string; providerType: string; models: ModelChoice[] }>>((result, model) => {
+  const groups = models.reduce<Array<{ key: string; label: string; iconTone: string; models: ModelChoice[] }>>((result, model) => {
     if (normalizedQuery && !`${model.displayName} ${model.model} ${model.provider}`.toLocaleLowerCase().includes(normalizedQuery)) return result;
     const key = `${model.providerType}:${model.provider}`;
     const group = result.find((item) => item.key === key);
-    if (group) group.models.push(model);
-    else result.push({ key, label: providerLabel(model.provider), providerType: model.providerType, models: [model] });
+    if (group) {
+      group.models.push(model);
+      return result;
+    }
+    // Brand marks are keyed by the catalog's `iconTone`, not by provider type:
+    // xAI, Z.AI, MiniMax and every relay share providerType "openai-compatible",
+    // so resolving the icon from the type alone rendered them all identically.
+    const catalog = catalogForConnection({ provider: model.provider, providerType: model.providerType });
+    result.push({
+      key,
+      label: catalog?.label ?? providerLabel(model.provider),
+      iconTone: catalog?.iconTone ?? "compatible",
+      models: [model]
+    });
     return result;
   }, []);
   return (
@@ -331,7 +460,7 @@ function ModelMenu({
       <div className="model-options-scroll">
         {groups.length ? groups.map((group) => (
           <div className="model-group" key={group.key}>
-            <div className="model-group-heading"><ProviderBrandGlyph type={group.providerType} /><span>{group.label}</span></div>
+            <div className="model-group-heading"><ProviderBrandGlyph type={group.iconTone} /><span>{group.label}</span></div>
             {group.models.map((model) => (
               <button className={`menu-option model-option${model.alias === currentAlias ? " is-selected" : ""}`} key={model.alias} onClick={() => onChange(model.alias, model.defaultThinking)} role="menuitemradio" title={model.model} type="button">
                 <span className="menu-check">{model.alias === currentAlias ? <Icon name="check" size={14} /> : null}</span>
@@ -341,24 +470,32 @@ function ModelMenu({
           </div>
         )) : <div className="menu-empty">没有匹配的模型</div>}
       </div>
-      {current && efforts.length ? (
-        <div className="reasoning-menu-anchor">
-          <button className="reasoning-control" onClick={() => setThinkingOpen((value) => !value)} type="button">
-            <span>思考级别</span>
-            <span>{thinkingLabel(currentThinking)}<Icon name="chevron" size={12} /></span>
-          </button>
-          {thinkingOpen ? (
-            <div className="thinking-menu" role="menu">
-              {efforts.map((effort) => (
-                <button className={effort === currentThinking ? "is-selected" : ""} key={effort} onClick={() => onChange(current.alias, effort)} role="menuitemradio" type="button">
-                  <span>{thinkingLabel(effort)}</span>
-                  {effort === currentThinking ? <Icon name="check" size={13} /> : null}
-                </button>
-              ))}
-            </div>
-          ) : null}
-        </div>
-      ) : null}
+    </div>
+  );
+}
+
+function ThinkingMenu({
+  current,
+  efforts,
+  open,
+  onChange
+}: {
+  current: ThinkingSelection;
+  efforts: ThinkingSelection[];
+  open: boolean;
+  onChange(thinking: ThinkingSelection): void;
+}): React.JSX.Element | null {
+  const presence = useClosingPresence(open);
+  if (!presence.present) return null;
+  return (
+    <div className={`t-dropdown composer-popover thinking-level-menu ${presenceClass(presence.phase)}`} data-origin="bottom-left" role="menu">
+      <div className="popover-heading">思考级别</div>
+      {(["off", ...efforts] as ThinkingSelection[]).map((effort) => (
+        <button className={`menu-option${effort === current ? " is-selected" : ""}`} key={effort} onClick={() => onChange(effort)} role="menuitemradio" type="button">
+          <span className="menu-check">{effort === current ? <Icon name="check" size={14} /> : null}</span>
+          <span className="menu-option-copy"><strong>{thinkingLabel(effort)}</strong><small>{thinkingDescription(effort)}</small></span>
+        </button>
+      ))}
     </div>
   );
 }
@@ -367,10 +504,35 @@ function permissionLabel(mode: PermissionMode): string {
   return permissionOptions.find((option) => option.mode === mode)?.label ?? mode;
 }
 
+const thinkingLabels: Record<ThinkingSelection, string> = {
+  off: "标准",
+  minimal: "极低",
+  low: "低",
+  medium: "中",
+  high: "高",
+  xhigh: "较高",
+  max: "最高"
+};
+
 function thinkingLabel(value: ThinkingSelection): string {
-  if (value === "high") return "高";
-  if (value === "max") return "最高";
-  return "默认";
+  return thinkingLabels[value] ?? value;
+}
+
+function thinkingDescription(value: ThinkingSelection): string {
+  return value === "off" ? "不额外要求模型思考，回复最快" : "思考越多越慢，但复杂任务更稳";
+}
+
+/**
+ * 上下文用量展示值。`usedTokens` 是上一轮实际占用，`maxTokens` 是本模型允许注入的输入预算，
+ * 超过它就会触发压缩，所以百分比按这个分母算才有意义。
+ */
+function formatContextUsage(usage?: ContextUsage): { percent: number; used: string; max: string } | undefined {
+  if (!usage || usage.maxTokens <= 0 || usage.usedTokens <= 0) return undefined;
+  return {
+    percent: Math.min(100, Math.round((usage.usedTokens / usage.maxTokens) * 100)),
+    used: usage.usedTokens.toLocaleString("en-US"),
+    max: usage.maxTokens.toLocaleString("en-US")
+  };
 }
 
 function providerLabel(provider: string): string {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { modelCapabilities, modelContextBudget, nativeReasoningEffort, reasoningBudgetTokens } from "../src/ai/capabilities.js";
+import { inferReasoningEfforts, modelCapabilities, modelContextBudget, nativeReasoningEffort, reasoningBudgetTokens } from "../src/ai/capabilities.js";
 import { parseModelCatalog } from "../src/ai/modelCatalog.js";
 import { createRetryFetch } from "../src/ai/retry.js";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
@@ -63,3 +63,25 @@ const retryingFetch = createRetryFetch({ maxAttempts: 3, initialDelayMs: 0, maxD
 });
 assert.equal((await retryingFetch("https://example.test")).status, 200);
 assert.equal(attempts, 2);
+
+// Relays and self-hosted gateways almost never declare reasoning_efforts, so
+// well-known reasoning models must still surface thinking controls via the
+// ID-based fallback — otherwise they silently show only a "default" level.
+assert.deepEqual(inferReasoningEfforts("grok-4.5"), ["high", "max"]);
+assert.deepEqual(inferReasoningEfforts("gpt-5.4"), ["high", "max"]);
+assert.deepEqual(inferReasoningEfforts("claude-sonnet-4.6"), ["high", "max"]);
+assert.deepEqual(inferReasoningEfforts("deepseek-v4-flash"), ["high", "max"]);
+assert.deepEqual(inferReasoningEfforts("openai/gpt-5.4"), ["high", "max"]); // aggregator vendor prefix
+assert.deepEqual(inferReasoningEfforts("grok-3-mini"), ["high", "max"]);
+assert.deepEqual(inferReasoningEfforts("gpt-4o-mini"), []);
+assert.deepEqual(inferReasoningEfforts("llama-3.3-70b-instruct"), []);
+assert.deepEqual(inferReasoningEfforts(""), []);
+
+const relayCatalog = parseModelCatalog({
+  data: [{ id: "grok-4.5" }]
+}, "relay", "openai-compatible");
+assert.deepEqual(relayCatalog[0]?.reasoningEfforts, ["high", "max"]);
+const relayCatalogNonReasoning = parseModelCatalog({
+  data: [{ id: "llama-3.3-70b-instruct" }]
+}, "relay", "openai-compatible");
+assert.deepEqual(relayCatalogNonReasoning[0]?.reasoningEfforts, []);

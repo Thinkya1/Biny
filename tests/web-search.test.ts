@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
 import { analyzePermissionRequest } from "../src/permission/policy.js";
 import { createToolRegistry } from "../src/tools/registry.js";
-import { createWebSearchTool, parseDuckDuckGoResults } from "../src/tools/web/search.js";
+import { createWebSearchTool, parseDuckDuckGoResults, parseTavilyResults } from "../src/tools/web/search.js";
 
 async function main(): Promise<void> {
   testDuckDuckGoParser();
+  testTavilyParser();
   await testDuckDuckGoSearch();
   await testBraveSearch();
+  await testTavilySearch();
   await testAnySearch();
   testWebSearchPermission();
   testWebSearchRegistration();
@@ -26,6 +28,18 @@ function testDuckDuckGoParser(): void {
     url: "https://example.com/",
     snippet: "A useful summary."
   }]);
+}
+
+function testTavilyParser(): void {
+  const results = parseTavilyResults({
+    results: [
+      { title: "Secure", url: "https://example.com/a", content: "ok", favicon: "https://example.com/favicon.ico" },
+      { title: "Plain HTTP favicon", url: "https://example.com/b", content: "ok", favicon: "http://tracker.example.com/pixel.ico" }
+    ]
+  }, 5);
+  assert.equal(results[0]?.favicon, "https://example.com/favicon.ico");
+  // 明文 http favicon 会被渲染端当 <img src> 加载，解析阶段直接丢弃。
+  assert.equal(results[1]?.favicon, undefined);
 }
 
 async function testDuckDuckGoSearch(): Promise<void> {
@@ -101,6 +115,59 @@ async function testBraveSearch(): Promise<void> {
     globalThis.fetch = originalFetch;
     if (originalKey === undefined) delete process.env.BINY_TEST_BRAVE_KEY;
     else process.env.BINY_TEST_BRAVE_KEY = originalKey;
+  }
+}
+
+async function testTavilySearch(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl: URL | undefined;
+  let requestedHeaders: Headers | undefined;
+  let requestedBody: { query?: string; max_results?: number; time_range?: string; include_favicon?: boolean; include_domains?: string[] } | undefined;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    requestedUrl = new URL(String(input));
+    requestedHeaders = new Headers(init?.headers);
+    requestedBody = JSON.parse(String(init?.body)) as typeof requestedBody;
+    return new Response(JSON.stringify({
+      query: "Biny",
+      results: [{
+        title: "Tavily result",
+        url: "https://example.com/tavily",
+        content: "A result from Tavily.",
+        score: 0.98,
+        favicon: "https://example.com/favicon.ico"
+      }]
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    const tool = createWebSearchTool({
+      enabled: true,
+      provider: "tavily",
+      apiKey: "tvly-test-key",
+      apiKeyEnv: undefined,
+      timeoutMs: 1_000,
+      maxResults: 5
+    });
+    const execution = await tool.resolveExecution({ query: "Biny", maxResults: 3, domains: ["example.com"], recency: "week" });
+    assert.equal("isError" in execution, false);
+    if ("isError" in execution) return;
+    const result = await execution.execute({ toolCallId: "search-tavily", signal: undefined });
+    assert.equal(result.provider, "tavily");
+    assert.deepEqual(result.results, [{
+      title: "Tavily result",
+      url: "https://example.com/tavily",
+      snippet: "A result from Tavily.",
+      favicon: "https://example.com/favicon.ico"
+    }]);
+    assert.equal(requestedUrl?.toString(), "https://api.tavily.com/search");
+    assert.equal(requestedHeaders?.get("authorization"), "Bearer tvly-test-key");
+    assert.equal(requestedBody?.query, "Biny");
+    assert.equal(requestedBody?.max_results, 3);
+    assert.equal(requestedBody?.time_range, "week");
+    assert.equal(requestedBody?.include_favicon, true);
+    assert.deepEqual(requestedBody?.include_domains, ["example.com"]);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 }
 

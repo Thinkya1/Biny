@@ -1,3 +1,9 @@
+/**
+ * 标题栏左侧的导航按钮组：侧栏开关、后退、前进。
+ *
+ * 只负责渲染和回调，前进/后退是否可用由上层的导航历史决定。按钮只有图标，因此必须带
+ * `aria-label`。
+ */
 import { Icon } from "./Icon.js";
 
 interface NavigationControlsProps {

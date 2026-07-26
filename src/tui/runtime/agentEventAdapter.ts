@@ -1,3 +1,10 @@
+/**
+ * Agent 宿主事件 → TUI runtime 事件的翻译层。
+ *
+ * Agent 侧的事件粒度比界面需要的更细，这里做三件事：改名成 TUI 的事件形状、把一个
+ * 事件拆成多个（如 run 结束同时更新状态行和会话状态）、丢弃 TUI 不展示的事件。
+ * 返回空数组即「该事件界面无需反应」，switch 必须穷举所有事件类型以便新增事件时报错。
+ */
 import type { AgentHostEvent } from "../../runtime/agentEvents.js";
 import type { RuntimeEvent } from "../../runtime/events.js";
 
@@ -73,6 +80,7 @@ export function agentEventToRuntimeEvents(event: AgentHostEvent): RuntimeEvent[]
       return [{ type: "session.error", sessionId: event.sessionId, message: event.error }];
     case "reasoning.completed":
       return [{ type: "reasoning.completed", status: event.status }];
+    // 以下事件由 session 记录或桌面端使用，终端界面不单独展示。
     case "reasoning.status":
     case "command.started":
     case "command.output":

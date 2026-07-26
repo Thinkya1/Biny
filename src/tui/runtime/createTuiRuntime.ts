@@ -3,9 +3,13 @@
  * the existing RuntimeEvent contract while Desktop consumes AgentHostEvent
  * directly from the same runtime.
  */
+import type { Checkpoint, RestoreSummary } from "../../session/checkpointStore.js";
+import type { InterruptedTurn } from "../../session/turnStore.js";
+import type { ForkedSession } from "../../session/fork.js";
 import type { AgentRunMode, AgentSessionInfo, ResumedAgentSession } from "../../agent/AgentSession.js";
 import type { ContextStatus } from "../../agent/context/types.js";
 import type { ExtensionSection } from "../../extensions/report.js";
+import type { SubagentDefinition } from "../../extensions/agents.js";
 import type { ModelChoice, ModelRuntimeInfo, ThinkingSelection } from "../../llm/ModelManager.js";
 import type { PermissionMode, PermissionResult } from "../../permission/PermissionManager.js";
 import { createInteractiveAgentRuntime, type AgentRunOutcome } from "../../runtime/InteractiveAgentRuntime.js";
@@ -28,9 +32,15 @@ export interface TuiRuntime {
   resumeSession(session: string): Promise<ResumedAgentSession>;
   listSessions(): Promise<SessionSummary[]>;
   extensionReport(section?: ExtensionSection): string;
+  forkSession(session: string | undefined, upToEvent?: number): Promise<ForkedSession>;
+  interruptedTurn(): Promise<InterruptedTurn | undefined>;
+  listCheckpoints(): Promise<Checkpoint[]>;
+  restoreCheckpoint(id: string): Promise<RestoreSummary>;
   runSubagentTask(task: string): Promise<string>;
   listSubagentTasks(): SubagentTaskSnapshot[];
   cancelSubagentTask(taskId: string, reason?: string): boolean;
+  listSubagentAgents(): Promise<SubagentDefinition[]>;
+  runMemoryCommand(args: string[]): Promise<string>;
   contextReport(): Promise<string>;
   usageReport(): string;
   contextStatus(): Promise<ContextStatus>;
@@ -111,6 +121,18 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
     async listSessions(): Promise<SessionSummary[]> {
       return await host.listSessions();
     },
+    async forkSession(session: string | undefined, upToEvent?: number): Promise<ForkedSession> {
+      return await host.forkSession(session, upToEvent);
+    },
+    async interruptedTurn(): Promise<InterruptedTurn | undefined> {
+      return await host.interruptedTurn();
+    },
+    async listCheckpoints(): Promise<Checkpoint[]> {
+      return await host.listCheckpoints();
+    },
+    async restoreCheckpoint(id: string): Promise<RestoreSummary> {
+      return await host.restoreCheckpoint(id);
+    },
     extensionReport(section?: ExtensionSection): string {
       return host.extensionReport(section);
     },
@@ -122,6 +144,12 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
     },
     cancelSubagentTask(taskId: string, reason?: string): boolean {
       return host.cancelSubagentTask(taskId, reason);
+    },
+    async listSubagentAgents(): Promise<SubagentDefinition[]> {
+      return await host.listSubagentAgents();
+    },
+    async runMemoryCommand(args: string[]): Promise<string> {
+      return await host.runMemoryCommand(args);
     },
     async contextReport(): Promise<string> {
       return await host.contextReport();

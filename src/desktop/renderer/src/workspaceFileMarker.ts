@@ -1,3 +1,9 @@
+/**
+ * 文件列表里的类型角标。
+ *
+ * 每个文件给一个短标签和一种色调（tone 对应 CSS 里的配色类名）。标签统一控制在 3 个字符
+ * 以内，角标宽度才不会跳动；识别不出扩展名时用扩展名前三位兜底。
+ */
 export type WorkspaceFileMarkerTone =
   | "config"
   | "container"
@@ -23,6 +29,7 @@ export interface WorkspaceFileMarker {
   tone: WorkspaceFileMarkerTone;
 }
 
+// 无扩展名但有约定含义的文件，按整个文件名匹配。
 const namedMarkers: Readonly<Record<string, WorkspaceFileMarker>> = {
   dockerfile: { label: "DK", tone: "container" },
   makefile: { label: "MK", tone: "config" },
@@ -88,6 +95,7 @@ const extensionMarkers: Readonly<Record<string, WorkspaceFileMarker>> = {
   zsh: { label: "SH", tone: "shell" }
 };
 
+/** 匹配顺序：git 系列 → .env 系列 → 整名 → 扩展名 → 兜底。 */
 export function workspaceFileMarker(name: string): WorkspaceFileMarker {
   const lowerName = name.toLocaleLowerCase();
   if (lowerName === ".gitignore" || lowerName === ".gitattributes" || lowerName === ".gitmodules") {
@@ -96,6 +104,7 @@ export function workspaceFileMarker(name: string): WorkspaceFileMarker {
   if (lowerName === ".env" || lowerName.startsWith(".env.")) return { label: "ENV", tone: "config" };
   const namedMarker = namedMarkers[lowerName];
   if (namedMarker) return namedMarker;
+  // 要求 lastDot > 0：`.gitkeep` 这类点开头的文件，前面那个点不是扩展名分隔符。
   const lastDot = lowerName.lastIndexOf(".");
   const extension = lastDot > 0 ? lowerName.slice(lastDot + 1) : "";
   const extensionMarker = extensionMarkers[extension];

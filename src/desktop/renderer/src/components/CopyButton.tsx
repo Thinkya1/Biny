@@ -1,3 +1,9 @@
+/**
+ * 复制按钮。
+ *
+ * 复制成功后图标临时变成对勾再自动复原，复制失败则不给成功反馈。
+ * `resolveValue` 用于内容会变的场景（如实时渲染的代码块），点击时才取当前文本。
+ */
 import { useState } from "react";
 import { copyToClipboard } from "../copyToClipboard.js";
 import { Icon } from "./Icon.js";
@@ -23,6 +29,7 @@ export function CopyButton({
       aria-label={copied ? "已复制" : label}
       className={className}
       onClick={() => {
+        // 去掉结尾换行：代码块渲染时会带一个，复制到别处会多出一空行。
         const text = (resolveValue?.() ?? value).replace(/\n$/, "");
         void copyToClipboard(text).then((ok) => {
           if (!ok) return;

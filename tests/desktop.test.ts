@@ -31,8 +31,12 @@ import {
 } from "../src/desktop/renderer/src/navigationHistory.js";
 import { activeTimelineTool, buildSessionTimeline, listChangedFiles, listTimelineFiles, timelineToolEntries } from "../src/desktop/renderer/src/sessionTimeline.js";
 import { reasoningDetailText } from "../src/desktop/renderer/src/reasoningPresentation.js";
+import { projectWebSearchView } from "../src/desktop/renderer/src/webSearchPresentation.js";
 import type { TimelineTool } from "../src/desktop/renderer/src/sessionTimeline.js";
-import { highlightWorkspaceFile } from "../src/desktop/renderer/src/syntaxHighlight.js";
+import { catalogForConnection, customCatalogEntry } from "../src/desktop/renderer/src/providerCatalog.js";
+import { highlightFencedCode, highlightWorkspaceFile } from "../src/desktop/renderer/src/syntaxHighlight.js";
+import { splitAttachmentReferences, withAttachmentReferences } from "../src/desktop/attachmentReferences.js";
+import { tokenizeCommand } from "../src/desktop/renderer/src/commandHighlight.js";
 import { workspaceFileMarker } from "../src/desktop/renderer/src/workspaceFileMarker.js";
 import { listModelChoices, ModelManager } from "../src/llm/ModelManager.js";
 import type { SessionEvent } from "../src/session/recorder.js";
@@ -54,23 +58,33 @@ await testWorkspaceFilePreview();
 await testWorkspaceDirectoryListing();
 await testDesktopGitInspectionDisablesHelpers();
 testWorkspaceSyntaxHighlighting();
+testFencedCodeHighlighting();
+testAttachmentReferenceRoundTrip();
+await testInlineImageReading();
+testCommandHighlighting();
 testWorkspaceFileMarkers();
 await testFilePanelSizing();
 await testDesktopThemePreference();
 await testDesktopModelConfiguration();
 await testDesktopReportsRuntimeLeaseConflict();
 await testDesktopCredentialsAreSeparated();
+await testDesktopWebSearchSettings();
 await testDesktopRequiresModelConfiguration();
+await testDesktopConnectionMetadata();
 await testWorkspaceSnapshotDoesNotReorderProjects();
 await testDesktopProjectReorder();
 await testLegacyDesktopDataMigration();
+testProviderCatalogResolution();
 testModelChoicesDeduplicateEquivalentAliases();
 testHistoricalAbortProjection();
 testHistoricalUsageProjection();
 testHistoricalToolProjection();
+testWebSearchProjection();
 testHistoricalReasoningAndSkillProjection();
 testExecutionTimelineKeepsReasoningAndToolsInOrder();
 testLiveExecutionTimelineKeepsReasoningAndToolsInOrder();
+testLiveAssistantCompletionDoesNotDuplicateDelta();
+testVerifierPromptIsNotRenderedAsUserMessage();
 testHistoricalPrefixKeepsUnpersistedDuplicatePrompt();
 testHistoricalEmptyAssistantDoesNotEraseReply();
 testChangedFileProjection();
@@ -389,6 +403,72 @@ function testWorkspaceSyntaxHighlighting(): void {
   assert.match(highlighted.html, /hljs-number/);
 }
 
+function testFencedCodeHighlighting(): void {
+  const typescript = highlightFencedCode("const answer: number = 42;", "ts");
+  assert.equal(typescript.language, "typescript");
+  assert.match(typescript.html, /hljs-keyword/);
+
+  // 认不出的语言标注不高亮，但仍然要转义后交出去。
+  const unknown = highlightFencedCode("<script>alert(1)</script>", "brainfuck");
+  assert.equal(unknown.language, undefined);
+  assert.equal(unknown.html, "&lt;script&gt;alert(1)&lt;/script&gt;");
+}
+
+function testAttachmentReferenceRoundTrip(): void {
+  const prompt = withAttachmentReferences("看下这张图", [
+    { name: "shot.png", path: "@attachments/1753600000000-a1b2c3-shot.png", mimeType: "image/png", size: 2048 }
+  ]);
+  const split = splitAttachmentReferences(prompt);
+  assert.equal(split.text, "看下这张图");
+  assert.deepEqual(split.attachments, [
+    { path: "@attachments/1753600000000-a1b2c3-shot.png", name: "shot.png", mimeType: "image/png", size: 2048 }
+  ]);
+
+  // 没有附件块，以及格式对不上的历史消息，都要原样返回。
+  assert.deepEqual(splitAttachmentReferences("普通消息"), { text: "普通消息", attachments: [] });
+  const malformed = "普通消息\n\nAttached files (read them with read_file using these @attachments/ paths):\n- 说明文字";
+  assert.deepEqual(splitAttachmentReferences(malformed), { text: malformed, attachments: [] });
+}
+
+async function testInlineImageReading(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-inline-image-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-inline-image-desktop-"));
+  try {
+    const { projects } = await createDesktopTestServices(desktopRoot);
+    const project = await projects.createProject(workspaceRoot);
+    const pixel = Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64");
+    await writeFile(path.join(workspaceRoot, "shot.gif"), pixel);
+    const attachment = await projects.saveAttachment(project, "shot.gif", "image/gif", pixel);
+
+    assert.equal(await projects.readInlineImage(project, "shot.gif"), `data:image/gif;base64,${pixel.toString("base64")}`);
+    assert.equal(await projects.readInlineImage(project, attachment.path), `data:image/gif;base64,${pixel.toString("base64")}`);
+    // 非图片、越界路径和不存在的文件都只是「没图」，不能抛错打断消息渲染。
+    assert.equal(await projects.readInlineImage(project, "notes.txt"), undefined);
+    assert.equal(await projects.readInlineImage(project, "../outside.png"), undefined);
+    assert.equal(await projects.readInlineImage(project, "@attachments/../../escape.png"), undefined);
+    assert.equal(await projects.readInlineImage(project, "missing.png"), undefined);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
+  }
+}
+
+function testCommandHighlighting(): void {
+  const kinds = (command: string): string => tokenizeCommand(command).filter((token) => token.text.trim()).map((token) => `${token.kind}:${token.text}`).join(" ");
+
+  assert.equal(kinds("git commit -m \"修复 #12\""), "program:git subcommand:commit flag:-m string:\"修复 #12\"");
+  assert.equal(kinds("pnpm run build 2>&1 | tail -n 20"), "program:pnpm subcommand:run plain:build plain:2 operator:>& plain:1 operator:| program:tail flag:-n plain:20");
+  assert.equal(kinds("NODE_ENV=test npx vite preview --port=4190 # 预览"), "variable:NODE_ENV operator:= plain:test program:npx subcommand:vite plain:preview flag:--port operator:= plain:4190 comment:# 预览");
+  assert.equal(kinds("cat src/index.ts > $HOME/out.log"), "program:cat path:src/index.ts operator:> variable:$HOME path:/out.log");
+  assert.equal(kinds("rm -rf ./dist && echo ok"), "program:rm flag:-rf path:./dist operator:&& program:echo plain:ok");
+  assert.equal(kinds("$(which node) --version"), "operator:$( program:which plain:node operator:) flag:--version");
+
+  // 引号未闭合、变量残缺这类畸形输入也不能吞字符：拼回去必须和原文一致。
+  for (const command of ["node -e \"console.log('x')\" 2>&1", "echo '未闭合", "echo $", "find . -exec rm {} \\;", ""]) {
+    assert.equal(tokenizeCommand(command).map((token) => token.text).join(""), command);
+  }
+}
+
 function testWorkspaceFileMarkers(): void {
   assert.deepEqual(workspaceFileMarker("README.md"), { label: "MD", tone: "markdown" });
   assert.deepEqual(workspaceFileMarker("src/App.tsx"), { label: "TSX", tone: "typescript" });
@@ -450,6 +530,23 @@ async function testDesktopModelConfiguration(): Promise<void> {
     await configStore.save(initialConfig);
     const project = await projects.createProject(workspaceRoot);
     const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
+    // Enabling an extra model must not hijack the active default — that is what
+    // the settings "启用模型" toggles do on every click.
+    const enabledOnly = await agents.saveModelConfiguration(project.id, {
+      alias: "local-qwen-extra",
+      displayName: "本地 Qwen 备用",
+      providerAlias: "local",
+      providerType: "ollama",
+      model: "qwen3:4b",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      apiKeyEnv: undefined,
+      apiKey: undefined,
+      supportsTools: true,
+      supportsThinking: false
+    });
+    assert.equal((await configStore.load()).defaultModel, "deepseek-v4-flash");
+    assert.equal(enabledOnly.models.some((model) => model.alias === "local-qwen-extra"), true);
+
     const snapshot = await agents.saveModelConfiguration(project.id, {
       alias: "local-qwen",
       displayName: "本地 Qwen",
@@ -460,7 +557,8 @@ async function testDesktopModelConfiguration(): Promise<void> {
       apiKeyEnv: undefined,
       apiKey: undefined,
       supportsTools: true,
-      supportsThinking: false
+      supportsThinking: false,
+      makeDefault: true
     });
     const config = await configStore.load();
     assert.equal(config.defaultModel, "local-qwen");
@@ -540,6 +638,7 @@ async function testDesktopCredentialsAreSeparated(): Promise<void> {
     });
     const config = structuredClone(defaultConfig);
     config.providers.deepseek!.apiKey = "desktop-secret";
+    config.web.search.apiKey = "tvly-web-secret";
     await store.save(config);
     const [settings, credentials] = await Promise.all([
       readFile(path.join(desktopRoot, "agent.config.json"), "utf8"),
@@ -547,8 +646,71 @@ async function testDesktopCredentialsAreSeparated(): Promise<void> {
     ]);
     assert.doesNotMatch(settings, /desktop-secret/);
     assert.doesNotMatch(credentials, /desktop-secret/);
-    assert.equal((await store.load()).providers.deepseek?.apiKey, "desktop-secret");
+    // 联网搜索密钥同样只进加密凭据文件，不落明文设置文件。
+    assert.doesNotMatch(settings, /tvly-web-secret/);
+    assert.doesNotMatch(credentials, /tvly-web-secret/);
+    const loaded = await store.load();
+    assert.equal(loaded.providers.deepseek?.apiKey, "desktop-secret");
+    assert.equal(loaded.web.search.apiKey, "tvly-web-secret");
   } finally {
+    await rm(desktopRoot, { recursive: true, force: true });
+  }
+}
+
+async function testDesktopWebSearchSettings(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-web-search-workspace-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-web-search-data-"));
+  try {
+    const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
+    const project = await projects.createProject(workspaceRoot);
+    const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
+
+    const initial = await agents.webSearchSettings(project.id);
+    assert.equal(initial.enabled, true);
+    assert.equal(initial.provider, "anysearch");
+    assert.equal(initial.hasApiKey, false);
+
+    const saved = await agents.saveWebSearchSettings(project.id, {
+      enabled: true,
+      provider: "tavily",
+      apiKey: "tvly-test-secret",
+      apiKeyEnv: undefined,
+      timeoutMs: 8_000,
+      maxResults: 6
+    });
+    assert.equal(saved.provider, "tavily");
+    assert.equal(saved.hasApiKey, true);
+    assert.equal(saved.envKeyName, "TAVILY_API_KEY");
+    assert.equal(saved.maxResults, 6);
+
+    // 同 provider 重新保存且未传 apiKey：已存密钥保留。
+    const kept = await agents.saveWebSearchSettings(project.id, {
+      enabled: true,
+      provider: "tavily",
+      apiKey: undefined,
+      apiKeyEnv: undefined,
+      timeoutMs: 8_000,
+      maxResults: 6
+    });
+    assert.equal(kept.hasApiKey, true);
+
+    // 切换 provider 且未提供新密钥：旧密钥必须被清除，不能带给新服务商。
+    const switched = await agents.saveWebSearchSettings(project.id, {
+      enabled: true,
+      provider: "brave",
+      apiKey: undefined,
+      apiKeyEnv: undefined,
+      timeoutMs: 8_000,
+      maxResults: 6
+    });
+    assert.equal(switched.provider, "brave");
+    assert.equal(switched.hasApiKey, false);
+    assert.equal(switched.envKeyName, "BRAVE_SEARCH_API_KEY");
+    assert.equal((await configStore.load()).web.search.apiKey, undefined);
+
+    await agents.closeAll();
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
     await rm(desktopRoot, { recursive: true, force: true });
   }
 }
@@ -576,6 +738,55 @@ async function testDesktopRequiresModelConfiguration(): Promise<void> {
     const ready = await agents.workspaceSnapshot(project.id);
     assert.equal(ready.requiresModelConfiguration, false);
     assert.equal(ready.models[0]?.alias, configured.defaultModel);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
+  }
+}
+
+async function testDesktopConnectionMetadata(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-connections-workspace-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-connections-data-"));
+  try {
+    const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
+    const project = await projects.createProject(workspaceRoot);
+    const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
+    const config = structuredClone(defaultConfig);
+    config.providers.deepseek!.apiKey = "connection-metadata-secret";
+    config.providers.subscription = {
+      type: "claude-subscription",
+      baseUrl: "https://api.anthropic.com",
+      apiKey: "oauth-access-token",
+      authMode: "oauth-bearer",
+      oauth: { provider: "claude-code", expiresAt: 1_900_000_000_000 }
+    };
+    await configStore.save(config);
+
+    const snapshot = await agents.workspaceSnapshot(project.id);
+    const deepseek = snapshot.connections.find((item) => item.providerAlias === "deepseek");
+    assert.equal(deepseek?.hasCredential, true);
+    assert.equal(deepseek?.credentialSource, "config");
+    assert.equal(deepseek?.baseUrl, "https://api.deepseek.com");
+    // Presence only — the key itself must never reach the renderer.
+    assert.doesNotMatch(JSON.stringify(snapshot.connections), /connection-metadata-secret|oauth-access-token/);
+
+    const subscription = snapshot.connections.find((item) => item.providerAlias === "subscription");
+    assert.equal(subscription?.authMode, "oauth-bearer");
+    assert.equal(subscription?.oauthProvider, "claude-code");
+    assert.equal(subscription?.oauthExpiresAt, 1_900_000_000_000);
+
+    // An unreachable provider degrades to `fallback` instead of throwing, so the
+    // settings dialog keeps showing the models it already had.
+    const unreachable = structuredClone(config);
+    unreachable.providers.deepseek!.baseUrl = "http://127.0.0.1:1/v1";
+    unreachable.providers.deepseek!.retry = { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0 };
+    await configStore.save(unreachable);
+    const catalog = await agents.fetchModelCatalog(project.id, "deepseek");
+    assert.equal(catalog.source, "fallback");
+    assert.equal(catalog.models.length, 0);
+    assert.equal(catalog.providerAlias, "deepseek");
+    await assert.rejects(agents.fetchModelCatalog(project.id, "missing-provider"), /missing-provider/);
+    await agents.closeAll();
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
     await rm(desktopRoot, { recursive: true, force: true });
@@ -759,6 +970,30 @@ async function createDesktopTestServices(root: string): Promise<{
   return { configStore, projects: new DesktopProjectService(state, storage, configStore), state };
 }
 
+function testProviderCatalogResolution(): void {
+  // A relay / self-hosted gateway matches no catalog vendor. It used to fall
+  // back to "the first openai-compatible entry", which branded a grok endpoint
+  // at ai.td.ee as MiniMax Coding Plan and offered MiniMax M3 as a candidate.
+  const relay = { provider: "ai-td-ee", providerType: "openai-compatible" };
+  assert.equal(catalogForConnection(relay, "https://ai.td.ee/v1"), undefined);
+  const custom = customCatalogEntry({ ...relay, models: [] }, "https://ai.td.ee/v1");
+  assert.equal(custom.label, "ai.td.ee");
+  assert.equal(custom.iconTone, "compatible");
+  assert.equal(custom.models.length, 0);
+
+  // Known vendors still resolve, and the saved endpoint disambiguates two
+  // catalog entries that share a hostname.
+  assert.equal(catalogForConnection({ provider: "api-x-ai", providerType: "openai-compatible" })?.id, "xai");
+  assert.equal(
+    catalogForConnection({ provider: "api-z-ai", providerType: "openai-compatible" }, "https://api.z.ai/api/coding/paas/v4")?.id,
+    "zai-coding-plan"
+  );
+  assert.equal(
+    catalogForConnection({ provider: "api-z-ai", providerType: "openai-compatible" }, "https://api.z.ai/api/paas/v4")?.id,
+    "zai"
+  );
+}
+
 function testModelChoicesDeduplicateEquivalentAliases(): void {
   const config = structuredClone(defaultConfig);
   config.models["deepseek-deepseek-v4-flash"] = { ...config.models["deepseek-v4-flash"] };
@@ -807,6 +1042,53 @@ function testHistoricalToolProjection(): void {
   ], []);
   assert.equal(timeline[0]?.tools[0]?.path, "src/index.ts");
   assert.deepEqual(timeline[0]?.tools[0]?.display, { kind: "file_io", operation: "read", path: "src/index.ts" });
+}
+
+function testWebSearchProjection(): void {
+  const searchResult = {
+    query: "Chicago weather",
+    provider: "tavily",
+    results: [
+      { title: "Chicago Forecast", url: "https://www.weather.gov/chicago", snippet: "Official forecast.", favicon: "https://www.weather.gov/favicon.ico" },
+      { title: "HTTP favicon", url: "https://example.com/http-favicon", favicon: "http://tracker.example.com/pixel.ico" },
+      { title: "Broken entry", url: "not-a-url" },
+      { title: "FTP entry", url: "ftp://example.com/file" }
+    ],
+    fetchedAt: "2026-01-01T00:00:03.000Z"
+  };
+  const timeline = buildSessionTimeline([
+    { type: "user_message", content: "查天气" },
+    { type: "tool_call", tool: "web_search", args: { query: "Chicago weather" }, toolCallId: "search" },
+    { type: "tool_result", tool: "web_search", result: searchResult, toolCallId: "search" }
+  ], []);
+  const tool = timeline[0]?.tools[0];
+  assert.equal(tool?.status, "success");
+  assert.deepEqual(tool?.display, { kind: "generic", summary: "Chicago weather", detail: { query: "Chicago weather" } });
+
+  const view = projectWebSearchView(tool?.args, tool?.result);
+  assert.equal(view.query, "Chicago weather");
+  assert.equal(view.providerLabel, "Tavily");
+  assert.equal(view.fetchedAt, "2026-01-01T00:00:03.000Z");
+  // 非法 URL 与非 http(s) 协议的结果不进入视图。
+  assert.equal(view.results.length, 2);
+  assert.equal(view.results[0]?.domain, "weather.gov");
+  assert.equal(view.results[0]?.fallbackLetter, "W");
+  assert.deepEqual(view.results[0]?.faviconCandidates, [
+    "https://www.weather.gov/favicon.ico",
+    "https://icons.duckduckgo.com/ip3/www.weather.gov.ico",
+    "https://www.google.com/s2/favicons?domain=www.weather.gov&sz=64"
+  ]);
+  // 明文 http favicon 不进入回退链，直接落到图标服务。
+  assert.deepEqual(view.results[1]?.faviconCandidates, [
+    "https://icons.duckduckgo.com/ip3/example.com.ico",
+    "https://www.google.com/s2/favicons?domain=example.com&sz=64"
+  ]);
+
+  // 运行中（尚无结果）时只有查询词，provider 未知。
+  const runningView = projectWebSearchView({ query: "Chicago weather" }, undefined);
+  assert.equal(runningView.query, "Chicago weather");
+  assert.equal(runningView.providerLabel, undefined);
+  assert.equal(runningView.results.length, 0);
 }
 
 function testHistoricalReasoningAndSkillProjection(): void {
@@ -860,6 +1142,41 @@ function testLiveExecutionTimelineKeepsReasoningAndToolsInOrder(): void {
   assert.deepEqual(turn?.steps.map((step) => step.kind), ["reasoning", "tool", "reasoning", "tool", "assistant"]);
   assert.deepEqual(turn?.steps.filter((step) => step.kind === "reasoning").map((step) => step.content), ["先检查入口。", "再运行测试。"]);
   assert.deepEqual(turn?.steps.filter((step) => step.kind === "tool").map((step) => step.tool.id), ["read", "test"]);
+}
+
+function testLiveAssistantCompletionDoesNotDuplicateDelta(): void {
+  const base = { sessionId: "session", runId: "duplicate-run", timestamp: "2026-01-01T00:00:00.000Z" };
+  const timeline = buildSessionTimeline([], [
+    { ...base, type: "message.user", messageId: "message", content: "停止进程" },
+    { ...base, type: "assistant.delta", messageId: "message", content: "正文" },
+    { ...base, type: "tool.started", toolCallId: "tool", tool: "list_processes", args: {} },
+    { ...base, type: "tool.completed", toolCallId: "tool", tool: "list_processes", result: {}, durationMs: 10 },
+    { ...base, type: "assistant.completed", messageId: "message", content: "正文" },
+    { ...base, type: "run.completed", durationMs: 20 }
+  ]);
+  const turn = timeline[0];
+  const assistantSteps = turn?.steps.filter((step) => step.kind === "assistant") ?? [];
+  assert.equal(assistantSteps.length, 1);
+  assert.equal(assistantSteps[0]?.kind === "assistant" ? assistantSteps[0].content : undefined, "正文");
+  assert.equal(turn?.assistant, "正文");
+}
+
+function testVerifierPromptIsNotRenderedAsUserMessage(): void {
+  const internalPrompt = [
+    "关掉它吧",
+    "",
+    "This is a verifier-driven task. Complete the objective and satisfy every acceptance criterion below.",
+    "Task contract type: conversation.",
+    "Constraints:\n- Keep all work inside the workspace.",
+    "Current plan:\n- [pending] Produce the requested answer or analysis. (required)",
+    "Do not claim completion until the workspace and the required checks are actually in a passing state."
+  ].join("\n");
+  const base = { sessionId: "session", runId: "verifier-run", timestamp: "2026-01-01T00:00:00.000Z" };
+  const historical = buildSessionTimeline([{ type: "user_message", content: internalPrompt }], []);
+  assert.equal(historical[0]?.user, "关掉它吧");
+
+  const live = buildSessionTimeline([], [{ ...base, type: "message.user", messageId: "message", content: internalPrompt }]);
+  assert.equal(live[0]?.user, "关掉它吧");
 }
 
 function testHistoricalPrefixKeepsUnpersistedDuplicatePrompt(): void {

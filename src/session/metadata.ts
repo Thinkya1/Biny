@@ -1,3 +1,9 @@
+/**
+ * Session 元数据类型：token 用量、费用和上下文预算。
+ *
+ * 这些结构会原样写进 session 文件，属于对外的持久化格式，改字段要考虑历史 session 的
+ * 兼容性，因此除 `operation` 等必需项外都保持可选。
+ */
 import type { LanguageModelUsage } from "ai";
 
 export type UsageOperation = "agent" | "plan" | "compaction" | "memory" | "subagent";

@@ -14,6 +14,8 @@ export interface SubagentTaskSnapshot {
   completedAt?: string;
   error?: string;
   accessMode?: SubagentAccessMode;
+  /** 具名子代理定义名；省略表示默认子代理。 */
+  agent?: string;
 }
 
 export interface SubagentTaskRunOptions {
@@ -22,6 +24,7 @@ export interface SubagentTaskRunOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
   accessMode?: SubagentAccessMode;
+  agent?: string;
 }
 
 export interface SubmittedSubagentTask {
@@ -36,7 +39,7 @@ export interface SubagentTaskManagerOptions {
   maxPendingSubagents?: number;
   timeoutMs: number;
   shutdownDrainMs?: number;
-  execute(task: string, context: { taskId: string; parentRunId: string; signal: AbortSignal; deadline: string; accessMode: SubagentAccessMode }): Promise<string>;
+  execute(task: string, context: { taskId: string; parentRunId: string; signal: AbortSignal; deadline: string; accessMode: SubagentAccessMode; agent?: string }): Promise<string>;
 }
 
 interface ManagedSubagentTask extends SubagentTaskSnapshot {
@@ -118,6 +121,7 @@ export class SubagentTaskManager {
       createdAt: new Date(createdAtMs).toISOString(),
       deadline: new Date(deadlineMs).toISOString(),
       accessMode: options.accessMode ?? "read-only",
+      agent: options.agent,
       controller,
       completion,
       resolve: resolveCompletion,
@@ -232,7 +236,8 @@ export class SubagentTaskManager {
         parentRunId: task.parentRunId,
         signal: task.controller.signal,
         deadline: task.deadline,
-        accessMode: task.accessMode
+        accessMode: task.accessMode,
+        agent: task.agent
       });
       if (task.controller.signal.aborted) this.fail(task, abortError(task));
       else this.complete(task, output);
@@ -350,7 +355,8 @@ function publicSnapshot(task: ManagedSubagentTask): SubagentTaskSnapshot {
     startedAt: task.startedAt,
     completedAt: task.completedAt,
     error: task.error,
-    accessMode: task.accessMode
+    accessMode: task.accessMode,
+    agent: task.agent
   };
 }
 

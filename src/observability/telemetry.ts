@@ -1,3 +1,10 @@
+/**
+ * 本地 telemetry 落盘（`.agent/telemetry.jsonl`）。
+ *
+ * 只写本地文件，不上报任何外部服务。输入/输出是否记录由配置决定，且写入前一律脱敏。
+ *
+ * 这里的所有失败都被吞掉：telemetry 属于诊断信息，写不进去不能影响产生该事件的实际操作。
+ */
 import { constants, promises as fs } from "node:fs";
 import path from "node:path";
 import type { Telemetry, TelemetryOptions } from "ai";
@@ -18,8 +25,8 @@ export function createSdkTelemetry(config: AgentConfig, workspaceRoot: string, f
 export function createLocalTelemetry(filePath: string): Telemetry {
   let writeTail: Promise<void> = Promise.resolve();
   const append = (event: Record<string, unknown>): Promise<void> => {
-    // Telemetry is diagnostic only: an unsafe or unavailable sink is disabled
-    // without breaking the agent operation that produced the event.
+    // 串行追加，并在链条两端都吞掉异常：一次写入失败不能中断后续写入，
+    // 也不能让异常冒到产生事件的 agent 流程里。
     writeTail = writeTail
       .catch(() => undefined)
       .then(async () => await appendSecureTelemetry(filePath, `${JSON.stringify({ ...event, time: new Date().toISOString() })}\n`))
@@ -60,6 +67,7 @@ export function createLocalTelemetry(filePath: string): Telemetry {
   };
 }
 
+/** 追加一行前先确认目录和文件都是真实的普通文件/目录，不跟随符号链接写到别处。 */
 async function appendSecureTelemetry(requestedPath: string, line: string): Promise<void> {
   const requestedDirectory = path.dirname(path.resolve(requestedPath));
   const directoryStat = await fs.lstat(requestedDirectory);
@@ -82,6 +90,8 @@ async function appendSecureTelemetry(requestedPath: string, line: string): Promi
     0o600
   );
   try {
+    // 打开之后再核对一次：确认句柄指向的 inode 就是路径当前指向的那个，
+    // 防止在 lstat 与 open 之间文件被替换（TOCTOU）。
     const descriptorStat = await handle.stat();
     const pathStat = await fs.lstat(filePath);
     if (
@@ -103,6 +113,7 @@ async function appendSecureTelemetry(requestedPath: string, line: string): Promi
   }
 }
 
+/** 只挑出确定需要的 token 字段，避免把 SDK 未来新增的未知字段一并写进日志。 */
 function sanitizeUsage(value: unknown): Record<string, unknown> | undefined {
   if (!isRecord(value)) return undefined;
   const inputTokenDetails = isRecord(value.inputTokenDetails) ? value.inputTokenDetails : {};
@@ -125,6 +136,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** 输入/输出先截断再脱敏后落盘；序列化不了（循环引用等）就记个占位，不抛错。 */
 function safePayload(value: unknown): string | undefined {
   if (value === undefined) return undefined;
   try {

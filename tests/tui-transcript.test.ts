@@ -1,36 +1,35 @@
 import assert from "node:assert/strict";
-import { PassThrough } from "node:stream";
-import React from "react";
-import { render, renderToString } from "ink";
-import { Transcript } from "../src/tui/components/Transcript.js";
-import { HelpDialog } from "../src/tui/components/HelpDialog.js";
-import { ModelPicker, ReasoningPicker, reasoningOptions } from "../src/tui/components/ModelPicker.js";
-import { PermissionPrompt } from "../src/tui/components/PermissionPrompt.js";
-import { TranscriptViewer, transcriptViewerPage } from "../src/tui/components/TranscriptViewer.js";
-import { diffLineStyle } from "../src/tui/diffLines.js";
+import { CombinedAutocompleteProvider, visibleWidth } from "@earendil-works/pi-tui";
 import { createInitialTuiState, tuiReducer } from "../src/tui/state.js";
 import { agentEventToRuntimeEvents } from "../src/tui/runtime/agentEventAdapter.js";
 import { sessionEventsToTranscript } from "../src/tui/sessionTranscript.js";
+import { diffLineStyle } from "../src/tui/diffLines.js";
+import { foldableTranscriptItems, formatToolDuration, latestExpandableTranscript } from "../src/tui/transcriptText.js";
+import { TranscriptView } from "../src/tui/components/transcriptView.js";
+import { ThinkingComponent, ToolExecutionComponent, splitToolTitle } from "../src/tui/components/messages.js";
+import { PermissionDialog, SelectDialog, TextViewerDialog } from "../src/tui/components/dialogs.js";
 import {
-  clampTerminalLines,
-  stripAnsi,
-  terminalWidth,
-  truncateToTerminalWidth,
-  wrapTerminalLines
-} from "../src/tui/terminalText.js";
+  FooterComponent,
+  ShortcutsBarComponent,
+  WelcomeComponent,
+  footerLayout,
+  formatTokens,
+  shortSessionId,
+  shortcutHints,
+  statusMessage,
+  visibleShortcutHints
+} from "../src/tui/components/chrome.js";
+import type { PermissionChoice, ToolTranscriptItem, TranscriptState, TuiPermissionRequest } from "../src/tui/types.js";
 import {
-  sliceTranscriptRows,
-  transcriptRowsForDisplay,
-  transcriptScrollMaxOffset,
-  visibleTranscriptRows,
-  type TranscriptDisplayRow
-} from "../src/tui/transcriptRows.js";
-import { latestExpandableTranscript } from "../src/tui/transcriptViewer.js";
-import type { PermissionChoice, ToolTranscriptItem } from "../src/tui/types.js";
-import type { ModelChoice } from "../src/llm/ModelManager.js";
-import { statusBarLayout } from "../src/tui/components/StatusBar.js";
-import { Welcome } from "../src/tui/components/Welcome.js";
-import { tuiColors } from "../src/tui/theme/index.js";
+  ansi256ToHex,
+  availableThemes,
+  getTheme,
+  rgbToAnsi256,
+  setTheme,
+  theme,
+  themeBgTokens,
+  themeColorTokens
+} from "../src/tui/theme/index.js";
 import { CHAT_SLASH_COMMANDS } from "../src/cli/commands/chatSlash.js";
 import { isConcurrentTuiSlashCommand, TUI_SLASH_COMMANDS } from "../src/tui/slashCommands.js";
 import {
@@ -42,12 +41,28 @@ import { isFullYesConfirmation, permissionResultFromAnswer } from "../src/permis
 import { permissionChoiceToResult } from "../src/tui/runtime/createTuiRuntime.js";
 import type { SessionEvent } from "../src/session/recorder.js";
 
+/** 去掉 ANSI，方便对渲染出来的行做文本断言。 */
+function plain(line: string): string {
+  return line.replace(/\u001B\[[0-9;]*m/g, "").replace(/\u001B_pi:c\u0007/g, "");
+}
+
+function plainLines(lines: string[]): string[] {
+  return lines.map(plain);
+}
+
+
+/** 把一份 transcript 状态渲染成去掉 ANSI 的文本，便于断言。 */
+function renderTranscript(transcript: TranscriptState, width: number): string {
+  const view = new TranscriptView();
+  view.sync(transcript);
+  return renderView(view, width);
+}
+
+function renderView(view: TranscriptView, width: number): string {
+  return plainLines(view.render(width)).join("\n");
+}
+
 async function main(): Promise<void> {
-  testStripAnsi();
-  testTerminalWidth();
-  testTruncateToTerminalWidth();
-  testWrapTerminalLines();
-  testClampTerminalLines();
   testTranscriptUsesIndependentItemKinds();
   testRuntimeStatusEventsReachFooterState();
   testReasoningStreamingRendersContent();
@@ -63,26 +78,26 @@ async function main(): Promise<void> {
   testRecoverableErrorDoesNotFinalizeSiblingTools();
   testPermissionRejectionKeepsTurnRunning();
   testPermissionConfirmationContract();
-  await testPermissionPromptInputContract();
   testLongCommandStaysInFoldedDetails();
   testCommandDisplayNeverLeaksRawCommand();
-  testNarrowToolCellFitsViewport();
-  testLongSingleLineWrapsBeforeFourRowClamp();
   testFailedCommandCommitsOneToolItem();
   testErrorFinalizesActiveCells();
   testSessionReplayUsesToolItems();
   testSessionReplayFinalizesPendingTools();
-  testViewportKeepsLatestRowsVisible();
-  testTranscriptDoesNotClipLongOutput();
-  testFooterContainsOnlyRuntimeSummary();
-  testWelcomeRendersCatAndWorkspace();
-  testTranscriptComponentRendersToolHierarchy();
-  testTranscriptViewerPagesByVisualLines();
-  testTranscriptViewerFitsNarrowViewport();
-  testModelPickerDialogs();
-  testHelpDialogLayout();
   testSlashCommandParity();
-  testDiffUsesForegroundSemanticColors();
+  await testSlashAutocompleteInsertsSingleSlash();
+  testThemeTokensResolveToAnsi();
+  testTranscriptViewSyncsIncrementally();
+  testAssistantMarkdownRendersBlocks();
+  testToolBlockRendersTitleAndClampedOutput();
+  testThinkingBlockCollapses();
+  testFooterAndChromeLayout();
+  testStatusAndShortcutHints();
+  testWelcomeRendersOnboarding();
+  testDialogsRenderAndHandleKeys();
+  testPermissionDialogRequiresFullYes();
+  testDiffStylesUseThemeTokens();
+  testTranscriptTextHelpers();
 }
 
 function testPermissionConfirmationContract(): void {
@@ -132,103 +147,6 @@ function testPermissionConfirmationContract(): void {
     confirmationAttempted: false
   });
 
-  const normalView = stripAnsi(renderToString(React.createElement(PermissionPrompt, {
-    request: { ...baseRequest, requireFullYes: false },
-    detailsExpanded: false,
-    onAnswer: () => undefined,
-    onToggleDetails: () => undefined
-  })));
-  assert.match(normalView, /Y execute/u);
-  assert.doesNotMatch(normalView, /Approval requires the full word yes/u);
-
-  const strongView = stripAnsi(renderToString(React.createElement(PermissionPrompt, {
-    request: baseRequest,
-    detailsExpanded: false,
-    onAnswer: () => undefined,
-    onToggleDetails: () => undefined
-  })));
-  assert.match(strongView, /Type yes, then press Enter/u);
-  assert.match(strongView, /Empty Enter or y will not execute/u);
-  assert.doesNotMatch(strongView, /Y execute/u);
-}
-
-async function testPermissionPromptInputContract(): Promise<void> {
-  const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream & {
-    setRawMode(mode: boolean): void;
-  };
-  Object.assign(stdin, {
-    isTTY: true,
-    setRawMode: () => undefined,
-    ref: () => stdin,
-    unref: () => stdin
-  });
-  const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream;
-  Object.assign(stdout, { isTTY: true, columns: 100, rows: 40, getColorDepth: () => 8 });
-  const answers: PermissionChoice[] = [];
-  const request = {
-    tool: "run_command",
-    title: "Command execution request",
-    details: "sudo example",
-    actionType: "shell",
-    riskLevel: "critical",
-    requireFullYes: true
-  };
-  const prompt = (nextRequest: typeof request) => React.createElement(PermissionPrompt, {
-    request: nextRequest,
-    detailsExpanded: false,
-    onAnswer: (answer) => answers.push(answer),
-    onToggleDetails: () => undefined
-  });
-  const app = render(prompt(request), {
-    stdin,
-    stdout,
-    stderr: stdout,
-    interactive: false,
-    patchConsole: false,
-    exitOnCtrlC: false,
-    maxFps: 1_000
-  });
-
-  try {
-    await app.waitUntilRenderFlush();
-    await waitForPermissionInput();
-
-    await send("\r");
-    assert.deepEqual(answers, []);
-    await send("y");
-    await send("\r");
-    assert.deepEqual(answers, []);
-    await send("es");
-    await send("\r");
-    assert.deepEqual(answers, ["approve_once"]);
-
-    app.rerender(prompt({ ...request, title: "Second request" }));
-    await app.waitUntilRenderFlush();
-    await waitForPermissionInput();
-    await send("\r");
-    assert.deepEqual(answers, ["approve_once"]);
-
-    app.rerender(prompt({ ...request, title: "Third request" }));
-    await app.waitUntilRenderFlush();
-    await waitForPermissionInput();
-    await send("c");
-    await send("\r");
-    assert.deepEqual(answers, ["approve_once"]);
-  } finally {
-    app.unmount();
-    await app.waitUntilExit();
-    stdin.end();
-    stdout.end();
-  }
-
-  async function send(value: string): Promise<void> {
-    stdin.write(value);
-    await waitForPermissionInput();
-  }
-}
-
-async function waitForPermissionInput(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 10));
 }
 
 function testSlashCommandParity(): void {
@@ -236,120 +154,16 @@ function testSlashCommandParity(): void {
     CHAT_SLASH_COMMANDS.map((command) => command.name),
     TUI_SLASH_COMMANDS.map((command) => command.name)
   );
-  assert.equal(TUI_SLASH_COMMANDS.length, 19);
+  assert.equal(TUI_SLASH_COMMANDS.length, 23);
   assert.equal(TUI_SLASH_COMMANDS.find((command) => command.name === "/plan")?.requiresArgs, undefined);
+  assert.ok(TUI_SLASH_COMMANDS.some((command) => command.name === "/memory"));
+  assert.ok(TUI_SLASH_COMMANDS.some((command) => command.name === "/undo"));
+  assert.ok(TUI_SLASH_COMMANDS.some((command) => command.name === "/continue"));
+  assert.ok(TUI_SLASH_COMMANDS.some((command) => command.name === "/fork"));
   assert.equal(isConcurrentTuiSlashCommand("/subagent status"), true);
   assert.equal(isConcurrentTuiSlashCommand("/subagent CANCEL task-id"), true);
+  assert.equal(isConcurrentTuiSlashCommand("/subagent agents"), true);
   assert.equal(isConcurrentTuiSlashCommand("/subagent review this"), false);
-}
-
-function testModelPickerDialogs(): void {
-  const model: ModelChoice = {
-    alias: "terra",
-    displayName: "gpt-5.6-terra",
-    description: "Balanced agentic coding model for everyday work.",
-    provider: "openai",
-    providerType: "openai",
-    model: "gpt-5.6-terra",
-    efforts: ["high", "max"],
-    defaultThinking: "high"
-  };
-  const modelView = stripAnsi(renderToString(React.createElement(ModelPicker, {
-    models: [model],
-    currentAlias: "terra",
-    currentThinking: "high",
-    onSelect: () => undefined,
-    onCancel: () => undefined
-  })));
-  assert.match(modelView, /Select Model and Effort/u);
-  assert.match(modelView, /❯ 1\. gpt-5\.6-terra/u);
-  assert.match(modelView, /Balanced agentic coding model/u);
-
-  const reasoningView = stripAnsi(renderToString(React.createElement(ReasoningPicker, {
-    model,
-    options: reasoningOptions(model),
-    selectedIndex: 1,
-    currentAlias: "terra",
-    currentThinking: "high"
-  })));
-  assert.match(reasoningView, /Select Reasoning Level for gpt-5\.6-terra/u);
-  assert.match(reasoningView, /❯ 2\. High/u);
-  assert.match(reasoningView, /Press enter to confirm or esc to go back/u);
-}
-
-function testHelpDialogLayout(): void {
-  const output = stripAnsi(renderToString(React.createElement(HelpDialog, {
-    commands: TUI_SLASH_COMMANDS,
-    message: "Unknown command: /missing",
-    onExit: () => undefined
-  })));
-  assert.match(output, /Commands/u);
-  assert.match(output, /Unknown command: \/missing/u);
-  assert.match(output, /❯ 1\. \/help/u);
-  assert.match(output, /1 \/ 19/u);
-  assert.match(output, /Press esc to cancel/u);
-}
-
-function testWelcomeRendersCatAndWorkspace(): void {
-  const output = renderToString(React.createElement(Welcome, { cwd: "~/CodingAgent/biny" }));
-  assert.match(output, /Biny is ready/u);
-  assert.match(output, /████/u);
-  assert.match(output, /███\s+████\s+████/u);
-  assert.match(output, /Workspace · ~\/CodingAgent\/biny/u);
-}
-
-function testStripAnsi(): void {
-  assert.equal(stripAnsi("\u001B[31m错误\u001B[0m plain"), "错误 plain");
-  assert.equal(stripAnsi("\u001B]8;;https://example.com\u0007link\u001B]8;;\u0007"), "link");
-}
-
-function testTerminalWidth(): void {
-  assert.equal(terminalWidth("plain"), 5);
-  assert.equal(terminalWidth("中文"), 4);
-  assert.equal(terminalWidth("e\u0301"), 1);
-  assert.equal(terminalWidth("👨‍👩‍👧‍👦"), 2);
-  assert.equal(terminalWidth("🇨🇳"), 2);
-  assert.equal(terminalWidth("\u001B[32m中文\u001B[0m"), 4);
-}
-
-function testTruncateToTerminalWidth(): void {
-  assert.equal(truncateToTerminalWidth("abcdef", 4), "abc…");
-  assert.equal(truncateToTerminalWidth("中文测试", 5), "中文…");
-  assert.equal(truncateToTerminalWidth("中文", 1), "…");
-  assert.equal(truncateToTerminalWidth("abcdef", 0), "");
-  assert.equal(truncateToTerminalWidth("abcdef", 4, ".."), "ab..");
-
-  const colored = truncateToTerminalWidth("\u001B[31mabcdef\u001B[0m", 4);
-  assert.equal(stripAnsi(colored), "abc…");
-  assert.equal(terminalWidth(colored), 4);
-  assert.match(colored, /\u001B\[0m$/u);
-}
-
-function testWrapTerminalLines(): void {
-  assert.deepEqual(wrapTerminalLines("abcdef", 3), ["abc", "def"]);
-  assert.deepEqual(wrapTerminalLines("你好世界", 4), ["你好", "世界"]);
-  assert.deepEqual(wrapTerminalLines("e\u0301e\u0301", 1), ["e\u0301", "e\u0301"]);
-  assert.deepEqual(wrapTerminalLines("👨‍👩‍👧‍👦x", 2), ["👨‍👩‍👧‍👦", "x"]);
-  assert.deepEqual(wrapTerminalLines("a\n\nb\n", 4), ["a", "", "b", ""]);
-
-  const colored = wrapTerminalLines("\u001B[31mabcd\u001B[0m", 2);
-  assert.deepEqual(colored.map(stripAnsi), ["ab", "cd"]);
-  assert.deepEqual(colored.map(terminalWidth), [2, 2]);
-}
-
-function testClampTerminalLines(): void {
-  assert.deepEqual(clampTerminalLines("abcdefghij", 2, 4), {
-    lines: ["ab", "cd", "ef", "gh"],
-    hiddenLines: 1
-  });
-  assert.deepEqual(clampTerminalLines("a\n\nb", 10, 2), {
-    lines: ["a", ""],
-    hiddenLines: 1
-  });
-  assert.deepEqual(clampTerminalLines("中文测试完成", 4, 2), {
-    lines: ["中文", "测试"],
-    hiddenLines: 1
-  });
 }
 
 function testTranscriptUsesIndependentItemKinds(): void {
@@ -397,14 +211,20 @@ function testReasoningStreamingRendersContent(): void {
   state = tuiReducer(state, { type: "reasoning.completed", status: "分析完成" });
   assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["user", "reasoning"]);
   assert.equal(state.transcript.committed[1]?.content, "先检查入口文件。");
-  // Completed thinking collapses by default (Grok-style block header).
-  assert.match(transcriptRowsForDisplay(state.transcript, 80).map(rowText).join("\n"), /Thought/u);
+  // Pi keeps completed thinking visible by default; Ctrl+E can still collapse it.
+  const view = new TranscriptView();
+  view.sync(state.transcript);
+  const visibleThinking = renderView(view, 80);
+  assert.match(visibleThinking, /先检查入口文件。/u);
   const reasoningId = state.transcript.committed[1]?.id;
   assert.ok(reasoningId);
-  assert.match(
-    transcriptRowsForDisplay(state.transcript, 80, undefined, new Set([reasoningId])).map(rowText).join("\n"),
-    /先检查入口文件。/u
-  );
+  // 折叠后只剩标题行。
+  const thinkingComponent = view.componentFor(reasoningId);
+  assert.ok(thinkingComponent instanceof ThinkingComponent);
+  thinkingComponent.setCollapsed(true);
+  const collapsedThinking = renderView(view, 80);
+  assert.match(collapsedThinking, /Thought/u);
+  assert.doesNotMatch(collapsedThinking, /先检查入口文件。/u);
 
   const runtimeEvents = agentEventToRuntimeEvents({
     sessionId: "session",
@@ -501,11 +321,11 @@ function testActiveToolShowsLatestOutput(): void {
     tool: "run_command",
     update: { kind: "stdout", text: Array.from({ length: 8 }, (_, index) => `line ${String(index + 1)}`).join("\n") }
   });
-  const output = transcriptRowsForDisplay(state.transcript, 80)
-    .filter((row) => row.kind === "tool-output" && !row.omitted)
-    .map(rowText);
-  assert.equal(output.some((line) => line.includes("line 1")), false);
-  assert.equal(output.some((line) => line.includes("line 8")), true);
+  // 运行中的工具优先显示最新输出，最早的几行折叠掉。
+  const output = renderTranscript(state.transcript, 80);
+  assert.equal(output.includes("line 1\n"), false);
+  assert.match(output, /line 8/u);
+  assert.match(output, /earlier lines/u);
 }
 
 function testParallelToolsUpdateById(): void {
@@ -609,10 +429,15 @@ function testLongCommandStaysInFoldedDetails(): void {
   assert.match(tool.details ?? "", /Command: node script\.js/);
   assert.match(tool.details ?? "", /Exit code: 0/);
 
-  const collapsed = transcriptRowsForDisplay(state.transcript, 40).map(rowText).join("\n");
+  const view = new TranscriptView();
+  view.sync(state.transcript);
+  const collapsed = renderView(view, 40);
   assert.equal(collapsed.includes(command), false);
   assert.equal(collapsed.includes("Exit code"), false);
-  const expanded = transcriptRowsForDisplay(state.transcript, 40, tool.id).map(rowText).join("\n");
+  const toolComponent = view.componentFor(tool.id);
+  assert.ok(toolComponent instanceof ToolExecutionComponent);
+  toolComponent.setExpanded(true);
+  const expanded = renderView(view, 40);
   assert.equal(expanded.includes("Command: node script.js"), true);
   assert.equal(expanded.includes("Exit code: 0"), true);
 }
@@ -650,42 +475,6 @@ function testCommandDisplayNeverLeaksRawCommand(): void {
   assert.match(completed.details ?? "", /Exit code: 0/);
 }
 
-function testNarrowToolCellFitsViewport(): void {
-  let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "cjk", tool: "read_file", args: { path: "非常长的中文文件名.ts" } });
-  state = tuiReducer(state, { type: "tool.call.completed", toolCallId: "cjk", tool: "read_file", result: { path: "非常长的中文文件名.ts", content: "中文输出内容继续延长", durationMs: 1234 } });
-
-  for (const width of [1, 12, 20]) {
-    const rows = transcriptRowsForDisplay(state.transcript, width);
-    for (const row of rows) assert.equal(terminalWidth(rowText(row)) <= width, true, `${width}: ${rowText(row)}`);
-  }
-  const narrowMessages = transcriptRowsForDisplay({
-    committed: [{ id: "user", kind: "user", content: "中文" }],
-    active: []
-  }, 1);
-  for (const row of narrowMessages) assert.equal(terminalWidth(rowText(row)) <= 1, true);
-  const title = transcriptRowsForDisplay(state.transcript, 20).find((row) => row.kind === "tool-title");
-  assert.equal(title?.kind === "tool-title" ? title.duration : "", "1.2s");
-}
-
-function testLongSingleLineWrapsBeforeFourRowClamp(): void {
-  let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "long-output", tool: "run_command", args: { command: "printf output" } });
-  state = tuiReducer(state, {
-    type: "tool.call.completed",
-    toolCallId: "long-output",
-    tool: "run_command",
-    result: { stdout: "x".repeat(100), stderr: "", exitCode: 0 }
-  });
-  const rows = transcriptRowsForDisplay(state.transcript, 12);
-  const outputRows = rows.filter((row) => row.kind === "tool-output" && !row.omitted);
-  const omitted = rows.find((row) => row.kind === "tool-output" && row.omitted);
-  assert.equal(outputRows.length, 4);
-  assert.match(omitted?.kind === "tool-output" ? omitted.text : "", /6 more/);
-  const tool = state.transcript.committed[0] as ToolTranscriptItem;
-  assert.equal(tool.output?.length, 100);
-}
-
 function testFailedCommandCommitsOneToolItem(): void {
   const command = "pnpm test --filter impossible";
   let state = createInitialTuiState("/workspace");
@@ -700,7 +489,7 @@ function testFailedCommandCommitsOneToolItem(): void {
   const tool = state.transcript.committed[0] as ToolTranscriptItem;
   assert.equal(tool.status, "failed");
   assert.equal(tool.title, "Ran tests");
-  const collapsed = transcriptRowsForDisplay(state.transcript, 80).map(rowText).join("\n");
+  const collapsed = renderTranscript(state.transcript, 80);
   assert.match(collapsed, /test suite failed/);
   assert.equal(collapsed.includes(command), false);
   assert.equal(collapsed.includes("Exit code: 2"), false);
@@ -751,147 +540,322 @@ function testSessionReplayFinalizesPendingTools(): void {
   assert.equal((interrupted[0] as ToolTranscriptItem).title, "Interrupted command");
 }
 
-function testViewportKeepsLatestRowsVisible(): void {
-  const transcript = {
-    committed: Array.from({ length: 6 }, (_, index) => ({ id: `notification-${String(index)}`, kind: "notification" as const, content: `line ${String(index)}` })),
-    active: []
-  };
-  const latest = visibleTranscriptRows(transcript, { width: 20, height: 2, scrollOffset: 0, followLatest: true });
-  assert.deepEqual(latest.map(rowText), ["• line 4", "• line 5"]);
-  const scrolled = visibleTranscriptRows(transcript, { width: 20, height: 2, scrollOffset: 2, followLatest: false });
-  assert.deepEqual(scrolled.map(rowText), ["• line 2", "• line 3"]);
-  // Resume-style long history: page-up offset must reveal older rows.
-  const long = {
-    committed: Array.from({ length: 30 }, (_, index) => ({
-      id: `assistant-${String(index)}`,
-      kind: "assistant" as const,
-      content: `turn ${String(index)}`
-    })),
-    active: []
-  };
-  const bottom = visibleTranscriptRows(long, { width: 40, height: 5, scrollOffset: 0, followLatest: true }).map(rowText).join("\n");
-  assert.match(bottom, /turn 29/);
-  const older = visibleTranscriptRows(long, { width: 40, height: 5, scrollOffset: 10, followLatest: false }).map(rowText).join("\n");
-  assert.match(older, /turn 2[0-4]/);
-  assert.doesNotMatch(older, /turn 29/);
-  const top = visibleTranscriptRows(long, { width: 40, height: 5, scrollOffset: 10_000, followLatest: false }).map(rowText).join("\n");
-  assert.match(top, /turn 0/);
-  assert.doesNotMatch(top, /turn 29/);
+function testThemeTokensResolveToAnsi(): void {
+  const tokens = [...themeColorTokens, ...themeBgTokens];
+  for (const name of availableThemes()) {
+    setTheme(name);
+    for (const token of tokens) {
+      assert.match(getTheme().color(token), /^#[0-9a-f]{6}$/, `${name} 主题缺少 token ${token}`);
+    }
+  }
 
-  // Scroll must only slice precomputed rows (no re-wrap) and clamp offset.
-  const layout = transcriptRowsForDisplay(long, 40);
-  assert.equal(transcriptScrollMaxOffset(layout.length, 5), Math.max(0, layout.length - 5));
-  const sliced = sliceTranscriptRows(layout, { height: 5, scrollOffset: 10, followLatest: false });
-  assert.equal(sliced.length, 5);
-  assert.deepEqual(sliced.map((row) => row.id), layout.slice(layout.length - 5 - 10, layout.length - 10).map((row) => row.id));
+  setTheme("dark");
+  const dark = getTheme().color("accent");
+  setTheme("light");
+  assert.notEqual(getTheme().color("accent"), dark);
+  setTheme("does-not-exist");
+  assert.equal(getTheme().color("accent"), dark);
+
+  // 前景只重置前景，保证嵌套加粗不会把颜色清掉。
+  const nested = theme.fg("accent", `a${theme.bold("b")}c`);
+  assert.match(nested, /\u001B\[39m$/u);
+  assert.equal(plain(nested), "abc");
+  assert.equal(plain(theme.bg("userMessageBg", "x")), "x");
+
+  // 思考等级越高边框越亮，未知等级退回 off。
+  assert.equal(plain(theme.thinkingBorder("max")("│")), "│");
+  assert.notEqual(theme.thinkingBorder("max")("│"), theme.thinkingBorder("off")("│"));
+  assert.equal(theme.thinkingBorder(undefined)("│"), theme.thinkingBorder("off")("│"));
+
+  assert.equal(ansi256ToHex(196), "#ff0000");
+  assert.equal(ansi256ToHex(240), "#585858");
+  assert.equal(rgbToAnsi256(255, 0, 0), 196);
 }
 
-function testTranscriptDoesNotClipLongOutput(): void {
-  const transcript = {
-    committed: Array.from({ length: 40 }, (_, index) => ({
-      id: `assistant-${String(index)}`,
-      kind: "assistant" as const,
-      content: `long output line ${String(index)}`
-    })),
-    active: []
-  };
-  const output = stripAnsi(renderToString(React.createElement(Transcript, {
-    transcript,
-    width: 40
-  }), { columns: 40 }));
-  assert.match(output, /long output line 0/);
-  assert.match(output, /long output line 39/);
+function testTranscriptViewSyncsIncrementally(): void {
+  setTheme("dark");
+  const view = new TranscriptView();
+  const user = { id: "u1", kind: "user" as const, content: "请分析 `src/`" };
+  const assistant = { id: "a1", kind: "assistant" as const, content: "## 结论\n\n- 一\n- 二" };
+
+  assert.equal(view.sync({ committed: [user], active: [] }), true);
+  const first = view.componentFor("u1");
+  assert.notEqual(first, undefined);
+
+  // 同一批条目再同步一次不应重建组件，也不应报告变化。
+  assert.equal(view.sync({ committed: [user], active: [] }), false);
+  assert.equal(view.componentFor("u1"), first);
+
+  assert.equal(view.sync({ committed: [user], active: [assistant] }), true);
+  const lines = plainLines(view.render(40));
+  assert.match(lines.join("\n"), /请分析 src\//u);
+  assert.match(lines.join("\n"), /结论/u);
+  for (const line of lines) assert.equal(visibleWidth(line) <= 40, true, line);
+
+  // 条目消失后组件要被回收。
+  assert.equal(view.sync({ committed: [user], active: [] }), true);
+  assert.equal(view.componentFor("a1"), undefined);
 }
 
-function testFooterContainsOnlyRuntimeSummary(): void {
-  const layout = statusBarLayout({
-    modelLabel: "deepseek-v4-pro",
-    contextUsedTokens: 2500,
-    contextMaxTokens: 10_000,
-    status: "running",
-    mode: "chat",
-    width: 100
-  });
-  const text = `${layout.model}${layout.context}${layout.status}${layout.gap}${layout.shortcuts}`;
-  assert.match(text, /deepseek-v4-pro/);
-  assert.match(text, /ctx 25%/);
-  assert.match(text, /running/);
-  assert.match(text, /esc stop/);
-  assert.equal(text.includes("Snapshot"), false);
-  assert.equal(text.includes("RepoMap"), false);
-  assert.equal(terminalWidth(text), 100);
-
-  const plan = statusBarLayout({ modelLabel: "deepseek-v4-pro", status: "idle", mode: "plan", width: 100 });
-  const planText = `${plan.model}${plan.context}${plan.status}${plan.gap}${plan.shortcuts}`;
-  assert.match(planText, /Plan mode/);
-  assert.match(planText, /↑\/↓ history|pgup|shift\+↑|scroll|shift\+tab/u);
-
-  const narrow = statusBarLayout({ modelLabel: "very-long-model-name", status: "idle", mode: "chat", width: 12 });
-  assert.equal(terminalWidth(`${narrow.model}${narrow.context}${narrow.status}${narrow.gap}${narrow.shortcuts}`) <= 12, true);
-}
-
-function testTranscriptComponentRendersToolHierarchy(): void {
-  const transcript = {
+function testAssistantMarkdownRendersBlocks(): void {
+  setTheme("dark");
+  const view = new TranscriptView();
+  view.sync({
     committed: [{
-      id: "tests",
-      kind: "tool" as const,
-      tool: "run_command",
-      title: "Ran tests",
-      argsSummary: "pnpm test",
-      status: "success" as const,
-      output: "tests passed\nline two\nline three\nline four\nline five",
-      details: "Command: pnpm test\nExit code: 0\n\nstdout:\ntests passed",
-      durationMs: 1234
+      id: "a1",
+      kind: "assistant" as const,
+      content: "## 标题\n\n| 模式 | 数 |\n|---|---|\n| apiKey | 0 |\n\n```ts\nconst a = 1;\n```\n\n> 结论"
     }],
     active: []
+  });
+  const lines = plainLines(view.render(44));
+  const output = lines.join("\n");
+  // 表格走框架的 Markdown 渲染：画成表格框，源码里的分隔行不再原样出现。
+  assert.match(output, /┌.*┬.*┐/u);
+  assert.match(output, /│ 模式\s+│ 数 │/u);
+  assert.equal(output.includes("|---|"), false);
+  // 代码块保留围栏标记并缩进内容。
+  assert.match(output, /```ts/u);
+  assert.match(output, /^ {3}const a = 1;/mu);
+  assert.match(output, /结论/u);
+  for (const line of lines) assert.equal(visibleWidth(line) <= 44, true, line);
+}
+
+function testToolBlockRendersTitleAndClampedOutput(): void {
+  setTheme("dark");
+  const item: ToolTranscriptItem = {
+    id: "t1",
+    kind: "tool",
+    tool: "run_command",
+    title: "Ran tests",
+    argsSummary: "pnpm test",
+    status: "success",
+    output: "line one\nline two\nline three\nline four\nline five\nline six",
+    details: "Command: pnpm test\nExit code: 0",
+    durationMs: 1234
   };
-  const output = stripAnsi(renderToString(React.createElement(Transcript, {
-    transcript,
-    width: 40
-  }), { columns: 40 }));
-  assert.match(output, /[✓•] Ran tests\s+1\.2s/u);
-  assert.match(output, /└ tests passed/);
-  assert.match(output, /… 1 more/);
-  for (const line of output.split("\n")) assert.equal(terminalWidth(line) <= 40, true);
+  const component = new ToolExecutionComponent(item);
+  const lines = plainLines(component.render(40));
+  const text = lines.join("\n");
+  assert.match(text, /✓ Ran tests\s+1\.2s/u);
+  assert.match(text, /line one/u);
+  // 默认只显示前四行，其余折叠成一行提示。
+  assert.match(text, /… 2 more lines/u);
+  assert.equal(text.includes("line six"), false);
+  for (const line of lines) assert.equal(visibleWidth(line) <= 40, true, line);
+
+  component.setExpanded(true);
+  assert.match(plainLines(component.render(40)).join("\n"), /Exit code: 0/u);
+
+  assert.deepEqual(splitToolTitle("Ran tests"), { verb: "Ran", rest: " tests" });
+  assert.deepEqual(splitToolTitle("Ran"), { verb: "Ran", rest: "" });
 }
 
-function testTranscriptViewerPagesByVisualLines(): void {
-  const first = transcriptViewerPage("中".repeat(40), 10, 6, 0);
-  assert.equal(first.lines.length, 8);
-  assert.equal(first.bodyRows, 1);
-  assert.equal(first.maxScroll, 7);
-  assert.equal(first.visible.length, 1);
-  for (const line of first.lines) assert.equal(terminalWidth(line) <= 10, true);
+function testThinkingBlockCollapses(): void {
+  setTheme("dark");
+  const component = new ThinkingComponent(
+    { id: "r1", kind: "reasoning", content: "先看 transcript 的结构。", durationMs: 2300 },
+    false
+  );
+  assert.match(plainLines(component.render(40)).join("\n"), /先看 transcript 的结构。/u);
+  assert.match(plainLines(component.render(40)).join("\n"), /Thought for 2\.3s/u);
 
-  const last = transcriptViewerPage("中".repeat(40), 10, 6, 99);
-  assert.equal(last.safeScrollTop, 7);
-  assert.deepEqual(last.visible, last.lines.slice(7));
+  component.setCollapsed(true);
+  const collapsed = plainLines(component.render(40)).join("\n");
+  assert.match(collapsed, /▸ Thought for 2\.3s/u);
+  assert.equal(collapsed.includes("先看 transcript 的结构。"), false);
 }
 
-function testTranscriptViewerFitsNarrowViewport(): void {
-  const output = stripAnsi(renderToString(React.createElement(TranscriptViewer, {
-    transcript: { title: "A very long command detail title", content: "x".repeat(100) },
-    width: 10,
-    height: 6,
-    onExit: () => undefined
-  }), { columns: 10 }));
-  const lines = output.split("\n");
-  assert.equal(lines.length <= 6, true);
-  for (const line of lines) assert.equal(terminalWidth(line) <= 10, true, line);
+function testFooterAndChromeLayout(): void {
+  setTheme("dark");
+  const data = {
+    cwd: "/tmp/workspace",
+    sessionId: "0123456789abcdef",
+    gitBranch: "main",
+    modelLabel: "deepseek-v4-pro",
+    thinkingLabel: "High",
+    permissionMode: "ask" as const,
+    mode: "chat" as const,
+    contextUsedTokens: 2500,
+    contextMaxTokens: 10_000
+  };
+  const layout = footerLayout(data, 100);
+  assert.match(layout.workspace, /\/tmp\/workspace \(main\) • 01234567/u);
+  // 日期前缀的会话 id 要取末段随机后缀，否则每个会话看起来都一样。
+  assert.equal(shortSessionId("20260726-041954-481e7876"), "481e7876");
+  assert.equal(shortSessionId("0123456789abcdef"), "01234567");
+  assert.equal(shortSessionId("short"), "short");
+  const stats = `${layout.context}${layout.meta}${layout.gap}${layout.model}`;
+  assert.match(stats, /ctx 25%\/10k/u);
+  assert.match(stats, /ask/u);
+  assert.match(stats, /deepseek-v4-pro • high$/u);
+  assert.equal(visibleWidth(stats), 100);
+
+  const narrow = footerLayout({ ...data, modelLabel: "very-long-model-name" }, 12);
+  assert.equal(visibleWidth(`${narrow.context}${narrow.meta}${narrow.gap}${narrow.model}`) <= 12, true);
+  assert.equal(visibleWidth(narrow.workspace) <= 12, true);
+
+  for (const line of plainLines(new FooterComponent(data).render(60))) {
+    assert.equal(visibleWidth(line) <= 60, true, line);
+  }
+
+  assert.equal(formatTokens(999), "999");
+  assert.equal(formatTokens(2_500), "2.5k");
+  assert.equal(formatTokens(128_000), "128k");
+  assert.equal(formatTokens(2_000_000), "2.0M");
 }
 
-function testDiffUsesForegroundSemanticColors(): void {
-  assert.deepEqual(diffLineStyle("+new code"), { color: tuiColors.success });
-  assert.deepEqual(diffLineStyle("-old code"), { color: tuiColors.error });
-  assert.equal("backgroundColor" in (diffLineStyle("+new code") ?? {}), false);
-  assert.equal("fillBackground" in (diffLineStyle("+new code") ?? {}), false);
+function testStatusAndShortcutHints(): void {
+  setTheme("dark");
+  assert.match(statusMessage("running", 2), /Working… · 2 queued \(esc to interrupt\)/u);
+  assert.match(statusMessage("waiting_permission", 0), /Waiting for approval/u);
+  assert.equal(statusMessage("idle", 0), "");
+
+  const busy = shortcutHints("running", "chat").map((hint) => hint.key);
+  assert.equal(busy.includes("esc"), true);
+  const planHint = shortcutHints("idle", "plan").find((hint) => hint.key === "shift+tab");
+  assert.equal(planHint?.description, "chat mode");
+
+  // 窄终端整条丢弃，不把单条提示截半句。
+  const visible = visibleShortcutHints(shortcutHints("idle", "chat"), 14);
+  const rendered = visible.map((hint) => `${hint.key} ${hint.description}`).join(" · ");
+  assert.equal(visibleWidth(rendered) <= 14, true);
+
+  const bar = new ShortcutsBarComponent();
+  bar.setState("idle", "chat");
+  for (const line of plainLines(bar.render(50))) assert.equal(visibleWidth(line) <= 50, true, line);
 }
 
-function rowText(row: TranscriptDisplayRow): string {
-  if (row.kind === "message") return `${row.prefix}${row.text}`;
-  if (row.kind === "tool-title" || row.kind === "block-header") return `${row.marker}${row.title}${row.gap}${row.duration}`;
-  if (row.kind === "tool-output") return `${row.prefix}${row.text}`;
-  return "";
+function testWelcomeRendersOnboarding(): void {
+  setTheme("dark");
+  const lines = plainLines(new WelcomeComponent("~/CodingAgent/biny", "0.2.2").render(70));
+  const text = lines.join("\n");
+  assert.match(text, /Biny v0\.2\.2/u);
+  assert.match(text, /Workspace · ~\/CodingAgent\/biny/u);
+  assert.match(text, /local agent is ready/u);
+  for (const line of lines) assert.equal(visibleWidth(line) <= 70, true, line);
+}
+
+function testDialogsRenderAndHandleKeys(): void {
+  setTheme("dark");
+  let selected: string | undefined;
+  let cancelled = false;
+  const select = new SelectDialog({
+    title: "Select model",
+    items: [
+      { value: "a", label: "alpha", description: "first" },
+      { value: "b", label: "beta", description: "second" }
+    ],
+    onSelect: (item) => { selected = item.value; },
+    onCancel: () => { cancelled = true; }
+  });
+  const selectText = plainLines(select.render(50)).join("\n");
+  assert.match(selectText, /Select model/u);
+  assert.match(selectText, /alpha/u);
+  select.handleInput("\u001B[B");
+  select.handleInput("\r");
+  assert.equal(selected, "b");
+  select.handleInput("\u001B");
+  assert.equal(cancelled, true);
+
+  let closed = false;
+  const content = Array.from({ length: 30 }, (_, index) => `line ${String(index)}`).join("\n");
+  const viewer = new TextViewerDialog("Details", content, 5, () => { closed = true; });
+  const firstPage = plainLines(viewer.render(40)).join("\n");
+  assert.match(firstPage, /line 0/u);
+  assert.equal(firstPage.includes("line 20"), false);
+  viewer.handleInput("\u001B[6~");
+  assert.match(plainLines(viewer.render(40)).join("\n"), /line 4/u);
+  viewer.handleInput("\u001B");
+  assert.equal(closed, true);
+}
+
+function testPermissionDialogRequiresFullYes(): void {
+  setTheme("dark");
+  const request: TuiPermissionRequest = {
+    tool: "run_command",
+    title: "Command execution request",
+    details: "sudo example",
+    requireFullYes: true,
+    actionType: "shell",
+    riskLevel: "critical"
+  };
+  const answers: PermissionChoice[] = [];
+  let detailsToggled = 0;
+  const dialog = new PermissionDialog(request, (choice) => answers.push(choice), () => { detailsToggled += 1; });
+
+  const rendered = plainLines(dialog.render(60)).join("\n");
+  assert.match(rendered, /Command execution request/u);
+  assert.match(rendered, /Critical or sensitive operation/u);
+  assert.match(rendered, /Type yes, then press enter/u);
+
+  // 强确认下直接回车不通过，要先输入完整 yes。
+  dialog.handleInput("\r");
+  assert.deepEqual(answers, []);
+  assert.match(plainLines(dialog.render(60)).join("\n"), /must be the full word yes/u);
+  for (const char of "yes") dialog.handleInput(char);
+  dialog.handleInput("\r");
+  assert.deepEqual(answers, ["approve_once"]);
+
+  dialog.handleInput("\u000F");
+  assert.equal(detailsToggled, 1);
+
+  // 拒绝不需要确认词。
+  const rejectAnswers: PermissionChoice[] = [];
+  const rejectDialog = new PermissionDialog(request, (choice) => rejectAnswers.push(choice), () => undefined);
+  rejectDialog.handleInput("\u001B");
+  assert.deepEqual(rejectAnswers, ["reject"]);
+}
+
+function testDiffStylesUseThemeTokens(): void {
+  assert.deepEqual(diffLineStyle("+new code"), { color: "toolDiffAdded" });
+  assert.deepEqual(diffLineStyle("-old code"), { color: "toolDiffRemoved" });
+  assert.deepEqual(diffLineStyle("@@ -1 +1 @@"), { color: "toolDiffContext", dim: true });
+}
+
+function testTranscriptTextHelpers(): void {
+  assert.equal(formatToolDuration(undefined), "");
+  assert.equal(formatToolDuration(940), "940ms");
+  assert.equal(formatToolDuration(1_234), "1.2s");
+  assert.equal(formatToolDuration(75_000), "1m 15s");
+
+  const foldables = foldableTranscriptItems({
+    committed: [
+      { id: "u1", kind: "user", content: "hi" },
+      { id: "t1", kind: "tool", tool: "read_file", title: "Read a", argsSummary: "a", status: "success" }
+    ],
+    active: [{ id: "r1", kind: "reasoning", content: "thinking" }]
+  });
+  assert.deepEqual(foldables.map((item) => item.id), ["t1", "r1"]);
+}
+
+async function testSlashAutocompleteInsertsSingleSlash(): Promise<void> {
+  // 补全器要的是不带斜杠的命令名，传成 `/resume` 会补出 `//resume`。
+  const provider = new CombinedAutocompleteProvider(
+    TUI_SLASH_COMMANDS.map((command) => ({
+      name: command.name.replace(/^\//, ""),
+      description: command.description
+    })),
+    process.cwd()
+  );
+
+  const controller = new AbortController();
+  const suggestions = await provider.getSuggestions(["/res"], 0, 4, { signal: controller.signal });
+  assert.ok(suggestions);
+  const resume = suggestions.items.find((item) => item.value === "resume");
+  assert.ok(resume, "should suggest resume");
+
+  const applied = provider.applyCompletion(["/res"], 0, 4, resume, suggestions.prefix);
+  assert.deepEqual(applied.lines, ["/resume "]);
+
+  // 分发时对多余斜杠有容错，避免历史输入或粘贴直接变成未知命令。
+  assert.equal(normalizeSlashCommand("//resume"), "/resume");
+  assert.equal(normalizeSlashCommand("/resume abc"), "/resume abc");
+}
+
+/** 与 app.ts 中 handleSlashCommand 的归一化保持一致。 */
+function normalizeSlashCommand(value: string): string {
+  return value.trim().replace(/^\/+/, "/");
 }
 
 await main();

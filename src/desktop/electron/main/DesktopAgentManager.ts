@@ -1,13 +1,30 @@
+/**
+ * 桌面端 agent 运行时管理。
+ *
+ * 每个项目一个 `InteractiveAgentRuntime`，按需懒创建并缓存在 `runtimes` 里；
+ * 一个项目同一时刻只能有一个活动会话在跑，切换会话前必须先停掉当前运行。
+ *
+ * 几处需要注意的状态：
+ * - `runtimeInitializations` 缓存正在创建中的 promise，避免并发请求把同一个项目初始化两次；
+ * - `liveEvents` 暂存本轮的实时事件，界面重新打开会话时要把它们接在历史事件后面；
+ * - `runtimeErrors` 记住初始化失败原因，让界面能显示「为什么这个项目起不来」而不是一直转圈。
+ *
+ * 模型配置的保存与连通性测试也在这里：写入前先用候选配置实际发一次请求，避免存下一份用不了的配置。
+ */
 import type { AgentAttachment, AgentRunMode } from "../../../agent/AgentSession.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { generateText } from "ai";
-import { configSchema, type AgentConfig } from "../../../config/schema.js";
+import { fetchModelCatalog } from "../../../ai/modelCatalog.js";
+import { providerDefinition } from "../../../ai/provider.js";
+import { configSchema, type AgentConfig, type ProviderConfig } from "../../../config/schema.js";
 import type { AgentConfigStore } from "../../../config/store.js";
 import { createModelSettings } from "../../../llm/factory.js";
 import { hasUsableModelConfiguration, listConfiguredModelChoices, type ModelRuntimeInfo, type ThinkingSelection } from "../../../llm/ModelManager.js";
 import { providerProfile } from "../../../llm/profiles.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
+import { webSearchKeyEnvNames } from "../../../tools/web/search.js";
+import { formatSubagentAgentList } from "../../../extensions/report.js";
 import {
   createInteractiveAgentRuntime,
   type AgentRunOutcome,
@@ -15,14 +32,24 @@ import {
 } from "../../../runtime/InteractiveAgentRuntime.js";
 import { RootRunLedgerLeaseError } from "../../../runtime/RootRunLedger.js";
 import type { AgentHostEvent } from "../../../runtime/agentEvents.js";
+import { withAttachmentReferences } from "../../attachmentReferences.js";
 import type {
   DesktopAttachment,
+  DesktopMemoryCompactionResult,
+  DesktopMemoryOverview,
+  DesktopMemorySearchMatch,
+  DesktopMemorySettings,
+  DesktopModelCatalogResult,
   DesktopModelConfigurationInput,
+  DesktopModelConnection,
   DesktopModelConnectionTestResult,
   DesktopModelLoginProvider,
   DesktopModelLoginStartResult,
   DesktopRunReceipt,
   DesktopSessionDocument,
+  DesktopSlashResult,
+  DesktopWebSearchSettings,
+  DesktopWebSearchSettingsInput,
   DesktopWorkspaceSnapshot
 } from "../../protocol.js";
 import { DesktopProjectService } from "./DesktopProjectService.js";
@@ -72,7 +99,8 @@ export class DesktopAgentManager {
       runtime: runtime?.getSnapshot(),
       runtimeError: this.runtimeErrors.get(projectId),
       requiresModelConfiguration: !config || !hasUsableModelConfiguration(config),
-      models
+      models,
+      connections: config ? describeModelConnections(config) : []
     };
   }
 
@@ -119,7 +147,9 @@ export class DesktopAgentManager {
     await this.refreshOAuthCredentials(projectId);
     const runtime = await this.ensureRuntime(projectId);
     const snapshot = runtime.getSnapshot();
+    // 空闲时才从磁盘重载模型配置：跑到一半换模型会让同一轮对话前后用的模型不一致。
     if (!snapshot.activeRun && !snapshot.queuedRuns.length) await runtime.refreshModelFromDisk();
+    // 目标会话不是运行时当前会话时需要切过去，但只能在完全空闲时切。
     if (sessionId && runtime.getInfo().sessionId !== sessionId) {
       const snapshot = runtime.getSnapshot();
       if (snapshot.activeRun || snapshot.queuedRuns.length) {
@@ -142,6 +172,12 @@ export class DesktopAgentManager {
     };
   }
 
+  /**
+   * 编辑并重发某条用户消息。
+   *
+   * 做法是分叉出一个只保留该消息之前内容的新会话，再在新会话里发送新消息，原会话保持不变。
+   * 因此必须先取消当前运行、等它真正结束、销毁旧运行时，否则旧运行时还会往老会话里写事件。
+   */
   async editPrompt(
     projectId: string,
     sessionId: string,
@@ -286,6 +322,149 @@ export class DesktopAgentManager {
     return await this.workspaceSnapshot(projectId);
   }
 
+  async webSearchSettings(projectId: string): Promise<DesktopWebSearchSettings> {
+    this.projects.requireProject(projectId);
+    const config = await this.configStore.load();
+    return describeWebSearchSettings(config.web.search);
+  }
+
+  async saveWebSearchSettings(projectId: string, input: DesktopWebSearchSettingsInput): Promise<DesktopWebSearchSettings> {
+    const managed = this.runtimes.get(projectId);
+    if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
+      throw new Error("任务运行期间不能修改联网搜索配置。");
+    }
+    this.projects.requireProject(projectId);
+    const current = await this.configStore.load();
+    // 密钥槽位是各 provider 共用的：换 provider 时必须丢弃旧密钥和自定义 env 名，
+    // 否则上一家的密钥会被原样发给新服务商，并遮蔽环境变量里的正确密钥。
+    const sameProvider = input.provider === current.web.search.provider;
+    const next = configSchema.parse({
+      ...current,
+      web: {
+        ...current.web,
+        search: {
+          enabled: input.enabled,
+          provider: input.provider,
+          // undefined 保留同 provider 的已存密钥，空字符串表示清除。
+          apiKey: input.apiKey === undefined ? (sameProvider ? current.web.search.apiKey : undefined) : input.apiKey || undefined,
+          apiKeyEnv: sameProvider ? input.apiKeyEnv : undefined,
+          timeoutMs: input.timeoutMs,
+          maxResults: input.maxResults
+        }
+      }
+    });
+    await this.configStore.save(next);
+    // 工具注册表在 runtime 装配时读取搜索配置，关闭后下次使用即按新配置重建。
+    if (managed) {
+      managed.unsubscribe();
+      await managed.runtime.close();
+      this.runtimes.delete(projectId);
+    }
+    return describeWebSearchSettings(next.web.search);
+  }
+
+  /** 记忆面板总览：设置来自配置文件；条目列表需要活的 runtime（记忆禁用时不创建）。 */
+  async memoryOverview(projectId: string): Promise<DesktopMemoryOverview> {
+    this.projects.requireProject(projectId);
+    const config = await this.configStore.load();
+    const settings = describeMemorySettings(config);
+    if (!settings.enabled) return { settings, totalEntries: 0, topics: [], entries: [] };
+    const runtime = await this.ensureRuntime(projectId);
+    const entries = await runtime.listMemoryEntries();
+    const topicCounts = new Map<string, number>();
+    for (const entry of entries) topicCounts.set(entry.topic, (topicCounts.get(entry.topic) ?? 0) + 1);
+    return {
+      settings,
+      totalEntries: entries.length,
+      topics: [...topicCounts.entries()].map(([topic, count]) => ({ topic, entries: count })),
+      entries
+    };
+  }
+
+  async saveMemorySettings(projectId: string, input: DesktopMemorySettings): Promise<DesktopMemoryOverview> {
+    const managed = this.runtimes.get(projectId);
+    if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
+      throw new Error("任务运行期间不能修改记忆设置。");
+    }
+    this.projects.requireProject(projectId);
+    const current = await this.configStore.load();
+    const next = configSchema.parse({
+      ...current,
+      context: {
+        ...current.context,
+        memory: {
+          enabled: input.enabled,
+          autoRemember: input.autoRemember,
+          maxRecalled: input.maxRecalled,
+          model: input.model
+        }
+      }
+    });
+    await this.configStore.save(next);
+    // 记忆配置在 runtime 装配时读取；关闭后下次使用即按新配置重建。
+    if (managed) {
+      managed.unsubscribe();
+      await managed.runtime.close();
+      this.runtimes.delete(projectId);
+    }
+    return await this.memoryOverview(projectId);
+  }
+
+  async searchMemory(projectId: string, query: string): Promise<DesktopMemorySearchMatch[]> {
+    this.projects.requireProject(projectId);
+    return await (await this.ensureRuntime(projectId)).searchMemory(query);
+  }
+
+  async addMemoryEntry(projectId: string, topic: string, note: string): Promise<DesktopMemoryOverview> {
+    this.projects.requireProject(projectId);
+    const result = await (await this.ensureRuntime(projectId)).addMemoryEntry(topic, note);
+    if (!result.written) {
+      throw new Error(result.path ? "已存在等价的记忆条目，未重复保存。" : "内容太短，至少需要 20 个字符才能作为持久记忆。");
+    }
+    return await this.memoryOverview(projectId);
+  }
+
+  async deleteMemoryEntry(projectId: string, topic: string, index: number): Promise<DesktopMemoryOverview> {
+    this.projects.requireProject(projectId);
+    const removed = await (await this.ensureRuntime(projectId)).deleteMemoryEntry(topic, index);
+    if (!removed) throw new Error("未找到该记忆条目，可能已被删除。");
+    return await this.memoryOverview(projectId);
+  }
+
+  async clearMemory(projectId: string): Promise<DesktopMemoryOverview> {
+    this.projects.requireProject(projectId);
+    await (await this.ensureRuntime(projectId)).clearMemory();
+    return await this.memoryOverview(projectId);
+  }
+
+  async compactMemory(projectId: string): Promise<DesktopMemoryCompactionResult[]> {
+    this.projects.requireProject(projectId);
+    return await (await this.ensureRuntime(projectId)).compactMemory();
+  }
+
+  /**
+   * Asks the provider for its live model list. Never throws for an offline or
+   * unauthenticated provider — the caller renders `source: "fallback"` and keeps
+   * showing whatever static catalog it already had.
+   */
+  async fetchModelCatalog(projectId: string, providerAlias: string): Promise<DesktopModelCatalogResult> {
+    this.projects.requireProject(projectId);
+    const config = await this.configStore.load();
+    const provider = config.providers[providerAlias];
+    if (!provider) throw new Error(`未找到服务商配置：${providerAlias}`);
+    const fetchedAt = new Date().toISOString();
+    try {
+      const models = await fetchModelCatalog({
+        alias: providerAlias,
+        config: provider,
+        definition: providerDefinition(provider.type)
+      });
+      return { providerAlias, source: "fetched", fetchedAt, models };
+    } catch {
+      return { providerAlias, source: "fallback", fetchedAt, models: [] };
+    }
+  }
+
   async testModelConfiguration(projectId: string, input: DesktopModelConfigurationInput): Promise<DesktopModelConnectionTestResult> {
     this.projects.requireProject(projectId);
     const current = await this.configStore.load();
@@ -348,9 +527,14 @@ export class DesktopAgentManager {
     const models = Object.fromEntries(Object.entries(current.models).filter(([alias, model]) => (
       alias === input.alias || model.provider !== input.providerAlias || model.model !== input.model
     )));
+    // Enabling an extra model, rotating a key or editing a base URL must not
+    // silently hijack the active default — only an explicit connect does, and
+    // the de-dup above can still strip the previous default out from under us.
+    const keepsCurrentDefault = input.alias === current.defaultModel || Boolean(models[current.defaultModel]);
+    const defaultModel = input.makeDefault || !keepsCurrentDefault ? input.alias : current.defaultModel;
     return configSchema.parse({
       ...current,
-      defaultModel: input.alias,
+      defaultModel,
       providers: { ...current.providers, [input.providerAlias]: provider },
       models: {
         ...models,
@@ -370,12 +554,74 @@ export class DesktopAgentManager {
           thinking: input.supportsThinking ? { efforts: ["high", "max"], defaultEffort: "high" } : undefined
         }
       },
-      thinking: { enabled: false, effort: "high" }
+      // Thinking is validated against the *default* model, so it only has to be
+      // reset when the default actually moves to a freshly configured model.
+      thinking: defaultModel === current.defaultModel ? current.thinking : { enabled: false, effort: current.thinking.effort }
     });
   }
 
   async compact(projectId: string, hint?: string): Promise<string> {
     return await (await this.ensureRuntime(projectId)).compactConversation(hint);
+  }
+
+  /** 桌面端只读斜杠命令：报告类命令直接读 runtime 状态，不产生会话消息。 */
+  async runSlashCommand(projectId: string, sessionId: string | undefined, input: string): Promise<DesktopSlashResult> {
+    await this.requireConfiguredModel();
+    const runtime = await this.ensureRuntime(projectId);
+    // /context、/usage 依赖当前会话：用户查看的会话与 runtime 不一致且空闲时先切换。
+    if (sessionId && runtime.getInfo().sessionId !== sessionId) {
+      const snapshot = runtime.getSnapshot();
+      if (!snapshot.activeRun && !snapshot.queuedRuns.length) await runtime.resumeSession(sessionId);
+    }
+    const [command, ...args] = input.trim().split(/\s+/);
+    switch (command) {
+      case "/status": {
+        const info = runtime.getInfo();
+        return {
+          command,
+          title: "状态",
+          content: [
+            `模型：${info.modelLabel}（${info.reasoningLabel}）`,
+            `权限：${runtime.getPermissionMode()}`,
+            "",
+            runtime.extensionReport()
+          ].join("\n")
+        };
+      }
+      case "/context":
+        return { command, title: "上下文", content: await runtime.contextReport() };
+      case "/usage":
+        return { command, title: "用量", content: runtime.usageReport() };
+      case "/mcp": {
+        if (args[0]?.toLowerCase() === "reconnect") {
+          const serverName = args[1]?.trim();
+          if (!serverName || args.length !== 2) throw new Error("用法：/mcp reconnect <server>");
+          const status = await runtime.reconnectMcpServer(serverName);
+          return {
+            command,
+            title: "MCP",
+            content: status.connected
+              ? `已重连 ${serverName}（${String(status.toolNames.length)} 个工具）。`
+              : `重连 ${serverName} 失败：${status.lastError ?? "未知错误"}`
+          };
+        }
+        return { command, title: "MCP", content: runtime.extensionReport("mcp") };
+      }
+      case "/skills":
+        return { command, title: "技能", content: runtime.extensionReport("skills") };
+      case "/plugins":
+        return { command, title: "插件", content: runtime.extensionReport("plugins") };
+      case "/memory":
+        return { command, title: "记忆", content: await runtime.runMemoryCommand(args) };
+      case "/subagent": {
+        if (args[0]?.toLowerCase() === "agents") {
+          return { command, title: "子代理", content: formatSubagentAgentList(await runtime.listSubagentAgents()) };
+        }
+        throw new Error("桌面端当前仅支持 /subagent agents 查看具名子代理定义。");
+      }
+      default:
+        throw new Error(`未知命令：${command ?? input}`);
+    }
   }
 
   async duplicateSession(projectId: string, sessionId: string): Promise<DesktopWorkspaceSnapshot> {
@@ -407,6 +653,7 @@ export class DesktopAgentManager {
     this.runtimes.delete(projectId);
   }
 
+  /** 关窗前用它决定要不要提示用户：等待权限也算「在跑」，直接关掉会丢掉这次询问。 */
   hasRunningTasks(): boolean {
     return [...this.runtimes.values()].some(({ runtime }) => {
       const snapshot = runtime.getSnapshot();
@@ -425,6 +672,10 @@ export class DesktopAgentManager {
     for (const { runtime } of this.runtimes.values()) runtime.cancelCurrentRun();
   }
 
+  /**
+   * 退出前收尾。先置 `closing` 挡住新的创建请求，再等正在初始化的运行时结束（否则它们会
+   * 在关闭之后才注册进来，成为泄漏的运行时），最后统一取消订阅并关闭。
+   */
   async closeAll(): Promise<void> {
     this.closing = true;
     await Promise.allSettled(this.runtimeInitializations.values());
@@ -442,6 +693,10 @@ export class DesktopAgentManager {
     this.runtimes.delete(projectId);
   }
 
+  /**
+   * 取得项目运行时，没有就创建。并发调用会复用同一个初始化 promise，避免同一项目被初始化两次
+   * （两个运行时抢同一份 session 和运行锁）。
+   */
   private async ensureRuntime(projectId: string): Promise<InteractiveAgentRuntime> {
     if (this.closing) throw new Error("Desktop runtime is shutting down.");
     const current = this.runtimes.get(projectId)?.runtime;
@@ -465,8 +720,8 @@ export class DesktopAgentManager {
   private observeRunCompletion(projectId: string, completion: Promise<AgentRunOutcome>): void {
     void completion.then(
       (outcome) => {
-        // Normal terminal outcomes are presented through AgentHostEvent. Only a
-        // successfully completed task clears a prior runtime initialization error.
+        // 正常的终态结果通过 AgentHostEvent 呈现，这里不重复上报；
+        // 只有真正跑成功了才清掉之前记下的初始化错误。
         if (outcome.status === "completed") this.runtimeErrors.delete(projectId);
       },
       (error: unknown) => {
@@ -479,7 +734,7 @@ export class DesktopAgentManager {
     const project = this.projects.requireProject(projectId);
     if (project.missing) throw new Error(`Project path is unavailable: ${project.path}`);
     await this.refreshOAuthCredentials(projectId);
-    // Project sessions share `<project>/.agent` with TUI/CLI. Attachments stay in desktop userData.
+    // 项目会话与 TUI/CLI 共用 `<项目>/.agent`；附件仍留在桌面端的 userData 里。
     const persistenceRoot = await this.projects.dataRoot(project);
     const runtime = await createInteractiveAgentRuntime(project.path, {
       persistenceRoot,
@@ -492,9 +747,11 @@ export class DesktopAgentManager {
       try {
         await runtime.resumeSession(selectedSessionId);
       } catch (error) {
+        // 会话文件已被删除：清掉选中项，让运行时留在刚创建的新会话上。
         if (isMissingSession(error)) {
           await this.state.setSelectedSession(projectId, undefined);
         } else {
+          // 其他错误则整体回滚，包括删掉刚创建但没用上的空 session 文件，避免留下垃圾会话。
           await runtime.close();
           await fs.rm(initialSessionFile, { force: true });
           throw error;
@@ -505,6 +762,7 @@ export class DesktopAgentManager {
       const projectEvents = this.projectEvents(projectId);
       const sessionEvents = projectEvents.get(event.sessionId) ?? [];
       sessionEvents.push(event);
+      // 实时事件只为「重新打开会话时补上本轮内容」，按会话保留最近 4000 条，防止长跑占满内存。
       if (sessionEvents.length > 4_000) sessionEvents.splice(0, sessionEvents.length - 4_000);
       projectEvents.set(event.sessionId, sessionEvents);
       this.emit(projectId, event);
@@ -605,6 +863,57 @@ function modelAliasForAuthenticatedModel(providerAlias: string, modelId: string)
   return `${providerAlias}-${modelId}`.replace(/[^a-z0-9.-]+/gi, "-");
 }
 
+/**
+ * Projects the saved provider configs into the credential/endpoint facts the
+ * settings UI needs. Only presence is reported — an API key or refresh token
+ * never crosses the IPC bridge.
+ */
+function describeWebSearchSettings(search: AgentConfig["web"]["search"]): DesktopWebSearchSettings {
+  const envKeyName = search.provider === "duckduckgo" ? undefined : search.apiKeyEnv ?? webSearchKeyEnvNames[search.provider];
+  return {
+    enabled: search.enabled,
+    provider: search.provider,
+    apiKeyEnv: search.apiKeyEnv,
+    timeoutMs: search.timeoutMs,
+    maxResults: search.maxResults,
+    hasApiKey: Boolean(search.apiKey),
+    envKeyName,
+    envKeyDetected: Boolean(envKeyName && process.env[envKeyName])
+  };
+}
+
+function describeMemorySettings(config: AgentConfig): DesktopMemorySettings {
+  const memory = config.context.memory;
+  return { enabled: memory.enabled, autoRemember: memory.autoRemember, maxRecalled: memory.maxRecalled, model: memory.model };
+}
+
+function describeModelConnections(config: AgentConfig): DesktopModelConnection[] {
+  return Object.entries(config.providers).map(([providerAlias, provider]) => {
+    const profile = providerProfile(provider.type);
+    const apiKeyEnv = provider.apiKeyEnv ?? profile.apiKeyEnv;
+    const credentialSource = describeCredentialSource(provider, apiKeyEnv);
+    return {
+      providerAlias,
+      providerType: provider.type,
+      protocol: provider.protocol,
+      baseUrl: provider.baseUrl ?? profile.baseUrl,
+      requiresApiKey: provider.requiresApiKey ?? profile.requiresApiKey,
+      hasCredential: credentialSource !== undefined,
+      credentialSource,
+      apiKeyEnv,
+      authMode: provider.authMode,
+      oauthProvider: provider.oauth?.provider,
+      oauthExpiresAt: provider.oauth?.expiresAt
+    };
+  });
+}
+
+function describeCredentialSource(provider: ProviderConfig, apiKeyEnv: string | undefined): "config" | "env" | undefined {
+  if (provider.apiKey) return "config";
+  if (apiKeyEnv && process.env[apiKeyEnv]) return "env";
+  return undefined;
+}
+
 function isMissingSession(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return message.startsWith("Session not found:") || message.startsWith("Session file not found:");
@@ -661,16 +970,6 @@ function compactJsonError(body: string): string | undefined {
   }
   const trimmed = body.replace(/\s+/g, " ").trim();
   return trimmed.length > 240 ? `${trimmed.slice(0, 240)}…` : trimmed || undefined;
-}
-
-function withAttachmentReferences(input: string, attachments: DesktopAttachment[]): string {
-  if (!attachments.length) return input;
-  return [
-    input,
-    "",
-    "Attached files (read them with read_file using these @attachments/ paths):",
-    ...attachments.map((attachment) => `- ${attachment.path} (${attachment.mimeType || "unknown type"}, ${String(attachment.size)} bytes)`)
-  ].join("\n");
 }
 
 async function loadNativeAttachments(root: string, attachments: DesktopAttachment[]): Promise<AgentAttachment[]> {

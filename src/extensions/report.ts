@@ -1,9 +1,17 @@
+/**
+ * 扩展状态汇总与文本报告。
+ *
+ * `/status`、`/mcp`、`/skills`、`/plugins` 输出的都是这里生成的文本。纯格式化，不去连接
+ * MCP、不加载技能，状态由调用方采集后传入。
+ */
 import type { McpServerStatus } from "./mcp.js";
+import type { SkillDefinition } from "./skills.js";
+import type { SubagentDefinition } from "./agents.js";
 import type { ToolSource } from "../tools/types.js";
 
 export interface ExtensionStatus {
   mcp: McpServerStatus[];
-  skills: string[];
+  skills: SkillDefinition[];
   plugins: string[];
   subagent: {
     enabled: boolean;
@@ -15,6 +23,7 @@ export interface ExtensionStatus {
     model?: string;
     maxCostUsd?: number;
     allowedTools: string[];
+    agents: SubagentDefinition[];
   };
   toolScheduling: {
     maxConcurrentTools: number;
@@ -39,7 +48,7 @@ export function createToolCounts(entries: Array<{ source: ToolSource }>): Record
 
 export function formatExtensionReport(status: ExtensionStatus, section: ExtensionSection = "all"): string {
   if (section === "mcp") return formatMcpReport(status.mcp);
-  if (section === "skills") return formatPathReport("Skills", status.skills, "No skills loaded.");
+  if (section === "skills") return formatSkillReport(status.skills);
   if (section === "plugins") return formatPathReport("Plugins", status.plugins, "No plugins loaded.");
 
   const counts = status.toolCounts;
@@ -48,7 +57,7 @@ export function formatExtensionReport(status: ExtensionStatus, section: Extensio
     "",
     formatMcpReport(status.mcp),
     "",
-    formatPathReport("Skills", status.skills, "No skills loaded."),
+    formatSkillReport(status.skills),
     "",
     formatPathReport("Plugins", status.plugins, "No plugins loaded."),
     "",
@@ -57,13 +66,14 @@ export function formatExtensionReport(status: ExtensionStatus, section: Extensio
       ? [
         `  enabled · delegate_task · adaptive up to ${String(status.subagent.maxSteps)} steps · ${String(status.subagent.maxOutputTokens)} output tokens`,
         `  concurrency ${String(status.subagent.maxConcurrentSubagents)} · queue cap ${String(status.subagent.maxPendingSubagents)} · timeout ${String(status.subagent.timeoutMs)}ms · model ${status.subagent.model ?? "current"}`,
-        `  cost stop threshold ${status.subagent.maxCostUsd === undefined ? "not set" : `$${status.subagent.maxCostUsd.toFixed(6)}`} · tools ${status.subagent.allowedTools.join(", ")}`
+        `  cost stop threshold ${status.subagent.maxCostUsd === undefined ? "not set" : `$${status.subagent.maxCostUsd.toFixed(6)}`} · tools ${status.subagent.allowedTools.join(", ")}`,
+        ...formatSubagentAgents(status.subagent.agents)
       ].join("\n")
       : "  disabled",
     "",
     "Tools",
     `  scheduling concurrency ${String(status.toolScheduling.maxConcurrentTools)} · queue cap ${String(status.toolScheduling.maxQueuedToolCalls)}`,
-    `  builtin ${String(counts.builtin)} · mcp ${String(counts.mcp)} · plugin ${String(counts.plugin)} · subagent ${String(counts.subagent)}`
+    `  builtin ${String(counts.builtin)} · mcp ${String(counts.mcp)} · skill ${String(counts.skill)} · plugin ${String(counts.plugin)} · subagent ${String(counts.subagent)}`
   ].join("\n");
 }
 
@@ -76,8 +86,45 @@ function formatMcpReport(servers: McpServerStatus[]): string {
       continue;
     }
     const state = server.connected ? "connected" : "disconnected";
-    lines.push(`  ${server.connected ? "✓" : "!"} ${server.name} · ${state} · ${String(server.toolNames.length)} tools`);
+    const extras = [
+      server.hasResources ? "resources" : "",
+      server.promptNames.length ? `${String(server.promptNames.length)} prompts` : "",
+      server.instructions ? "instructions" : ""
+    ].filter(Boolean);
+    lines.push(`  ${server.connected ? "✓" : "!"} ${server.name} · ${server.transport} · ${state} · ${String(server.toolNames.length)} tools${extras.length ? ` · ${extras.join(" · ")}` : ""}`);
+    if (server.lastError) lines.push(`    error: ${server.lastError}`);
     for (const toolName of server.toolNames) lines.push(`    ${toolName}`);
+    if (server.promptNames.length) lines.push(`    prompts: ${server.promptNames.join(", ")}`);
+  }
+  return lines.join("\n");
+}
+
+/** /subagent agents 的独立列表输出（CLI 与 TUI 共用）。 */
+export function formatSubagentAgentList(definitions: readonly SubagentDefinition[]): string {
+  if (!definitions.length) return "No named subagent definitions. Add markdown files (frontmatter: name/description/tools/model) under .biny/agents or ~/.biny/agents.";
+  return definitions.map((definition) => {
+    const extras = [definition.scope, definition.model ? `model ${definition.model}` : "", definition.tools ? `tools ${definition.tools.join("/")}` : ""].filter(Boolean).join(" · ");
+    return `${definition.name} · ${extras} · ${definition.path}\n  ${definition.description}`;
+  }).join("\n");
+}
+
+function formatSubagentAgents(agents: SubagentDefinition[]): string[] {
+  if (!agents.length) return ["  named agents: none (add markdown definitions under .biny/agents or ~/.biny/agents)"];
+  const lines = ["  named agents:"];
+  for (const agent of agents) {
+    const extras = [agent.scope, agent.model ? `model ${agent.model}` : "", agent.tools ? `tools ${agent.tools.join("/")}` : ""].filter(Boolean).join(" · ");
+    lines.push(`    ${agent.name} · ${extras} · ${agent.path}`);
+    lines.push(`      ${agent.description}`);
+  }
+  return lines;
+}
+
+function formatSkillReport(skills: SkillDefinition[]): string {
+  if (!skills.length) return "Skills\n  No skills loaded.";
+  const lines = ["Skills"];
+  for (const skill of skills) {
+    lines.push(`  ${skill.name} · ${skill.scope} · ${skill.path}`);
+    lines.push(`    ${skill.description}`);
   }
   return lines.join("\n");
 }

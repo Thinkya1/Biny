@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { ModelMessage } from "ai";
 import { messageText } from "../modelMessages.js";
@@ -41,7 +42,9 @@ export class WorkspaceContext {
   constructor(
     private readonly workspaceRoot: string,
     private readonly ignore: string[],
-    private readonly instructionMaxBytes: number
+    private readonly instructionMaxBytes: number,
+    /** 全局指令文件（参考 pi 的全局 AGENTS.md）；传 undefined 关闭，默认 ~/.biny/AGENTS.md。 */
+    private readonly globalInstructionFile: string | undefined = path.join(os.homedir(), ".biny", "AGENTS.md")
   ) {
     this.canonicalWorkspaceRoot = resolveWorkspaceDirectory(workspaceRoot, ".", []);
   }
@@ -49,6 +52,8 @@ export class WorkspaceContext {
   async initialize(signal?: AbortSignal): Promise<void> {
     if (this.initialized) return;
     signal?.throwIfAborted();
+    // 全局指令先于项目指令加载：全局是基线，项目级内容在其后可以细化覆盖。
+    await this.loadGlobalInstructions(signal);
     await Promise.all([
       this.loadInstructionDirectory(this.workspaceRoot, signal),
       this.refreshSnapshot(signal),
@@ -170,6 +175,31 @@ export class WorkspaceContext {
     for (const directory of [...directories].sort((left, right) => left.localeCompare(right))) {
       await this.loadInstructionDirectory(directory, signal);
     }
+  }
+
+  private async loadGlobalInstructions(signal?: AbortSignal): Promise<void> {
+    const filePath = this.globalInstructionFile;
+    if (!filePath) return;
+    signal?.throwIfAborted();
+    try {
+      // 全局文件在 home 下、不在 workspace 防御边界内，这里单独拒绝软链。
+      const stat = await fs.lstat(filePath);
+      if (stat.isSymbolicLink() || !stat.isFile()) return;
+    } catch {
+      return;
+    }
+    const content = await fs.readFile(filePath, { encoding: "utf8", signal });
+    signal?.throwIfAborted();
+    const selectedContent = truncateUtf8(content, this.instructionMaxBytes - this.instructionBytes);
+    const bytes = Buffer.byteLength(selectedContent, "utf8");
+    if (!selectedContent || !bytes) return;
+    const fromHome = path.relative(os.homedir(), filePath);
+    this.loadedInstructions.push({
+      path: fromHome && !fromHome.startsWith("..") && !path.isAbsolute(fromHome) ? path.join("~", fromHome) : filePath,
+      content: selectedContent,
+      bytes
+    });
+    this.instructionBytes += bytes;
   }
 
   private async loadInstructionDirectory(directory: string, signal?: AbortSignal): Promise<void> {

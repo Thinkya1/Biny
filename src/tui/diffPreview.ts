@@ -1,3 +1,10 @@
+/**
+ * Diff 预览行模型。
+ *
+ * 把「旧文本 / 新文本」算成带行号和 +/- 标记的结构化行，并给每行标好配色 token。
+ * 这里只产出数据，不做终端渲染：TUI 组件和桌面端各自决定怎么画，因此样式字段存的是
+ * token 名而不是具体色值。
+ */
 import type { ColorToken } from "./theme/index.js";
 
 export type DiffLineKind = "context" | "add" | "delete";
@@ -26,12 +33,12 @@ export interface DiffPreviewLineStyle {
 }
 
 export const diffPreviewStyles = {
-  header: { bold: true, additions: "diffAddedStrong", deletions: "diffRemovedStrong", path: "textStrong" },
-  add: { gutter: "diffGutter", marker: "diffAdded", content: "diffAdded" },
-  delete: { gutter: "diffGutter", marker: "diffRemoved", content: "diffRemoved" },
-  context: { gutter: "diffGutter", marker: "diffMeta", content: "textDim", dimColor: true },
-  content: { gutter: "diffGutter", content: "text" },
-  meta: { content: "diffMeta", dimColor: true }
+  header: { bold: true, additions: "toolDiffAdded", deletions: "toolDiffRemoved", path: "text" },
+  add: { gutter: "dim", marker: "toolDiffAdded", content: "toolDiffAdded" },
+  delete: { gutter: "dim", marker: "toolDiffRemoved", content: "toolDiffRemoved" },
+  context: { gutter: "dim", marker: "toolDiffContext", content: "dim", dimColor: true },
+  content: { gutter: "dim", content: "text" },
+  meta: { content: "toolDiffContext", dimColor: true }
 } satisfies Record<"header" | DiffLineKind | "content" | "meta", DiffPreviewLineStyle>;
 
 export interface ClusteredDiffOptions {
@@ -50,6 +57,11 @@ interface Cluster {
   end: number;
 }
 
+/**
+ * 按行做 LCS diff。`oldStart` / `newStart` 是这段文本在原文件中的起始行号，用于局部
+ * 编辑（只 diff 片段）时行号仍对得上文件。`isIncomplete` 表示新文本还在流式输出中，
+ * 此时结尾的删除行只是「还没写出来」，不应展示成删除。
+ */
 export function computeDiffLines(
   oldText: string,
   newText: string,
@@ -61,6 +73,7 @@ export function computeDiffLines(
   const newLines = newText ? newText.split("\n") : [];
   const oldLength = oldLines.length;
   const newLength = newLines.length;
+  // dp[i][j] = 前 i 行旧文本与前 j 行新文本的最长公共子序列长度。
   const dp: number[][] = Array.from({ length: oldLength + 1 }, () => Array.from({ length: newLength + 1 }, () => 0));
 
   for (let oldIndex = 1; oldIndex <= oldLength; oldIndex += 1) {
@@ -71,6 +84,7 @@ export function computeDiffLines(
     }
   }
 
+  // 从右下角回溯 dp 表，因此结果是倒序的，最后再 reverse 回正序。
   const reversed: DiffLine[] = [];
   let oldIndex = oldLength;
   let newIndex = newLength;
@@ -95,6 +109,7 @@ export function computeDiffLines(
   return result;
 }
 
+/** 紧凑模式：只列出变更行，不带上下文，超出 `maxLines` 的部分折叠成一行提示。 */
 export function renderDiffLines(
   oldText: string,
   newText: string,
@@ -118,6 +133,10 @@ export function renderDiffLines(
   return rendered;
 }
 
+/**
+ * 聚类模式：变更行按 `contextLines` 带上下文分组展示，组之间用「… N unchanged lines …」
+ * 占位。行数预算 `maxLines` 只算正文，标题行不计入。
+ */
 export function renderDiffLinesClustered(
   oldText: string,
   newText: string,
@@ -176,6 +195,7 @@ export function renderDiffLinesClustered(
   return rendered;
 }
 
+/** 同上，但直接接收已算好的 diff 行（多段 patch 已在上游合并好，无需再跑 LCS）。 */
 export function renderDiffLineSetClustered(
   diffLines: readonly DiffLine[],
   filePath: string,
@@ -296,6 +316,11 @@ function createMeta(content: string): DiffPreviewLine {
   return { kind: "meta", content, style: diffPreviewStyles.meta };
 }
 
+/**
+ * 把变更行按位置聚成若干块，每块向两侧各扩 `contextLines` 行上下文。
+ * 两个变更之间的间隔不超过 `2 * contextLines` 时合并成一块，否则中间的未改动行没必要
+ * 全部展开。
+ */
 function buildClusters(diffLines: readonly DiffLine[], contextLines: number): { clusters: Cluster[]; changedCount: number; additions: number; deletions: number } {
   const changedIndexes: number[] = [];
   let additions = 0;
@@ -329,6 +354,10 @@ function buildClusters(diffLines: readonly DiffLine[], contextLines: number): { 
   return { clusters, changedCount: changedIndexes.length, additions, deletions };
 }
 
+/**
+ * 流式写入时，新文本尾部还没到，LCS 会把旧文件剩下的行全判成删除。
+ * 这里裁掉结尾连续的删除行，避免预览一开始就闪出「整个文件被删」。
+ */
 function suppressTrailingDeletes(lines: DiffLine[]): void {
   let lastNonDelete = lines.length - 1;
   while (lastNonDelete >= 0 && lines[lastNonDelete]?.kind === "delete") {

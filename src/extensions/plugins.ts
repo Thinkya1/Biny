@@ -121,7 +121,11 @@ function configWithoutCredentials(config: AgentConfig): AgentConfig {
     provider.apiKey = undefined;
     if (provider.oauth) provider.oauth.refreshToken = undefined;
   }
-  for (const server of Object.values(safe.extensions.mcp)) server.env = undefined;
+  for (const server of Object.values(safe.extensions.mcp)) {
+    server.env = undefined;
+    // http 传输的 headers 通常携带 Authorization token，同样不能进插件上下文。
+    server.headers = undefined;
+  }
   return safe;
 }
 

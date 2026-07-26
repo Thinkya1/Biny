@@ -1,3 +1,9 @@
+/**
+ * 内置图标集。
+ *
+ * 全部内联 SVG，不引外部图标库：图标数量有限，内联能省一个依赖，也避免网络字体/雪碧图。
+ * 新增图标要同时补 `IconName` 联合类型和下面的绘制分支，漏一处会有类型错误。
+ */
 import type { SVGProps } from "react";
 
 export type IconName =
@@ -19,6 +25,7 @@ export type IconName =
   | "cpu"
   | "database"
   | "diff"
+  | "display"
   | "edit"
   | "external"
   | "eye"
@@ -30,6 +37,7 @@ export type IconName =
   | "home"
   | "menu"
   | "mic"
+  | "moon"
   | "more"
   | "network"
   | "paperclip"
@@ -47,9 +55,12 @@ export type IconName =
   | "site"
   | "spark"
   | "stop"
+  | "sun"
   | "terminal"
   | "timer"
   | "trash"
+  | "volume"
+  | "volume-off"
   | "warning"
   | "wand"
   | "wrench";
@@ -104,6 +115,7 @@ function pathFor(name: IconName): React.JSX.Element {
     case "cpu": return <><rect {...common} height="12" rx="2" width="12" x="6" y="6" /><path {...common} d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4M10 10h4v4h-4z" /></>;
     case "database": return <><ellipse {...common} cx="12" cy="5.5" rx="7.5" ry="2.8" /><path {...common} d="M4.5 5.5v6.5c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V5.5M4.5 12v6.5c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V12" /></>;
     case "diff": return <><path {...common} d="M7 4v16M17 4v16M4 8h6M14 16h6" /><path {...common} d="m17 6 2 2-2 2M17 14l-2 2 2 2" /></>;
+    case "display": return <><rect {...common} height="13" rx="2" width="18" x="3" y="4" /><path {...common} d="M9 21h6M12 17v4" /></>;
     case "edit": return <path {...common} d="m4 16.5-.8 3.8 3.8-.8L18.8 7.7a2.1 2.1 0 0 0-3-3L4 16.5ZM14.5 6.5l3 3" />;
     case "external": return <><path {...common} d="M14 5h5v5M19 5l-8 8" /><path {...common} d="M19 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5" /></>;
     case "eye": return <><path {...common} d="M2.5 12s3.5-6.5 9.5-6.5S21.5 12 21.5 12s-3.5 6.5-9.5 6.5S2.5 12 2.5 12Z" /><circle {...common} cx="12" cy="12" r="3" /></>;
@@ -115,6 +127,7 @@ function pathFor(name: IconName): React.JSX.Element {
     case "home": return <path {...common} d="m4 10 8-6 8 6v9a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1v-9Z" />;
     case "menu": return <path {...common} d="M5 7h14M5 12h14M5 17h14" />;
     case "mic": return <><rect {...common} height="11" rx="3.5" width="7" x="8.5" y="3" /><path {...common} d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M8.5 21h7" /></>;
+    case "moon": return <path {...common} d="M20.5 13.2A8 8 0 1 1 10.8 3.5a6.8 6.8 0 0 0 9.7 9.7Z" />;
     case "more": return <><circle cx="6" cy="12" fill="currentColor" r="1.2" /><circle cx="12" cy="12" fill="currentColor" r="1.2" /><circle cx="18" cy="12" fill="currentColor" r="1.2" /></>;
     case "network": return <><circle {...common} cx="5" cy="12" r="2" /><circle {...common} cx="19" cy="6" r="2" /><circle {...common} cx="19" cy="18" r="2" /><path {...common} d="m6.8 11.2 10.4-4.4M6.8 12.8l10.4 4.4" /></>;
     case "paperclip": return <path {...common} d="m9 12.5 5.9-5.9a3 3 0 0 1 4.2 4.2l-7.4 7.4a5 5 0 0 1-7.1-7.1l7.2-7.2M7.5 14l6.4-6.4" />;
@@ -132,9 +145,12 @@ function pathFor(name: IconName): React.JSX.Element {
     case "site": return <><circle {...common} cx="12" cy="12" r="9" /><path {...common} d="M3.5 12h17M12 3c2.4 2.5 3.5 5.5 3.5 9S14.4 18.5 12 21c-2.4-2.5-3.5-5.5-3.5-9S9.6 5.5 12 3Z" /></>;
     case "spark": return <path {...common} d="m12 3 1.5 5.5L19 10l-5.5 1.5L12 17l-1.5-5.5L5 10l5.5-1.5L12 3Zm6 13 .6 2.4L21 19l-2.4.6L18 22l-.6-2.4L15 19l2.4-.6L18 16Z" />;
     case "stop": return <rect fill="currentColor" height="9" rx="2" width="9" x="7.5" y="7.5" />;
+    case "sun": return <><circle {...common} cx="12" cy="12" r="4" /><path {...common} d="M12 2.5V5M12 19v2.5M2.5 12H5M19 12h2.5M5.3 5.3 7 7M17 17l1.7 1.7M18.7 5.3 17 7M7 17l-1.7 1.7" /></>;
     case "terminal": return <><rect {...common} height="16" rx="2" width="19" x="2.5" y="4" /><path {...common} d="m6 9 3 3-3 3M12 15h5" /></>;
     case "timer": return <><circle {...common} cx="12" cy="13" r="8" /><path {...common} d="M9 2h6M12 5V2M12 13l3-3" /></>;
     case "trash": return <><path {...common} d="M5 7h14M10 4h4l1 3H9l1-3ZM8 7l.7 13h6.6L16 7M10 10v7M14 10v7" /></>;
+    case "volume": return <><path {...common} d="M11 5 6.5 9H3.5v6h3L11 19V5Z" /><path {...common} d="M14.5 9.5a3.5 3.5 0 0 1 0 5M17 7a7 7 0 0 1 0 10" /></>;
+    case "volume-off": return <><path {...common} d="M11 5 6.5 9H3.5v6h3L11 19V5Z" /><path {...common} d="m15 10 5 4M20 10l-5 4" /></>;
     case "warning": return <><path {...common} d="M11 4.5 3.7 18a1 1 0 0 0 .9 1.5h14.8a1 1 0 0 0 .9-1.5L13 4.5a1.1 1.1 0 0 0-2 0Z" /><path {...common} d="M12 9v4M12 16.5h.01" /></>;
     case "wand": return <><path {...common} d="m5 19 10.5-10.5M7 5h.01M17 4h.01M19 9h.01M5 12h.01M17 16h.01" /><path {...common} d="m15.5 3.5.7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7.7-2.3Z" /></>;
     case "wrench": return <path {...common} d="M14.5 6.2a4.5 4.5 0 0 0-5.8 5.7l-5.1 5.2a1.8 1.8 0 0 0 2.5 2.5l5.2-5.1a4.5 4.5 0 0 0 5.7-5.8l-3 3-2.5-.7-.7-2.5 3-3Z" />;

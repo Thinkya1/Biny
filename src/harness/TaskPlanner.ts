@@ -1,3 +1,9 @@
+/**
+ * 任务计划的生成与推进。
+ *
+ * 计划状态一律由证据推导，不采信模型自己写的「已完成」清单：inspect 看有没有成功的只读
+ * 工具调用，执行项看有没有对应的写入/启动动作，verify 看验收证据，cleanup 看清理状态。
+ */
 import type {
   AcceptanceEvidence,
   AgentAttemptExecution,
@@ -24,14 +30,17 @@ const mutationTools = new Set([
   "apply_patch",
   "delete_file",
   "move_file",
-  // A successful shell command can mutate files through redirection, sed, awk,
-  // generators, or build scripts. The independent workspace predicate remains
-  // the source of truth for whether a change actually happened.
+  // 一条成功的 shell 命令也可能通过重定向、sed/awk、代码生成或构建脚本改文件，
+  // 所以算作可能的写入动作；真正有没有改动仍以独立的工作区指纹判定为准。
   "run_command"
 ]);
 
-/** Creates a small, stable plan that task execution can update from evidence. */
+/**
+ * 生成初始计划：inspect（可选）→ 执行项 → verify → cleanup。
+ * 刻意做得短而固定，让执行过程只需按证据更新状态，不需要重新规划。
+ */
 export function createInitialTaskPlan(taskType: TaskType, verificationMode: TaskVerificationMode): TaskPlanItem[] {
+  // 执行项按任务类型换描述和 id：启动服务 / 改代码 / 直接作答。
   const execute = taskType === "launch"
     ? { id: "start", description: "Start and configure the required managed services.", required: true }
     : taskType === "code_change"
@@ -78,9 +87,10 @@ export interface TaskPlanProgress {
   cleanup?: TaskCleanupPlan;
 }
 
-/** Derives plan state from durable evidence rather than model-written checklist prose. */
+/** 按持久化证据推进计划状态，而不是采信模型写的清单文本。 */
 export function advanceTaskPlan(plan: TaskPlanItem[], progress: TaskPlanProgress): TaskPlanItem[] {
   const toolEvidence = progress.toolEvidence ?? progress.execution?.attemptToolEvidence ?? [];
+  // 只认「没报错且有结果」的调用：发起了但失败或没拿到结果的不算做过这件事。
   const successfulToolEvidence = toolEvidence.filter((item) => item.error === undefined && item.result !== undefined);
   const now = new Date().toISOString();
   const inspectionIds = successfulToolEvidence
@@ -95,6 +105,7 @@ export function advanceTaskPlan(plan: TaskPlanItem[], progress: TaskPlanProgress
         : [];
   const verificationEvidence = progress.verificationEvidence ?? [];
   const verificationIds = verificationEvidence.map((item) => verificationEvidenceId(progress.attemptId, item));
+  // 没有任何验收证据时不能算通过，所以这里额外要求 length > 0（空数组的 every 恒为 true）。
   const verificationPassed = progress.verificationPassed === true
     || verificationEvidence.length > 0 && verificationEvidence.every((item) => item.passed);
   const verificationFailed = progress.verificationPassed === false || verificationEvidence.some((item) => !item.passed);
@@ -121,6 +132,7 @@ export function advanceTaskPlan(plan: TaskPlanItem[], progress: TaskPlanProgress
   });
 }
 
+/** 列出还没完成的必做项；skipped 视为已交代过，不算失败。 */
 export function requiredPlanFailures(plan: TaskPlanItem[]): TaskPlanItem[] {
   return plan.filter((item) => item.required && item.status !== "completed" && item.status !== "skipped");
 }
@@ -134,6 +146,8 @@ function update(item: TaskPlanItem, status: TaskPlanStatus, evidenceIds: string[
   };
 }
 
+// 以下 id 拼装要和 TaskEvidenceCollector 保持一致，否则计划项会引用到不存在的证据。
+// attemptId 缺失时退化成不带尝试前缀的形式（轻量任务没有分尝试）。
 function toolEvidenceId(attemptId: string | undefined, evidence: TaskToolEvidence): string {
   return attemptId === undefined ? `tool:${evidence.toolCallId}` : `attempt:${attemptId}:tool:${evidence.toolCallId}`;
 }

@@ -1,5 +1,14 @@
+/**
+ * preload 桥。
+ *
+ * 把 `DesktopApi` 里声明的每个方法转成一次 IPC 调用，通过 contextBridge 暴露成
+ * `window.biny`。这里只做转发，不放任何业务逻辑——渲染进程能做什么完全由 `protocol.ts`
+ * 的接口和主进程的 handler 决定。
+ *
+ * 事件订阅返回取消函数，组件卸载时必须调用，否则监听器会随重新挂载不断累积。
+ */
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import type { DesktopAgentEventEnvelope, DesktopApi, DesktopMenuAction } from "../../protocol.js";
+import type { DesktopAgentEventEnvelope, DesktopApi, DesktopMenuAction, DesktopTerminalEvent } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
 
 const api: DesktopApi = {
@@ -24,25 +33,49 @@ const api: DesktopApi = {
   sendPrompt: async (projectId, sessionId, input, mode, attachments) => await ipcRenderer.invoke(desktopIpc.sendPrompt, projectId, sessionId, input, mode, attachments),
   editPrompt: async (projectId, sessionId, userMessageIndex, input, mode, attachments) => await ipcRenderer.invoke(desktopIpc.editPrompt, projectId, sessionId, userMessageIndex, input, mode, attachments),
   cancelRun: async (projectId) => await ipcRenderer.invoke(desktopIpc.cancelRun, projectId),
+  runSlashCommand: async (projectId, sessionId, command) => await ipcRenderer.invoke(desktopIpc.runSlashCommand, projectId, sessionId, command),
   resolvePermission: async (projectId, requestId, result) => await ipcRenderer.invoke(desktopIpc.resolvePermission, projectId, requestId, result),
   setPermissionMode: async (projectId, mode) => await ipcRenderer.invoke(desktopIpc.setPermissionMode, projectId, mode),
   switchModel: async (projectId, alias, thinking) => await ipcRenderer.invoke(desktopIpc.switchModel, projectId, alias, thinking),
   saveModelConfiguration: async (projectId, configuration) => await ipcRenderer.invoke(desktopIpc.saveModelConfiguration, projectId, configuration),
   testModelConfiguration: async (projectId, configuration) => await ipcRenderer.invoke(desktopIpc.testModelConfiguration, projectId, configuration),
   removeModelConfiguration: async (projectId, alias) => await ipcRenderer.invoke(desktopIpc.removeModelConfiguration, projectId, alias),
+  fetchModelCatalog: async (projectId, providerAlias) => await ipcRenderer.invoke(desktopIpc.fetchModelCatalog, projectId, providerAlias),
   startModelLogin: async (projectId, provider) => await ipcRenderer.invoke(desktopIpc.startModelLogin, projectId, provider),
   completeModelLogin: async (projectId, provider, authRequestId, pastedAuthorization) => await ipcRenderer.invoke(desktopIpc.completeModelLogin, projectId, provider, authRequestId, pastedAuthorization),
   cancelModelLogin: async (projectId, provider, authRequestId) => await ipcRenderer.invoke(desktopIpc.cancelModelLogin, projectId, provider, authRequestId),
   compact: async (projectId, hint) => await ipcRenderer.invoke(desktopIpc.compact, projectId, hint),
+  webSearchSettings: async (projectId) => await ipcRenderer.invoke(desktopIpc.webSearchSettings, projectId),
+  saveWebSearchSettings: async (projectId, input) => await ipcRenderer.invoke(desktopIpc.saveWebSearchSettings, projectId, input),
+  memoryOverview: async (projectId) => await ipcRenderer.invoke(desktopIpc.memoryOverview, projectId),
+  saveMemorySettings: async (projectId, input) => await ipcRenderer.invoke(desktopIpc.saveMemorySettings, projectId, input),
+  searchMemory: async (projectId, query) => await ipcRenderer.invoke(desktopIpc.searchMemory, projectId, query),
+  addMemoryEntry: async (projectId, topic, note) => await ipcRenderer.invoke(desktopIpc.addMemoryEntry, projectId, topic, note),
+  deleteMemoryEntry: async (projectId, topic, index) => await ipcRenderer.invoke(desktopIpc.deleteMemoryEntry, projectId, topic, index),
+  clearMemory: async (projectId) => await ipcRenderer.invoke(desktopIpc.clearMemory, projectId),
+  compactMemory: async (projectId) => await ipcRenderer.invoke(desktopIpc.compactMemory, projectId),
   saveAttachment: async (projectId, name, mimeType, bytes) => await ipcRenderer.invoke(desktopIpc.saveAttachment, projectId, name, mimeType, bytes),
+  // 渲染进程拿不到拖入文件的真实路径，只有 preload 里的 webUtils 能解析。
   resolveDroppedFile: (file) => webUtils.getPathForFile(file),
   listWorkspaceDirectory: async (projectId, relativePath) => await ipcRenderer.invoke(desktopIpc.listWorkspaceDirectory, projectId, relativePath),
   readWorkspaceFile: async (projectId, relativePath) => await ipcRenderer.invoke(desktopIpc.readWorkspaceFile, projectId, relativePath),
+  readInlineImage: async (projectId, relativePath) => await ipcRenderer.invoke(desktopIpc.readInlineImage, projectId, relativePath),
   openWorkspaceFile: async (projectId, relativePath) => await ipcRenderer.invoke(desktopIpc.openWorkspaceFile, projectId, relativePath),
   openExternal: async (url) => await ipcRenderer.invoke(desktopIpc.openExternal, url),
   setSidebarWidth: async (width) => await ipcRenderer.invoke(desktopIpc.setSidebarWidth, width),
   setFilePanelWidth: async (width) => await ipcRenderer.invoke(desktopIpc.setFilePanelWidth, width),
   setThemePreference: async (theme) => await ipcRenderer.invoke(desktopIpc.setThemePreference, theme),
+  setFontPreference: async (font) => await ipcRenderer.invoke(desktopIpc.setFontPreference, font),
+  createTerminal: async (projectId, cols, rows) => await ipcRenderer.invoke(desktopIpc.createTerminal, projectId, cols, rows),
+  // 输入与尺寸是高频小消息，用 send 避免 invoke 的往返开销。
+  writeTerminal: (terminalId, data) => { ipcRenderer.send(desktopIpc.writeTerminal, terminalId, data); },
+  resizeTerminal: (terminalId, cols, rows) => { ipcRenderer.send(desktopIpc.resizeTerminal, terminalId, cols, rows); },
+  disposeTerminal: async (terminalId) => await ipcRenderer.invoke(desktopIpc.disposeTerminal, terminalId),
+  onTerminalEvent(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, event: DesktopTerminalEvent): void => listener(event);
+    ipcRenderer.on(desktopIpc.terminalEvent, handler);
+    return () => ipcRenderer.removeListener(desktopIpc.terminalEvent, handler);
+  },
   onAgentEvent(listener) {
     const handler = (_event: Electron.IpcRendererEvent, envelope: DesktopAgentEventEnvelope): void => listener(envelope);
     ipcRenderer.on(desktopIpc.event, handler);

@@ -1,3 +1,16 @@
+/**
+ * 安全文件读写。
+ *
+ * 工具层所有真实的文件读写都走这里，目的是两条：一是有界（读取有字节上限，不会被巨大文件
+ * 打爆内存），二是不被中途换掉目标。
+ *
+ * 「不被换掉」靠 `FileSnapshot`（device/inode/size/mode/链接数/时间戳）实现：打开后、写入
+ * 前、提交前反复核对句柄和路径指向的还是同一个 inode，一旦不一致就中止。所有打开操作都带
+ * `O_NOFOLLOW`，符号链接一律拒绝，避免被引到工作区之外。
+ *
+ * 写入是原子的：先写临时文件并 fsync，新建用 `link`（目标已存在即失败，不覆盖），覆盖用
+ * `rename`，并先用硬链接把原文件的 inode 钉住，以便提交窗口内被外部改动时能还原回去。
+ */
 import { randomBytes } from "node:crypto";
 import { constants, promises as fs, type BigIntStats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
@@ -88,6 +101,13 @@ export async function readUtf8FileForEdit(filePath: string, signal?: AbortSignal
   return { content: result.content, snapshot: result.snapshot };
 }
 
+/**
+ * 原子写入单个文件，返回写入字节数。
+ *
+ * `expectedSnapshot` 表示调用方认为写之前文件应有的状态：`null` 意为「文件应当不存在」，
+ * 传具体快照意为「必须还是我读到的那一版」，`undefined` 则表示不做版本校验（以当前状态为准）。
+ * 对不上就抛错，绝不悄悄覆盖别人的改动。
+ */
 export async function atomicWriteUtf8File(
   filePath: string,
   content: string,
@@ -141,8 +161,8 @@ export async function atomicWriteUtf8File(
     signal?.throwIfAborted();
 
     if (targetSnapshot === null) {
-      // Linking is an atomic no-replace commit for a new target. Unlike rename,
-      // it cannot clobber a file created after the last snapshot check.
+      // 新建文件用 link 提交：它是「不覆盖」的原子操作，和 rename 不同，
+      // 不会把最后一次校验之后刚被别人创建出来的文件冲掉。
       try {
         await fs.link(temporaryPath, filePath);
       } catch (error) {
@@ -155,9 +175,9 @@ export async function atomicWriteUtf8File(
       await fs.unlink(temporaryPath);
       temporarySnapshot = undefined;
     } else {
-      // Keep the approved inode reachable across rename. If another process
-      // writes through the old path during the commit window, the hardlink lets
-      // us detect that mutation and restore its content instead of losing it.
+      // 覆盖已有文件前，用硬链接把「已确认的那一版」inode 钉住，让它在 rename 之后仍可访问。
+      // 如果提交窗口内有别的进程通过旧路径写入，靠这个备份既能发现改动，也能把内容还原回去，
+      // 而不是直接丢掉。
       backupPath = path.join(
         directory,
         `.biny-backup-${String(process.pid)}-${randomBytes(8).toString("hex")}.tmp`
@@ -169,17 +189,16 @@ export async function atomicWriteUtf8File(
       }
       signal?.throwIfAborted();
 
-      // rename is the commit point for an existing target. Cancellation after
-      // this call must not turn a completed replacement into a pre-commit abort.
+      // rename 就是覆盖写的提交点。这一行之后即使收到取消信号，也不能把「已完成的替换」
+      // 当成未提交去回滚，因此下面立刻置 committed。
       await fs.rename(temporaryPath, filePath);
       temporarySnapshot = undefined;
       committed = true;
       const displacedSnapshot = await requiredTargetSnapshot(backupPath);
       backupSnapshot = displacedSnapshot;
       if (!sameStableFileVersion(targetSnapshot, displacedSnapshot)) {
-        // Only restore while the visible target is still the inode we just
-        // committed. If somebody has replaced it again, preserve both files and
-        // fail without overwriting that newer external target.
+        // 只有当前可见的目标还是我们刚提交的那个 inode 时才还原。若又被别人替换过，
+        // 就两个文件都保留并直接失败，不去覆盖那个更新的外部版本。
         await assertFileBinding(filePath, handle, true);
         await fs.rename(backupPath, filePath);
         backupPath = undefined;
@@ -192,9 +211,8 @@ export async function atomicWriteUtf8File(
       backupSnapshot = undefined;
     }
     await assertFileBinding(filePath, handle, true);
-    // The file is already committed here. Directory fsync improves crash
-    // durability where supported, but must not report the completed write as a
-    // failure on filesystems that reject directory syncing.
+    // 走到这里文件已经提交成功。对目录 fsync 只是为了在支持的文件系统上提高断电耐久性，
+    // 某些文件系统不允许同步目录，那种失败不能让已完成的写入被报成失败。
     await syncDirectory(directory).catch(() => undefined);
     return Buffer.byteLength(content, "utf8");
   } finally {
@@ -216,10 +234,10 @@ export async function atomicWriteUtf8File(
 }
 
 /**
- * Atomically writes a workspace file, creating only the missing real-directory
- * components below the canonical workspace root. Directories created before a
- * failed or cancelled write are removed again when they are still empty and
- * still refer to the exact inodes created by this call.
+ * 工作区内的原子写入：只在规范化后的工作区根之下创建缺失的真实目录层级。
+ *
+ * 写入失败或被取消时会回收本次创建的目录，但只删「仍然为空、且 inode 还是本次创建的那个」
+ * 的目录，避免删掉别人同时建出来的同名目录。
  */
 export async function atomicWriteWorkspaceUtf8File(
   workspaceRoot: string,
@@ -253,9 +271,10 @@ export async function snapshotRegularFile(filePath: string, signal?: AbortSignal
 }
 
 /**
- * Deletes one bound regular file by first moving the approved inode to a
- * private same-directory quarantine path. A replacement detected during that
- * move is restored rather than silently deleted.
+ * 删除一个已绑定的普通文件：先把确认过的 inode 移到同目录下的私有隔离路径，再真正删除。
+ *
+ * 这样做是为了「删错了还能还原」——如果在这一步发现文件已被替换，会把隔离出来的版本移回去，
+ * 而不是把别人的新文件默默删掉。
  */
 export async function deleteBoundRegularFile(
   filePath: string,
@@ -283,8 +302,8 @@ export async function deleteBoundRegularFile(
       throw new Error("The delete target changed before it could be removed.");
     }
 
-    // From this rename onward the small transaction is completed without an
-    // abort check so cancellation cannot strand a half-deleted target.
+    // 从这次 rename 开始，剩下的小事务一路做完、不再检查取消信号，
+    // 否则中途取消会留下一个「删了一半」的状态。
     await fs.rename(filePath, quarantinePath);
     quarantined = true;
     const moved = await assertFileBinding(quarantinePath, handle);
@@ -304,8 +323,8 @@ export async function deleteBoundRegularFile(
           quarantined = false;
         }
       } catch {
-        // Preserve the quarantined inode if its directory or destination changed;
-        // overwriting a newer external target would be worse than leaving evidence.
+        // 目录或目标位置变了就保留隔离文件不动：覆盖掉一个更新的外部文件，
+        // 比在目录里留下一个可追查的隔离文件更糟。
       }
     }
     throw error;
@@ -315,11 +334,10 @@ export async function deleteBoundRegularFile(
 }
 
 /**
- * Moves one prepared regular file without replacing a destination that appeared
- * after permission approval. The hard-link/unlink sequence is used instead of
- * rename so the destination commit is no-replace on filesystems that support
- * hard links; cross-device moves are rejected rather than downgraded to an
- * unverified copy.
+ * 移动一个已准备好的普通文件，且不覆盖「授权之后才出现」的目标路径。
+ *
+ * 用 link + unlink 而不是 rename：在支持硬链接的文件系统上，link 遇到已存在的目标会失败，
+ * 天然是「不覆盖」的提交方式。跨设备移动直接报错，不降级成未经校验的复制。
  */
 export async function moveBoundRegularFile(
   sourcePath: string,
@@ -370,8 +388,8 @@ export async function moveBoundRegularFile(
     }
     linked = true;
 
-    // The link is the no-replace commit point. Do not honor cancellation after
-    // it: finish the unlink or leave a verifiable duplicate for manual recovery.
+    // link 成功即为「不覆盖」的提交点。此后不再响应取消：要么把 unlink 做完，
+    // 要么留下一份可核对的副本供人工恢复，不能停在中间态。
     const moved = await assertFileBinding(destination, handle);
     if (!sameStableFileVersion(moved, expectedSnapshot)) {
       throw new Error("The move destination does not contain the prepared source inode.");
@@ -392,7 +410,7 @@ export async function moveBoundRegularFile(
         if (await snapshotTarget(source) === null) sourceRemoved = true;
         if (!sourceRemoved) await fs.unlink(destination);
       } catch {
-        // Preserve an uncertain destination rather than deleting a replacement.
+        // 目标状态不确定时宁可留着，也不要误删掉一个替换进来的新文件。
       }
     }
     throw error;
@@ -401,6 +419,12 @@ export async function moveBoundRegularFile(
   }
 }
 
+/**
+ * 逐层创建缺失目录，并记录「哪几层是本次创建的」以便回滚。
+ *
+ * 从规范化的工作区根开始一段一段往下走，每建一层都核对父目录还是原来那个 inode，
+ * 这样即使路径中某一段在中途被替换成软链接，也不会顺着它跑到工作区外面去。
+ */
 async function createMissingWorkspaceDirectories(
   workspaceRoot: string,
   targetDirectory: string,
@@ -441,13 +465,14 @@ async function createMissingWorkspaceDirectories(
   }
 }
 
+/** 回滚本次创建的目录：从最深一层往外删，且只删 inode 未变的空目录。 */
 async function removeCreatedDirectories(created: readonly CreatedDirectory[]): Promise<void> {
   for (const directory of [...created].reverse()) {
     try {
       const current = await snapshotDirectory(directory.path);
       if (sameIdentity(current, directory.identity)) await fs.rmdir(directory.path);
     } catch {
-      // Never remove a replaced or non-empty directory during rollback.
+      // 回滚过程绝不删被替换过的目录，也不删非空目录（rmdir 会自己失败）。
     }
   }
 }
@@ -469,6 +494,10 @@ async function openBoundRegularFile(filePath: string): Promise<FileHandle> {
   }
 }
 
+/**
+ * 核对「已打开的句柄」和「路径当前指向的文件」仍是同一个 inode，并返回最新快照。
+ * `requireSingleLink` 用于临时文件和提交场景：要求硬链接数为 1，确保没有第二条路径指向它。
+ */
 async function assertFileBinding(filePath: string, handle: FileHandle, requireSingleLink = false): Promise<FileSnapshot> {
   const descriptorStat = await handle.stat({ bigint: true });
   const pathStat = await fs.lstat(filePath, { bigint: true });
@@ -486,6 +515,7 @@ async function assertFileBinding(filePath: string, handle: FileHandle, requireSi
   return fileSnapshot(descriptorStat);
 }
 
+/** 取目标文件快照；文件不存在返回 null（这是合法状态），是软链接或非普通文件则报错。 */
 async function snapshotTarget(filePath: string): Promise<FileSnapshot | null> {
   try {
     const stat = await fs.lstat(filePath, { bigint: true });
@@ -532,7 +562,7 @@ async function removeBoundTemporaryFile(
       await fs.unlink(temporaryPath);
     }
   } catch {
-    // A missing, renamed, linked, or replaced temporary file is never removed.
+    // 临时文件已消失、被改名、被加了硬链接或被替换时都不删，避免误删别人的文件。
   }
 }
 
@@ -547,10 +577,11 @@ async function removeBoundAuxiliaryFile(
     const current = await requiredTargetSnapshot(auxiliaryPath);
     if (sameFileSnapshot(current, auxiliarySnapshot)) await fs.unlink(auxiliaryPath);
   } catch {
-    // Never remove an auxiliary path whose directory or inode changed.
+    // 所在目录或 inode 变过的辅助文件一律不删。
   }
 }
 
+/** 目录 fsync 让改名/创建也落盘；Windows 不支持以目录方式打开，直接跳过。 */
 async function syncDirectory(directory: string): Promise<void> {
   if (process.platform === "win32") return;
   const handle = await fs.open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
@@ -592,6 +623,10 @@ export function sameFileSnapshot(left: FileSnapshot, right: FileSnapshot): boole
     && left.changedAt === right.changedAt;
 }
 
+/**
+ * 比 `sameFileSnapshot` 宽松一档：不比较硬链接数。
+ * 提交过程中会临时给文件加/去硬链接（备份、隔离），此时 nlink 必然变化，但内容版本没变。
+ */
 function sameStableFileVersion(left: FileSnapshot, right: FileSnapshot): boolean {
   return left.device === right.device
     && left.inode === right.inode
@@ -600,6 +635,7 @@ function sameStableFileVersion(left: FileSnapshot, right: FileSnapshot): boolean
     && left.modifiedAt === right.modifiedAt;
 }
 
+/** 平台不提供 O_NOFOLLOW 时退化为 0（不加该标志），此时依赖 lstat 校验兜底。 */
 function noFollowFlag(): number {
   return typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
 }

@@ -1,3 +1,10 @@
+/**
+ * 独立验收器。
+ *
+ * 只认可观测的事实：文件是否存在、工作区指纹有没有变、命令能不能自己跑通、HTTP/TCP 探针
+ * 是否可达、受管进程是否真在运行。模型的说法和 Agent 自己执行命令的结果都不算证据——命令
+ * 类条件会在这里重新独立执行一遍。
+ */
 import { promises as fs } from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -39,11 +46,7 @@ export interface AcceptanceVerifierOptions {
   defaultCommandTimeoutMs?: number;
 }
 
-/**
- * Verifies observable acceptance predicates. Model prose and Agent command
- * results are deliberately not evidence: command criteria run independently
- * here, while service criteria probe live runtime state.
- */
+/** 校验可观测的验收条件；命令独立执行，服务类条件探测实时运行状态。 */
 export class AcceptanceVerifier {
   private readonly defaultProbeTimeoutMs: number;
   private readonly defaultCommandTimeoutMs: number;
@@ -61,6 +64,8 @@ export class AcceptanceVerifier {
 
   async verify(task: TaskContract, attempt: AgentAttemptExecution): Promise<AcceptanceVerificationResult> {
     const evidence: AcceptanceEvidence[] = [];
+    // Agent 没有正常收尾就没必要跑后面的检查：此时工作区可能停在中间状态，
+    // 即使个别条件碰巧通过也不能算验收成功。
     if (attempt.outcomeStatus !== "completed" || attempt.stopReason !== "model_stop") {
       evidence.push(this.evidence(
         "agent_outcome",
@@ -79,6 +84,8 @@ export class AcceptanceVerifier {
     }
 
     for (const criterion of task.acceptanceCriteria) evidence.push(await this.verifyCriterion(criterion));
+    // 声明了要做确定性验收却没编译出任何可执行条件，说明契约有问题，直接判失败，
+    // 否则「零条件全通过」会变成一条免检通道。
     if (task.verificationMode === "deterministic" && task.acceptanceCriteria.length === 0) {
       evidence.push(this.evidence(
         "deterministic_verification",
@@ -103,6 +110,7 @@ export class AcceptanceVerifier {
     };
   }
 
+  /** 单条条件的分发；任何异常都转成「该条不通过」的证据，不让一条检查炸掉整轮验收。 */
   private async verifyCriterion(criterion: AcceptanceCriterion): Promise<AcceptanceEvidence> {
     try {
       if (criterion.kind === "file_exists") return await this.verifyFile(criterion);
@@ -127,6 +135,7 @@ export class AcceptanceVerifier {
       this.options.ignore ?? []
     );
     const stat = await fs.stat(absolutePath);
+    // 目录也算「存在」：产物可能是一个目录（如构建输出），但设备/管道之类不算。
     const passed = stat.isFile() || stat.isDirectory();
     return this.evidence(
       criterion.id,
@@ -138,6 +147,7 @@ export class AcceptanceVerifier {
     );
   }
 
+  /** 拿当前指纹和任务开始时的基线比：只要不一样就说明工作区确实被改过。 */
   private async verifyWorkspaceChanged(
     criterion: Extract<AcceptanceCriterion, { kind: "workspace_changed" }>
   ): Promise<AcceptanceEvidence> {
@@ -153,6 +163,10 @@ export class AcceptanceVerifier {
     );
   }
 
+  /**
+   * 由验收器自己重新执行命令，不复用 Agent 跑过的结果（证据里也标了
+   * `execution: independent_verifier`），这样「测试通过」是这里跑出来的结论。
+   */
   private async verifyCommand(
     criterion: Extract<AcceptanceCriterion, { kind: "command_succeeded" }>
   ): Promise<AcceptanceEvidence> {
@@ -187,9 +201,11 @@ export class AcceptanceVerifier {
     const timeoutMs = criterion.timeoutMs ?? this.defaultProbeTimeoutMs;
     const response = await fetch(criterion.url, {
       method: "GET",
+      // 不跟随重定向：期望的是这个地址本身的状态码，跟随之后就分不清了。
       redirect: "manual",
       signal: AbortSignal.timeout(timeoutMs)
     });
+    // 只关心状态码，主动取消响应体，避免占着连接不放。
     await response.body?.cancel();
     const expectedStatus = criterion.expectedStatus ?? 200;
     const passed = response.status === expectedStatus;
@@ -214,6 +230,12 @@ export class AcceptanceVerifier {
     );
   }
 
+  /**
+   * 受管进程验收：先按条件筛出候选进程，优先取「运行中且探针通过」的那个，都不满足时
+   * 退回最后一个候选——这样证据里能说明它当前到底是什么状态，而不是笼统的「没找到」。
+   *
+   * 即使进程自报 ready，只要有 URL 仍会现场再发一次 HTTP 请求：进程活着不等于服务可用。
+   */
   private async verifyManagedProcess(
     criterion: Extract<AcceptanceCriterion, { kind: "managed_process" }>
   ): Promise<AcceptanceEvidence> {
@@ -237,6 +259,7 @@ export class AcceptanceVerifier {
     if (!process) {
       return this.evidence(criterion.id, false, `${criterion.description ?? criterion.processId ?? criterion.url ?? criterion.id}: managed process was not found.`);
     }
+    // readiness 的形状不固定：可能是 { passed } / { ready } / 布尔值，逐种尝试。
     const readiness = readBoolean(process.readiness, "passed")
       ?? readBoolean(process.readiness, "ready")
       ?? (typeof process.readiness === "boolean" ? process.readiness : undefined);
@@ -286,6 +309,7 @@ export class AcceptanceVerifier {
   }
 }
 
+/** 只探测「端口能不能连上」，连上即断；超时和错误都要清掉定时器与监听器再销毁 socket。 */
 async function connectTcp(host: string, port: number, timeoutMs: number): Promise<void> {
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) throw new Error("TCP port must be between 1 and 65535.");
   await new Promise<void>((resolve, reject) => {

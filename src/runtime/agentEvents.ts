@@ -6,7 +6,7 @@ import type { SessionUsage } from "../session/metadata.js";
 import type { ToolInputDisplay, ToolUpdate } from "../tools/types.js";
 
 export type AgentRunStatus = "queued" | "thinking" | "running" | "waiting_permission" | "completed" | "incomplete" | "aborted" | "failed";
-export type RuntimeOperation = "resume" | "compact" | "switch_model" | "refresh_model" | "subagent" | "plan";
+export type RuntimeOperation = "resume" | "compact" | "switch_model" | "refresh_model" | "subagent" | "plan" | "mcp";
 
 export interface AgentEventBase {
   sessionId: string;

@@ -1,11 +1,32 @@
-import { useDeferredValue, useEffect, useRef, useState } from "react";
+/**
+ * 各类浮层：快速搜索、设置（通用/模型/权限/外观/联网搜索/项目/关于）、重命名、slash 结果、Toast。
+ *
+ * 都通过 portal 挂到 body 上，并配合 `useClosingPresence` 播放关闭动画后再卸载。
+ * 设置里的每个分页是本文件内的独立组件，状态各自持有；真正的保存动作一律通过 props 回调上抛，
+ * 这里不直接调 IPC。
+ *
+ * 文件偏大，是因为设置面板的各分页彼此共用样式与交互约定，拆开反而要重复大量约定。
+ */
+import { useCallback, useDeferredValue, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { inferReasoningEfforts } from "../../../../ai/capabilities.js";
 import type { ModelChoice, ThinkingSelection } from "../../../../llm/ModelManager.js";
-import type { PermissionMode } from "../../../../permission/PermissionManager.js";
-import type { DesktopModelConfigurationInput, DesktopModelConnectionTestResult, DesktopModelLoginProvider, DesktopModelLoginStartResult, DesktopProject, DesktopSessionSummary, DesktopThemePreference, DesktopWorkspaceSnapshot } from "../../../protocol.js";
+import type { DesktopFontPreference, DesktopMemoryCompactionResult, DesktopMemoryOverview, DesktopMemorySearchMatch, DesktopMemorySettings, DesktopModelCatalogResult, DesktopModelConfigurationInput, DesktopModelConnection, DesktopModelConnectionTestResult, DesktopModelLoginProvider, DesktopModelLoginStartResult, DesktopProject, DesktopSessionSummary, DesktopSlashResult, DesktopThemePreference, DesktopWebSearchProvider, DesktopWebSearchSettings, DesktopWebSearchSettingsInput, DesktopWorkspaceSnapshot } from "../../../protocol.js";
+import { clampFontSize, MAX_FONT_SIZE, MIN_FONT_SIZE, SYSTEM_FONT_FAMILY } from "../../../fontPreference.js";
+import {
+  catalogForConnection,
+  customCatalogEntry,
+  modelAliasFor,
+  providerAliasFor,
+  providerCatalog,
+  providerCatalogOrder,
+  type CatalogModel,
+  type ProviderCatalogItem,
+  type ProviderCategory
+} from "../providerCatalog.js";
 import { useClosingPresence } from "../useClosingPresence.js";
 import { AppIcon } from "./AppIcon.js";
-import { Icon } from "./Icon.js";
+import { Icon, type IconName } from "./Icon.js";
 import { ProviderBrandGlyph } from "./ProviderBrandGlyph.js";
 
 interface SearchOverlayProps {
@@ -17,14 +38,17 @@ interface SearchOverlayProps {
   onSession(sessionId: string): void;
 }
 
+/** 快速搜索浮层（Cmd+K）：在项目名/路径和会话标题/首条消息里做子串匹配。 */
 export function SearchOverlay({ open, projects, sessions, onClose, onProject, onSession }: SearchOverlayProps): React.JSX.Element | null {
   const presence = useClosingPresence(open);
   const [query, setQuery] = useState("");
+  // 过滤用 deferred 值：输入很快时先保证输入框不掉帧，结果列表可以晚一帧。
   const deferredQuery = useDeferredValue(query.trim().toLocaleLowerCase());
   const inputRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (open) {
       setQuery("");
+      // 等一帧再聚焦：此刻节点刚挂载，直接 focus 可能落空。
       window.requestAnimationFrame(() => inputRef.current?.focus());
     }
   }, [open]);
@@ -54,28 +78,34 @@ interface SettingsOverlayProps {
   modelSetupRequired: boolean;
   themePreference: DesktopThemePreference;
   onThemePreference(theme: DesktopThemePreference): void;
+  fontPreference: DesktopFontPreference;
+  onFontPreference(font: DesktopFontPreference): void;
   onClose(): void;
   onSkipModelSetup(): void;
-  onPermissionMode(mode: PermissionMode): Promise<void>;
   onSwitchModel(alias: string, thinking: ThinkingSelection): Promise<void>;
   onSaveModelConfiguration(configuration: DesktopModelConfigurationInput): Promise<void>;
   onTestModelConfiguration(configuration: DesktopModelConfigurationInput): Promise<DesktopModelConnectionTestResult>;
   onRemoveModelConfiguration(alias: string): Promise<void>;
-  onRevealProject(): Promise<void>;
-  onOpenTerminal(): Promise<void>;
-  onRemoveProject(): Promise<void>;
-  onCompact(): Promise<void>;
+  onFetchModelCatalog(providerAlias: string): Promise<DesktopModelCatalogResult>;
+  onLoadMemoryOverview(): Promise<DesktopMemoryOverview>;
+  onSaveMemorySettings(input: DesktopMemorySettings): Promise<DesktopMemoryOverview>;
+  onSearchMemory(query: string): Promise<DesktopMemorySearchMatch[]>;
+  onAddMemoryEntry(topic: string, note: string): Promise<DesktopMemoryOverview>;
+  onDeleteMemoryEntry(topic: string, index: number): Promise<DesktopMemoryOverview>;
+  onClearMemory(): Promise<DesktopMemoryOverview>;
+  onCompactMemory(): Promise<DesktopMemoryCompactionResult[]>;
   onOpenExternal(url: string): Promise<void>;
+  onLoadWebSearchSettings(): Promise<DesktopWebSearchSettings>;
+  onSaveWebSearchSettings(input: DesktopWebSearchSettingsInput): Promise<DesktopWebSearchSettings>;
   onStartModelLogin(provider: DesktopModelLoginProvider): Promise<DesktopModelLoginStartResult>;
   onCompleteModelLogin(provider: DesktopModelLoginProvider, authRequestId: string, pastedAuthorization?: string): Promise<void>;
   onCancelModelLogin(provider: DesktopModelLoginProvider, authRequestId: string): Promise<void>;
 }
 
-type SettingsTab = "通用" | "外观" | "模型" | "使用统计" | "记忆" | "每日回顾" | "语音" | "开放网关" | "远程接入" | "联网搜索" | "数据" | "权限与能力" | "健康" | "关于";
+type SettingsTab = "外观" | "模型" | "使用统计" | "记忆" | "每日回顾" | "语音" | "开放网关" | "远程接入" | "联网搜索" | "健康" | "关于";
 
 const settingsNav: Array<{ badge?: string; group?: string; tab: SettingsTab; icon: React.ComponentProps<typeof Icon>["name"]; label: string }> = [
-  { group: "通用", tab: "通用", icon: "settings", label: "通用" },
-  { tab: "外观", icon: "spark", label: "外观" },
+  { group: "通用", tab: "外观", icon: "spark", label: "外观" },
   { group: "AI 与集成", tab: "模型", icon: "cpu", label: "模型" },
   { tab: "使用统计", icon: "chart", label: "使用统计" },
   { tab: "记忆", icon: "brain", label: "记忆" },
@@ -84,25 +114,20 @@ const settingsNav: Array<{ badge?: string; group?: string; tab: SettingsTab; ico
   { tab: "开放网关", icon: "network", label: "开放网关" },
   { tab: "远程接入", icon: "remote", label: "远程接入" },
   { badge: "Beta", tab: "联网搜索", icon: "search", label: "联网搜索" },
-  { group: "系统", tab: "数据", icon: "database", label: "数据" },
-  { tab: "权限与能力", icon: "shield", label: "权限与能力" },
-  { tab: "健康", icon: "activity", label: "健康" },
+  { group: "系统", tab: "健康", icon: "activity", label: "健康" },
   { tab: "关于", icon: "help", label: "关于" }
 ];
 
 const settingsSubtitles: Record<SettingsTab, string> = {
-  通用: "启动与工作区基础行为。",
   模型: "模型连接、API key 与默认模型管理。",
-  外观: "主题与动效偏好。",
+  外观: "主题偏好。",
   使用统计: "查看模型与工具的资源消耗。",
-  记忆: "会话上下文与长期记忆管理。",
+  记忆: "记忆检索、自动总结、整理与条目管理。",
   每日回顾: "管理每日自动回顾的内容与节奏。",
   语音: "语音输入与输出能力设置。",
   开放网关: "管理可供外部工具接入的服务。",
   远程接入: "配置远程设备与工作区访问。",
   联网搜索: "配置联网搜索与数据来源。",
-  数据: "项目、会话与本地数据管理。",
-  权限与能力: "控制 Agent 可自动执行的操作范围。",
   健康: "查看桌面端运行状态与诊断信息。",
   关于: "版本与产品信息。"
 };
@@ -114,18 +139,25 @@ export function SettingsOverlay({
   modelSetupRequired,
   themePreference,
   onThemePreference,
+  fontPreference,
+  onFontPreference,
   onClose,
   onSkipModelSetup,
-  onPermissionMode,
   onSwitchModel,
   onSaveModelConfiguration,
   onTestModelConfiguration,
   onRemoveModelConfiguration,
-  onRevealProject,
-  onOpenTerminal,
-  onRemoveProject,
-  onCompact,
+  onFetchModelCatalog,
+  onLoadMemoryOverview,
+  onSaveMemorySettings,
+  onSearchMemory,
+  onAddMemoryEntry,
+  onDeleteMemoryEntry,
+  onClearMemory,
+  onCompactMemory,
   onOpenExternal,
+  onLoadWebSearchSettings,
+  onSaveWebSearchSettings,
   onStartModelLogin,
   onCompleteModelLogin,
   onCancelModelLogin
@@ -189,10 +221,11 @@ export function SettingsOverlay({
               <p>{modelSetupRequired ? "开始使用前，请先连接一个可用模型。" : settingsSubtitles[tab]}</p>
             </div>
           </header>
-          {tab === "通用" ? <SettingsGeneral workspace={workspace} /> : null}
           {tab === "模型" ? <SettingsModels
             models={workspace?.models ?? []}
+            connections={workspace?.connections ?? []}
             runtime={runtime?.info}
+            onFetchCatalog={onFetchModelCatalog}
             onOpenExternal={onOpenExternal}
             onStartLogin={onStartModelLogin}
             onCompleteLogin={onCompleteModelLogin}
@@ -228,20 +261,21 @@ export function SettingsOverlay({
               }
             }}
           /> : null}
-          {tab === "权限与能力" ? <SettingsPermissions mode={runtime?.permissionMode ?? "ask"} onChange={(mode) => execute(async () => await onPermissionMode(mode), "权限模式已更新")} /> : null}
-          {tab === "外观" ? <SettingsAppearance theme={themePreference} onThemeChange={onThemePreference} /> : null}
-          {tab === "记忆" ? <SettingsAgent disabled={Boolean(runtime?.activeRun)} onCompact={() => execute(onCompact, "会话已压缩")} /> : null}
-          {tab === "数据" ? (
-            <SettingsProject
-              project={workspace?.project}
-              sessionCount={workspace?.sessions.length ?? 0}
-              onOpenTerminal={() => execute(onOpenTerminal, "已在终端中打开")}
-              onRemove={() => execute(onRemoveProject, "项目已从侧边栏移除")}
-              onReveal={() => execute(onRevealProject, "已在 Finder 中显示")}
-            />
-          ) : null}
+          {tab === "外观" ? <SettingsAppearance theme={themePreference} onThemeChange={onThemePreference} font={fontPreference} onFontChange={onFontPreference} /> : null}
+          {tab === "记忆" ? <SettingsMemory
+            models={workspace?.models ?? []}
+            onLoad={onLoadMemoryOverview}
+            onSaveSettings={onSaveMemorySettings}
+            onSearch={onSearchMemory}
+            onAdd={onAddMemoryEntry}
+            onDeleteEntry={onDeleteMemoryEntry}
+            onClear={onClearMemory}
+            onCompact={onCompactMemory}
+            onNotify={setMessage}
+          /> : null}
           {tab === "关于" ? <SettingsAbout version={version} /> : null}
-          {tab === "使用统计" || tab === "每日回顾" || tab === "语音" || tab === "开放网关" || tab === "远程接入" || tab === "联网搜索" || tab === "健康" ? <SettingsComingSoon tab={tab} /> : null}
+          {tab === "联网搜索" ? <SettingsWebSearch onLoad={onLoadWebSearchSettings} onNotify={setMessage} onOpenExternal={onOpenExternal} onSave={onSaveWebSearchSettings} /> : null}
+          {tab === "使用统计" || tab === "每日回顾" || tab === "语音" || tab === "开放网关" || tab === "远程接入" || tab === "健康" ? <SettingsComingSoon tab={tab} /> : null}
           {message ? <div className="settings-message">{message}</div> : null}
         </main>
       </section>
@@ -270,6 +304,55 @@ export function RenameOverlay({ open, initialValue, title = "重命名会话", o
   );
 }
 
+export function SlashResultOverlay({ result, onClose }: { result?: DesktopSlashResult; onClose(): void }): React.JSX.Element | null {
+  const presence = useClosingPresence(Boolean(result));
+  // 关闭动画期间 result 已被清空，保留上一次内容直到 presence 退场结束。
+  const [lastResult, setLastResult] = useState<DesktopSlashResult>();
+  useEffect(() => {
+    if (result) setLastResult(result);
+  }, [result]);
+  const shown = result ?? lastResult;
+  if (!presence.present || !shown) return null;
+  return (
+    <ModalBackdrop onClose={onClose}>
+      <section aria-label={shown.title} className={`t-modal slash-result-modal ${presenceClass(presence.phase)}`}>
+        <header>
+          <h2>{shown.title}</h2>
+          <span className="slash-result-command">{shown.command}</span>
+          <button aria-label="关闭" onClick={onClose} type="button"><Icon name="close" size={13} /></button>
+        </header>
+        <pre>{shown.content}</pre>
+      </section>
+    </ModalBackdrop>
+  );
+}
+
+/**
+ * 未完成功能提示弹窗。
+ *
+ * 界面上先摆出入口、但功能还没做完时统一走这里：明确说「还没做」，而不是给一个点了没反应的
+ * 按钮，也不用假数据把它装成能用。
+ */
+export function FeatureUnavailableOverlay({ feature, onClose }: { feature?: string; onClose(): void }): React.JSX.Element | null {
+  const presence = useClosingPresence(Boolean(feature));
+  const [lastFeature, setLastFeature] = useState<string>();
+  useEffect(() => {
+    if (feature) setLastFeature(feature);
+  }, [feature]);
+  const shown = feature ?? lastFeature;
+  if (!presence.present || !shown) return null;
+  return (
+    <ModalBackdrop onClose={onClose}>
+      <section aria-label={`${shown}功能开发中`} className={`t-modal feature-unavailable-modal ${presenceClass(presence.phase)}`}>
+        <Icon name="wand" size={22} />
+        <h2>{shown}还在开发中</h2>
+        <p>这个入口暂时不可用。Biny 不会用模拟数据把没完成的功能装成能用的样子，做好后会直接在这里生效。</p>
+        <div><button className="is-primary" onClick={onClose} type="button">知道了</button></div>
+      </section>
+    </ModalBackdrop>
+  );
+}
+
 export function Toast({ message, onClose }: { message?: string; onClose(): void }): React.JSX.Element | null {
   useEffect(() => {
     if (!message) return;
@@ -279,6 +362,10 @@ export function Toast({ message, onClose }: { message?: string; onClose(): void 
   return message ? <div className="toast" role="status"><span>{message}</span><button onClick={onClose} type="button"><Icon name="close" size={12} /></button></div> : null;
 }
 
+/**
+ * 浮层背板：统一处理 Esc 关闭和点击遮罩关闭。
+ * 判断 `event.target === event.currentTarget` 才关，避免点击浮层内部区域时误关。
+ */
 function ModalBackdrop({ children, onClose, variant }: { children: React.ReactNode; onClose(): void; variant?: "settings" }): React.JSX.Element {
   useEffect(() => {
     const escape = (event: KeyboardEvent): void => { if (event.key === "Escape") onClose(); };
@@ -289,221 +376,7 @@ function ModalBackdrop({ children, onClose, variant }: { children: React.ReactNo
   return <div className={className} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>{children}</div>;
 }
 
-function SettingsGeneral({ workspace }: { workspace?: DesktopWorkspaceSnapshot }): React.JSX.Element {
-  return (
-    <div className="settings-sections">
-      <section><h3>启动</h3><div className="setting-row"><span><strong>重新打开上次项目</strong><small>Biny 会恢复最近项目与会话</small></span><span className="setting-value">已启用</span></div></section>
-      <section><h3>当前工作区</h3><div className="setting-row"><span><strong>{workspace?.project.name ?? "没有打开项目"}</strong><small>{workspace?.project.path ?? "使用 Command+O 打开本地文件夹"}</small></span><span className="setting-value">本地</span></div></section>
-    </div>
-  );
-}
-
-type ProviderCategory = "推荐" | "账号" | "模型计划" | "API" | "聚合服务" | "本地";
-
-interface CatalogModel {
-  id: string;
-  displayName: string;
-  supportsThinking: boolean;
-  supportsVision?: boolean;
-  supportsAudio?: boolean;
-  contextWindow?: number;
-  maxOutputTokens?: number;
-}
-
-interface ProviderCatalogItem {
-  id: string;
-  value: DesktopModelConfigurationInput["providerType"];
-  label: string;
-  description: string;
-  badge: string;
-  categories: ProviderCategory[];
-  connectionMode: "api" | "login";
-  loginProvider?: DesktopModelLoginProvider;
-  baseUrl: string;
-  requiresApiKey: boolean;
-  models: CatalogModel[];
-  protocol?: DesktopModelConfigurationInput["protocol"];
-  iconTone: string;
-  apiKeyUrl?: string;
-}
-
-interface ApiProviderDefinition {
-  id: string;
-  value: DesktopModelConfigurationInput["providerType"];
-  label: string;
-  description: string;
-  badge: string;
-  categories: ProviderCategory[];
-  baseUrl: string;
-  requiresApiKey: boolean;
-  iconTone: string;
-  modelId: string;
-  modelDisplayName: string;
-  supportsThinking: boolean;
-  supportsVision?: boolean;
-  supportsAudio?: boolean;
-  protocol?: DesktopModelConfigurationInput["protocol"];
-  apiKeyUrl?: string;
-}
-
-function apiProvider(definition: ApiProviderDefinition): ProviderCatalogItem {
-  const { modelId, modelDisplayName, supportsThinking, supportsVision, supportsAudio, apiKeyUrl, ...provider } = definition;
-  return {
-    ...provider,
-    connectionMode: "api",
-    models: modelId ? [{ id: modelId, displayName: modelDisplayName, supportsThinking, supportsVision, supportsAudio }] : [],
-    apiKeyUrl: apiKeyUrl ?? providerApiKeyUrl(definition.id)
-  };
-}
-
-function providerApiKeyUrl(providerId: string): string | undefined {
-  const urls: Record<string, string | undefined> = {
-    deepseek: "https://platform.deepseek.com/api_keys",
-    moonshot: "https://platform.moonshot.cn/console/api-keys",
-    anthropic: "https://platform.claude.com/settings/keys",
-    openai: "https://platform.openai.com/api-keys",
-    google: "https://aistudio.google.com/app/apikey",
-    siliconflow: "https://cloud.siliconflow.cn/account/ak",
-    "MiniMax": "https://platform.minimaxi.com/user-center/basic-information/interface-key",
-    "MiniMax-cn": "https://platform.minimaxi.com/user-center/basic-information/interface-key",
-    mistral: "https://console.mistral.ai/api-keys",
-    togetherai: "https://api.together.ai/settings/api-keys",
-    "openrouter": "https://openrouter.ai/settings/keys",
-    huggingface: "https://huggingface.co/settings/tokens",
-    "deepinfra": "https://deepinfra.com/dash/api_keys",
-    cohere: "https://dashboard.cohere.com/api-keys",
-    "fireworks-ai": "https://fireworks.ai/account/api-keys",
-    nvidia: "https://build.nvidia.com/settings/api-keys",
-    groq: "https://console.groq.com/keys",
-    alibaba: "https://bailian.console.aliyun.com/?tab=model#/api-key",
-    qwen: "https://bailian.console.aliyun.com/?tab=model#/api-key",
-    "ollama-cloud": "https://ollama.com/settings/keys"
-  };
-  return urls[providerId];
-}
-
-const providerCatalog: ProviderCatalogItem[] = [
-  apiProvider({ id: "kimi-coding-plan", value: "kimi", label: "Kimi Coding Plan", description: "月之暗面 · Anthropic 兼容", badge: "Coding", categories: ["推荐", "模型计划"], baseUrl: "https://api.kimi.com/coding/v1", requiresApiKey: true, iconTone: "moonshot", modelId: "kimi-k2.5", modelDisplayName: "Kimi K2.5", supportsThinking: true, protocol: "anthropic" }),
-  apiProvider({ id: "minimax-coding-plan", value: "openai-compatible", label: "MiniMax Coding Plan", description: "MiniMax Coding 套餐 · Anthropic 兼容", badge: "Coding", categories: ["模型计划"], baseUrl: "https://api.minimax.io/anthropic", requiresApiKey: true, iconTone: "minimax", modelId: "MiniMax-M3", modelDisplayName: "MiniMax M3", supportsThinking: true, protocol: "anthropic" }),
-  apiProvider({ id: "deepseek", value: "deepseek", label: "DeepSeek", description: "DeepSeek 官方接入", badge: "API", categories: ["推荐", "API"], baseUrl: "https://api.deepseek.com", requiresApiKey: true, iconTone: "deepseek", modelId: "deepseek-v4-flash", modelDisplayName: "DeepSeek V4 Flash", supportsThinking: true }),
-  apiProvider({ id: "moonshot", value: "kimi", label: "Moonshot", description: "Moonshot 官方接入", badge: "API", categories: ["API"], baseUrl: "https://api.moonshot.cn/v1", requiresApiKey: true, iconTone: "moonshot", modelId: "kimi-k2.5", modelDisplayName: "Kimi K2.5", supportsThinking: true }),
-  apiProvider({ id: "zai-coding-plan", value: "openai-compatible", label: "Z.AI Coding Plan", description: "智谱 · OpenAI 兼容", badge: "Coding", categories: ["模型计划"], baseUrl: "https://api.z.ai/api/coding/paas/v4", requiresApiKey: true, iconTone: "zai", modelId: "glm-5", modelDisplayName: "GLM-5", supportsThinking: true }),
-  apiProvider({ id: "MiniMax", value: "openai-compatible", label: "MiniMax", description: "MiniMax · Anthropic 兼容", badge: "API", categories: ["API"], baseUrl: "https://api.minimax.io/anthropic/v1", requiresApiKey: true, iconTone: "minimax", modelId: "MiniMax-M3", modelDisplayName: "MiniMax M3", supportsThinking: true, protocol: "anthropic" }),
-  apiProvider({ id: "MiniMax-cn", value: "openai-compatible", label: "MiniMax 中国站", description: "MiniMax 中国站 · Anthropic 兼容", badge: "API", categories: ["API"], baseUrl: "https://api.minimaxi.com/anthropic/v1", requiresApiKey: true, iconTone: "minimax", modelId: "MiniMax-M3", modelDisplayName: "MiniMax M3", supportsThinking: true, protocol: "anthropic" }),
-  apiProvider({ id: "siliconflow", value: "openai-compatible", label: "SiliconFlow", description: "硅基流动多模型 API，支持精确模型 ID。", badge: "聚合", categories: ["推荐", "聚合服务"], baseUrl: "https://api.siliconflow.cn/v1", requiresApiKey: true, iconTone: "siliconflow", modelId: "deepseek-ai/DeepSeek-V3", modelDisplayName: "DeepSeek V3", supportsThinking: false }),
-  apiProvider({ id: "anthropic", value: "anthropic", label: "Anthropic", description: "Anthropic 官方接入", badge: "API", categories: ["推荐", "API"], baseUrl: "https://api.anthropic.com", requiresApiKey: true, iconTone: "anthropic", modelId: "claude-sonnet-4-5", modelDisplayName: "Claude Sonnet 4.5", supportsThinking: true, supportsVision: true }),
-  apiProvider({ id: "openai", value: "openai", label: "OpenAI", description: "OpenAI 官方接入", badge: "API", categories: ["推荐", "API"], baseUrl: "https://api.openai.com/v1", requiresApiKey: true, iconTone: "openai", modelId: "gpt-5.2", modelDisplayName: "GPT-5.2", supportsThinking: true, supportsVision: true }),
-  apiProvider({ id: "google", value: "gemini", label: "Google Gemini", description: "Google AI Studio 接入", badge: "API", categories: ["推荐", "API"], baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", requiresApiKey: true, iconTone: "gemini", modelId: "gemini-3.5-flash", modelDisplayName: "Gemini 3.5 Flash", supportsThinking: false, supportsVision: true }),
-  apiProvider({ id: "xai", value: "openai-compatible", label: "xAI", description: "xAI 官方接入，Grok 系列模型", badge: "API", categories: ["API"], baseUrl: "https://api.x.ai/v1", requiresApiKey: true, iconTone: "xai", modelId: "grok-4.5", modelDisplayName: "Grok 4.5", supportsThinking: true }),
-  apiProvider({ id: "zai", value: "openai-compatible", label: "Z.AI", description: "智谱官方接入，GLM 系列模型", badge: "API", categories: ["API"], baseUrl: "https://api.z.ai/api/paas/v4", requiresApiKey: true, iconTone: "zai", modelId: "glm-5.2", modelDisplayName: "GLM-5.2", supportsThinking: true }),
-  apiProvider({ id: "xiaomi", value: "openai-compatible", label: "Xiaomi", description: "小米官方接入，MiMo 系列模型", badge: "API", categories: ["API"], baseUrl: "https://api.xiaomimimo.com/v1", requiresApiKey: true, iconTone: "xiaomi", modelId: "mimo-v2.5", modelDisplayName: "MiMo-V2.5", supportsThinking: true }),
-  apiProvider({ id: "xiaomi-token-plan-cn", value: "openai-compatible", label: "Xiaomi Token Plan 中国", description: "小米 MiMo Token Plan 订阅 · 中国 · 编码工具", badge: "Token", categories: ["模型计划"], baseUrl: "https://api.xiaomimimo.com/v1", requiresApiKey: true, iconTone: "xiaomi", modelId: "mimo-v2.5-pro", modelDisplayName: "MiMo-V2.5-Pro", supportsThinking: true }),
-  apiProvider({ id: "xiaomi-token-plan-sgp", value: "openai-compatible", label: "Xiaomi Token Plan 新加坡", description: "小米 MiMo Token Plan 订阅 · 新加坡 · 编码工具", badge: "Token", categories: ["模型计划"], baseUrl: "https://api.xiaomimimo.com/v1", requiresApiKey: true, iconTone: "xiaomi", modelId: "mimo-v2.5-pro", modelDisplayName: "MiMo-V2.5-Pro", supportsThinking: true }),
-  apiProvider({ id: "xiaomi-token-plan-ams", value: "openai-compatible", label: "Xiaomi Token Plan 欧洲", description: "小米 MiMo Token Plan 订阅 · 欧洲 · 编码工具", badge: "Token", categories: ["模型计划"], baseUrl: "https://api.xiaomimimo.com/v1", requiresApiKey: true, iconTone: "xiaomi", modelId: "mimo-v2.5-pro", modelDisplayName: "MiMo-V2.5-Pro", supportsThinking: true }),
-  apiProvider({ id: "cerebras", value: "openai-compatible", label: "Cerebras", description: "高速推理托管开源模型", badge: "API", categories: ["API"], baseUrl: "https://api.cerebras.ai/v1", requiresApiKey: true, iconTone: "cerebras", modelId: "gpt-oss-120b", modelDisplayName: "GPT OSS 120B", supportsThinking: true }),
-  apiProvider({ id: "mistral", value: "openai-compatible", label: "Mistral", description: "Mistral 官方接入", badge: "API", categories: ["API"], baseUrl: "https://api.mistral.ai/v1", requiresApiKey: true, iconTone: "mistral", modelId: "mistral-large-latest", modelDisplayName: "Mistral Large", supportsThinking: true }),
-  apiProvider({ id: "togetherai", value: "openai-compatible", label: "Together AI", description: "托管开源模型 API", badge: "API", categories: ["API"], baseUrl: "https://api.together.ai/v1", requiresApiKey: true, iconTone: "together", modelId: "meta-llama/Llama-3.3-70B-Instruct", modelDisplayName: "Llama 3.3 70B", supportsThinking: false }),
-  apiProvider({ id: "ollama", value: "ollama", label: "Ollama", description: "本机运行 · 离线可用", badge: "Local", categories: ["推荐", "本地"], baseUrl: "http://127.0.0.1:11434/v1", requiresApiKey: false, iconTone: "ollama", modelId: "llama3.2", modelDisplayName: "Llama 3.2", supportsThinking: false }),
-  apiProvider({ id: "lm-studio", value: "openai-compatible", label: "LM Studio", description: "本机 LM Studio 服务 · 离线可用", badge: "Local", categories: ["本地"], baseUrl: "http://localhost:1234/v1", requiresApiKey: false, iconTone: "lm-studio", modelId: "", modelDisplayName: "", supportsThinking: false }),
-  apiProvider({ id: "localai", value: "openai-compatible", label: "LocalAI", description: "本机 LocalAI 服务，可选密钥保护", badge: "Local", categories: ["本地"], baseUrl: "http://localhost:8080/v1", requiresApiKey: false, iconTone: "localai", modelId: "qwen3-8b", modelDisplayName: "Qwen3 8B", supportsThinking: false }),
-  apiProvider({ id: "openai-compatible", value: "openai-compatible", label: "自定义 OpenAI 兼容接口", description: "中转站、代理服务或自部署网关。", badge: "Custom", categories: ["API", "聚合服务"], baseUrl: "", requiresApiKey: true, iconTone: "compatible", modelId: "", modelDisplayName: "", supportsThinking: false }),
-  apiProvider({ id: "fireworks-ai", value: "openai-compatible", label: "Fireworks AI", description: "Serverless 开源模型托管", badge: "API", categories: ["API"], baseUrl: "https://api.fireworks.ai/inference/v1", requiresApiKey: true, iconTone: "fireworks", modelId: "accounts/fireworks/models/kimi-k2p6", modelDisplayName: "Kimi K2.6", supportsThinking: true }),
-  apiProvider({ id: "nvidia", value: "openai-compatible", label: "NVIDIA", description: "NVIDIA 官方托管模型接入", badge: "API", categories: ["API"], baseUrl: "https://integrate.api.nvidia.com/v1", requiresApiKey: true, iconTone: "nvidia", modelId: "nvidia/nemotron-3-super-120b-a12b", modelDisplayName: "NVIDIA Nemotron", supportsThinking: true }),
-  apiProvider({ id: "tencent-tokenhub", value: "openai-compatible", label: "Tencent TokenHub", description: "腾讯云 TokenHub 按量接入，混元等模型", badge: "API", categories: ["API"], baseUrl: "https://tokenhub.tencentmaas.com/v1", requiresApiKey: true, iconTone: "tencent", modelId: "hy3", modelDisplayName: "混元 HY 3", supportsThinking: true }),
-  apiProvider({ id: "stepfun", value: "openai-compatible", label: "StepFun 中国站", description: "阶跃星辰官方接入 · 中国站", badge: "API", categories: ["API"], baseUrl: "https://api.stepfun.com/v1", requiresApiKey: true, iconTone: "stepfun", modelId: "step-3.7-flash", modelDisplayName: "Step 3.7 Flash", supportsThinking: true }),
-  apiProvider({ id: "tencent-coding-plan", value: "openai-compatible", label: "Tencent Coding Plan", description: "腾讯云 Coding 套餐 · OpenAI 兼容", badge: "Coding", categories: ["模型计划"], baseUrl: "https://api.hunyuan.cloud.tencent.com/v1", requiresApiKey: true, iconTone: "tencent", modelId: "tc-code-latest", modelDisplayName: "TC Code", supportsThinking: true }),
-  apiProvider({ id: "stepfun-ai", value: "openai-compatible", label: "StepFun 国际站", description: "阶跃星辰官方接入 · 国际站", badge: "API", categories: ["API"], baseUrl: "https://api.stepfun.ai/v1", requiresApiKey: true, iconTone: "stepfun", modelId: "step-3.7-flash", modelDisplayName: "Step 3.7 Flash", supportsThinking: true }),
-  apiProvider({ id: "volcengine-ark", value: "openai-compatible", label: "火山方舟", description: "火山引擎官方接入，豆包等模型", badge: "API", categories: ["API"], baseUrl: "https://ark.cn-beijing.volces.com/api/v3", requiresApiKey: true, iconTone: "volcengine", modelId: "doubao-seed-2-0-pro-260215", modelDisplayName: "Doubao Seed 2.0 Pro", supportsThinking: true }),
-  apiProvider({ id: "volcengine-coding-plan", value: "openai-compatible", label: "火山方舟 Coding Plan", description: "火山引擎 Coding 订阅 · OpenAI 兼容", badge: "Coding", categories: ["模型计划"], baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3", requiresApiKey: true, iconTone: "volcengine", modelId: "ark-code-latest", modelDisplayName: "Ark Code", supportsThinking: true }),
-  apiProvider({ id: "tencent-token-plan", value: "openai-compatible", label: "Tencent Token Plan", description: "腾讯云 Token 套餐，个人智能体与编码工具", badge: "Token", categories: ["模型计划"], baseUrl: "https://api.hunyuan.cloud.tencent.com/v1", requiresApiKey: true, iconTone: "tencent", modelId: "tc-code-latest", modelDisplayName: "TC Code", supportsThinking: true }),
-  apiProvider({ id: "stepfun-step-plan", value: "openai-compatible", label: "StepFun Step Plan 中国站", description: "阶跃星辰订阅套餐 · 中国站", badge: "Plan", categories: ["模型计划"], baseUrl: "https://api.stepfun.com/step_plan/v1", requiresApiKey: true, iconTone: "stepfun", modelId: "step-3.7-flash", modelDisplayName: "Step 3.7 Flash", supportsThinking: true }),
-  apiProvider({ id: "deepinfra", value: "openai-compatible", label: "DeepInfra", description: "开源模型托管推理 · OpenAI 兼容", badge: "API", categories: ["API"], baseUrl: "https://api.deepinfra.com/v1/openai", requiresApiKey: true, iconTone: "deepinfra", modelId: "meta-llama/Llama-3.3-70B-Instruct", modelDisplayName: "Llama 3.3 70B", supportsThinking: false }),
-  apiProvider({ id: "cohere", value: "openai-compatible", label: "Cohere", description: "Cohere 官方接入", badge: "API", categories: ["API"], baseUrl: "https://api.cohere.com/v2", requiresApiKey: true, iconTone: "cohere", modelId: "command-a-plus-05-2026", modelDisplayName: "Command A", supportsThinking: true }),
-  apiProvider({ id: "vercel", value: "openai-compatible", label: "Vercel AI Gateway", description: "一个密钥接入多家托管模型", badge: "网关", categories: ["聚合服务"], baseUrl: "https://ai-gateway.vercel.sh/v1", requiresApiKey: true, iconTone: "vercel", modelId: "openai/gpt-5.4", modelDisplayName: "OpenAI GPT-5.4", supportsThinking: true }),
-  apiProvider({ id: "stepfun-ai-step-plan", value: "openai-compatible", label: "StepFun Step Plan 国际站", description: "阶跃星辰订阅套餐 · 国际站", badge: "Plan", categories: ["模型计划"], baseUrl: "https://api.stepfun.ai/step_plan/v1", requiresApiKey: true, iconTone: "stepfun", modelId: "step-3.7-flash", modelDisplayName: "Step 3.7 Flash", supportsThinking: true }),
-  apiProvider({ id: "cloudflare-workers-ai", value: "openai-compatible", label: "Cloudflare Workers AI", description: "Cloudflare 托管模型，账户级接入", badge: "API", categories: ["API"], baseUrl: "", requiresApiKey: true, iconTone: "cloudflare", modelId: "@cf/meta/llama-3.1-8b-instruct", modelDisplayName: "Llama 3.1 8B", supportsThinking: false }),
-  apiProvider({ id: "huggingface", value: "openai-compatible", label: "Hugging Face", description: "Inference Providers 路由，聚合多家托管模型", badge: "路由", categories: ["聚合服务"], baseUrl: "https://router.huggingface.co/v1", requiresApiKey: true, iconTone: "huggingface", modelId: "openai/gpt-oss-120b", modelDisplayName: "GPT OSS 120B", supportsThinking: true }),
-  apiProvider({ id: "ollama-cloud", value: "openai-compatible", label: "Ollama Cloud", description: "Ollama 官方云端托管模型", badge: "API", categories: ["API"], baseUrl: "https://ollama.com/v1", requiresApiKey: true, iconTone: "ollama", modelId: "qwen3.5:397b", modelDisplayName: "Qwen 3.5 397B", supportsThinking: true }),
-  apiProvider({ id: "zenmux", value: "openai-compatible", label: "ZenMux", description: "模型路由网关，一个密钥接入多家模型", badge: "网关", categories: ["聚合服务"], baseUrl: "https://zenmux.ai/api/v1", requiresApiKey: true, iconTone: "zenmux", modelId: "moonshotai/kimi-k2.5", modelDisplayName: "Kimi K2.5", supportsThinking: true }),
-  apiProvider({ id: "opencode", value: "openai-compatible", label: "OpenCode Zen", description: "面向编码智能体的按量模型精选", badge: "Plan", categories: ["模型计划"], baseUrl: "https://opencode.ai/zen/v1", requiresApiKey: true, iconTone: "opencode", modelId: "claude-sonnet-4.6", modelDisplayName: "Claude Sonnet 4.6", supportsThinking: true }),
-  apiProvider({ id: "opencode-go", value: "openai-compatible", label: "OpenCode Go", description: "低价订阅制的开源编码模型精选", badge: "Plan", categories: ["模型计划"], baseUrl: "https://opencode.ai/zen/go/v1", requiresApiKey: true, iconTone: "opencode", modelId: "qwen3-coder-plus", modelDisplayName: "Qwen3 Coder Plus", supportsThinking: true }),
-  apiProvider({ id: "groq", value: "openai-compatible", label: "Groq", description: "LPU 高速推理托管开源模型", badge: "API", categories: ["API"], baseUrl: "https://api.groq.com/openai/v1", requiresApiKey: true, iconTone: "groq", modelId: "llama-3.3-70b-versatile", modelDisplayName: "Llama 3.3 70B", supportsThinking: false }),
-  apiProvider({ id: "openrouter", value: "openai-compatible", label: "OpenRouter", description: "一个密钥接入各大模型厂商 · OpenAI 兼容", badge: "聚合", categories: ["聚合服务"], baseUrl: "https://openrouter.ai/api/v1", requiresApiKey: true, iconTone: "openrouter", modelId: "openai/gpt-4o", modelDisplayName: "OpenAI GPT-4o", supportsThinking: true }),
-  apiProvider({ id: "alibaba", value: "openai-compatible", label: "Alibaba", description: "阿里云百炼接入，通义千问 Qwen 模型", badge: "API", categories: ["API"], baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", requiresApiKey: true, iconTone: "alibaba", modelId: "qwen-max", modelDisplayName: "Qwen Max", supportsThinking: true }),
-  apiProvider({ id: "alibaba-coding-plan-cn", value: "openai-compatible", label: "Alibaba Coding Plan 中国站", description: "阿里云百炼 Coding Plan 订阅 · 中国站", badge: "Plan", categories: ["模型计划"], baseUrl: "https://coding.dashscope.aliyuncs.com/v1", requiresApiKey: true, iconTone: "alibaba", modelId: "qwen3-coder-plus", modelDisplayName: "Qwen3 Coder Plus", supportsThinking: true }),
-  apiProvider({ id: "alibaba-coding-plan", value: "openai-compatible", label: "Alibaba Coding Plan 国际站", description: "阿里云百炼 Coding Plan 订阅 · 国际站", badge: "Plan", categories: ["模型计划"], baseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1", requiresApiKey: true, iconTone: "alibaba", modelId: "qwen3-coder-plus", modelDisplayName: "Qwen3 Coder Plus", supportsThinking: true }),
-  apiProvider({ id: "alibaba-token-plan-cn", value: "openai-compatible", label: "Alibaba Token Plan（团队版）", description: "阿里云百炼 Token Plan 订阅，交互式智能体与编码工具 · 北京", badge: "Token", categories: ["模型计划"], baseUrl: "https://coding.dashscope.aliyuncs.com/v1", requiresApiKey: true, iconTone: "alibaba", modelId: "qwen3-coder-plus", modelDisplayName: "Qwen3 Coder Plus", supportsThinking: true }),
-  apiProvider({ id: "alibaba-token-plan", value: "openai-compatible", label: "Alibaba Token Plan（团队版）", description: "阿里云百炼 Token Plan 订阅，交互式智能体与编码工具 · 新加坡", badge: "Token", categories: ["模型计划"], baseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1", requiresApiKey: true, iconTone: "alibaba", modelId: "qwen3-coder-plus", modelDisplayName: "Qwen3 Coder Plus", supportsThinking: true }),
-  apiProvider({ id: "qwen", value: "qwen", label: "Qwen", description: "通义千问官方接入", badge: "API", categories: [], baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", requiresApiKey: true, iconTone: "qwen", modelId: "qwen3.5-plus", modelDisplayName: "Qwen 3.5 Plus", supportsThinking: true }),
-  {
-    id: "claude-code",
-    value: "claude-subscription",
-    label: "Claude Code",
-    description: "Claude Pro / Max 订阅账号登录。",
-    badge: "可用",
-    categories: ["推荐", "账号"],
-    connectionMode: "login",
-    loginProvider: "claude-code",
-    baseUrl: "https://api.anthropic.com",
-    requiresApiKey: false,
-    iconTone: "anthropic",
-    models: []
-  },
-  {
-    id: "openai-codex",
-    value: "openai-codex",
-    label: "OpenAI Codex",
-    description: "ChatGPT Plus / Pro 订阅账号登录。",
-    badge: "可用",
-    categories: ["推荐", "账号"],
-    connectionMode: "login",
-    loginProvider: "openai-codex",
-    baseUrl: "https://chatgpt.com/backend-api/codex",
-    requiresApiKey: false,
-    iconTone: "openai",
-    models: []
-  },
-];
-
-const providerCatalogOrder: Record<ProviderCategory, string[]> = {
-  推荐: ["claude-code", "openai-codex", "siliconflow", "anthropic", "openai", "google", "kimi-coding-plan", "deepseek", "ollama"],
-  账号: ["claude-code", "openai-codex"],
-  模型计划: ["kimi-coding-plan", "minimax-coding-plan", "zai-coding-plan", "xiaomi-token-plan-cn", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "tencent-coding-plan", "volcengine-coding-plan", "tencent-token-plan", "stepfun-step-plan", "opencode", "opencode-go", "stepfun-ai-step-plan", "alibaba-coding-plan-cn", "alibaba-coding-plan", "alibaba-token-plan-cn", "alibaba-token-plan"],
-  API: ["deepseek", "moonshot", "MiniMax", "MiniMax-cn", "anthropic", "openai", "google", "xai", "zai", "xiaomi", "cerebras", "mistral", "togetherai", "openai-compatible", "fireworks-ai", "nvidia", "tencent-tokenhub", "stepfun", "stepfun-ai", "volcengine-ark", "deepinfra", "cohere", "cloudflare-workers-ai", "ollama-cloud", "groq", "alibaba"],
-  聚合服务: ["siliconflow", "vercel", "openai-compatible", "huggingface", "zenmux", "openrouter"],
-  本地: ["ollama", "lm-studio", "localai"]
-};
-
-type ProviderOption = ProviderCatalogItem;
-
-function providerAliasFor(option: ProviderOption, baseUrl: string): string {
-  if (option.value !== "openai-compatible") return option.value;
-  try {
-    const hostname = new URL(baseUrl).hostname.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "");
-    return hostname || "custom";
-  } catch {
-    return "custom";
-  }
-}
-
-function modelAliasFor(providerAlias: string, model: string): string {
-  const normalizedProvider = providerAlias.toLowerCase();
-  const normalizedModel = model.toLowerCase();
-  const alias = normalizedModel === normalizedProvider || normalizedModel.startsWith(`${normalizedProvider}-`)
-    ? model
-    : `${providerAlias}-${model}`;
-  return alias.replace(/[^a-z0-9.-]+/gi, "-");
-}
-
-function catalogForType(type: string): ProviderCatalogItem | undefined {
-  return providerCatalog.find((item) => item.value === type);
-}
-
-function catalogForConnection(connection: { provider: string; providerType: string }): ProviderCatalogItem | undefined {
-  return providerCatalog.find((item) => item.value === connection.providerType && providerAliasFor(item, item.baseUrl) === connection.provider)
-    ?? catalogForType(connection.providerType);
-}
-
+/** 把模型列表按 provider 归组，设置页里按「连接」为单位展示而不是罗列所有模型。 */
 function connectionLabel(models: ModelChoice[]): Array<{ provider: string; providerType: string; models: ModelChoice[]; defaultModel?: ModelChoice }> {
   const groups = new Map<string, { provider: string; providerType: string; models: ModelChoice[]; defaultModel?: ModelChoice }>();
   for (const model of models) {
@@ -520,22 +393,117 @@ function connectionLabel(models: ModelChoice[]): Array<{ provider: string; provi
   return [...groups.values()];
 }
 
-function mergeAvailableModels(catalogModels: CatalogModel[], configuredModels: ModelChoice[]): CatalogModel[] {
-  const configuredIds = new Set(configuredModels.map((model) => model.model));
-  return [
-    ...configuredModels.map((model) => ({
+/**
+ * Candidate list for the "启用模型" editor: models already configured first (so
+ * the user can always toggle one off), then whatever the provider's live
+ * catalog returned, then the built-in static entries as a floor. Live entries
+ * win over static ones on display name / capability metadata.
+ */
+function mergeAvailableModels(
+  catalogModels: CatalogModel[],
+  configuredModels: ModelChoice[],
+  liveModels: CatalogModel[] = []
+): CatalogModel[] {
+  const merged: CatalogModel[] = [];
+  const seen = new Set<string>();
+  const liveById = new Map(liveModels.map((model) => [model.id, model] as const));
+  for (const model of configuredModels) {
+    if (seen.has(model.model)) continue;
+    seen.add(model.model);
+    const live = liveById.get(model.model);
+    merged.push({
       id: model.model,
-      displayName: model.displayName,
-      supportsThinking: model.efforts.length > 0,
-      supportsVision: model.capabilities?.vision,
-      supportsAudio: model.capabilities?.audio,
-    })),
-    ...catalogModels.filter((model) => !configuredIds.has(model.id))
-  ];
+      displayName: live?.displayName ?? model.displayName,
+      supportsThinking: model.efforts.length > 0 || Boolean(live?.supportsThinking),
+      supportsVision: model.capabilities?.vision ?? live?.supportsVision,
+      supportsAudio: model.capabilities?.audio ?? live?.supportsAudio,
+      contextWindow: model.contextWindow ?? live?.contextWindow,
+      maxOutputTokens: live?.maxOutputTokens
+    });
+  }
+  for (const model of [...liveModels, ...catalogModels]) {
+    if (seen.has(model.id)) continue;
+    seen.add(model.id);
+    merged.push(model);
+  }
+  return merged;
 }
 
-function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, onNotify, onOpenExternal, onStartLogin, onCompleteLogin, onCancelLogin }: {
+/** Maps one live `ModelCatalogEntry` from the provider onto the picker's shape. */
+function catalogModelFromEntry(entry: DesktopModelCatalogResult["models"][number]): CatalogModel {
+  return {
+    id: entry.id,
+    displayName: entry.displayName,
+    supportsThinking: entry.reasoningEfforts.length > 0 || entry.capabilities.reasoning === true,
+    supportsVision: entry.capabilities.vision,
+    supportsAudio: entry.capabilities.audio,
+    contextWindow: entry.contextWindow,
+    maxOutputTokens: entry.maxOutputTokens
+  };
+}
+
+interface LiveCatalogState {
+  models: CatalogModel[];
+  fetchedAt: string;
+  source: DesktopModelCatalogResult["source"];
+}
+
+/** Short status line for one connection, or null when nothing needs attention. */
+function connectionStatus(connection: DesktopModelConnection | undefined): { label: string; tone: "warn" | "error" } | null {
+  if (!connection) return null;
+  if (connection.authMode === "oauth-bearer") {
+    if (!connection.hasCredential) return { label: "需要登录", tone: "error" };
+    if (connection.oauthExpiresAt !== undefined && connection.oauthExpiresAt <= Date.now()) {
+      return { label: "登录已过期", tone: "warn" };
+    }
+    return null;
+  }
+  if (connection.requiresApiKey && !connection.hasCredential) return { label: "缺少密钥", tone: "error" };
+  return null;
+}
+
+/** One-line credential hint under the API key field. Always rendered, so the dialog height never jumps. */
+function credentialHint(connection: DesktopModelConnection | undefined): string {
+  if (!connection) return "尚未保存该连接的凭据";
+  if (connection.credentialSource === "env") return `使用环境变量 ${connection.apiKeyEnv ?? ""} 中的密钥`;
+  if (connection.hasCredential) return "已设置，粘贴新值可替换";
+  return connection.requiresApiKey ? "尚未设置密钥，粘贴后点击“更新密钥”" : "该服务通常无需密钥";
+}
+
+/** Arrow/Home/End traversal inside the enabled-model list (roving tabindex). */
+function moveModelRowFocus(event: React.KeyboardEvent<HTMLDivElement>): void {
+  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+  const rows = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("[data-model-row]")].filter((row) => !row.disabled);
+  if (!rows.length) return;
+  const current = rows.findIndex((row) => row === document.activeElement);
+  const next = event.key === "Home"
+    ? 0
+    : event.key === "End"
+      ? rows.length - 1
+      : event.key === "ArrowDown"
+        ? Math.min(current + 1, rows.length - 1)
+        : Math.max(current - 1, 0);
+  event.preventDefault();
+  rows[next]?.focus();
+}
+
+function oauthExpiryHint(expiresAt: number | undefined): string {
+  if (expiresAt === undefined) return "已通过官方 OAuth 登录，使用订阅配额。";
+  const remainingMinutes = Math.round((expiresAt - Date.now()) / 60_000);
+  if (remainingMinutes <= 0) return "访问令牌已过期，将在下次发送时自动刷新。";
+  if (remainingMinutes < 60) return `已登录，访问令牌 ${String(remainingMinutes)} 分钟后自动刷新。`;
+  return `已登录，访问令牌 ${String(Math.round(remainingMinutes / 60))} 小时后自动刷新。`;
+}
+
+function formatFetchedAt(timestamp: string): string {
+  const parsed = Date.parse(timestamp);
+  if (!Number.isFinite(parsed)) return "";
+  return new Date(parsed).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+function SettingsModels({ models, connections: connectionInfos, runtime, onChange, onSave, onTest, onRemove, onNotify, onOpenExternal, onFetchCatalog, onStartLogin, onCompleteLogin, onCancelLogin }: {
   models: ModelChoice[];
+  connections: DesktopModelConnection[];
   runtime?: { modelAlias: string; thinking: ThinkingSelection };
   onChange(alias: string, thinking: ThinkingSelection): void;
   onSave(configuration: DesktopModelConfigurationInput): Promise<void>;
@@ -543,11 +511,16 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
   onRemove(alias: string): Promise<void>;
   onNotify(message: string): void;
   onOpenExternal(url: string): Promise<void>;
+  onFetchCatalog(providerAlias: string): Promise<DesktopModelCatalogResult>;
   onStartLogin(provider: DesktopModelLoginProvider): Promise<DesktopModelLoginStartResult>;
   onCompleteLogin(provider: DesktopModelLoginProvider, authRequestId: string, pastedAuthorization?: string): Promise<void>;
   onCancelLogin(provider: DesktopModelLoginProvider, authRequestId: string): Promise<void>;
 }): React.JSX.Element {
   const connections = connectionLabel(models);
+  const connectionInfoFor = (providerAlias: string): DesktopModelConnection | undefined =>
+    connectionInfos.find((item) => item.providerAlias === providerAlias);
+  // 模型设置是三态视图：连接列表 / 新增连接 / 连接详情。用一个 view 变量而不是多个布尔量，
+  // 保证三者互斥。
   const [view, setView] = useState<{ kind: "list" } | { kind: "connect"; provider: ProviderCatalogItem } | { kind: "detail"; provider: string }>({ kind: "list" });
   const [category, setCategory] = useState<ProviderCategory>("推荐");
   const [query, setQuery] = useState("");
@@ -565,6 +538,8 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
   const [authorizationCode, setAuthorizationCode] = useState("");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [fetchingCatalog, setFetchingCatalog] = useState(false);
+  const [liveCatalog, setLiveCatalog] = useState<Record<string, LiveCatalogState>>({});
   const [testResult, setTestResult] = useState<DesktopModelConnectionTestResult>();
 
   const providerOrder = providerCatalogOrder[category];
@@ -578,6 +553,8 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
     })
     .sort((left, right) => providerOrder.indexOf(left.id) - providerOrder.indexOf(right.id));
 
+  // 打开新增/详情视图时把表单状态全部复位：这些字段（尤其是 API key 和测试结果）不能跨
+  // provider 残留。
   const openConnect = (provider: ProviderCatalogItem): void => {
     setConnectApiKey("");
     setConnectBaseUrl(provider.baseUrl);
@@ -593,13 +570,36 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
 
   const openDetail = (providerAlias: string): void => {
     const group = connections.find((item) => item.provider === providerAlias);
-    const catalog = group ? catalogForConnection(group) : undefined;
+    const savedBaseUrl = connectionInfoFor(providerAlias)?.baseUrl;
+    const catalog = group ? catalogForConnection(group, savedBaseUrl) : undefined;
     setDetailApiKey("");
-    setDetailBaseUrl(catalog?.baseUrl ?? "");
+    // 回填这条连接实际保存的地址。若直接退回目录里的默认值，等于悄悄提议把用户自定义的
+    // base URL 覆盖成内置地址。
+    setDetailBaseUrl(savedBaseUrl ?? catalog?.baseUrl ?? "");
     setDetailShowKey(false);
     setAdvancedOpen(false);
     setTestResult(undefined);
     setView({ kind: "detail", provider: providerAlias });
+  };
+
+  const refreshCatalog = async (providerAlias: string): Promise<void> => {
+    setFetchingCatalog(true);
+    try {
+      const result = await onFetchCatalog(providerAlias);
+      if (result.source === "fallback") {
+        onNotify("无法从服务商获取模型列表，已保留当前列表。请检查密钥与服务地址。");
+        return;
+      }
+      setLiveCatalog((current) => ({
+        ...current,
+        [providerAlias]: { models: result.models.map(catalogModelFromEntry), fetchedAt: result.fetchedAt, source: result.source }
+      }));
+      onNotify(`模型目录已更新 · ${String(result.models.length)} 个模型`);
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : String(error));
+    } finally {
+      setFetchingCatalog(false);
+    }
   };
 
   const saveConfiguration = async (input: DesktopModelConfigurationInput): Promise<void> => {
@@ -613,7 +613,7 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
 
   const buildProviderConfiguration = (
     provider: ProviderCatalogItem,
-    options: { apiKey?: string; baseUrl?: string; modelId?: string; requireApiKey?: boolean } = {}
+    options: { apiKey?: string; baseUrl?: string; modelId?: string; requireApiKey?: boolean; makeDefault?: boolean } = {}
   ): DesktopModelConfigurationInput | undefined => {
     const isCustom = provider.value === "openai-compatible";
     const modelId = (options.modelId ?? (isCustom ? connectModelId : provider.models[0]?.id ?? connectModelId)).trim();
@@ -636,11 +636,17 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
       apiKeyEnv: undefined,
       requiresApiKey: provider.requiresApiKey,
       supportsTools: true,
-      supportsThinking: catalogModel?.supportsThinking ?? false,
+      // A hand-typed model ID (custom endpoint) never matches a static catalog
+      // entry, so `catalogModel` is undefined and thinking silently defaulted
+      // to off for every model — including well-known reasoning models routed
+      // through a relay. Infer from the ID as a fallback, same as the live
+      // catalog fetch does.
+      supportsThinking: catalogModel?.supportsThinking ?? inferReasoningEfforts(modelId).length > 0,
       supportsVision: catalogModel?.supportsVision,
       supportsAudio: catalogModel?.supportsAudio,
       contextWindow: catalogModel?.contextWindow,
-      maxOutputTokens: catalogModel?.maxOutputTokens
+      maxOutputTokens: catalogModel?.maxOutputTokens,
+      makeDefault: options.makeDefault ?? false
     };
   };
 
@@ -649,12 +655,32 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
       apiKey: connectApiKey,
       baseUrl: connectBaseUrl.trim() || provider.baseUrl,
       modelId: provider.value === "openai-compatible" ? connectModelId : provider.models[0]?.id,
-      requireApiKey: provider.requiresApiKey
+      requireApiKey: provider.requiresApiKey,
+      // Connecting a brand-new provider is the one place the active default
+      // should move — the user just picked this model.
+      makeDefault: true
     });
     if (!configuration) return;
     await saveConfiguration(configuration);
     setConnectApiKey("");
     setView({ kind: "list" });
+    // Pull the provider's real model list right away, so the connection detail
+    // opens on the live catalog instead of the single built-in seed model.
+    void refreshCatalogQuietly(configuration.providerAlias);
+  };
+
+  /** Post-connect catalog warm-up: best effort, never toasts. */
+  const refreshCatalogQuietly = async (providerAlias: string): Promise<void> => {
+    try {
+      const result = await onFetchCatalog(providerAlias);
+      if (result.source !== "fetched") return;
+      setLiveCatalog((current) => ({
+        ...current,
+        [providerAlias]: { models: result.models.map(catalogModelFromEntry), fetchedAt: result.fetchedAt, source: result.source }
+      }));
+    } catch {
+      // Leave the static catalog in place; the user can retry from 高级设置.
+    }
   };
 
   const startLogin = async (provider: ProviderCatalogItem): Promise<void> => {
@@ -718,23 +744,14 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
   };
 
   const detailGroup = view.kind === "detail" ? connections.find((item) => item.provider === view.provider) : undefined;
-  const detailCatalog = detailGroup ? catalogForConnection(detailGroup) ?? {
-    id: "custom",
-    value: "openai-compatible" as const,
-    protocol: undefined,
-    label: detailGroup.provider,
-    description: detailGroup.providerType,
-    badge: "API",
-    categories: ["API"] as ProviderCategory[],
-    connectionMode: "api" as const,
-    baseUrl: "",
-    requiresApiKey: true,
-    iconTone: "compatible",
-    models: detailGroup.models.map((model) => ({ id: model.model, displayName: model.displayName, supportsThinking: model.efforts.length > 0 }))
-  } : undefined;
   const detailDefaultAlias = runtime?.modelAlias;
+  const detailConnection = detailGroup ? connectionInfoFor(detailGroup.provider) : undefined;
+  const detailCatalog = detailGroup
+    ? catalogForConnection(detailGroup, detailConnection?.baseUrl) ?? customCatalogEntry(detailGroup, detailConnection?.baseUrl)
+    : undefined;
+  const detailLiveCatalog = detailGroup ? liveCatalog[detailGroup.provider] : undefined;
   const detailAvailableModels = detailGroup && detailCatalog
-    ? mergeAvailableModels(detailCatalog.models, detailGroup.models)
+    ? mergeAvailableModels(detailCatalog.models, detailGroup.models, detailLiveCatalog?.models)
     : [];
 
   const saveKey = async (): Promise<void> => {
@@ -746,7 +763,7 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
       displayName: active.displayName,
       providerAlias: detailGroup.provider,
       providerType: detailCatalog.value,
-      protocol: detailCatalog.protocol,
+      protocol: detailConnection?.protocol ?? detailCatalog.protocol,
       model: active.model,
       baseUrl: detailBaseUrl.trim() || detailCatalog.baseUrl || undefined,
       apiKey: detailApiKey.trim(),
@@ -757,6 +774,8 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
       supportsAudio: active.capabilities?.audio
     });
     setDetailApiKey("");
+    // A fresh key usually unlocks the provider's real model list.
+    void refreshCatalogQuietly(detailGroup.provider);
   };
 
   const saveBaseUrl = async (): Promise<void> => {
@@ -768,7 +787,7 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
       displayName: active.displayName,
       providerAlias: detailGroup.provider,
       providerType: detailCatalog.value,
-      protocol: detailCatalog.protocol,
+      protocol: detailConnection?.protocol ?? detailCatalog.protocol,
       model: active.model,
       baseUrl: detailBaseUrl.trim() || detailCatalog.baseUrl || undefined,
       apiKey: undefined,
@@ -787,7 +806,7 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
       displayName: catalogModel.displayName,
       providerAlias: detailGroup.provider,
       providerType: detailCatalog.value,
-      protocol: detailCatalog.protocol,
+      protocol: detailConnection?.protocol ?? detailCatalog.protocol,
       model: catalogModel.id,
       baseUrl: detailBaseUrl.trim() || detailCatalog.baseUrl || undefined,
       apiKey: undefined,
@@ -795,7 +814,9 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
       supportsTools: true,
       supportsThinking: catalogModel.supportsThinking,
       supportsVision: catalogModel.supportsVision,
-      supportsAudio: catalogModel.supportsAudio
+      supportsAudio: catalogModel.supportsAudio,
+      contextWindow: catalogModel.contextWindow,
+      maxOutputTokens: catalogModel.maxOutputTokens
     });
   };
 
@@ -814,7 +835,7 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
     displayName: detailActive.displayName,
     providerAlias: detailGroup.provider,
     providerType: detailCatalog.value,
-    protocol: detailCatalog.protocol,
+    protocol: detailConnection?.protocol ?? detailCatalog.protocol,
     model: detailActive.model,
     baseUrl: detailBaseUrl.trim() || detailCatalog.baseUrl || undefined,
     apiKey: detailApiKey.trim() || undefined,
@@ -854,18 +875,21 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
         {connections.length ? (
           <div className="connection-list">
             {connections.map((connection) => {
-              const catalog = catalogForConnection(connection);
+              const info = connectionInfoFor(connection.provider);
+              const catalog = catalogForConnection(connection, info?.baseUrl) ?? customCatalogEntry(connection, info?.baseUrl);
               const isDefault = connection.models.some((model) => model.alias === runtime?.modelAlias);
+              const status = connectionStatus(info);
               return (
                 <button className={`connection-card${isDefault ? " is-default" : ""}`} key={connection.provider} onClick={() => openDetail(connection.provider)} type="button">
-                  <span className={`provider-mark is-${catalog?.iconTone ?? "compatible"}`}><ProviderGlyph type={catalog?.iconTone ?? "compatible"} /></span>
+                  <span className={`provider-mark is-${catalog.iconTone}`}><ProviderBrandGlyph type={catalog.iconTone} /></span>
                   <span className="connection-card-copy">
                     <strong>
-                      {catalog?.label ?? connection.provider}
+                      {catalog.label}
                       {isDefault ? <span className="default-pill">默认</span> : null}
                     </strong>
-                    <small>{catalog?.label ?? connection.providerType}</small>
+                    <small>已启用 {connection.models.length} 个模型</small>
                   </span>
+                  {status ? <span className={`status-pill is-${status.tone}`}>{status.label}</span> : null}
                   <Icon name="chevron" className="connection-chevron" size={14} />
                 </button>
               );
@@ -898,7 +922,7 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
         <div className="provider-catalog-list">
           {filteredProviders.map((provider) => (
             <button className="provider-catalog-row" key={provider.id} onClick={() => openConnect(provider)} type="button">
-              <span className={`provider-mark is-${provider.iconTone}`}><ProviderGlyph type={provider.iconTone} /></span>
+              <span className={`provider-mark is-${provider.iconTone}`}><ProviderBrandGlyph type={provider.iconTone} /></span>
               <span className="provider-catalog-copy">
                 <strong>{provider.label}</strong>
                 <small>{provider.description}</small>
@@ -962,7 +986,9 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
           <ConnectionDetailDialog
             group={detailGroup}
             catalog={detailCatalog}
+            connection={detailConnection}
             availableModels={detailAvailableModels}
+            liveCatalog={detailLiveCatalog}
             defaultAlias={detailDefaultAlias}
             apiKey={detailApiKey}
             baseUrl={detailBaseUrl}
@@ -970,6 +996,7 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
             advancedOpen={advancedOpen}
             saving={saving}
             testing={testing}
+            fetchingCatalog={fetchingCatalog}
             testResult={testResult}
             configuration={detailConfiguration}
             onApiKey={(value) => { setDetailApiKey(value); setTestResult(undefined); }}
@@ -984,7 +1011,14 @@ function SettingsModels({ models, runtime, onChange, onSave, onTest, onRemove, o
             onDisableModel={(alias) => void disableModel(alias)}
             onDeleteConnection={() => void deleteConnection()}
             canDeleteConnection={models.length > detailGroup.models.length}
-            onNotify={onNotify}
+            onRefreshCatalog={() => void refreshCatalog(detailGroup.provider)}
+            onRelogin={() => {
+              // The saved config records which OAuth flow minted this token, so
+              // re-login reuses the exact same provider card rather than guessing.
+              const provider = providerCatalog.find((item) => item.loginProvider === detailConnection?.oauthProvider);
+              if (provider) openConnect(provider);
+              else onNotify("该连接没有可用的登录方式。");
+            }}
             onOpenExternal={onOpenExternal}
             onChange={onChange}
           />
@@ -1001,6 +1035,13 @@ function ModelDialogBackdrop({ children, onClose }: { children: React.ReactNode;
   return <div className="model-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>{children}</div>;
 }
 
+/**
+ * 订阅制登录对话框（Claude 订阅 / ChatGPT Codex）。
+ *
+ * 两家流程不同：`paste-code` 需要用户把授权码粘回来，`browser-callback` 由本地回调服务器
+ * 自动接收，界面上只显示等待。`stage` 驱动这几步的展示，`stateHint` 用于让用户确认浏览器里
+ * 打开的是同一个授权请求。
+ */
 function LoginProviderDialog({
   provider,
   stage,
@@ -1034,7 +1075,7 @@ function LoginProviderDialog({
     <section className={`connect-dialog login-dialog${waiting ? " is-waiting" : ""}`} role="dialog" aria-label={`连接 ${provider.label}`}>
       <header>
         <div className="connection-detail-title">
-          <span className={`provider-mark is-${provider.iconTone}`}><ProviderGlyph type={provider.iconTone} /></span>
+          <span className={`provider-mark is-${provider.iconTone}`}><ProviderBrandGlyph type={provider.iconTone} /></span>
           <div>
             <strong>连接 {provider.label}</strong>
             <small>{loginSubtitle}</small>
@@ -1079,10 +1120,18 @@ function LoginProviderDialog({
   );
 }
 
+/**
+ * 已有连接的详情对话框：换 key、改 base URL、启用/停用具体模型、测试连通性、删除连接。
+ *
+ * 所有状态都由 `SettingsModels` 持有并通过 props 传入（受控组件），这样测试结果、保存中标志
+ * 等能在多个子对话框之间共享一致。
+ */
 function ConnectionDetailDialog({
   group,
   catalog,
+  connection,
   availableModels,
+  liveCatalog,
   defaultAlias,
   apiKey,
   baseUrl,
@@ -1090,6 +1139,7 @@ function ConnectionDetailDialog({
   advancedOpen,
   saving,
   testing,
+  fetchingCatalog,
   testResult,
   configuration,
   onApiKey,
@@ -1104,13 +1154,16 @@ function ConnectionDetailDialog({
   onDisableModel,
   onDeleteConnection,
   canDeleteConnection,
-  onNotify,
+  onRefreshCatalog,
+  onRelogin,
   onOpenExternal,
   onChange
 }: {
   group: ConnectionGroup;
   catalog: ProviderCatalogItem;
+  connection?: DesktopModelConnection;
   availableModels: CatalogModel[];
+  liveCatalog?: LiveCatalogState;
   defaultAlias?: string;
   apiKey: string;
   baseUrl: string;
@@ -1118,6 +1171,7 @@ function ConnectionDetailDialog({
   advancedOpen: boolean;
   saving: boolean;
   testing: boolean;
+  fetchingCatalog: boolean;
   testResult?: DesktopModelConnectionTestResult;
   configuration?: DesktopModelConfigurationInput;
   onApiKey(value: string): void;
@@ -1132,19 +1186,28 @@ function ConnectionDetailDialog({
   onDisableModel(alias: string): void;
   onDeleteConnection(): void;
   canDeleteConnection: boolean;
-  onNotify(message: string): void;
+  onRefreshCatalog(): void;
+  onRelogin(): void;
   onOpenExternal(url: string): Promise<void>;
   onChange(alias: string, thinking: ThinkingSelection): void;
 }): React.JSX.Element {
   const [modelQuery, setModelQuery] = useState("");
   const filteredModels = availableModels.filter((model) => !modelQuery.trim() || `${model.displayName} ${model.id}`.toLocaleLowerCase().includes(modelQuery.trim().toLocaleLowerCase()));
   const isDefaultConnection = group.models.some((model) => model.alias === defaultAlias);
+  // The list is one Tab stop, carried by the first row that can actually take
+  // focus — the default-model row is locked and therefore unfocusable.
+  const tabStopModelId = filteredModels.find((model) => group.models.find((configured) => configured.model === model.id)?.alias !== defaultAlias)?.id;
   const apiKeyUrl = catalog.apiKeyUrl;
+  // OAuth-backed connections have no user-editable key: showing a password box
+  // there just invites pasting something that can never work.
+  const usesOAuth = connection?.authMode === "oauth-bearer";
+  const status = connectionStatus(connection);
+  const busy = saving || testing || fetchingCatalog;
   return (
     <section className={`connect-dialog connection-detail-dialog${advancedOpen ? " is-advanced" : ""}`} role="dialog" aria-label={`${catalog.label} 连接设置`}>
       <header>
         <div className="connection-detail-title">
-          <span className={`provider-mark is-${catalog.iconTone}`}><ProviderGlyph type={catalog.iconTone} /></span>
+          <span className={`provider-mark is-${catalog.iconTone}`}><ProviderBrandGlyph type={catalog.iconTone} /></span>
           <div>
             <strong>{catalog.label}</strong>
             <small>{isDefaultConnection ? "默认连接" : "已连接"}</small>
@@ -1153,29 +1216,53 @@ function ConnectionDetailDialog({
         <button aria-label="关闭连接设置" className="icon-button" onClick={onClose} type="button"><Icon name="close" /></button>
       </header>
 
-      <div className="connection-field">
-        <div className="connection-field-label">
-          <span>模型密钥</span>
-          <small>已设置，粘贴新值可替换</small>
+      {usesOAuth ? (
+        <div className={`connection-oauth-card${status ? " is-attention" : ""}`}>
+          <div className="connection-oauth-heading">
+            <strong>订阅登录</strong>
+            <span className={`status-pill is-${status?.tone ?? "ok"}`}>{status?.label ?? "已登录"}</span>
+          </div>
+          <p>
+            {status
+              ? "该连接的授权已失效，重新登录后即可继续使用订阅配额。"
+              : oauthExpiryHint(connection?.oauthExpiresAt)}
+          </p>
+          <button className="ghost-button" disabled={busy} onClick={onRelogin} type="button">重新登录</button>
         </div>
-        <div className="secret-input-row">
-          <input
-            autoComplete="off"
-            onChange={(event) => onApiKey(event.target.value)}
-            placeholder="••••••••"
-            type={showKey ? "text" : "password"}
-            value={apiKey}
-          />
-          <button aria-label={showKey ? "隐藏密钥" : "显示密钥"} className="icon-button" onClick={onToggleKey} type="button">
-            <Icon name={showKey ? "eye-off" : "eye"} size={14} />
-          </button>
-        </div>
-      </div>
+      ) : (
+        <>
+          <div className="connection-field">
+            <div className="connection-field-label">
+              <span>模型密钥</span>
+              <small>{credentialHint(connection)}</small>
+            </div>
+            <div className="secret-input-row">
+              <input
+                autoComplete="off"
+                onChange={(event) => onApiKey(event.target.value)}
+                placeholder={connection?.hasCredential ? "••••••••" : "输入或粘贴 API Key"}
+                type={showKey ? "text" : "password"}
+                value={apiKey}
+              />
+              {/* The saved key never reaches the renderer (see credentialHint) —
+                  this box only ever holds a freshly typed replacement, so there
+                  is nothing to reveal until the user starts typing one. Toggling
+                  `type` on an empty input looks identical either way, which read
+                  as "the button does nothing". */}
+              <button aria-label={showKey ? "隐藏密钥" : "显示密钥"} className="icon-button" disabled={!apiKey} onClick={onToggleKey} type="button">
+                <Icon name={showKey ? "eye-off" : "eye"} size={14} />
+              </button>
+            </div>
+          </div>
 
-      <div className="connection-inline-row">
-        {apiKeyUrl ? <a className="settings-link" href={apiKeyUrl} onClick={(event) => { event.preventDefault(); void onOpenExternal(apiKeyUrl); }} rel="noreferrer">获取模型密钥</a> : <span className="settings-link is-disabled">请向服务商获取密钥</span>}
-        <button className="ghost-button" disabled={saving || !apiKey.trim()} onClick={onSaveKey} type="button">更新密钥</button>
-      </div>
+          <div className="connection-inline-row">
+            {apiKeyUrl ? <a className="settings-link" href={apiKeyUrl} onClick={(event) => { event.preventDefault(); void onOpenExternal(apiKeyUrl); }} rel="noreferrer">获取模型密钥</a> : <span className="settings-link is-disabled">请向服务商获取密钥</span>}
+            {/* Kept mounted and disabled instead of conditionally rendered, so the
+                row height does not jump the moment the user starts typing a key. */}
+            <button className="ghost-button" disabled={busy || !apiKey.trim()} onClick={onSaveKey} type="button">{saving ? "保存中…" : "更新密钥"}</button>
+          </div>
+        </>
+      )}
       {testResult && !advancedOpen ? <ConnectionTestResult result={testResult} /> : null}
 
       <button className="advanced-toggle" onClick={onToggleAdvanced} type="button">
@@ -1188,13 +1275,20 @@ function ConnectionDetailDialog({
           <div className="connection-field">
             <div className="connection-field-label">
               <span>启用模型 {group.models.length}</span>
-              <small>勾选的模型会出现在模型选择器中。</small>
+              <small>
+                {liveCatalog
+                  ? `共 ${String(availableModels.length)} 个候选 · 已于 ${formatFetchedAt(liveCatalog.fetchedAt)} 从服务商获取`
+                  : `共 ${String(availableModels.length)} 个候选 · 内置列表，可点击“更新模型目录”拉取实时列表`}
+              </small>
             </div>
             <label className="model-search-input">
               <Icon name="search" size={13} />
               <input onChange={(event) => setModelQuery(event.target.value)} placeholder="搜索模型" value={modelQuery} />
             </label>
-            <div className="enabled-model-list">
+            {/* Roving tabindex: the whole list is one Tab stop, so a provider
+                returning hundreds of models doesn't wall off the controls below
+                it for keyboard users. */}
+            <div className="enabled-model-list" onKeyDown={(event) => moveModelRowFocus(event)} role="group" aria-label="可启用的模型">
               {filteredModels.map((catalogModel) => {
                 const configured = group.models.find((model) => model.model === catalogModel.id);
                 const isDefault = configured?.alias === defaultAlias;
@@ -1202,27 +1296,34 @@ function ConnectionDetailDialog({
                 return (
                   <div className={`enabled-model-row${enabled ? " is-enabled" : ""}${isDefault ? " is-default" : ""}`} key={catalogModel.id}>
                     <button
+                      aria-checked={enabled}
                       aria-label={enabled ? `取消启用 ${catalogModel.displayName}` : `启用 ${catalogModel.displayName}`}
                       className="enabled-model-toggle"
-                      disabled={saving}
+                      data-model-row=""
+                      // The default model must stay enabled — removing it would
+                      // leave the runtime pointing at a model that is gone.
+                      disabled={busy || isDefault}
                       onClick={() => {
                         if (configured) onDisableModel(configured.alias);
                         else onEnableModel(catalogModel);
                       }}
+                      role="checkbox"
+                      tabIndex={catalogModel.id === tabStopModelId ? 0 : -1}
                       type="button"
                     >
                       <span className={`check-dot${enabled ? " is-on" : ""}`}><Icon name="check" size={11} /></span>
                       <span className="enabled-model-name">{catalogModel.displayName}</span>
+                      {catalogModel.id !== catalogModel.displayName ? <span className="enabled-model-id">{catalogModel.id}</span> : null}
                     </button>
                     {enabled && configured ? (
                       isDefault
                         ? <span className="default-pill">默认</span>
-                        : <button className="set-default-button" disabled={saving} onClick={() => onChange(configured.alias, configured.defaultThinking)} type="button">设为默认</button>
+                        : <button className="set-default-button" disabled={busy} onClick={() => onChange(configured.alias, configured.defaultThinking)} type="button">设为默认</button>
                     ) : null}
                   </div>
                 );
               })}
-              {!filteredModels.length ? <div className="model-list-empty">没有匹配的模型</div> : null}
+              {!filteredModels.length ? <div className="model-list-empty">{availableModels.length ? "没有匹配的模型" : "尚未获取到模型列表"}</div> : null}
             </div>
           </div>
 
@@ -1230,16 +1331,16 @@ function ConnectionDetailDialog({
             <div className="connection-field-label"><span>服务地址</span></div>
             <div className="secret-input-row">
               <input onChange={(event) => onBaseUrl(event.target.value)} placeholder="https://api.example.com" value={baseUrl} />
-              <button className="ghost-button" disabled={saving} onClick={onSaveBaseUrl} type="button">保存服务地址</button>
+              <button className="ghost-button" disabled={busy || !baseUrl.trim()} onClick={onSaveBaseUrl} type="button">保存服务地址</button>
             </div>
           </div>
           {testResult ? <ConnectionTestResult result={testResult} /> : null}
           <div className="connection-detail-footer">
             <div>
-              <button className="ghost-button" disabled={saving || testing || !configuration} onClick={onTest} type="button">{testing ? "测试中…" : "测试连接"}</button>
-              <button className="text-button" disabled={saving} onClick={() => onNotify("模型目录已更新")} type="button">更新模型目录</button>
+              <button className="ghost-button" disabled={busy || !configuration} onClick={onTest} type="button">{testing ? "测试中…" : "测试连接"}</button>
+              <button className="text-button" disabled={busy} onClick={onRefreshCatalog} type="button">{fetchingCatalog ? "更新中…" : "更新模型目录"}</button>
             </div>
-            <button className="danger-text-button" disabled={saving || !canDeleteConnection} onClick={onDeleteConnection} type="button">删除连接</button>
+            <button className="danger-text-button" disabled={busy || !canDeleteConnection} onClick={onDeleteConnection} type="button">删除连接</button>
           </div>
         </div>
       ) : null}
@@ -1247,6 +1348,12 @@ function ConnectionDetailDialog({
   );
 }
 
+/**
+ * 新增连接对话框（API key 方式）。
+ *
+ * `isCustom` 指自建/中转端点：这类没有内置默认值，必须自己填 base URL 和模型 id，
+ * 因此提交条件比选内置服务商时更严。
+ */
 function ConnectProviderDialog({
   provider,
   apiKey,
@@ -1290,7 +1397,7 @@ function ConnectProviderDialog({
     <div className="connect-dialog" role="dialog" aria-label={`连接 ${provider.label}`}>
         <header>
           <div className="connection-detail-title">
-            <span className={`provider-mark is-${provider.iconTone}`}><ProviderGlyph type={provider.iconTone} /></span>
+            <span className={`provider-mark is-${provider.iconTone}`}><ProviderBrandGlyph type={provider.iconTone} /></span>
             <div>
               <strong>连接 {provider.label}</strong>
               <small>完成必要配置后，连接会出现在模型页上方。</small>
@@ -1309,7 +1416,7 @@ function ConnectProviderDialog({
               type={showKey ? "text" : "password"}
               value={apiKey}
             />
-            <button aria-label={showKey ? "隐藏密钥" : "显示密钥"} className="icon-button" onClick={onToggleKey} type="button">
+            <button aria-label={showKey ? "隐藏密钥" : "显示密钥"} className="icon-button" disabled={!apiKey} onClick={onToggleKey} type="button">
               <Icon name={showKey ? "eye-off" : "eye"} size={14} />
             </button>
           </div>
@@ -1356,75 +1463,265 @@ function ConnectionTestResult({ result }: { result: DesktopModelConnectionTestRe
   );
 }
 
-function ProviderGlyph({ type }: { type: string }): React.JSX.Element {
-  const common = { "aria-hidden": true, className: "provider-logo", viewBox: "0 0 24 24" } as const;
-  if (type === "deepseek") return <svg {...common}><path d="M23.748 4.651c-.254-.124-.364.113-.512.233-.051.04-.094.09-.137.137-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.155-.708-.311-.955-.65-.172-.24-.219-.509-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.094.172.187.129.323-.082.28-.18.553-.266.833-.055.179-.137.218-.328.14a5.5 5.5 0 0 1-1.737-1.179c-.857-.828-1.631-1.743-2.597-2.46a12 12 0 0 0-.689-.47c-.985-.957.13-1.743.387-1.836.27-.098.094-.433-.778-.428-.872.003-1.67.295-2.687.685a3 3 0 0 1-.465.136 9.6 9.6 0 0 0-2.883-.101c-1.885.21-3.39 1.1-4.497 2.622C.082 8.776-.231 10.854.152 13.02c.403 2.284 1.568 4.175 3.36 5.653 1.857 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.132-.284 4.994-1.86.47.234.962.328 1.78.398.629.058 1.235-.031 1.705-.129.735-.155.684-.836.418-.961-2.155-1.004-1.682-.595-2.112-.926 1.095-1.295 2.768-3.598 3.284-6.733.05-.346.115-.834.108-1.114-.004-.171.035-.238.23-.257a4.2 4.2 0 0 0 1.545-.475c1.397-.763 1.96-2.016 2.093-3.517.02-.23-.004-.467-.247-.588M11.58 18.168c-2.088-1.642-3.101-2.183-3.52-2.16-.39.024-.32.472-.234.763.09.288.207.487.371.74.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.168-1.361-.801-2.5-1.86-3.301-3.306-.775-1.393-1.225-2.888-1.299-4.482-.02-.385.094-.522.477-.592a4.7 4.7 0 0 1 1.53-.038c2.131.311 3.946 1.264 5.467 2.774.868.86 1.525 1.887 2.202 2.89.72 1.066 1.494 2.082 2.48 2.915.348.291.626.513.892.677-.802.09-2.14.109-3.055-.615zm1.001-6.44a.306.306 0 0 1 .415-.287.3.3 0 0 1 .113.074.3.3 0 0 1 .086.214c0 .17-.136.307-.308.307a.303.303 0 0 1-.306-.307m3.11 1.596c-.2.081-.4.151-.591.16a1.25 1.25 0 0 1-.798-.254c-.274-.23-.47-.358-.551-.758a1.7 1.7 0 0 1 .015-.588c.07-.327-.007-.537-.238-.727-.188-.156-.426-.199-.689-.199a.6.6 0 0 1-.254-.078.253.253 0 0 1-.114-.358 1 1 0 0 1 .192-.21c.356-.202.767-.136 1.146.016.352.144.618.408 1.001.782.392.451.462.576.685.915.176.264.336.536.446.848.066.194-.02.353-.25.45" fill="currentColor" /></svg>;
-  if (type === "openai" || type === "compatible") return <svg {...common}><path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zM9.403 10.498l2.602-1.5 2.607 1.5v2.999l-2.597 1.5-2.607-1.5Z" fill="currentColor" /></svg>;
-  if (type === "qwen") return <svg {...common}><path d="M23.919 14.545 20.817 9.17l1.47-2.544a.56.56 0 0 0 0-.566l-1.633-2.83a.57.57 0 0 0-.49-.283h-6.207L12.487.402a.57.57 0 0 0-.49-.284H8.732a.56.56 0 0 0-.49.284L5.139 5.775h-2.94a.56.56 0 0 0-.49.284L.077 8.887a.56.56 0 0 0 0 .567L3.18 14.83l-1.47 2.545a.56.56 0 0 0 0 .566l1.634 2.83a.57.57 0 0 0 .49.283h6.205l1.47 2.545a.57.57 0 0 0 .49.284h3.266a.57.57 0 0 0 .49-.284l3.104-5.375h2.94a.57.57 0 0 0 .49-.283l1.634-2.828a.55.55 0 0 0-.004-.568M8.733.686l1.634 2.828-1.634 2.828H21.8L20.164 9.17H7.425L5.63 6.06Zm1.306 19.801-6.205-.002 1.634-2.83h3.265L2.201 6.344h3.267q3.182 5.517 6.367 11.032zm10.124-5.66L18.53 12l-6.532 11.315-1.634-2.83c2.129-3.673 4.25-7.351 6.373-11.028h3.592l3.102 5.374z" fill="currentColor" /></svg>;
-  return <ProviderBrandGlyph type={type} />;
-}
+/** 字体下拉的候选项。值为 CSS 字体族名，未安装的字体会自然落回默认字体栈。 */
+const fontFamilyOptions: Array<{ value: string; title: string }> = [
+  { value: SYSTEM_FONT_FAMILY, title: "系统默认" },
+  { value: "PingFang SC", title: "苹方" },
+  { value: "Hiragino Sans GB", title: "冬青黑体" },
+  { value: "Noto Sans SC", title: "思源黑体" },
+  { value: "Songti SC", title: "宋体" },
+  { value: "Kaiti SC", title: "楷体" },
+  { value: "Yuanti SC", title: "圆体" }
+];
 
-function SettingsPermissions({ mode, onChange }: { mode: PermissionMode; onChange(mode: PermissionMode): void }): React.JSX.Element {
-  const options: Array<{ value: PermissionMode; title: string; detail: string }> = [
-    { value: "ask", title: "每次询问", detail: "敏感写入和命令由你逐次决定" },
-    { value: "auto", title: "自动允许安全修改", detail: "低风险操作自动放行" },
-    { value: "read-only", title: "只读", detail: "拒绝非读取操作" },
-    { value: "full-access", title: "完全访问", detail: "自动允许大多数工具；关键操作仍受项目策略保护" }
+function SettingsAppearance({ theme, onThemeChange, font, onFontChange }: {
+  theme: DesktopThemePreference;
+  onThemeChange(theme: DesktopThemePreference): void;
+  font: DesktopFontPreference;
+  onFontChange(font: DesktopFontPreference): void;
+}): React.JSX.Element {
+  const options: Array<{ value: DesktopThemePreference; title: string; icon: IconName }> = [
+    { value: "light", title: "浅色", icon: "sun" },
+    { value: "dark", title: "深色", icon: "moon" },
+    { value: "system", title: "跟随系统", icon: "display" }
   ];
-  return <div className="settings-sections"><section><h3>当前项目权限</h3>{options.map((option) => <button className="permission-setting-row" key={option.value} onClick={() => onChange(option.value)} type="button"><span className={`radio${mode === option.value ? " is-selected" : ""}`} /><span><strong>{option.title}</strong><small>{option.detail}</small></span></button>)}</section></div>;
-}
-
-function SettingsAppearance({ theme, onThemeChange }: { theme: DesktopThemePreference; onThemeChange(theme: DesktopThemePreference): void }): React.JSX.Element {
-  const options: Array<{ value: DesktopThemePreference; title: string }> = [
-    { value: "system", title: "系统" },
-    { value: "light", title: "浅色" },
-    { value: "dark", title: "深色" }
-  ];
+  // 字号输入允许中间态（比如清空后再输入），失焦或回车时才夹取并提交。
+  const [sizeText, setSizeText] = useState(String(font.size));
+  useEffect(() => {
+    setSizeText(String(font.size));
+  }, [font.size]);
+  const commitSize = (): void => {
+    const parsed = Number(sizeText);
+    const next = Number.isFinite(parsed) && sizeText.trim() !== "" ? clampFontSize(parsed) : font.size;
+    setSizeText(String(next));
+    if (next !== font.size) onFontChange({ ...font, size: next });
+  };
+  const changeSize = (value: string): void => {
+    setSizeText(value);
+    // 步进按钮或直接输入合法值时即时生效，便于所见即所得地预览。
+    const parsed = Number(value);
+    if (Number.isInteger(parsed) && parsed >= MIN_FONT_SIZE && parsed <= MAX_FONT_SIZE && parsed !== font.size) {
+      onFontChange({ ...font, size: parsed });
+    }
+  };
+  // 落盘的字体可能来自旧版本或手改配置，不在候选里也要能正常显示当前值。
+  const familyOptions = fontFamilyOptions.some((option) => option.value === font.family)
+    ? fontFamilyOptions
+    : [...fontFamilyOptions, { value: font.family, title: font.family }];
   return (
     <div className="settings-sections">
       <section>
         <h3>主题</h3>
-        <div className="theme-card-grid" role="radiogroup" aria-label="主题">
+        <div className="theme-option-grid" role="radiogroup" aria-label="主题">
           {options.map((option) => (
             <button
               aria-checked={theme === option.value}
-              className={`theme-card${theme === option.value ? " is-selected" : ""}`}
+              className={`theme-option${theme === option.value ? " is-selected" : ""}`}
               key={option.value}
               onClick={() => onThemeChange(option.value)}
               role="radio"
               type="button"
             >
-              <span className={`theme-card-preview theme-card-preview--${option.value}`} aria-hidden="true">
-                <span className="theme-card-window">
-                  <span className="theme-card-chrome" />
-                  <span className="theme-card-panel theme-card-panel--main">
-                    <span className="theme-card-line" />
-                    <span className="theme-card-line is-short" />
-                    <span className="theme-card-line is-medium" />
-                  </span>
-                  <span className="theme-card-panel theme-card-panel--float">
-                    <span className="theme-card-line is-short" />
-                    <span className="theme-card-line is-medium" />
-                  </span>
-                </span>
-              </span>
-              <span className="theme-card-label">{option.title}</span>
+              <Icon name={option.icon} size={19} />
+              <span className="theme-option-label">{option.title}</span>
             </button>
           ))}
         </div>
       </section>
       <section>
-        <h3>动效</h3>
-        <div className="setting-row">
-          <span><strong>减少动画</strong><small>自动遵循系统“减少动态效果”设置</small></span>
-          <span className="setting-value">系统</span>
+        <h3>字体设置</h3>
+        <div className="font-field">
+          <label className="font-field-label" htmlFor="appearance-font-family">字体</label>
+          <select
+            className="font-select"
+            id="appearance-font-family"
+            onChange={(event) => onFontChange({ ...font, family: event.target.value })}
+            value={font.family}
+          >
+            {familyOptions.map((option) => <option key={option.value} value={option.value}>{option.title}</option>)}
+          </select>
+          <small className="font-field-hint">选择应用界面的字体。保留系统默认将使用操作系统字体。</small>
+        </div>
+        <div className="font-field">
+          <label className="font-field-label" htmlFor="appearance-font-size">字体大小</label>
+          <div className="font-size-row">
+            <input
+              className="font-size-input"
+              id="appearance-font-size"
+              max={MAX_FONT_SIZE}
+              min={MIN_FONT_SIZE}
+              onBlur={commitSize}
+              onChange={(event) => changeSize(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") commitSize();
+              }}
+              step={1}
+              type="number"
+              value={sizeText}
+            />
+            <span className="font-size-unit">px</span>
+          </div>
+          <small className="font-field-hint">{MIN_FONT_SIZE} – {MAX_FONT_SIZE} px</small>
         </div>
       </section>
     </div>
   );
 }
 
-function SettingsComingSoon({ tab }: { tab: "使用统计" | "每日回顾" | "语音" | "开放网关" | "远程接入" | "联网搜索" | "健康" }): React.JSX.Element {
+const webSearchProviderOptions: Array<{ value: DesktopWebSearchProvider; title: string; detail: string; envKeyName?: string; keyUrl?: string }> = [
+  { value: "anysearch", title: "AnySearch", detail: "支持匿名额度的聚合搜索，可选配置密钥提升额度", envKeyName: "ANYSEARCH_API_KEY" },
+  { value: "duckduckgo", title: "DuckDuckGo", detail: "免密钥，直接解析网页版搜索结果；偶尔会被反爬限制" },
+  { value: "tavily", title: "Tavily", detail: "面向 AI 应用的搜索 API，免费额度约每月 1000 次", envKeyName: "TAVILY_API_KEY", keyUrl: "https://app.tavily.com/" },
+  { value: "brave", title: "Brave Search", detail: "官方 Web Search API，需在控制台创建订阅密钥", envKeyName: "BRAVE_SEARCH_API_KEY", keyUrl: "https://api-dashboard.search.brave.com/" }
+];
+
+/**
+ * 联网搜索设置。
+ *
+ * key 从不回填到输入框：主进程只回报「是否已配置」，不返回明文。因此输入框为空意为
+ * 「不改动」，要清空已存的 key 需要显式勾选 `clearKey`。
+ */
+function SettingsWebSearch({ onLoad, onSave, onNotify, onOpenExternal }: {
+  onLoad(): Promise<DesktopWebSearchSettings>;
+  onSave(input: DesktopWebSearchSettingsInput): Promise<DesktopWebSearchSettings>;
+  onNotify(message: string): void;
+  onOpenExternal(url: string): Promise<void>;
+}): React.JSX.Element {
+  const [settings, setSettings] = useState<DesktopWebSearchSettings>();
+  const [loadError, setLoadError] = useState<string>();
+  const [enabled, setEnabled] = useState(true);
+  const [provider, setProvider] = useState<DesktopWebSearchProvider>("anysearch");
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [clearKey, setClearKey] = useState(false);
+  const [maxResults, setMaxResults] = useState(5);
+  const [timeoutMs, setTimeoutMs] = useState(10_000);
+  const [saving, setSaving] = useState(false);
+
+  const adopt = (next: DesktopWebSearchSettings): void => {
+    setSettings(next);
+    setEnabled(next.enabled);
+    setProvider(next.provider);
+    setMaxResults(next.maxResults);
+    setTimeoutMs(next.timeoutMs);
+    setApiKeyInput("");
+    setClearKey(false);
+  };
+
+  // 加载期间组件可能被卸载（用户切走分页），用 cancelled 标志避免对已卸载组件 setState。
+  useEffect(() => {
+    let cancelled = false;
+    onLoad()
+      .then((next) => { if (!cancelled) adopt(next); })
+      .catch((error: unknown) => { if (!cancelled) setLoadError(error instanceof Error ? error.message : String(error)); });
+    return () => { cancelled = true; };
+  }, [onLoad]);
+
+  if (loadError) return <div className="settings-sections"><section><h3>无法加载联网搜索设置</h3><p>{loadError}</p></section></div>;
+  if (!settings) return <div className="settings-sections"><section><p>正在加载设置…</p></section></div>;
+
+  const option = webSearchProviderOptions.find((candidate) => candidate.value === provider);
+  const requiresKey = provider === "tavily" || provider === "brave";
+  const sameProviderSaved = settings.provider === provider;
+  const envKeyName = (sameProviderSaved ? settings.envKeyName : undefined) ?? option?.envKeyName;
+  const keyStatus = clearKey
+    ? "保存后将清除已保存的密钥。"
+    : sameProviderSaved && settings.hasApiKey
+      ? "已保存密钥，输入新值可替换。"
+      : sameProviderSaved && settings.envKeyDetected && envKeyName
+        ? `已检测到环境变量 ${envKeyName}，可直接使用。`
+        : envKeyName
+          ? `粘贴密钥保存到本机钥匙串，或设置环境变量 ${envKeyName}。`
+          : undefined;
+
+  const save = async (): Promise<void> => {
+    if (saving) return;
+    setSaving(true);
+    try {
+      const next = await onSave({
+        enabled,
+        provider,
+        apiKey: clearKey ? "" : apiKeyInput.trim() || undefined,
+        apiKeyEnv: settings.apiKeyEnv,
+        timeoutMs,
+        maxResults
+      });
+      adopt(next);
+      onNotify("联网搜索设置已保存");
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="settings-sections">
+      <section>
+        <h3>联网搜索</h3>
+        <div className="setting-row">
+          <span><strong>启用 web_search 工具</strong><small>关闭后 Agent 将无法搜索公网信息</small></span>
+          <button aria-checked={enabled} className={`setting-switch${enabled ? " is-on" : ""}`} onClick={() => setEnabled(!enabled)} role="switch" type="button"><span className="setting-switch-knob" /></button>
+        </div>
+      </section>
+      <section>
+        <h3>搜索服务</h3>
+        <div role="radiogroup" aria-label="搜索服务">
+          {webSearchProviderOptions.map((candidate) => (
+            <button aria-checked={provider === candidate.value} className="permission-setting-row" key={candidate.value} onClick={() => { setProvider(candidate.value); setApiKeyInput(""); setClearKey(false); }} role="radio" type="button">
+              <span className={`radio${provider === candidate.value ? " is-selected" : ""}`} />
+              <span><strong>{candidate.title}</strong><small>{candidate.detail}</small></span>
+              <em className="settings-nav-badge">{candidate.value === "duckduckgo" ? "免密钥" : candidate.value === "anysearch" ? "可匿名" : "API Key"}</em>
+            </button>
+          ))}
+        </div>
+      </section>
+      {provider !== "duckduckgo" ? (
+        <section>
+          <h3>API 密钥</h3>
+          <div className="secret-input-row">
+            <input
+              autoCapitalize="none"
+              autoComplete="off"
+              disabled={clearKey}
+              onChange={(event) => setApiKeyInput(event.target.value)}
+              placeholder={requiresKey ? `${option?.title ?? ""} API Key` : "可选，用于提升 AnySearch 额度"}
+              spellCheck={false}
+              type="password"
+              value={clearKey ? "" : apiKeyInput}
+            />
+            {sameProviderSaved && settings.hasApiKey ? (
+              <button className="ghost-button" onClick={() => { setClearKey(!clearKey); setApiKeyInput(""); }} type="button">{clearKey ? "取消清除" : "清除密钥"}</button>
+            ) : null}
+          </div>
+          {keyStatus ? <p className="web-search-key-status">{keyStatus}</p> : null}
+          {option?.keyUrl ? (
+            <a className="settings-link" href={option.keyUrl} onClick={(event) => { event.preventDefault(); void onOpenExternal(option.keyUrl ?? ""); }} rel="noreferrer">获取 {option.title} API Key</a>
+          ) : null}
+        </section>
+      ) : null}
+      <section>
+        <h3>结果偏好</h3>
+        <div className="setting-row">
+          <span><strong>返回结果数</strong><small>单次搜索最多返回的链接条数</small></span>
+          <select className="web-search-select" onChange={(event) => setMaxResults(Number(event.target.value))} value={maxResults}>
+            {[...new Set([3, 5, 8, 10, maxResults])].sort((a, b) => a - b).map((count) => <option key={count} value={count}>{count} 条</option>)}
+          </select>
+        </div>
+        <div className="setting-row">
+          <span><strong>请求超时</strong><small>超过该时间未响应则终止本次搜索</small></span>
+          <select className="web-search-select" onChange={(event) => setTimeoutMs(Number(event.target.value))} value={timeoutMs}>
+            {[...new Set([5_000, 10_000, 20_000, 30_000, timeoutMs])].sort((a, b) => a - b).map((duration) => <option key={duration} value={duration}>{duration / 1_000} 秒</option>)}
+          </select>
+        </div>
+      </section>
+      <div className="settings-button-row">
+        <button disabled={saving} onClick={() => void save()} type="button">{saving ? "保存中…" : "保存设置"}</button>
+      </div>
+    </div>
+  );
+}
+
+function SettingsComingSoon({ tab }: { tab: "使用统计" | "每日回顾" | "语音" | "开放网关" | "远程接入" | "健康" }): React.JSX.Element {
   return (
     <div className="settings-sections settings-coming-soon">
       <section>
@@ -1435,22 +1732,288 @@ function SettingsComingSoon({ tab }: { tab: "使用统计" | "每日回顾" | "�
   );
 }
 
-function SettingsAgent({ disabled, onCompact }: { disabled: boolean; onCompact(): void }): React.JSX.Element {
+const memoryTopicOptions = [
+  { value: "project", label: "project · 项目事实" },
+  { value: "decisions", label: "decisions · 决策" },
+  { value: "debugging", label: "debugging · 调试经验" },
+  { value: "workflows", label: "workflows · 工作流" }
+];
+
+/**
+ * 记忆设置面板：开关/检索条数/自动总结/专用模型走显式保存（改配置要重建 runtime）；
+ * 整理、添加、搜索、删除是即时操作，成功后用主进程返回的最新总览整体替换本地状态。
+ */
+function SettingsMemory({ models, onLoad, onSaveSettings, onSearch, onAdd, onDeleteEntry, onClear, onCompact, onNotify }: {
+  models: ModelChoice[];
+  onLoad(): Promise<DesktopMemoryOverview>;
+  onSaveSettings(input: DesktopMemorySettings): Promise<DesktopMemoryOverview>;
+  onSearch(query: string): Promise<DesktopMemorySearchMatch[]>;
+  onAdd(topic: string, note: string): Promise<DesktopMemoryOverview>;
+  onDeleteEntry(topic: string, index: number): Promise<DesktopMemoryOverview>;
+  onClear(): Promise<DesktopMemoryOverview>;
+  onCompact(): Promise<DesktopMemoryCompactionResult[]>;
+  onNotify(message: string): void;
+}): React.JSX.Element {
+  const [overview, setOverview] = useState<DesktopMemoryOverview>();
+  const [loadError, setLoadError] = useState<string>();
+  const [enabled, setEnabled] = useState(true);
+  const [autoRemember, setAutoRemember] = useState(true);
+  const [maxRecalled, setMaxRecalled] = useState(3);
+  // "" 表示未指定专用模型（跟随会话模型）。
+  const [modelAlias, setModelAlias] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  const [noteTopic, setNoteTopic] = useState("project");
+  const [query, setQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<DesktopMemorySearchMatch[]>();
+  const [compactReport, setCompactReport] = useState<string>();
+  const [confirmClear, setConfirmClear] = useState(false);
+
+  const adopt = useCallback((next: DesktopMemoryOverview): void => {
+    setOverview(next);
+    setEnabled(next.settings.enabled);
+    setAutoRemember(next.settings.autoRemember);
+    setMaxRecalled(next.settings.maxRecalled);
+    setModelAlias(next.settings.model ?? "");
+  }, []);
+
+  // 加载期间组件可能被卸载（用户切走分页），用 cancelled 标志避免对已卸载组件 setState。
+  useEffect(() => {
+    let cancelled = false;
+    onLoad()
+      .then((next) => { if (!cancelled) adopt(next); })
+      .catch((error: unknown) => { if (!cancelled) setLoadError(error instanceof Error ? error.message : String(error)); });
+    return () => { cancelled = true; };
+  }, [adopt, onLoad]);
+
+  if (loadError) return <div className="settings-sections"><section><h3>无法加载记忆设置</h3><p>{loadError}</p></section></div>;
+  if (!overview) return <div className="settings-sections"><section><p>正在加载记忆…</p></section></div>;
+
+  const saved = overview.settings;
+  const settingsDirty = enabled !== saved.enabled
+    || autoRemember !== saved.autoRemember
+    || maxRecalled !== saved.maxRecalled
+    || (modelAlias || undefined) !== saved.model;
+
+  /** 即时操作的统一包装：串行化、错误 toast、成功后按需替换总览。 */
+  const execute = async (operation: () => Promise<DesktopMemoryOverview | undefined>, success?: string): Promise<boolean> => {
+    if (busy) return false;
+    setBusy(true);
+    try {
+      const next = await operation();
+      if (next) adopt(next);
+      if (success) onNotify(success);
+      return true;
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : String(error));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveSettings = (): void => {
+    void execute(async () => await onSaveSettings({
+      enabled,
+      autoRemember,
+      maxRecalled,
+      model: modelAlias || undefined
+    }), "记忆设置已保存");
+  };
+
+  const compact = (): void => {
+    setCompactReport(undefined);
+    void execute(async () => {
+      const results = await onCompact();
+      if (!results.length) {
+        setCompactReport("记忆库为空，无需整理。");
+      } else {
+        const mergedCount = results.filter((result) => !result.error && result.after < result.before).length;
+        setCompactReport(results.map((result) => result.error
+          ? `${result.topic}：整理失败（${result.error}）`
+          : result.after < result.before
+            ? `${result.topic}：${String(result.before)} 条 → ${String(result.after)} 条`
+            : `${result.topic}：${String(result.before)} 条，无可合并内容`).join("\n"));
+        onNotify(mergedCount ? `整理完成，${String(mergedCount)} 个话题得到精简` : "整理完成，暂无可合并的条目");
+      }
+      return await onLoad();
+    });
+  };
+
+  const search = (): void => {
+    const trimmed = query.trim();
+    if (!trimmed) return;
+    void (async () => {
+      setBusy(true);
+      try {
+        setSearchResults(await onSearch(trimmed));
+      } catch (error) {
+        onNotify(error instanceof Error ? error.message : String(error));
+      } finally {
+        setBusy(false);
+      }
+    })();
+  };
+
+  const addNote = (): void => {
+    const trimmed = note.trim();
+    if (!trimmed) return;
+    void execute(async () => await onAdd(noteTopic, trimmed), "记忆已添加").then((ok) => { if (ok) setNote(""); });
+  };
+
+  const clearAll = (): void => {
+    if (!confirmClear) {
+      setConfirmClear(true);
+      return;
+    }
+    setConfirmClear(false);
+    void execute(async () => await onClear(), "已清空全部记忆");
+  };
+
   return (
     <div className="settings-sections">
       <section>
-        <h3>会话上下文</h3>
+        <h3>记忆功能</h3>
         <div className="setting-row">
-          <span><strong>压缩当前会话</strong><small>调用现有 ContextRuntime 的真实压缩流程</small></span>
-          <button className="ghost-button" disabled={disabled} onClick={onCompact} type="button">立即压缩</button>
+          <span><strong>启用记忆</strong><small>启用后自动沉淀与检索 .agent/memory 中的可审计项目记忆</small></span>
+          <button aria-checked={enabled} className={`setting-switch${enabled ? " is-on" : ""}`} onClick={() => setEnabled(!enabled)} role="switch" type="button"><span className="setting-switch-knob" /></button>
+        </div>
+        <div className="setting-row">
+          <span><strong>自动总结对话</strong><small>任务成功后自动提取一条持久记忆；关闭后仍可检索与手动保存</small></span>
+          <button aria-checked={autoRemember} className={`setting-switch${autoRemember ? " is-on" : ""}`} disabled={!enabled} onClick={() => setAutoRemember(!autoRemember)} role="switch" type="button"><span className="setting-switch-knob" /></button>
+        </div>
+        <div className="setting-row">
+          <span><strong>最大检索记忆数</strong><small>每次对话自动注入上下文的相关记忆条数（1-20）</small></span>
+          <span className="memory-range-control">
+            <input
+              disabled={!enabled}
+              max={20}
+              min={1}
+              onChange={(event) => setMaxRecalled(Number(event.target.value))}
+              type="range"
+              value={maxRecalled}
+            />
+            <em>{maxRecalled}</em>
+          </span>
+        </div>
+        <div className="setting-row">
+          <span><strong>记忆工具模型</strong><small>为记忆提取与整理指定专用模型；留空使用当前会话模型</small></span>
+          <select className="web-search-select" disabled={!enabled} onChange={(event) => setModelAlias(event.target.value)} value={modelAlias}>
+            <option value="">跟随会话模型</option>
+            {models.map((model) => <option key={model.alias} value={model.alias}>{model.displayName}</option>)}
+          </select>
+        </div>
+        <div className="settings-button-row">
+          <button disabled={busy || !settingsDirty} onClick={saveSettings} type="button">{busy ? "处理中…" : "保存设置"}</button>
         </div>
       </section>
+
+      <section>
+        <h3>统计</h3>
+        <div className="memory-stat-grid">
+          <div className="memory-stat-card"><strong>{overview.totalEntries}</strong><span>记忆总数</span></div>
+          <div className="memory-stat-card"><strong>{overview.topics.length}</strong><span>话题数</span></div>
+          <div className="memory-stat-card"><strong>{saved.maxRecalled}</strong><span>每轮注入上限</span></div>
+        </div>
+      </section>
+
+      {saved.enabled ? (
+        <>
+          <section>
+            <h3>记忆整理</h3>
+            <div className="setting-row">
+              <span><strong>整理记忆库</strong><small>用模型合并重复与相近条目、丢弃无长期价值的内容，逐话题重写文件</small></span>
+              <button className="ghost-button" disabled={busy || !overview.totalEntries} onClick={compact} type="button">{busy ? "处理中…" : "立即整理"}</button>
+            </div>
+            {compactReport ? <pre className="settings-memory-report">{compactReport}</pre> : null}
+          </section>
+
+          <section>
+            <h3>添加记忆</h3>
+            <textarea
+              className="memory-note-input"
+              onChange={(event) => setNote(event.target.value)}
+              placeholder="输入您希望 AI 记住的内容…（至少 20 个字符）"
+              rows={3}
+              value={note}
+            />
+            <div className="memory-add-row">
+              <select className="web-search-select" onChange={(event) => setNoteTopic(event.target.value)} value={noteTopic}>
+                {memoryTopicOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+              <button disabled={busy || note.trim().length < 20} onClick={addNote} type="button">添加记忆</button>
+            </div>
+          </section>
+
+          <section>
+            <h3>搜索记忆</h3>
+            <div className="memory-search-row">
+              <input
+                className="settings-inline-input"
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") search(); }}
+                placeholder="按关键词搜索记忆…"
+                value={query}
+              />
+              <button className="ghost-button" disabled={busy || !query.trim()} onClick={search} type="button">搜索</button>
+            </div>
+            {searchResults ? (
+              searchResults.length ? (
+                <div className="memory-entry-list">
+                  {searchResults.map((match) => (
+                    <div className="memory-entry" key={`${match.topic}-${match.path}`}>
+                      <div className="memory-entry-head">
+                        <span className="memory-topic-tag">{match.topic}</span>
+                        <small>匹配度 {match.score}</small>
+                      </div>
+                      <p>{match.excerpt}</p>
+                    </div>
+                  ))}
+                </div>
+              ) : <p className="memory-empty-hint">没有匹配的记忆。</p>
+            ) : null}
+          </section>
+
+          <section>
+            <div className="section-heading-row">
+              <div><h3>记忆列表</h3></div>
+              <span className="settings-inline-actions">
+                <button className="ghost-button" disabled={busy} onClick={() => { setConfirmClear(false); void execute(onLoad); }} type="button">刷新</button>
+                <button className="ghost-button is-danger" disabled={busy || !overview.totalEntries} onClick={clearAll} type="button">{confirmClear ? "确认清空？" : "清空全部"}</button>
+              </span>
+            </div>
+            {overview.entries.length ? (
+              <div className="memory-entry-list">
+                {overview.entries.map((entry) => (
+                  <div className="memory-entry" key={`${entry.topic}-${String(entry.index)}`}>
+                    <div className="memory-entry-head">
+                      <span className="memory-topic-tag">{entry.topic}</span>
+                      <small>{formatMemoryDate(entry.date)}</small>
+                      <button aria-label={`删除记忆：${entry.title}`} className="icon-button memory-entry-delete" disabled={busy} onClick={() => void execute(async () => await onDeleteEntry(entry.topic, entry.index), "记忆已删除")} type="button"><Icon name="close" size={12} /></button>
+                    </div>
+                    <strong>{entry.title}</strong>
+                    {entry.summary && entry.summary !== entry.title ? <p>{entry.summary}</p> : null}
+                  </div>
+                ))}
+              </div>
+            ) : <p className="memory-empty-hint">记忆库为空。任务成功后会自动沉淀，也可在上方手动添加。</p>}
+          </section>
+        </>
+      ) : (
+        <section>
+          <h3>记忆已停用</h3>
+          <p className="memory-empty-hint">启用记忆并保存设置后，即可整理、添加、搜索与管理记忆条目。</p>
+        </section>
+      )}
     </div>
   );
 }
 
-function SettingsProject({ project, sessionCount, onReveal, onOpenTerminal, onRemove }: { project?: DesktopProject; sessionCount: number; onReveal(): void; onOpenTerminal(): void; onRemove(): void }): React.JSX.Element {
-  return <div className="settings-sections"><section><h3>{project?.name ?? "没有项目"}</h3><div className="project-settings-path">{project?.path}</div><div className="project-settings-meta">{String(sessionCount)} 个会话{project?.branch ? ` · ${project.branch}` : ""}{project?.dirty ? " · 有未提交修改" : ""}</div><div className="settings-button-row"><button disabled={!project} onClick={onReveal} type="button">在 Finder 中显示</button><button disabled={!project} onClick={onOpenTerminal} type="button">在终端中打开</button><button className="is-danger" disabled={!project} onClick={onRemove} type="button">从侧边栏移除</button></div></section></div>;
+function formatMemoryDate(value?: string): string {
+  if (!value) return "";
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return value;
+  return new Date(parsed).toLocaleString(undefined, { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
 function SettingsAbout({ version }: { version: string }): React.JSX.Element {

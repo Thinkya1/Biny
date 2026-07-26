@@ -16,14 +16,18 @@ export const TUI_SLASH_COMMANDS: SlashCommand[] = [
   { name: "/model", description: "Switch model and thinking effort", category: "system" },
   { name: "/status", description: "Show model, permissions and extensions", category: "system" },
   { name: "/mcp", description: "List configured MCP servers and tools", category: "extension" },
-  { name: "/skills", description: "List loaded workspace skills", category: "extension" },
+  { name: "/skills", description: "List available skills (project & global)", category: "extension" },
   { name: "/plugins", description: "List loaded plugins", category: "extension" },
-  { name: "/subagent", description: "Run, inspect, or cancel a read-only subagent", category: "extension", requiresArgs: true },
+  { name: "/subagent", description: "Run, inspect, or cancel a subagent; `agents` lists named definitions", category: "extension", requiresArgs: true },
   { name: "/review", description: "Review current changes with a read-only subagent", category: "extension" },
+  { name: "/memory", description: "Manage durable project memory (list/show/add/forget/search/compact)", category: "extension" },
   { name: "/sessions", description: "List recorded sessions", category: "session" },
   { name: "/resume", description: "Show a session, defaults to latest", category: "session" },
   { name: "/permissions", description: "View or change permission mode", category: "system" },
   { name: "/approvals", description: "Alias for /permissions", category: "system" },
+  { name: "/undo", description: "Restore the workspace from a Biny checkpoint", category: "system" },
+  { name: "/continue", description: "Continue a turn that was interrupted mid-run", category: "system" },
+  { name: "/fork", description: "Fork a session into a new one", category: "system" },
   { name: "/plan", description: "Toggle Plan mode or plan the next task", category: "plan" },
   { name: "/exit", description: "Exit TUI", category: "system" },
   { name: "/quit", description: "Exit TUI", category: "system" }
@@ -33,5 +37,5 @@ export function isConcurrentTuiSlashCommand(value: string): boolean {
   const [command, action] = value.trim().split(/\s+/);
   if (command !== "/subagent") return false;
   const normalizedAction = action?.toLowerCase();
-  return normalizedAction === "status" || normalizedAction === "cancel";
+  return normalizedAction === "status" || normalizedAction === "cancel" || normalizedAction === "agents";
 }

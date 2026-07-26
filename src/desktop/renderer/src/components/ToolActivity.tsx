@@ -1,29 +1,42 @@
+/**
+ * 单个工具调用的展示卡片：状态、参数摘要、diff/输出，以及权限询问的交互。
+ *
+ * 展开状态是「自动 + 手动覆盖」的组合：等待权限、失败、被拒时默认展开，其余（包括运行中）
+ * 保持折叠，运行状态由行首的 spinner 表达；用户手动切换后 `override` 记住该选择，
+ * 直到工具状态发生变化再回到自动策略。
+ */
 import { memo, useEffect, useMemo, useState } from "react";
 import { isFullYesConfirmation } from "../../../../permission/confirmation.js";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
+import { tokenizeCommand } from "../commandHighlight.js";
 import type { TimelineCommand, TimelineTool } from "../sessionTimeline.js";
+import { projectWebSearchView, type WebSearchResultView, type WebSearchView } from "../webSearchPresentation.js";
 import { CopyButton } from "./CopyButton.js";
-import { Icon, type IconName } from "./Icon.js";
+import { Icon } from "./Icon.js";
 
 interface ToolActivityProps {
   projectId: string;
   tool: TimelineTool;
   onPreviewFile(path: string): void;
+  onOpenExternal(url: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
 }
 
-export const ToolActivity = memo(function ToolActivity({ projectId, tool, onPreviewFile, onResolvePermission }: ToolActivityProps): React.JSX.Element {
+export const ToolActivity = memo(function ToolActivity({ projectId, tool, onPreviewFile, onOpenExternal, onResolvePermission }: ToolActivityProps): React.JSX.Element {
   const permissionPending = Boolean(tool.permission && !tool.permission.resolved);
-  const [expanded, setExpanded] = useState(permissionPending);
+  const auto = permissionPending || tool.status === "failed" || tool.status === "denied";
+  // override 连同当时的状态一起记：状态一变（比如从 running 变 success）就作废，回到自动策略。
+  const [override, setOverride] = useState<{ status: TimelineTool["status"]; expanded: boolean }>();
+  const expanded = override?.status === tool.status ? override.expanded : auto;
   const [resolving, setResolving] = useState(false);
   const command = useMemo(() => commandDetails(tool), [tool]);
   const diff = useMemo(() => tool.diff ? analyzeDiff(tool.diff) : undefined, [tool.diff]);
-  const summary = toolSummary(tool, command, diff);
+  const fileChange = useMemo(() => fileChangeDetails(tool), [tool]);
+  const webSearch = useMemo(() => tool.tool === "web_search" ? projectWebSearchView(tool.args, tool.result) : undefined, [tool.args, tool.result, tool.tool]);
+  const summary = toolSummary(tool, command, diff, webSearch);
   const previewPath = changedFilePath(tool);
-
-  useEffect(() => {
-    if (permissionPending) setExpanded(true);
-  }, [permissionPending]);
+  const durationMs = useLiveDuration(tool);
+  const errorText = meaningfulError(tool, command);
 
   const resolve = async (result: PermissionResult): Promise<void> => {
     if (!tool.permission || resolving) return;
@@ -38,12 +51,10 @@ export const ToolActivity = memo(function ToolActivity({ projectId, tool, onPrev
   return (
     <article className={`tool-activity is-${tool.status}`} data-project-id={projectId}>
       <div className="tool-heading-row">
-        <button aria-expanded={expanded} className="tool-heading" onClick={() => setExpanded(!expanded)} type="button">
-          <span className="tool-icon"><Icon name={toolIcon(tool)} size={14} /></span>
+        <button aria-expanded={expanded} className="tool-heading" onClick={() => setOverride({ status: tool.status, expanded: !expanded })} type="button">
+          <ToolStatusGlyph status={tool.status} />
           <span className="tool-name">{toolLabel(tool.tool)}</span>
           <span className="tool-summary">{summary}</span>
-          <ToolStatus status={tool.status} />
-          {tool.durationMs !== undefined ? <span className="tool-duration">{formatDuration(tool.durationMs)}</span> : null}
           <span className={`tool-disclosure${expanded ? " is-expanded" : ""}`}><Icon name="chevron" size={13} /></span>
         </button>
         {previewPath ? (
@@ -65,22 +76,35 @@ export const ToolActivity = memo(function ToolActivity({ projectId, tool, onPrev
             <PermissionCard disabled={resolving} permission={tool.permission} onResolve={resolve} />
           ) : null}
           {command ? <CommandLog command={command} running={tool.status === "running"} /> : null}
+          {fileChange ? <FileChangeView change={fileChange} onPreviewFile={onPreviewFile} /> : null}
           {diff && tool.diff ? <DiffView diff={tool.diff} info={diff} onPreviewFile={onPreviewFile} /> : null}
-          {tool.path && !diff ? (
+          {webSearch ? <WebSearchLog onOpenExternal={onOpenExternal} tool={tool} view={webSearch} /> : null}
+          {tool.path && !diff && !fileChange ? (
             <button className="file-path-row" onClick={() => onPreviewFile(tool.path ?? "")} title="在右侧预览" type="button"><Icon name="file" size={13} /><span>{tool.path}</span></button>
           ) : null}
-          {!command && !diff ? <ToolPayload tool={tool} /> : null}
-          {tool.error ? (
-            <div className="copyable-code-block is-error">
-              <CopyButton className="copy-button" label="复制错误" value={tool.error} />
-              <pre className="tool-error-output"><code>{tool.error}</code></pre>
-            </div>
+          {!command && !diff && !webSearch && !fileChange ? <ToolPayload tool={tool} /> : null}
+          {errorText ? (
+            <section className="tool-section">
+              <h4 className="tool-section-label">错误</h4>
+              <div className="copyable-code-block is-error">
+                <CopyButton className="copy-button" label="复制错误" value={errorText} />
+                <pre className="tool-error-output"><code>{errorText}</code></pre>
+              </div>
+            </section>
           ) : null}
+          {durationMs !== undefined ? <footer className="tool-call-meta">时长 {formatDuration(durationMs)}</footer> : null}
         </div>
       ) : null}
     </article>
   );
 });
+
+// 「Command exited with code N.」只是退出码徽标的复读，不单独成段。
+function meaningfulError(tool: TimelineTool, command: TimelineCommand | undefined): string | undefined {
+  if (!tool.error) return undefined;
+  if (command?.exitCode !== undefined && /^Command exited with code \d+\.$/.test(tool.error)) return undefined;
+  return tool.error;
+}
 
 function changedFilePath(tool: TimelineTool): string | undefined {
   const operation = tool.display?.kind === "file_io" ? tool.display.operation : undefined;
@@ -115,7 +139,7 @@ function PermissionCard({
     <section className="permission-card">
       <div className="permission-title"><Icon name="warning" size={16} /><strong>{request.title}</strong><span className={`risk-badge is-${request.riskLevel}`}>{riskLabel(request.riskLevel)}</span></div>
       <p>{request.details}</p>
-      {request.command ? <pre className="permission-preview"><code>{request.command}</code></pre> : null}
+      {request.command ? <pre className="permission-preview command-text"><code><CommandText command={request.command} /></code></pre> : null}
       {request.targetPath ? <div className="permission-target"><Icon name="file" size={13} /><span>{request.targetPath}</span></div> : null}
       {request.preview && !request.command ? <pre className="permission-preview"><code>{request.preview}</code></pre> : null}
       {request.reason ? <p className="permission-reason">{request.reason}</p> : null}
@@ -142,29 +166,173 @@ function PermissionCard({
   );
 }
 
+/** 命令按语义分段着色；配色规则见 styles.css 里的 `.command-text`。 */
+function CommandText({ command }: { command: string }): React.JSX.Element {
+  const tokens = useMemo(() => tokenizeCommand(command), [command]);
+  return <>{tokens.map((token, position) => <span className={`cmd-${token.kind}`} key={position}>{token.text}</span>)}</>;
+}
+
 function CommandLog({ command, running }: { command: TimelineCommand; running: boolean }): React.JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const output = [command.stdout, command.stderr].filter(Boolean).join(command.stdout && command.stderr ? "\n" : "");
   const longOutput = output.length > 3_000 || output.split("\n").length > 18;
   return (
-    <section className="command-log">
-      <header>
-        <div className="command-line"><span className="prompt-symbol">$</span><code>{command.command}</code></div>
-        <div className="command-meta">
-          {command.cwd ? <span>{command.cwd}</span> : null}
-          {running ? <span className="running-label"><span className="mini-spinner" />运行中</span> : command.exitCode !== undefined ? <span>退出码 {command.exitCode}</span> : null}
-          <CopyButton label="复制命令" value={command.command} />
+    <>
+      <section className="tool-section">
+        <h4 className="tool-section-label">命令</h4>
+        <div className="code-card is-dashed command-card">
+          <CopyButton className="copy-button" label="复制命令" value={command.command} />
+          <pre className="command-text"><code><CommandText command={command.command} /></code></pre>
         </div>
-      </header>
-      {output ? (
-        <div className="terminal-output-wrap">
-          <pre className={`terminal-output${expanded ? " is-expanded" : ""}`}><code>{command.stdout}{command.stdout && command.stderr && !command.stdout.endsWith("\n") ? "\n" : null}{command.stderr ? <span className="stderr-output">{command.stderr}</span> : null}</code></pre>
-          <CopyButton label="复制输出" value={output} />
-          {longOutput ? <button className="expand-output" onClick={() => setExpanded(!expanded)} type="button">{expanded ? "收起输出" : "展开全部输出"}</button> : null}
+      </section>
+      {output || running ? (
+        <section className="tool-section">
+          <h4 className="tool-section-label">
+            结果
+            {running ? <span className="running-label"><span className="mini-spinner" />运行中</span>
+              : command.exitCode !== undefined && command.exitCode !== 0 ? <span className="tool-section-meta is-error">退出码 {command.exitCode}</span> : null}
+          </h4>
+          {output ? (
+            <div className="code-card">
+              <div className="terminal-output-wrap">
+                <pre className={`terminal-output${expanded ? " is-expanded" : ""}`}><code>{command.stdout}{command.stdout && command.stderr && !command.stdout.endsWith("\n") ? "\n" : null}{command.stderr ? <span className="stderr-output">{command.stderr}</span> : null}</code></pre>
+                <CopyButton label="复制输出" value={output} />
+              </div>
+              {longOutput ? <button className="expand-output" onClick={() => setExpanded(!expanded)} type="button">{expanded ? "收起输出" : "展开全部输出"}</button> : null}
+            </div>
+          ) : <div className="code-card is-empty">等待输出…</div>}
+        </section>
+      ) : null}
+    </>
+  );
+}
+
+interface FileChangeDetails {
+  operation: "write" | "edit";
+  path?: string;
+  content?: string;
+  before?: string;
+  after?: string;
+}
+
+function fileChangeDetails(tool: TimelineTool): FileChangeDetails | undefined {
+  const display = tool.display?.kind === "file_io" ? tool.display : undefined;
+  const args = typeof tool.args === "object" && tool.args !== null ? tool.args as Record<string, unknown> : undefined;
+  const path = display?.path ?? tool.path ?? stringField(args, "path");
+  if (tool.tool === "write_file" || display?.operation === "write") {
+    const content = display?.content ?? stringField(args, "content");
+    if (content === undefined) return undefined;
+    return { operation: "write", path, content };
+  }
+  if (tool.tool === "edit_file" || display?.operation === "edit") {
+    const before = display?.before ?? stringField(args, "oldText");
+    const after = display?.after ?? stringField(args, "newText");
+    if (before === undefined || after === undefined) return undefined;
+    return { operation: "edit", path, before, after };
+  }
+  return undefined;
+}
+
+interface FileChangeLine {
+  kind: "add" | "del";
+  number?: number;
+  text: string;
+}
+
+function fileChangeLines(change: FileChangeDetails): FileChangeLine[] {
+  const split = (value: string): string[] => {
+    const lines = value.split("\n");
+    if (lines.at(-1) === "") lines.pop();
+    return lines;
+  };
+  if (change.operation === "write") {
+    return split(change.content ?? "").map((text, index) => ({ kind: "add", number: index + 1, text }));
+  }
+  return [
+    ...split(change.before ?? "").map((text): FileChangeLine => ({ kind: "del", text })),
+    ...split(change.after ?? "").map((text): FileChangeLine => ({ kind: "add", text }))
+  ];
+}
+
+const fileChangeVisibleLines = 24;
+
+function FileChangeView({ change, onPreviewFile }: { change: FileChangeDetails; onPreviewFile(path: string): void }): React.JSX.Element {
+  const [showAll, setShowAll] = useState(false);
+  const lines = useMemo(() => fileChangeLines(change), [change]);
+  const visible = showAll ? lines : lines.slice(0, fileChangeVisibleLines);
+  const fileName = change.path?.replaceAll("\\", "/").split("/").at(-1);
+  return (
+    <section className="tool-section">
+      <h4 className="tool-section-label">{change.operation === "write" ? "内容" : "变更"}</h4>
+      <div className="code-card">
+        {change.path ? (
+          <button className="code-card-header" onClick={() => onPreviewFile(change.path ?? "")} title={`在右侧预览 ${change.path}`} type="button">
+            <Icon name="file" size={12} />
+            <span className="code-card-filename">{fileName}</span>
+          </button>
+        ) : null}
+        <div className="code-card-body">
+          <CopyButton className="copy-button" label={change.operation === "write" ? "复制内容" : "复制新内容"} value={(change.operation === "write" ? change.content : change.after) ?? ""} />
+          <pre className="code-lines"><code>
+            {visible.map((line, index) => (
+              <span className={`code-line is-${line.kind}`} key={`${String(index)}-${line.text.slice(0, 20)}`}>
+                <span className="code-line-number">{line.number ?? ""}</span>
+                <span className="code-line-sign">{line.kind === "add" ? "+" : "-"}</span>
+                <span className="code-line-text">{line.text}</span>{"\n"}
+              </span>
+            ))}
+          </code></pre>
         </div>
-      ) : <div className="empty-output">{running ? "等待输出…" : "命令没有输出"}</div>}
+        {lines.length > visible.length ? <button className="expand-output" onClick={() => setShowAll(true)} type="button">展开全部 {lines.length} 行</button> : null}
+      </div>
     </section>
   );
+}
+
+function WebSearchLog({ view, tool, onOpenExternal }: { view: WebSearchView; tool: TimelineTool; onOpenExternal(url: string): void }): React.JSX.Element {
+  const running = tool.status === "running" || tool.status === "waiting";
+  const statusText = [...tool.updates].reverse().find((update) => update.text)?.text;
+  return (
+    <section className="web-search-log">
+      <header className="web-search-meta">
+        <span className="web-search-query" title={view.query}><Icon name="search" size={12} /><span>{view.query}</span></span>
+        {view.providerLabel ? <span className="web-search-provider">{view.providerLabel}</span> : null}
+        {running ? (
+          <span className="running-label"><span className="mini-spinner" />{statusText ?? "正在搜索网页…"}</span>
+        ) : tool.status === "success" ? (
+          <span className="web-search-count">{String(view.results.length)} 条结果</span>
+        ) : null}
+      </header>
+      {view.results.length ? (
+        <ol className="web-search-results">
+          {view.results.map((result) => (
+            <li key={result.url}>
+              <button className="web-search-result" onClick={() => onOpenExternal(result.url)} title={`在浏览器中打开 ${result.url}`} type="button">
+                <ResultFavicon key={result.url} result={result} />
+                <span className="web-search-result-main">
+                  <span className="web-search-result-heading">
+                    <span className="web-search-result-title">{result.title}</span>
+                    <span className="web-search-result-domain">{result.domain}</span>
+                  </span>
+                  {result.snippet ? <span className="web-search-result-snippet">{result.snippet}</span> : null}
+                </span>
+                <span className="web-search-result-open"><Icon name="external" size={13} /></span>
+              </button>
+            </li>
+          ))}
+        </ol>
+      ) : tool.status === "success" ? (
+        <div className="empty-output">没有找到搜索结果</div>
+      ) : null}
+    </section>
+  );
+}
+
+function ResultFavicon({ result }: { result: WebSearchResultView }): React.JSX.Element {
+  const [candidateIndex, setCandidateIndex] = useState(0);
+  const src = result.faviconCandidates[candidateIndex];
+  if (!src) return <span aria-hidden="true" className="web-search-favicon is-fallback">{result.fallbackLetter}</span>;
+  return <img alt="" className="web-search-favicon" loading="lazy" onError={() => setCandidateIndex(candidateIndex + 1)} src={src} />;
 }
 
 interface DiffInfo {
@@ -221,21 +389,40 @@ function ToolPayload({ tool }: { tool: TimelineTool }): React.JSX.Element {
   const progress = tool.updates.filter((update) => update.text).map((update) => update.text).join("\n");
   const display = tool.display;
   if (display?.kind === "file_io") {
+    // 操作和路径在折叠行的名称与摘要里已经表达过，这里只补充结果本身。
     const resultPreview = fileToolResult(tool.result);
+    if (!resultPreview?.text && resultPreview?.count === undefined) return <></>;
     return (
-      <>
-        <dl className="tool-fields">
-          <div><dt>操作</dt><dd>{display.operation}</dd></div>
-          {display.path ? <div><dt>路径</dt><dd><code>{display.path}</code></dd></div> : null}
-          {display.detail ? <div><dt>说明</dt><dd>{display.detail}</dd></div> : null}
-          {resultPreview?.count !== undefined ? <div><dt>结果</dt><dd>{resultPreview.count}</dd></div> : null}
-        </dl>
-        {resultPreview?.text ? <CopyableCodeBlock label="复制结果" value={resultPreview.text} /> : null}
-      </>
+      <section className="tool-section">
+        <h4 className="tool-section-label">结果{resultPreview.count !== undefined ? <span className="tool-section-meta">{resultPreview.count}</span> : null}</h4>
+        {resultPreview.text ? <CopyableCodeBlock label="复制结果" value={resultPreview.text} /> : null}
+      </section>
     );
   }
-  const value = friendlyResult(tool.result) ?? (progress || friendlyResult(tool.args));
-  return value ? <CopyableCodeBlock label="复制结果" value={value} /> : <div className="empty-output">没有可展示的详细信息</div>;
+  const argsValue = friendlyResult(tool.args);
+  const resultValue = friendlyResult(tool.result) ?? (progress || undefined);
+  // 有结果时参数只是重复信息，只在还没有结果时展示参数。
+  if (hasPayloadValue(resultValue)) {
+    return (
+      <section className="tool-section">
+        <h4 className="tool-section-label">结果</h4>
+        <CopyableCodeBlock label="复制结果" value={resultValue ?? ""} />
+      </section>
+    );
+  }
+  if (hasPayloadValue(argsValue)) {
+    return (
+      <section className="tool-section">
+        <h4 className="tool-section-label">参数</h4>
+        <CopyableCodeBlock label="复制参数" value={argsValue ?? ""} />
+      </section>
+    );
+  }
+  return <></>;
+}
+
+function hasPayloadValue(value: string | undefined): boolean {
+  return Boolean(value && value !== "{}" && value !== "null");
 }
 
 function CopyableCodeBlock({ value, label }: { value: string; label: string }): React.JSX.Element {
@@ -247,25 +434,43 @@ function CopyableCodeBlock({ value, label }: { value: string; label: string }): 
   );
 }
 
-function ToolStatus({ status }: { status: TimelineTool["status"] }): React.JSX.Element {
-  if (status === "running") return <span className="tool-state"><span className="mini-spinner" />运行中</span>;
-  if (status === "success") return <span className="tool-state"><Icon name="check" size={12} />成功</span>;
-  if (status === "failed") return <span className="tool-state is-error"><Icon name="warning" size={12} />失败</span>;
-  if (status === "denied") return <span className="tool-state is-error">已拒绝</span>;
-  if (status === "aborted") return <span className="tool-state">已中止</span>;
-  return <span className="tool-state">等待</span>;
+// 运行中的工具没有 durationMs，用事件时间戳实时递增，结束后回落到权威时长（Alma 同款交互）。
+function useLiveDuration(tool: TimelineTool): number | undefined {
+  const running = tool.durationMs === undefined && tool.status === "running";
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!running) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, [running]);
+  if (tool.durationMs !== undefined) return tool.durationMs;
+  if (!running || !tool.timestamp) return undefined;
+  const startedAt = Date.parse(tool.timestamp);
+  return Number.isNaN(startedAt) ? undefined : Math.max(0, now - startedAt);
 }
 
-function toolSummary(tool: TimelineTool, command: TimelineCommand | undefined, diff: DiffInfo | undefined): string {
+// 行首状态字形（Alma 风格）：类型信息交给工具名，行首只表达执行状态。
+function ToolStatusGlyph({ status }: { status: TimelineTool["status"] }): React.JSX.Element {
+  if (status === "running") return <span className="tool-status-glyph is-running"><span className="mini-spinner" /></span>;
+  if (status === "success") return <span className="tool-status-glyph is-success"><Icon name="check" size={13} /></span>;
+  if (status === "failed") return <span className="tool-status-glyph is-error"><Icon name="close" size={13} /></span>;
+  if (status === "denied") return <span className="tool-status-glyph is-error"><Icon name="shield" size={12} /></span>;
+  if (status === "aborted") return <span className="tool-status-glyph"><Icon name="stop" size={12} /></span>;
+  return <span className="tool-status-glyph is-waiting"><span className="tool-waiting-dot" /></span>;
+}
+
+function toolSummary(tool: TimelineTool, command: TimelineCommand | undefined, diff: DiffInfo | undefined, webSearch: WebSearchView | undefined): string {
   if (command?.command) return command.command;
   if (diff) return `${String(diff.files.length)} 个文件，+${String(diff.additions)} -${String(diff.deletions)}`;
+  if (webSearch?.query) return tool.status === "success" ? `${webSearch.query} · ${String(webSearch.results.length)} 条结果` : webSearch.query;
   if (tool.path) return tool.path;
   if (tool.display?.kind === "file_io") return tool.display.path ?? tool.display.detail ?? tool.display.operation;
   if (tool.display?.kind === "generic") return tool.display.summary;
   if (tool.description) return tool.description;
   const args = tool.args as Record<string, unknown> | undefined;
   const candidate = args && [args.path, args.query, args.pattern, args.command].find((value) => typeof value === "string");
-  return typeof candidate === "string" ? candidate : "查看详情";
+  return typeof candidate === "string" ? candidate : "";
 }
 
 function commandDetails(tool: TimelineTool): TimelineCommand | undefined {
@@ -381,14 +586,6 @@ function friendlyResult(value: unknown): string | undefined {
   }
 }
 
-function toolIcon(tool: TimelineTool): IconName {
-  if (tool.command || tool.display?.kind === "command" || tool.tool === "run_command") return "terminal";
-  if (tool.diff || tool.tool === "git_diff") return "diff";
-  if (tool.tool.includes("search") || tool.tool.includes("grep")) return "search";
-  if (tool.tool.includes("file") || tool.display?.kind === "file_io") return "file";
-  return "code";
-}
-
 function toolLabel(tool: string): string {
   const labels: Record<string, string> = {
     read_file: "读取文件",
@@ -397,11 +594,12 @@ function toolLabel(tool: string): string {
     list_files: "列出文件",
     search_files: "搜索文件",
     grep_search: "搜索内容",
-    run_command: "运行命令",
+    run_command: "Bash",
     git_diff: "查看 Diff",
-    git_status: "检查 Git"
+    git_status: "检查 Git",
+    web_search: "联网搜索"
   };
-  return labels[tool] ?? tool.replaceAll("_", " ");
+  return labels[tool] ?? tool;
 }
 
 function riskLabel(risk: string): string {

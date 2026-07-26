@@ -1,0 +1,336 @@
+import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { z } from "zod";
+import { LocalMemory } from "../src/agent/context/LocalMemory.js";
+import { runMemoryCommand } from "../src/agent/context/memoryCommands.js";
+import { WorkspaceContext } from "../src/agent/context/WorkspaceContext.js";
+import { configSchema, defaultConfig } from "../src/config/schema.js";
+import {
+  buildSubagentDefinitionsPrompt,
+  findSubagentDefinition,
+  loadSubagentDefinitions
+} from "../src/extensions/agents.js";
+import { createMemoryTools } from "../src/extensions/memory.js";
+import { runSubagentTask, type SubagentOptions } from "../src/extensions/subagent.js";
+import { createModelSettings } from "../src/llm/factory.js";
+import { ensureAgentDirs } from "../src/session/store.js";
+import { ToolRegistry } from "../src/tools/registry.js";
+import type { Tool } from "../src/tools/types.js";
+import { SubagentTaskManager } from "../src/runtime/SubagentTaskManager.js";
+import type { LanguageModel } from "ai";
+
+async function main(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-named-agents-"));
+  try {
+    await testSubagentDefinitionLoading(workspaceRoot);
+    await testSubagentDefinitionBoundaries(workspaceRoot);
+    await testSubagentTaskManagerAgentThreading();
+    await testSubagentBudgetExhaustionReturnsPartialFindings();
+    await testMemoryTopicLifecycle();
+    await testMemoryTools();
+    await testGlobalInstructionFile();
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testSubagentDefinitionLoading(workspaceRoot: string): Promise<void> {
+  const projectDir = path.join(workspaceRoot, ".biny", "agents");
+  await mkdir(projectDir, { recursive: true });
+  await writeFile(path.join(projectDir, "scout.md"), [
+    "---",
+    "name: scout",
+    "description: Read-only reconnaissance over the repository.",
+    "tools: read_file, grep_search, read_file",
+    "model: deepseek-v4-flash",
+    "---",
+    "Locate relevant files and report exact paths with line ranges."
+  ].join("\n"), "utf8");
+  // 文件名兜底命名 + 无 tools/model。
+  await writeFile(path.join(projectDir, "Reviewer Agent.md"), [
+    "---",
+    "description: Reviews diffs for regressions.",
+    "---",
+    "Review the change set and report concrete risks."
+  ].join("\n"), "utf8");
+  // 缺 description 的定义应被跳过。
+  await writeFile(path.join(projectDir, "invalid.md"), "---\nname: broken\n---\nBody only.", "utf8");
+
+  const globalRoot = await mkdtemp(path.join(os.tmpdir(), "biny-global-agents-"));
+  try {
+    // 全局同名 scout 应被项目级覆盖；独有的 planner 应保留。
+    await writeFile(path.join(globalRoot, "scout.md"), "---\ndescription: global scout\n---\nGlobal scout body.", "utf8");
+    await writeFile(path.join(globalRoot, "planner.md"), "---\ndescription: Plans implementation steps.\n---\nProduce a step-by-step plan.", "utf8");
+
+    const definitions = await loadSubagentDefinitions({
+      workspaceRoot,
+      projectPaths: [".biny/agents", ".agent/agents"],
+      globalRoot
+    });
+    assert.deepEqual(definitions.map((definition) => definition.name).sort(), ["planner", "reviewer-agent", "scout"]);
+
+    const scout = findSubagentDefinition(definitions, "Scout");
+    assert.ok(scout);
+    assert.equal(scout.scope, "project");
+    assert.equal(scout.model, "deepseek-v4-flash");
+    assert.deepEqual(scout.tools, ["read_file", "grep_search"]);
+    assert.match(scout.prompt, /exact paths with line ranges/);
+    assert.equal(scout.path, path.join(".biny", "agents", "scout.md"));
+
+    const planner = findSubagentDefinition(definitions, "planner");
+    assert.equal(planner?.scope, "global");
+    assert.equal(planner?.tools, undefined);
+
+    const prompt = buildSubagentDefinitionsPrompt(definitions);
+    assert.match(prompt, /Named subagents/);
+    assert.match(prompt, /scout \(project, model deepseek-v4-flash, tools read_file\/grep_search\)/);
+    assert.match(prompt, /delegate_task/);
+    assert.equal(buildSubagentDefinitionsPrompt([]), "");
+  } finally {
+    await rm(globalRoot, { recursive: true, force: true });
+  }
+}
+
+async function testSubagentDefinitionBoundaries(workspaceRoot: string): Promise<void> {
+  const outside = await mkdtemp(path.join(os.tmpdir(), "biny-agents-outside-"));
+  try {
+    await writeFile(path.join(outside, "evil.md"), "---\ndescription: escaped\n---\nEscaped body.", "utf8");
+    // 指向 workspace 外的软链文件应被跳过，不成为定义。
+    const projectDir = path.join(workspaceRoot, ".biny", "agents");
+    await symlink(path.join(outside, "evil.md"), path.join(projectDir, "evil.md"));
+    const definitions = await loadSubagentDefinitions({
+      workspaceRoot,
+      projectPaths: [".biny/agents"],
+      globalRoot: path.join(outside, "missing-global")
+    });
+    assert.ok(!definitions.some((definition) => definition.name === "evil"));
+
+    // 配置目录本身是软链时必须硬失败。
+    await symlink(outside, path.join(workspaceRoot, "linked-agents"));
+    await assert.rejects(
+      loadSubagentDefinitions({ workspaceRoot, projectPaths: ["linked-agents"], globalRoot: path.join(outside, "missing-global") }),
+      /symbolic link/
+    );
+    // 越界路径同样拒绝。
+    await assert.rejects(
+      loadSubagentDefinitions({ workspaceRoot, projectPaths: ["../escape"], globalRoot: path.join(outside, "missing-global") }),
+      /inside workspace/
+    );
+  } finally {
+    await rm(outside, { recursive: true, force: true });
+  }
+}
+
+async function testSubagentTaskManagerAgentThreading(): Promise<void> {
+  const seenAgents: Array<string | undefined> = [];
+  const manager = new SubagentTaskManager({
+    maxConcurrentSubagents: 1,
+    timeoutMs: 5_000,
+    execute: async (_task, context) => {
+      seenAgents.push(context.agent);
+      return "done";
+    }
+  });
+  try {
+    const withAgent = await manager.run("inspect the repo", { agent: "scout" });
+    assert.equal(withAgent, "done");
+    const withoutAgent = await manager.run("inspect the repo again");
+    assert.equal(withoutAgent, "done");
+    assert.deepEqual(seenAgents, ["scout", undefined]);
+    const snapshots = manager.listSnapshots();
+    assert.equal(snapshots.find((snapshot) => snapshot.agent === "scout")?.status, "completed");
+  } finally {
+    await manager.close();
+  }
+}
+
+/** 模型每步都继续请求工具，验证步数预算截停时返回带标注的部分结论而不是抛错。 */
+async function testSubagentBudgetExhaustionReturnsPartialFindings(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-subagent-partial-"));
+  const originalFetch = globalThis.fetch;
+  try {
+    await ensureAgentDirs(workspaceRoot);
+    let requestCount = 0;
+    // 子代理走非流式 generate，返回 JSON chat completion；每步都继续请求工具。
+    globalThis.fetch = (async (): Promise<Response> => {
+      requestCount += 1;
+      return jsonCompletionResponse({
+        id: `cmpl-${String(requestCount)}`,
+        object: "chat.completion",
+        created: 0,
+        model: "test-model",
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: `Inspect round ${String(requestCount)}.`,
+            tool_calls: [{ id: `list-${String(requestCount)}`, type: "function", function: { name: "list_files", arguments: "{}" } }]
+          },
+          finish_reason: "tool_calls"
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }
+      });
+    }) as typeof fetch;
+
+    const config = configSchema.parse({
+      defaultModel: "test-model",
+      providers: { active: { type: "openai", apiKey: "test-key", baseUrl: "https://api.openai.com/v1" } },
+      models: { "test-model": { provider: "active", model: "test-model" } },
+      thinking: { enabled: false, effort: "high" },
+      permission: defaultConfig.permission,
+      workspace: defaultConfig.workspace,
+      context: { ...defaultConfig.context, memory: { enabled: false } }
+    });
+    const registry = new ToolRegistry();
+    registry.registerBuiltinTool(listFilesTool());
+    const options: SubagentOptions = {
+      workspaceRoot,
+      config,
+      getModelSettings: () => createModelSettings(config),
+      getAccessMode: () => "read-only",
+      toolRegistry: registry
+    };
+
+    // "review …" 不含实现/调查关键词，命中最小 8 步预算。
+    const output = await runSubagentTask(options, "review the current repository state");
+    assert.match(output, /\[Partial result: the bounded subagent budget ran out after 8 steps/);
+    assert.match(output, /Inspect round 1\./);
+    assert.equal(requestCount, 8);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+function listFilesTool(): Tool {
+  return {
+    name: "list_files",
+    description: "List workspace files.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    schema: z.object({}),
+    capability: "filesystem.list",
+    risk: "read",
+    resolveExecution() {
+      return { approvalRule: "list_files", async execute() { return { files: ["src/index.ts"] }; } };
+    }
+  } as Tool;
+}
+
+function jsonCompletionResponse(payload: Record<string, unknown>): Response {
+  return new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+function unusedModel(): LanguageModel {
+  throw new Error("The model must not be called by explicit memory operations.");
+}
+
+async function testMemoryTopicLifecycle(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-memory-cmd-"));
+  try {
+    const memory = new LocalMemory(workspaceRoot, unusedModel);
+
+    const disabled = await runMemoryCommand(undefined, []);
+    assert.match(disabled, /disabled/);
+
+    const empty = await runMemoryCommand(memory, ["list"]);
+    assert.match(empty, /empty/);
+
+    const added = await runMemoryCommand(memory, ["add", "decisions", "Always run pnpm typecheck before committing changes."]);
+    assert.match(added, /Saved memory note/);
+
+    const tooShort = await runMemoryCommand(memory, ["add", "decisions", "too short"]);
+    assert.match(tooShort, /Skipped/);
+
+    const listed = await runMemoryCommand(memory, ["list"]);
+    assert.match(listed, /decisions/);
+
+    const shown = await runMemoryCommand(memory, ["show", "decisions"]);
+    assert.match(shown, /pnpm typecheck/);
+
+    const forgotten = await runMemoryCommand(memory, ["forget", "decisions"]);
+    assert.match(forgotten, /Forgot memory topic decisions/);
+    assert.deepEqual(await memory.listTopics(), []);
+    // 索引中的话题行也要被清掉。
+    assert.ok(!((await memory.readIndex()) ?? "").includes("decisions.md"));
+
+    const missing = await runMemoryCommand(memory, ["forget", "decisions"]);
+    assert.match(missing, /No memory topic/);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testMemoryTools(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-memory-tools-"));
+  try {
+    const memory = new LocalMemory(workspaceRoot, unusedModel);
+    const [saveTool, recallTool] = createMemoryTools(() => memory);
+    assert.equal(saveTool?.name, "save_memory");
+    assert.equal(recallTool?.name, "recall_memory");
+    assert.equal(saveTool.risk, "write");
+    assert.equal(recallTool.risk, "read");
+
+    const saveExecution = await saveTool.resolveExecution({
+      topic: "workflows",
+      title: "Release flow",
+      summary: "Releases are cut from main after pnpm test and pnpm typecheck pass.",
+      keywords: ["release", "main"]
+    });
+    assert.ok(!("isError" in saveExecution));
+    const saved = await saveExecution.execute({ toolCallId: "save-1" }) as { saved: boolean; path?: string };
+    assert.equal(saved.saved, true);
+    assert.equal(saved.path, path.join(".agent", "memory", "workflows.md"));
+
+    // 无效参数走 isError 分支而不是抛异常。
+    const invalid = await saveTool.resolveExecution({ topic: "x", title: "y", summary: "short" });
+    assert.ok("isError" in invalid);
+
+    const recallExecution = await recallTool.resolveExecution({ query: "release main" });
+    assert.ok(!("isError" in recallExecution));
+    const recalled = await recallExecution.execute({ toolCallId: "recall-1" }) as { matches: Array<{ topic: string }> };
+    assert.equal(recalled.matches[0]?.topic, "workflows");
+
+    const topicExecution = await recallTool.resolveExecution({ query: "anything", topic: "workflows" });
+    assert.ok(!("isError" in topicExecution));
+    const topicResult = await topicExecution.execute({ toolCallId: "recall-2" }) as { content?: string };
+    assert.match(topicResult.content ?? "", /Release flow/);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testGlobalInstructionFile(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-global-instructions-"));
+  const globalDir = await mkdtemp(path.join(os.tmpdir(), "biny-global-home-"));
+  try {
+    await writeFile(path.join(workspaceRoot, "AGENTS.md"), "Project instructions.", "utf8");
+    const globalFile = path.join(globalDir, "AGENTS.md");
+    await writeFile(globalFile, "Global instructions baseline.", "utf8");
+
+    const workspace = new WorkspaceContext(workspaceRoot, [], 32 * 1024, globalFile);
+    await workspace.initialize();
+    const status = workspace.status();
+    // 全局指令在项目指令之前加载。
+    assert.equal(status.loadedInstructions[0], globalFile);
+    assert.equal(status.loadedInstructions[1], "AGENTS.md");
+
+    // 软链全局文件应被忽略。
+    const linkedWorkspace = await mkdtemp(path.join(os.tmpdir(), "biny-global-linked-"));
+    try {
+      const linkPath = path.join(linkedWorkspace, "AGENTS.link.md");
+      await symlink(globalFile, linkPath);
+      const linked = new WorkspaceContext(linkedWorkspace, [], 32 * 1024, linkPath);
+      await linked.initialize();
+      assert.deepEqual(linked.status().loadedInstructions, []);
+    } finally {
+      await rm(linkedWorkspace, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(globalDir, { recursive: true, force: true });
+  }
+}
+
+await main();

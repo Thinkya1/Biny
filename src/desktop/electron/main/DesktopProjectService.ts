@@ -1,3 +1,12 @@
+/**
+ * 桌面端项目与会话服务。
+ *
+ * 负责项目的增删改查、git 分支/脏状态探测、会话列表与复制/删除/分叉、附件保存，以及工作区
+ * 文件浏览。IPC 层只做参数转发，实际的文件系统和 session 操作都在这里。
+ *
+ * 所有工作区路径都经过 `resolveWorkspacePath` / `resolveWorkspaceDirectory` 收敛，渲染层传来的
+ * 相对路径不能逃出项目目录。
+ */
 import { createHash, randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
@@ -25,6 +34,20 @@ import { DesktopUserDataStore } from "./DesktopUserDataStore.js";
 
 const execFileAsync = promisify(execFile);
 const filePreviewLimit = 512 * 1024;
+/** 内联图片要整张塞进 data URL，超过这个大小就不给了，免得 IPC 和 DOM 里挂着几十兆的 base64。 */
+const inlineImageLimit = 8 * 1024 * 1024;
+const attachmentPathPrefix = "@attachments/";
+const imageMediaTypes: Record<string, string> = {
+  avif: "image/avif",
+  bmp: "image/bmp",
+  gif: "image/gif",
+  ico: "image/x-icon",
+  jpeg: "image/jpeg",
+  jpg: "image/jpeg",
+  png: "image/png",
+  svg: "image/svg+xml",
+  webp: "image/webp"
+};
 
 export class DesktopProjectService {
   constructor(
@@ -33,6 +56,10 @@ export class DesktopProjectService {
     private readonly configStore: AgentConfigStore
   ) {}
 
+  /**
+   * 打开（或重新打开）一个项目目录。同一路径已存在时沿用原有 id、名称、置顶状态和加入时间，
+   * 只更新最后打开时间，这样重复打开不会变成一个新项目、也不会丢掉用户改过的名字。
+   */
   async createProject(projectPath: string): Promise<DesktopProject> {
     const resolvedPath = path.resolve(projectPath);
     const stat = await fs.stat(resolvedPath);
@@ -66,6 +93,10 @@ export class DesktopProjectService {
     return await this.createProject(resolvedPath);
   }
 
+  /**
+   * 刷新项目的实时信息（分支、是否有未提交改动）。目录已不存在时标记 `missing` 但保留记录，
+   * 让用户能在列表里看到并自行移除，而不是悄悄消失。
+   */
   async inspectProject(project: DesktopProject): Promise<DesktopProject> {
     const missing = !await directoryExists(project.path);
     if (missing) return { ...project, branch: undefined, dirty: false, missing: true };
@@ -178,6 +209,11 @@ export class DesktopProjectService {
     return targetSessionId;
   }
 
+  /**
+   * 在第 N 条用户消息处分叉出一个新会话，用于「编辑并重发」：新会话只保留该消息之前的事件，
+   * 原会话保持不变。`userMessageIndex` 是用户消息的序号（不是事件下标），因为界面上只看得到
+   * 用户消息。
+   */
   async forkSessionAtUserMessage(project: DesktopProject, sessionId: string, userMessageIndex: number): Promise<string> {
     const dataRoot = await this.storage.ensureProjectData(project);
     const events = await readStoredSessionEvents(dataRoot, sessionId).then((result) => result.events);
@@ -197,6 +233,10 @@ export class DesktopProjectService {
     await this.state.deleteSessionMetadata(project.id, sessionId);
   }
 
+  /**
+   * 保存附件到项目的附件目录。文件名先做安全化处理，再加时间戳和随机串前缀，
+   * 既避免同名覆盖，也避免用户提供的名字里带路径分隔符写到目录之外。
+   */
   async saveAttachment(project: DesktopProject, name: string, mimeType: string, bytes: Uint8Array): Promise<DesktopAttachment> {
     const safeName = sanitizeFileName(name);
     const directory = await this.storage.ensureAttachmentsRoot(project);
@@ -223,6 +263,7 @@ export class DesktopProjectService {
         path: directoryRelativePath === "." ? entry.name : `${directoryRelativePath.split(path.sep).join("/")}/${entry.name}`,
         kind: entry.isDirectory() ? "directory" : "file"
       } satisfies DesktopWorkspaceDirectoryEntry))
+      // 目录在前、文件在后，同类按名称排序。
       .sort((left, right) => {
         if (left.kind !== right.kind) return left.kind === "directory" ? -1 : 1;
         return left.name.localeCompare(right.name);
@@ -233,6 +274,10 @@ export class DesktopProjectService {
     };
   }
 
+  /**
+   * 读取文件预览：最多读 `filePreviewLimit` 字节，`truncated` 告诉界面内容不完整。
+   * 内容里出现 0 字节即判为二进制，此时不返回文本（界面改为提示不可预览）。
+   */
   async readWorkspaceFile(project: DesktopProject, relativePath: string): Promise<DesktopWorkspaceFilePreview> {
     const filePath = this.workspaceFile(project, relativePath);
     const stat = await fs.stat(filePath);
@@ -263,6 +308,30 @@ export class DesktopProjectService {
     };
   }
 
+  /**
+   * 读取消息里引用的图片，转成 data URL 交给界面内联显示。
+   *
+   * 渲染进程的 CSP 只放行 self / data: / https:，本地图片没法直接用 file:// 加载，只能由主进程
+   * 读出来转码。附件存在 userData 而不是工作区里，所以要按 `@attachments/` 前缀分流。
+   * 这是展示用的旁路加载，任何失败都返回 undefined 让界面退回文件名，不往上抛错。
+   */
+  async readInlineImage(project: DesktopProject, relativePath: string): Promise<string | undefined> {
+    const mediaType = imageMediaTypes[relativePath.toLowerCase().split(".").at(-1) ?? ""];
+    if (!mediaType) return undefined;
+    try {
+      const filePath = relativePath.startsWith(attachmentPathPrefix)
+        ? attachmentFilePath(this.storage.attachmentsRoot(project), relativePath)
+        : this.workspaceFile(project, relativePath);
+      if (!filePath) return undefined;
+      const stat = await fs.stat(filePath);
+      if (!stat.isFile() || stat.size > inlineImageLimit) return undefined;
+      return `data:${mediaType};base64,${(await fs.readFile(filePath)).toString("base64")}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // 文件浏览统一屏蔽 node_modules 和 .git：既没有查看价值，也避免误改仓库内部数据。
   workspaceFile(project: DesktopProject, relativePath: string): string {
     return resolveWorkspacePath(project.path, relativePath, ["node_modules", ".git"]);
   }
@@ -277,7 +346,7 @@ export class DesktopProjectService {
     return project;
   }
 
-  /** Project-local persistence root (`<project>/.agent`), shared with TUI/CLI. */
+  /** 项目内的持久化根目录（`<项目>/.agent`），与 TUI / CLI 共用同一份数据。 */
   async dataRoot(project: DesktopProject): Promise<string> {
     return await this.storage.ensureProjectData(project);
   }
@@ -290,6 +359,13 @@ export class DesktopProjectService {
   attachmentsRoot(project: DesktopProject): string {
     return this.storage.attachmentsRoot(project);
   }
+}
+
+/** 附件目录是平铺的，文件名里不允许出现分隔符，否则就是想读目录之外的东西。 */
+function attachmentFilePath(attachmentsRoot: string, relativePath: string): string | undefined {
+  const fileName = relativePath.slice(attachmentPathPrefix.length);
+  if (!fileName || fileName.includes("/") || fileName.includes("\\") || fileName.includes("..")) return undefined;
+  return path.join(attachmentsRoot, fileName);
 }
 
 function isAlreadyExists(error: unknown): boolean {

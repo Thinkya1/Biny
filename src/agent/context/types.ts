@@ -1,3 +1,9 @@
+/**
+ * 上下文层共享类型。
+ *
+ * 工作区上下文、仓库地图、压缩状态、token 预算和本地记忆之间互相引用，类型集中放在这里，
+ * 避免各实现文件之间循环依赖。
+ */
 import type { ProjectContext } from "../../project/ProjectContext.js";
 
 export interface LoadedInstruction {
@@ -27,6 +33,7 @@ export interface RecentWorkspaceActivity {
   summaries: string[];
 }
 
+/** 单轮对话要注入模型的工作区材料。 */
 export interface WorkspaceTurnData {
   instructions: LoadedInstruction[];
   snapshot: ProjectSnapshot;
@@ -35,6 +42,10 @@ export interface WorkspaceTurnData {
   repoMapCandidates: RepoMapEntry[];
 }
 
+/**
+ * token 预算现状。`source` 区分是本地估算还是 provider 回报的真实用量，
+ * `omitted` 列出因预算不足被丢掉的上下文块，便于界面解释「为什么没带上这些内容」。
+ */
 export interface ContextBudgetStatus {
   maxTokens: number;
   usedTokens: number;
@@ -90,4 +101,21 @@ export interface MemoryMatch {
   path: string;
   excerpt: string;
   score: number;
+}
+
+/** 话题文件里的一个 `##` 小节，供列表展示与按条删除定位。`index` 是小节在文件中的序号。 */
+export interface MemoryEntrySummary {
+  topic: string;
+  index: number;
+  title: string;
+  date?: string;
+  summary: string;
+}
+
+/** 单个话题的整理结果；`error` 存在表示该话题整理失败并保持原样。 */
+export interface MemoryCompactionTopicResult {
+  topic: string;
+  before: number;
+  after: number;
+  error?: string;
 }

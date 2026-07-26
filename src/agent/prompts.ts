@@ -108,6 +108,7 @@ export function buildSystemPrompt(mode: PromptMode, skillPrompt?: string): strin
   return [
     GLOBAL_SYSTEM_PROMPT.trim(),
     MODE_PROMPTS[mode].trim(),
-    skillPrompt?.trim() ? `Workspace skills:\n${skillPrompt.trim()}` : ""
+    // skillPrompt 自带说明头（渐进式披露：仅元数据 + invoke_skill 指引）。
+    skillPrompt?.trim() ?? ""
   ].filter(Boolean).join("\n\n");
 }

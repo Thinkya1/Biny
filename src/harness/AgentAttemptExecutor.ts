@@ -1,3 +1,12 @@
+/**
+ * 单次 Agent 尝试的执行器。
+ *
+ * 跑一轮受限的模型/工具循环，边跑边把工具调用攒成证据。证据按 toolCallId 存 Map，因为
+ * 「开始 / 结果 / 失败」是三个事件，需要后到的补写同一条记录。
+ *
+ * `accumulatedEvidence` 跨自动续跑保留：验收看的是整段任务的证据，而 `attemptToolEvidence`
+ * 只含本次尝试的，用于按尝试审计。
+ */
 import type { AgentRunOptions, AgentSession } from "../agent/AgentSession.js";
 import type { AgentSessionEvent, AgentTurnOutcome } from "../agent/types.js";
 import { redactSecrets, redactSensitiveValue } from "../utils/secrets.js";
@@ -12,7 +21,7 @@ export interface AgentAttemptExecutorOptions {
   onEvent?(event: AgentSessionEvent, context: TaskAttemptContext<TaskContract>): void;
 }
 
-/** Runs one bounded model/tool attempt while retaining evidence across continuations. */
+/** 执行一次受限的模型/工具尝试，并跨续跑保留证据。 */
 export class AgentAttemptExecutor {
   private readonly accumulatedEvidence: TaskToolEvidence[];
 
@@ -27,7 +36,11 @@ export class AgentAttemptExecutor {
     let terminalEvents = 0;
     let streamFailure: string | undefined;
 
-    for await (const event of this.options.agent.runSdk(prompt, this.options.runOptions(context))) {
+    const runOptions = this.options.runOptions(context);
+    const publicInput = runOptions.sessionUserMessage ?? prompt;
+    // 验收用的提示词属于模型上下文，不是用户看到的消息，因此宿主事件和 session 记录里
+    // 用 publicInput，真正发给模型的完整 prompt 走 modelInput（对应 publicUserMessage 的切分）。
+    for await (const event of this.options.agent.runSdk(publicInput, { ...runOptions, modelInput: prompt })) {
       this.options.onEvent?.(event, context);
       if (event.type === "tool-started") {
         evidence.set(event.toolCallId, {
@@ -58,9 +71,8 @@ export class AgentAttemptExecutor {
         streamFailure = redactSecrets(event.message);
       } else if (event.type === "done") {
         terminalEvents += 1;
-        // Older embedders emitted only the terminal text. Treat that shape as
-        // a successful terminal stop so host event tests and lightweight
-        // integrations remain compatible with the durable executor.
+        // 早期嵌入方只发终态文本、不带 outcome。这种形状按「正常收尾」处理，
+        // 以便宿主事件测试和轻量集成方仍能配合当前执行器工作。
         outcome = event.outcome ?? {
           status: "completed",
           stopReason: "model_stop",
@@ -71,6 +83,8 @@ export class AgentAttemptExecutor {
       }
     }
 
+    // 一次尝试必须恰好有一个终态事件：一个都没有说明流异常结束，多于一个说明上游有 bug，
+    // 两种情况都不能当成完成，否则会把没做完的任务判成通过。
     if (terminalEvents !== 1 || !outcome) {
       const attemptToolEvidence = [...evidence.values()];
       this.accumulatedEvidence.push(...attemptToolEvidence);
@@ -107,6 +121,10 @@ export class AgentAttemptExecutor {
 const maxEvidenceStringChars = 2_000;
 const maxEvidenceValueBytes = 8 * 1024;
 
+/**
+ * 证据要落盘，所以工具参数和结果先脱敏再压缩：限制字符串长度、数组/对象条目数和嵌套深度，
+ * 整体仍超过字节上限时只留一段预览并标记 truncated。
+ */
 function compactEvidenceValue(value: unknown): unknown {
   const compact = compactValue(redactSensitiveValue(value), 0);
   const serialized = JSON.stringify(compact);
@@ -139,6 +157,14 @@ function compactValue(value: unknown, depth: number): unknown {
   return String(value);
 }
 
+/**
+ * 拼装本次尝试的提示词。
+ *
+ * 三种形态：纯对话任务的首次尝试直接用目标原文；验收驱动任务的首次尝试附上契约和验收条件；
+ * 续跑则改成「自主继续」的口吻并带上上一次的反馈，避免模型反问用户或重做已完成的部分。
+ *
+ * 这里的固定前缀/标记同时被 `session/publicMessage.ts` 用来还原用户原始输入，改文案要一起改。
+ */
 function attemptPrompt(context: TaskAttemptContext<TaskContract>): string {
   if (context.task.verificationMode === "model_only" && context.attemptNumber === 1) {
     return context.task.objective;
