@@ -1,0 +1,200 @@
+/**
+ * 网页抓取工具模块。
+ *
+ * `web_search` 只能拿到摘要；给定一个 URL（文档页、issue、RFC）时模型需要读到正文。
+ * 抓取本身是把一个任意出网请求交给模型，所以目标地址必须先过 `addressPolicy` 的校验，
+ * 跳转也要逐跳重新校验 —— 一次跳到 `169.254.169.254` 就能读到云实例凭证。
+ */
+import { z } from "zod";
+import type { WebFetchConfig } from "../../config/schema.js";
+import { ToolAccesses } from "../access.js";
+import type { Tool } from "../types.js";
+import { assertFetchableUrl } from "./addressPolicy.js";
+import { htmlTitle, htmlToText } from "./html.js";
+
+const defaultLength = 24_000;
+const maxLength = 200_000;
+
+export interface WebFetchArgs {
+  url: string;
+  offset?: number;
+  length?: number;
+}
+
+export interface WebFetchResult {
+  url: string;
+  finalUrl: string;
+  status: number;
+  contentType?: string;
+  title?: string;
+  totalCharacters: number;
+  offset: number;
+  content: string;
+  hasMore: boolean;
+  truncatedAtByteLimit: boolean;
+}
+
+export function createWebFetchTool(config?: WebFetchConfig): Tool<WebFetchArgs, WebFetchResult> {
+  const timeoutMs = config?.timeoutMs ?? 15_000;
+  const maxBytes = config?.maxBytes ?? 2 * 1024 * 1024;
+  const maxRedirects = config?.maxRedirects ?? 5;
+  const allowPrivateNetwork = config?.allowPrivateNetwork ?? false;
+  return {
+    name: "web_fetch",
+    description: `Fetch a public http(s) URL and return its readable text. HTML is converted to text. Returns at most ${String(maxLength)} characters; page through longer documents with offset.`,
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string", minLength: 1, description: "Absolute http or https URL to fetch." },
+        offset: { type: "integer", minimum: 0, description: "Character offset into the extracted text. Defaults to 0." },
+        length: { type: "integer", minimum: 1, maximum: maxLength, description: `Characters to return. Defaults to ${String(defaultLength)}.` }
+      },
+      required: ["url"],
+      additionalProperties: false
+    },
+    schema: z.object({
+      url: z.string().min(1).max(4_096),
+      offset: z.number().int().min(0).optional(),
+      length: z.number().int().min(1).max(maxLength).optional()
+    }),
+    capability: "web.fetch",
+    risk: "read",
+    resolveExecution(args) {
+      const target = parseUrl(args.url);
+      return {
+        accesses: ToolAccesses.none(),
+        display: { kind: "generic", summary: "Fetch web page", detail: target.toString() },
+        description: `Fetch ${target.toString()}`,
+        approvalRule: `web_fetch(${target.origin})`,
+        async execute({ signal }) {
+          const fetched = await fetchDocument(target, { timeoutMs, maxBytes, maxRedirects, allowPrivateNetwork }, signal);
+          const text = isHtml(fetched.contentType) ? htmlToText(fetched.body) : fetched.body;
+          const offset = Math.min(args.offset ?? 0, text.length);
+          const content = text.slice(offset, offset + (args.length ?? defaultLength));
+          return {
+            url: args.url,
+            finalUrl: fetched.finalUrl,
+            status: fetched.status,
+            contentType: fetched.contentType,
+            title: isHtml(fetched.contentType) ? htmlTitle(fetched.body) : undefined,
+            totalCharacters: text.length,
+            offset,
+            content,
+            hasMore: offset + content.length < text.length,
+            truncatedAtByteLimit: fetched.truncated
+          };
+        }
+      };
+    }
+  };
+}
+
+interface FetchLimits {
+  timeoutMs: number;
+  maxBytes: number;
+  maxRedirects: number;
+  allowPrivateNetwork: boolean;
+}
+
+interface FetchedDocument {
+  finalUrl: string;
+  status: number;
+  contentType?: string;
+  body: string;
+  truncated: boolean;
+}
+
+async function fetchDocument(url: URL, limits: FetchLimits, signal?: AbortSignal): Promise<FetchedDocument> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, limits.timeoutMs);
+  const abort = (): void => controller.abort();
+  if (signal?.aborted) controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+
+  try {
+    let current = url;
+    for (let redirect = 0; redirect <= limits.maxRedirects; redirect += 1) {
+      await assertFetchableUrl(current, { allowPrivateNetwork: limits.allowPrivateNetwork });
+      // 手动处理跳转：交给 fetch 自动跟随就没有机会校验中间跳板的地址。
+      const response = await fetch(current, {
+        redirect: "manual",
+        headers: { accept: "text/html,text/plain,application/json;q=0.9,*/*;q=0.8", "user-agent": "Biny/web_fetch" },
+        signal: controller.signal
+      });
+      const location = response.headers.get("location");
+      if (isRedirectStatus(response.status) && location) {
+        await response.body?.cancel();
+        current = new URL(location, current);
+        continue;
+      }
+      if (!response.ok) {
+        throw new Error(`Fetching ${current.toString()} returned HTTP ${String(response.status)}.`);
+      }
+      const { text, truncated } = await readBounded(response, limits.maxBytes);
+      return {
+        finalUrl: current.toString(),
+        status: response.status,
+        contentType: response.headers.get("content-type") ?? undefined,
+        body: text,
+        truncated
+      };
+    }
+    throw new Error(`Fetching ${url.toString()} exceeded ${String(limits.maxRedirects)} redirects.`);
+  } catch (error) {
+    if (timedOut) throw new Error(`Fetching ${url.toString()} timed out after ${String(limits.timeoutMs)}ms.`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+/** Content-Length 是可以撒谎的，所以按实际读到的字节数收口。 */
+async function readBounded(response: Response, maxBytes: number): Promise<{ text: string; truncated: boolean }> {
+  const body = response.body;
+  if (!body) return { text: "", truncated: false };
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      const remaining = maxBytes - total;
+      if (value.byteLength > remaining) {
+        chunks.push(value.subarray(0, remaining));
+        total = maxBytes;
+        truncated = true;
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+    if (total >= maxBytes) truncated = true;
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  return { text: Buffer.concat(chunks, total).toString("utf8"), truncated };
+}
+
+function parseUrl(value: string): URL {
+  try {
+    return new URL(value.trim());
+  } catch {
+    throw new Error(`Not an absolute URL: ${value}`);
+  }
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+function isHtml(contentType: string | undefined): boolean {
+  return Boolean(contentType && /\b(?:text\/html|application\/xhtml\+xml)\b/i.test(contentType));
+}

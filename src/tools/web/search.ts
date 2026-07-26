@@ -1,9 +1,10 @@
 /**
  * 公网搜索工具模块。
  *
- * `web_search` 只返回搜索结果标题、链接和摘要，不打开网页、不执行本地命令，也不修改工作区。
- * 默认使用支持匿名额度的 AnySearch API，也支持无需密钥的 DuckDuckGo HTML 搜索和 Brave Search。
+ * `web_search` 只返回搜索结果标题、链接、摘要和可选的站点图标，不打开网页、不执行本地命令，也不修改工作区。
+ * 默认使用支持匿名额度的 AnySearch API，也支持无需密钥的 DuckDuckGo HTML 搜索、Tavily 和 Brave Search。
  */
+import { decodeHtmlEntities } from "./html.js";
 import { z } from "zod";
 import type { WebSearchConfig } from "../../config/schema.js";
 import { ToolAccesses } from "../access.js";
@@ -12,10 +13,21 @@ import type { Tool } from "../types.js";
 const defaultConfig: WebSearchConfig = {
   enabled: true,
   provider: "duckduckgo",
+  apiKey: undefined,
   apiKeyEnv: undefined,
   timeoutMs: 10_000,
   maxResults: 5
 };
+
+// html.duckduckgo.com 自 2025 年下半年起加强了反爬校验，非浏览器 UA 更容易收到 403。
+const browserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/** 需要密钥的 provider 对应的默认环境变量名；DuckDuckGo 免密钥所以不在其中。 */
+export const webSearchKeyEnvNames = {
+  tavily: "TAVILY_API_KEY",
+  brave: "BRAVE_SEARCH_API_KEY",
+  anysearch: "ANYSEARCH_API_KEY"
+} as const;
 
 const recencyValues = ["day", "week", "month", "year"] as const;
 type SearchRecency = (typeof recencyValues)[number];
@@ -31,6 +43,7 @@ export interface WebSearchResult {
   title: string;
   url: string;
   snippet?: string;
+  favicon?: string;
 }
 
 export interface WebSearchResponse {
@@ -90,9 +103,11 @@ async function searchWeb(config: WebSearchConfig, args: WebSearchArgs, signal: A
   const searchQuery = buildSearchQuery(query, domains);
   const results = config.provider === "anysearch"
     ? await searchWithAnySearch(config, searchQuery, maxResults, signal)
-    : config.provider === "brave"
-      ? await searchWithBrave(config, searchQuery, maxResults, args.recency, signal)
-      : await searchWithDuckDuckGo(config, searchQuery, maxResults, args.recency, signal);
+    : config.provider === "tavily"
+      ? await searchWithTavily(config, query, domains, maxResults, args.recency, signal)
+      : config.provider === "brave"
+        ? await searchWithBrave(config, searchQuery, maxResults, args.recency, signal)
+        : await searchWithDuckDuckGo(config, searchQuery, maxResults, args.recency, signal);
 
   return {
     query,
@@ -113,8 +128,15 @@ async function searchWithDuckDuckGo(
   url.searchParams.set("q", query);
   const freshness = duckDuckGoFreshness(recency);
   url.searchParams.set("df", freshness);
-  const html = await fetchText(url, { "accept": "text/html", "user-agent": "Biny web_search" }, config.timeoutMs, signal);
-  return parseDuckDuckGoResults(html, maxResults);
+  try {
+    const html = await fetchText(url, { "accept": "text/html", "accept-language": "en-US,en;q=0.9", "user-agent": browserUserAgent }, config.timeoutMs, signal);
+    return parseDuckDuckGoResults(html, maxResults);
+  } catch (error) {
+    if (error instanceof Error && /HTTP 40[13]/.test(error.message)) {
+      throw new Error("DuckDuckGo blocked this request (anti-bot protection). Retry later, or switch web.search.provider to tavily or brave.");
+    }
+    throw error;
+  }
 }
 
 async function searchWithBrave(
@@ -124,10 +146,9 @@ async function searchWithBrave(
   recency: SearchRecency | undefined,
   signal: AbortSignal | undefined
 ): Promise<WebSearchResult[]> {
-  const apiKey = config.apiKeyEnv ? process.env[config.apiKeyEnv] : undefined;
+  const { apiKey, envName } = resolveApiKey(config, webSearchKeyEnvNames.brave);
   if (!apiKey) {
-    const envName = config.apiKeyEnv ?? "BRAVE_SEARCH_API_KEY";
-    throw new Error(`Brave web search requires the ${envName} environment variable.`);
+    throw new Error(`Brave web search requires an API key. Set web.search.apiKey or the ${envName} environment variable.`);
   }
 
   const url = new URL("https://api.search.brave.com/res/v1/web/search");
@@ -150,14 +171,52 @@ async function searchWithBrave(
   return parseBraveResults(payload, maxResults);
 }
 
+async function searchWithTavily(
+  config: WebSearchConfig,
+  query: string,
+  domains: string[],
+  maxResults: number,
+  recency: SearchRecency | undefined,
+  signal: AbortSignal | undefined
+): Promise<WebSearchResult[]> {
+  const { apiKey, envName } = resolveApiKey(config, webSearchKeyEnvNames.tavily);
+  if (!apiKey) {
+    throw new Error(`Tavily web search requires an API key. Set web.search.apiKey or the ${envName} environment variable.`);
+  }
+
+  const url = new URL("https://api.tavily.com/search");
+  const body = await fetchText(url, {
+    "accept": "application/json",
+    "content-type": "application/json",
+    "authorization": `Bearer ${apiKey}`,
+    "user-agent": "Biny web_search"
+  }, config.timeoutMs, signal, {
+    method: "POST",
+    body: JSON.stringify({
+      query,
+      max_results: maxResults,
+      time_range: recency,
+      include_favicon: true,
+      include_domains: domains.length ? domains : undefined
+    })
+  });
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(body) as unknown;
+  } catch {
+    throw new Error("Tavily web search returned invalid JSON.");
+  }
+  return parseTavilyResults(payload, maxResults);
+}
+
 async function searchWithAnySearch(
   config: WebSearchConfig,
   query: string,
   maxResults: number,
   signal: AbortSignal | undefined
 ): Promise<WebSearchResult[]> {
-  const envName = config.apiKeyEnv ?? "ANYSEARCH_API_KEY";
-  const apiKey = process.env[envName];
+  const { apiKey, envName } = resolveApiKey(config, webSearchKeyEnvNames.anysearch);
   if (config.apiKeyEnv && !apiKey) {
     throw new Error(`AnySearch web search requires the ${envName} environment variable.`);
   }
@@ -218,7 +277,27 @@ function parseBraveResults(payload: unknown, maxResults: number): WebSearchResul
     const snippet = typeof item.description === "string" ? cleanHtmlText(item.description) : "";
     if (!title || !url || seenUrls.has(url)) continue;
     seenUrls.add(url);
-    results.push({ title, url, snippet: snippet || undefined });
+    const favicon = isRecord(item.meta_url) ? sanitizeFaviconUrl(item.meta_url.favicon) : undefined;
+    results.push({ title, url, snippet: snippet || undefined, favicon });
+  }
+  return results;
+}
+
+export function parseTavilyResults(payload: unknown, maxResults: number): WebSearchResult[] {
+  if (!isRecord(payload) || !Array.isArray(payload.results)) {
+    throw new Error("Tavily web search returned an invalid response.");
+  }
+
+  const results: WebSearchResult[] = [];
+  const seenUrls = new Set<string>();
+  for (const item of payload.results) {
+    if (results.length >= maxResults || !isRecord(item)) break;
+    const title = typeof item.title === "string" ? cleanHtmlText(item.title) : "";
+    const url = typeof item.url === "string" ? resolveSearchUrl(item.url) : undefined;
+    const snippet = typeof item.content === "string" ? cleanHtmlText(item.content) : "";
+    if (!title || !url || seenUrls.has(url)) continue;
+    seenUrls.add(url);
+    results.push({ title, url, snippet: snippet || undefined, favicon: sanitizeFaviconUrl(item.favicon) });
   }
   return results;
 }
@@ -242,9 +321,25 @@ export function parseAnySearchResults(payload: unknown, maxResults: number): Web
     const snippet = typeof item.snippet === "string" ? cleanHtmlText(item.snippet) : "";
     if (!title || !url || seenUrls.has(url)) continue;
     seenUrls.add(url);
-    results.push({ title, url, snippet: snippet || undefined });
+    results.push({ title, url, snippet: snippet || undefined, favicon: sanitizeFaviconUrl(item.favicon) });
   }
   return results;
+}
+
+function resolveApiKey(config: WebSearchConfig, defaultEnv: string): { apiKey: string | undefined; envName: string } {
+  const envName = config.apiKeyEnv ?? defaultEnv;
+  return { apiKey: config.apiKey ?? process.env[envName], envName };
+}
+
+function sanitizeFaviconUrl(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value) return undefined;
+  try {
+    const parsed = new URL(value);
+    // favicon 会被渲染端直接当 <img src> 加载，明文 http 会泄露请求，只保留 https。
+    return parsed.protocol === "https:" ? parsed.toString() : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function fetchText(
@@ -332,20 +427,6 @@ function resolveSearchUrl(rawUrl: string): string | undefined {
 
 function cleanHtmlText(value: string): string {
   return decodeHtmlEntities(value.replace(/<br\s*\/?\s*>/gi, " ").replace(/<[^>]*>/g, "")).replace(/\s+/g, " ").trim().slice(0, 800);
-}
-
-function decodeHtmlEntities(value: string): string {
-  return value.replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/giu, (entity, code: string) => {
-    const lower = code.toLowerCase();
-    if (lower === "amp") return "&";
-    if (lower === "lt") return "<";
-    if (lower === "gt") return ">";
-    if (lower === "quot") return '"';
-    if (lower === "apos") return "'";
-    if (lower === "nbsp") return " ";
-    const numeric = lower.startsWith("#x") ? Number.parseInt(lower.slice(2), 16) : Number.parseInt(lower.slice(1), 10);
-    return Number.isInteger(numeric) && numeric >= 0 && numeric <= 0x10ffff ? String.fromCodePoint(numeric) : entity;
-  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
