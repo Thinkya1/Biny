@@ -6,11 +6,13 @@
  * `commands/` 下的具体实现。入口层只处理参数拼接、默认 TUI 和异常展示，
  * 不直接承载 agent、工具或 TUI 的业务流程。
  */
+import { createRequire } from "node:module";
 import { Command } from "commander";
 import { initCommand } from "./commands/init.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { runCommand } from "./commands/run.js";
 import { chatCommand, type ChatCommandOptions } from "./commands/chat.js";
+import { evalCompareCommand, evalRunCommand } from "./commands/evals.js";
 import { resumeCommand } from "./commands/resume.js";
 import { sessionsCommand } from "./commands/sessions.js";
 import { planCommand } from "./commands/plan.js";
@@ -19,8 +21,10 @@ import { tuiCommand } from "./commands/tui.js";
 const program = new Command();
 // CLI 的工作区以用户执行 biny 时的当前目录为准。
 const workspaceRoot = process.cwd();
+// 版本号来自 package.json，界面头部和 `--version` 用同一个来源。
+const { version: cliVersion } = createRequire(import.meta.url)("../../package.json") as { version: string };
 
-program.name("biny").description("Biny local desktop assistant").version("0.1.0");
+program.name("biny").description("Biny local desktop assistant").version(cliVersion);
 
 program.command("init").description("Initialize config and .agent directories").action(wrap(() => initCommand(workspaceRoot)));
 program.command("doctor").description("Check local environment").action(wrap(() => doctorCommand(workspaceRoot)));
@@ -30,7 +34,7 @@ program
   .option("-c, --continue", "continue the latest recorded session")
   .option("-s, --session <id>", "continue a specific session id or .jsonl path")
   .action((options: ChatCommandOptions) => wrap(() => chatCommand(workspaceRoot, options))());
-program.command("tui").description("Start terminal UI mode").action(wrap(() => tuiCommand(workspaceRoot)));
+program.command("tui").description("Start terminal UI mode").action(wrap(() => tuiCommand(workspaceRoot, cliVersion)));
 program.command("sessions").description("List recorded sessions").action(wrap(() => sessionsCommand(workspaceRoot)));
 program
   .command("plan")
@@ -43,6 +47,25 @@ program
   .description("Run a one-shot agent task")
   .argument("<input...>", "task text")
   .action((input: string[]) => wrap(() => runCommand(workspaceRoot, input.join(" ")))());
+const evals = program.command("eval").description("Run and compare agent evaluations");
+evals
+  .command("run")
+  .description("Run the built-in eval suite and write a report")
+  .option("--label <label>", "label for this run, used in the report and comparisons")
+  .option("--out <path>", "where to write the JSON report")
+  .option("--task <id...>", "only run these task ids")
+  .action((options: { label?: string; out?: string; task?: string[] }) => wrap(() => evalRunCommand(workspaceRoot, {
+    ...(options.label === undefined ? {} : { label: options.label }),
+    ...(options.out === undefined ? {} : { out: options.out }),
+    ...(options.task === undefined ? {} : { tasks: options.task })
+  }))());
+evals
+  .command("compare")
+  .description("Compare two eval reports")
+  .argument("<baseline>", "baseline report path")
+  .argument("<candidate>", "candidate report path")
+  .action((baseline: string, candidate: string) => wrap(() => evalCompareCommand(baseline, candidate))());
+
 program
   .command("resume")
   .description("Print history from an existing session")
@@ -51,7 +74,7 @@ program
 
 
 if (process.argv.length <= 2) {
-  await wrap(() => tuiCommand(workspaceRoot))();
+  await wrap(() => tuiCommand(workspaceRoot, cliVersion))();
 } else {
   await program.parseAsync(process.argv);
 }

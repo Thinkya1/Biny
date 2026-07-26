@@ -1,8 +1,14 @@
+import type { Checkpoint, RestoreSummary } from "../session/checkpointStore.js";
+import type { InterruptedTurn } from "../session/turnStore.js";
+import type { ForkedSession } from "../session/fork.js";
 import { randomUUID } from "node:crypto";
 import type { AgentAttachment, AgentRunMode, AgentSessionInfo, ResumedAgentSession } from "../agent/AgentSession.js";
 import type { AgentPermissionResult, AgentSessionEvent, AgentTurnOutcome } from "../agent/types.js";
-import type { ContextStatus } from "../agent/context/types.js";
+import type { ContextStatus, MemoryCompactionTopicResult, MemoryEntrySummary, MemoryMatch } from "../agent/context/types.js";
+import type { LocalMemory, MemoryWriteResult } from "../agent/context/LocalMemory.js";
 import type { ExtensionSection } from "../extensions/report.js";
+import type { SubagentDefinition } from "../extensions/agents.js";
+import type { McpServerStatus } from "../extensions/mcp.js";
 import type { ModelChoice, ModelRuntimeInfo, ThinkingSelection } from "../llm/ModelManager.js";
 import { isFullYesConfirmation } from "../permission/confirmation.js";
 import type { PermissionMode, PermissionResult } from "../permission/PermissionManager.js";
@@ -32,7 +38,7 @@ import type {
   RuntimeOperation
 } from "./agentEvents.js";
 
-type ExclusiveRuntimeOperation = RuntimeOperation | "permission" | "plan";
+type ExclusiveRuntimeOperation = RuntimeOperation | "permission" | "plan" | "memory";
 
 export interface SubmittedAgentRun {
   runId: string;
@@ -277,8 +283,87 @@ export class InteractiveAgentRuntime {
     return await this.commandRuntime.agent.listSessions();
   }
 
+  async forkSession(session: string | undefined, upToEvent?: number): Promise<ForkedSession> {
+    return await this.commandRuntime.forkSession(session, upToEvent);
+  }
+
+  async interruptedTurn(): Promise<InterruptedTurn | undefined> {
+    return await this.commandRuntime.interruptedTurn();
+  }
+
+  async listCheckpoints(): Promise<Checkpoint[]> {
+    return await this.commandRuntime.listCheckpoints();
+  }
+
+  async restoreCheckpoint(id: string): Promise<RestoreSummary> {
+    return await this.commandRuntime.restoreCheckpoint(id);
+  }
+
   extensionReport(section?: ExtensionSection): string {
     return this.commandRuntime.extensionReport(section);
+  }
+
+  async runMemoryCommand(args: string[]): Promise<string> {
+    // add/forget 会改写 .agent/memory，与活动回合的自动记忆写入互斥，走维护操作队列。
+    return await this.runMaintenanceOperation("memory", async () => await this.commandRuntime.agent.runMemoryCommand(args));
+  }
+
+  /** 以下记忆面板操作与 runMemoryCommand 同队列：读写都不与活动回合的自动记忆写入并发。 */
+  async listMemoryEntries(): Promise<MemoryEntrySummary[]> {
+    return await this.runMaintenanceOperation("memory", async () => await this.requireLocalMemory().listEntries());
+  }
+
+  async searchMemory(query: string): Promise<MemoryMatch[]> {
+    return await this.runMaintenanceOperation("memory", async () => await this.requireLocalMemory().findRelevant(query, [], 8));
+  }
+
+  async addMemoryEntry(topic: string, note: string): Promise<MemoryWriteResult> {
+    return await this.runMaintenanceOperation("memory", async () => await this.requireLocalMemory().write({
+      topic,
+      title: note.split("\n", 1)[0]?.slice(0, 120) ?? "Project note",
+      summary: note,
+      decisions: [],
+      paths: [],
+      keywords: []
+    }));
+  }
+
+  async deleteMemoryEntry(topic: string, index: number): Promise<boolean> {
+    return await this.runMaintenanceOperation("memory", async () => await this.requireLocalMemory().deleteEntry(topic, index));
+  }
+
+  async forgetMemoryTopic(topic: string): Promise<boolean> {
+    return await this.runMaintenanceOperation("memory", async () => await this.requireLocalMemory().forgetTopic(topic));
+  }
+
+  /** 清空全部话题，返回清掉的话题数。 */
+  async clearMemory(): Promise<number> {
+    return await this.runMaintenanceOperation("memory", async () => {
+      const memory = this.requireLocalMemory();
+      let removed = 0;
+      for (const topic of await memory.listTopics()) {
+        if (await memory.forgetTopic(topic)) removed += 1;
+      }
+      return removed;
+    });
+  }
+
+  async compactMemory(topic?: string): Promise<MemoryCompactionTopicResult[]> {
+    return await this.runMaintenanceOperation("memory", async () => await this.requireLocalMemory().compactTopics(topic ? [topic] : undefined));
+  }
+
+  private requireLocalMemory(): LocalMemory {
+    const memory = this.commandRuntime.agent.getLocalMemory();
+    if (!memory) throw new Error("Local memory is disabled (context.memory.enabled = false).");
+    return memory;
+  }
+
+  async listSubagentAgents(): Promise<SubagentDefinition[]> {
+    return await this.commandRuntime.listSubagentAgents();
+  }
+
+  async reconnectMcpServer(serverName: string): Promise<McpServerStatus> {
+    return await this.runMaintenanceOperation("mcp", async () => await this.commandRuntime.reconnectMcpServer(serverName));
   }
 
   listSubagentTasks(): SubagentTaskSnapshot[] {
@@ -378,7 +463,8 @@ export class InteractiveAgentRuntime {
     return {
       info: this.getInfo(),
       permissionMode: this.getPermissionMode(),
-      activeOperation: this.activeOperation === "permission" ? undefined : this.activeOperation,
+      // permission/memory 是即时命令，不作为公共快照里的长操作暴露。
+      activeOperation: this.activeOperation === "permission" || this.activeOperation === "memory" ? undefined : this.activeOperation,
       activeRun: this.rootRunScheduler.activeRun
         ? publicRunSnapshot(this.rootRunScheduler.activeRun)
         : this.directRun ? publicRunSnapshot(this.directRun) : undefined,
@@ -1190,6 +1276,8 @@ function publicOperationName(operation: ExclusiveRuntimeOperation): string {
   if (operation === "resume") return "session resume";
   if (operation === "compact") return "conversation compaction";
   if (operation === "plan") return "plan creation";
+  if (operation === "mcp") return "MCP reconnection";
+  if (operation === "memory") return "a memory command";
   return "a subagent task";
 }
 

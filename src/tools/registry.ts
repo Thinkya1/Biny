@@ -6,7 +6,7 @@
  */
 import type { JsonObjectSchema } from "./schema.js";
 import type { ToolDefinition } from "./definition.js";
-import type { WebSearchConfig } from "../config/schema.js";
+import type { SandboxConfig, WebFetchConfig, WebSearchConfig } from "../config/schema.js";
 import type { Tool, ToolContext, ToolExecution, ToolSource } from "./types.js";
 import { createReadFileTool } from "./file/readFile.js";
 import { createWriteFileTool } from "./file/writeFile.js";
@@ -15,13 +15,16 @@ import { createMultiEditTool } from "./file/multiEdit.js";
 import { createDeleteFileTool } from "./file/deleteFile.js";
 import { createApplyPatchTool } from "./file/applyPatch.js";
 import { createMoveFileTool } from "./file/moveFile.js";
+import { createReadToolResultTool } from "./file/readToolResult.js";
 import { createListFilesTool } from "./file/listFiles.js";
 import { createSearchFilesTool } from "./search/searchFiles.js";
 import { createGrepSearchTool } from "./search/grepSearch.js";
 import { createRunCommandTool } from "./shell/runCommand.js";
 import { createManagedProcessTools } from "./process/managedProcesses.js";
 import { createGitStatusTool } from "./git/status.js";
+import { createGitCommitTool } from "./git/commit.js";
 import { createGitDiffTool } from "./git/diff.js";
+import { createWebFetchTool } from "./web/fetch.js";
 import { createWebSearchTool } from "./web/search.js";
 import type { ManagedProcessService } from "../runtime/ManagedProcessService.js";
 
@@ -62,6 +65,11 @@ export class ToolManager {
     this.register(tool, "subagent");
   }
 
+  /** MCP tools/list_changed 之类的动态刷新需要先移除旧注册；对进行中的调用无影响。 */
+  unregister(name: string): boolean {
+    return this.tools.delete(name);
+  }
+
   get<TArgs = unknown, TResult = unknown>(name: string): Tool<TArgs, TResult> {
     const entry = this.tools.get(name);
     if (!entry) {
@@ -92,27 +100,32 @@ export class ToolRegistry extends ToolManager {}
 export function createToolRegistry(
   context: ToolContext,
   webSearchConfig?: WebSearchConfig,
-  managedProcessService?: ManagedProcessService
+  managedProcessService?: ManagedProcessService,
+  webFetchConfig?: WebFetchConfig,
+  sandboxConfig?: SandboxConfig
 ): ToolRegistry {
   // 这里集中注册内置工具；外部扩展在 CommandRuntime 装配完成后追加到同一 registry。
   const registry = new ToolRegistry();
   registry.register(createReadFileTool(context));
+  registry.register(createReadToolResultTool(context));
   registry.register(createListFilesTool(context));
   registry.register(createSearchFilesTool(context));
   registry.register(createGrepSearchTool(context));
   registry.register(createGitStatusTool(context));
   registry.register(createGitDiffTool(context));
+  registry.register(createGitCommitTool(context));
   registry.register(createWriteFileTool(context));
   registry.register(createEditFileTool(context));
   registry.register(createMultiEditTool(context));
   registry.register(createDeleteFileTool(context));
   registry.register(createApplyPatchTool(context));
   registry.register(createMoveFileTool(context));
-  registry.register(createRunCommandTool(context));
+  registry.register(createRunCommandTool(context, sandboxConfig));
   if (managedProcessService) {
     for (const tool of createManagedProcessTools(context, managedProcessService)) registry.register(tool);
   }
   if (webSearchConfig?.enabled !== false) registry.register(createWebSearchTool(webSearchConfig));
+  if (webFetchConfig?.enabled !== false) registry.register(createWebFetchTool(webFetchConfig));
   return registry;
 }
 

@@ -12,11 +12,18 @@ import { ModelManager, modelRuntimeInfo, type ModelRuntimeInfo } from "../llm/Mo
 import { SessionRecorder } from "../session/recorder.js";
 import { ensureAgentDirs } from "../session/store.js";
 import { createToolRegistry } from "../tools/registry.js";
+import { createTodoTool } from "../tools/todo.js";
+import { TodoStore } from "../session/todoStore.js";
+import type { InterruptedTurn } from "../session/turnStore.js";
+import { forkSession, type ForkedSession } from "../session/fork.js";
+import { CheckpointStore, type Checkpoint, type RestoreSummary } from "../session/checkpointStore.js";
 import { PermissionManager } from "../permission/PermissionManager.js";
-import { loadSkills } from "../extensions/skills.js";
+import { createSkillTool, loadSkills, type SkillBundle } from "../extensions/skills.js";
 import { loadPlugins } from "../extensions/plugins.js";
-import { McpToolHost } from "../extensions/mcp.js";
+import { createMcpResourceTools, McpToolHost, type McpServerStatus } from "../extensions/mcp.js";
 import { createSubagentTool, runSubagentTask as executeSubagentTask, type SubagentOptions } from "../extensions/subagent.js";
+import { buildSubagentDefinitionsPrompt, loadSubagentDefinitions, type SubagentDefinition } from "../extensions/agents.js";
+import { createMemoryTools } from "../extensions/memory.js";
 import { createToolCounts, formatExtensionReport, type ExtensionSection, type ExtensionStatus } from "../extensions/report.js";
 import { createModelSettings, type ModelSettings } from "../llm/factory.js";
 import {
@@ -26,6 +33,7 @@ import {
   type SubmittedSubagentTask
 } from "./SubagentTaskManager.js";
 import { ManagedProcessService } from "./ManagedProcessService.js";
+import { subagentAccessMode } from "./subagentAccess.js";
 import { TaskRunStore, type TaskRunSnapshot } from "../harness/TaskRunStore.js";
 import { modelReasoningConfig } from "../ai/capabilities.js";
 
@@ -38,7 +46,17 @@ export interface CommandRuntime {
   managedProcesses: ManagedProcessService;
   taskRuns: TaskRunStore;
   extensionReport(section?: ExtensionSection): string;
+  /** 从某个时点分叉出一条新会话；原会话不受影响。 */
+  forkSession(session: string | undefined, upToEvent?: number): Promise<ForkedSession>;
+  /** 上次被打断、尚未收尾的回合。 */
+  interruptedTurn(): Promise<InterruptedTurn | undefined>;
+  /** 工作区快照；非 git 目录下为 undefined。 */
+  listCheckpoints(): Promise<Checkpoint[]>;
+  restoreCheckpoint(id: string): Promise<RestoreSummary>;
+  reconnectMcpServer(serverName: string): Promise<McpServerStatus>;
   getSubagentInfo(): ModelRuntimeInfo;
+  /** 实时重新扫描具名子代理定义（会话期间可编辑生效）。 */
+  listSubagentAgents(): Promise<SubagentDefinition[]>;
   startSubagentTask(task: string, options?: SubagentTaskRunOptions): SubmittedSubagentTask;
   runSubagentTask(task: string, options?: SubagentTaskRunOptions): Promise<string>;
   listSubagentTasks(): SubagentTaskSnapshot[];
@@ -69,18 +87,33 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   const toolRegistry = createToolRegistry(
     { workspaceRoot, ignore: config.workspace.ignore, attachmentRoot: options.attachmentRoot },
     config.web.search,
-    managedProcesses
+    managedProcesses,
+    config.web.fetch,
+    config.sandbox
   );
+  // 快照挂在工作区的 git 仓库上；非 git 目录下这项能力直接不可用。
+  const checkpoints = config.checkpoints.enabled ? await CheckpointStore.open(workspaceRoot) : undefined;
+  const todos = new TodoStore(persistenceRoot, recorder.sessionId);
+  await todos.initialize();
+  toolRegistry.registerBuiltinTool(createTodoTool(todos));
   const permissionManager = new PermissionManager({ ...config.permission, source: "agent.config.json" });
-  const skills = await loadSkills(workspaceRoot, config.extensions.skills);
   const mcpHost = new McpToolHost();
+  let skills: SkillBundle | undefined;
   let agent: AgentSession | undefined;
   let subagentParentRunId: string | undefined;
+  let subagentDefinitions: SubagentDefinition[] = [];
+  // 具名子代理定义每次委派时重新读取（会话期间可编辑生效）；启动时读一次用于 prompt 与报告。
+  const loadAgentDefinitions = (): Promise<SubagentDefinition[]> => loadSubagentDefinitions({
+    workspaceRoot,
+    projectPaths: config.extensions.subagent.agentPaths
+  });
   const subagentOptions: SubagentOptions = {
     workspaceRoot,
     config,
-    getModelSettings: () => subagentModelSettings(config, modelManager),
+    getModelSettings: (modelAlias?: string) => subagentModelSettings(config, modelManager, modelAlias),
+    getAccessMode: () => subagentAccessMode(permissionManager),
     getParentRunId: () => subagentParentRunId,
+    loadAgentDefinitions,
     toolRegistry,
     onUsage: async (usage, operation, modelAlias) => agent?.observeModelUsage(usage, operation, modelAlias)
   };
@@ -88,14 +121,27 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     maxConcurrentSubagents: config.extensions.subagent.maxConcurrentSubagents,
     maxPendingSubagents: config.extensions.subagent.maxPendingSubagents,
     timeoutMs: config.extensions.subagent.timeoutMs,
-    execute: async (task, context) => await executeSubagentTask(subagentOptions, task, context.signal, context.accessMode)
+    execute: async (task, context) => await executeSubagentTask(subagentOptions, task, context.signal, context.accessMode, context.agent)
   });
   let loadedPlugins: string[] = [];
   try {
+    // 技能扫描可能因项目内配置路径的软链/硬链问题抛错，放在清理保护内执行。
+    skills = await loadSkills({ workspaceRoot, projectPaths: config.extensions.skills });
+    if (skills.skills.length) toolRegistry.registerUserTool(createSkillTool(skills));
+    // 先注册通用资源工具。若服务器工具归一化后撞名，connectConfiguredServers 中的
+    // 按工具隔离会跳过它，而不会让整个 runtime 在之后重复注册时失败。
+    if (Object.values(config.extensions.mcp).some((server) => server.enabled)) {
+      for (const tool of createMcpResourceTools(mcpHost)) toolRegistry.registerMcpTool(tool);
+    }
     await mcpHost.connectConfiguredServers(workspaceRoot, config, toolRegistry);
     loadedPlugins = await loadPlugins(workspaceRoot, config.extensions.plugins, config, toolRegistry);
     if (config.extensions.subagent.enabled) {
       toolRegistry.registerSubagentTool(createSubagentTool(subagentOptions, subagentTaskManager));
+      subagentDefinitions = await loadAgentDefinitions();
+    }
+    if (config.context.memory.enabled) {
+      // 记忆工具通过闭包延迟取 LocalMemory：注册发生在 AgentSession 创建前，调用发生在其后。
+      for (const tool of createMemoryTools(() => agent?.getLocalMemory())) toolRegistry.registerBuiltinTool(tool);
     }
     agent = new AgentSession({
       workspaceRoot,
@@ -109,7 +155,11 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
       recorder,
       taskStatePrompt: async () => formatDurableTaskContext(await taskRuns.list()),
       skillPrompt: skills.prompt,
-      skillPaths: skills.paths
+      subagentPrompt: buildSubagentDefinitionsPrompt(subagentDefinitions),
+      skillPaths: skills.paths,
+      mcpPrompt: () => mcpHost.instructionsPrompt(),
+      todoPrompt: () => todos.promptSection(),
+      createCheckpoint: checkpoints ? async (label) => await checkpoints.create(label) : undefined
     });
     await agent.initialize();
   } catch (error) {
@@ -119,25 +169,27 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     await recorder.close();
     throw error;
   }
-  if (!agent) throw new Error("Failed to initialize Biny agent runtime.");
+  if (!agent || !skills) throw new Error("Failed to initialize Biny agent runtime.");
 
-  const extensionStatus: ExtensionStatus = {
+  const loadedSkills = skills;
+  // MCP 连接状态与工具集合在运行期会变（断线、重连、list_changed），报告每次实时取。
+  const extensionStatus = (): ExtensionStatus => ({
     mcp: mcpHost.listServers(),
-    skills: [...skills.paths],
+    skills: [...loadedSkills.skills],
     plugins: [...loadedPlugins],
-    subagent: { ...config.extensions.subagent },
+    subagent: { ...config.extensions.subagent, agents: [...subagentDefinitions] },
     toolScheduling: {
       maxConcurrentTools: config.agent.maxConcurrentTools,
       maxQueuedToolCalls: config.agent.maxQueuedToolCalls
     },
     toolCounts: createToolCounts(toolRegistry.listEntries())
-  };
+  });
 
   const startSubagentTask = (task: string, taskOptions?: SubagentTaskRunOptions): SubmittedSubagentTask => {
     if (!config.extensions.subagent.enabled) throw new Error("Subagent extension is disabled in agent.config.json.");
     const taskId = taskOptions?.taskId ?? randomUUID();
     agent.recordHostedUserMessage(task);
-    const sequence = agent.recordHostedToolCall("delegate_task", { task }, taskId);
+    const sequence = agent.recordHostedToolCall("delegate_task", taskOptions?.agent ? { task, agent: taskOptions.agent } : { task }, taskId);
     let submitted: SubmittedSubagentTask;
     try {
       taskOptions?.signal?.throwIfAborted();
@@ -146,7 +198,8 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
         parentRunId: taskOptions?.parentRunId,
         signal: taskOptions?.signal,
         timeoutMs: taskOptions?.timeoutMs,
-        accessMode: taskOptions?.accessMode ?? (permissionManager.getStatus().mode === "full-access" ? "workspace" : "read-only")
+        accessMode: taskOptions?.accessMode ?? subagentAccessMode(permissionManager),
+        agent: taskOptions?.agent
       });
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
@@ -180,8 +233,21 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     agent,
     managedProcesses,
     taskRuns,
-    extensionReport: (section?: ExtensionSection): string => formatExtensionReport(extensionStatus, section),
+    extensionReport: (section?: ExtensionSection): string => formatExtensionReport(extensionStatus(), section),
+    forkSession: async (session: string | undefined, upToEvent?: number): Promise<ForkedSession> =>
+      await forkSession(persistenceRoot, session, upToEvent === undefined ? {} : { upToEvent }),
+    interruptedTurn: async (): Promise<InterruptedTurn | undefined> => await agent.interruptedTurn(),
+    listCheckpoints: async (): Promise<Checkpoint[]> => checkpoints ? await checkpoints.list() : [],
+    restoreCheckpoint: async (id: string): Promise<RestoreSummary> => {
+      if (!checkpoints) throw new Error("Checkpoints need a git repository; this workspace is not one.");
+      return await checkpoints.restore(id);
+    },
+    reconnectMcpServer: async (serverName: string): Promise<McpServerStatus> => await mcpHost.reconnectServer(serverName),
     getSubagentInfo: (): ModelRuntimeInfo => subagentRuntimeInfo(config),
+    listSubagentAgents: async (): Promise<SubagentDefinition[]> => {
+      subagentDefinitions = await loadAgentDefinitions();
+      return [...subagentDefinitions];
+    },
     startSubagentTask,
     runSubagentTask: async (task: string, taskOptions?: SubagentTaskRunOptions): Promise<string> => await startSubagentTask(task, taskOptions).completion,
     listSubagentTasks: (): SubagentTaskSnapshot[] => subagentTaskManager.listSnapshots(),
@@ -240,11 +306,13 @@ function formatDurableTaskContext(snapshots: TaskRunSnapshot[]): string | undefi
   return lines.join("\n").slice(0, 8_000);
 }
 
-function subagentModelSettings(config: AgentConfig, modelManager: ModelManager): ModelSettings {
-  const alias = config.extensions.subagent.model;
+function subagentModelSettings(config: AgentConfig, modelManager: ModelManager, modelAlias?: string): ModelSettings {
+  // 具名定义的 model 覆盖优先于全局 subagent model；两者都未配置时沿用当前会话模型。
+  const alias = modelAlias ?? config.extensions.subagent.model;
   if (!alias) return modelManager.getModelSettings();
   const model = config.models[alias];
   if (!model) throw new Error(`Unknown subagent model alias: ${alias}`);
+  if (model.supportsTools === false) throw new Error(`Subagent model ${alias} does not support tools.`);
   const reasoning = modelReasoningConfig(model);
   const modelConfig = {
     ...config,
