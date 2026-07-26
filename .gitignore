@@ -17,3 +17,6 @@ ARCHITECTURE.local.md
 /jobs/
 /reports/
 /scripts/evals/
+
+# Product showcase site (separate project, own toolchain)
+/website/
