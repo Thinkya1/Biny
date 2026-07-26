@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { stepCountIs, streamText, ToolLoopAgent, type LanguageModel, type LanguageModelUsage, type ModelMessage, type TextStreamPart, type ToolLoopAgentSettings, type ToolSet } from "ai";
+import { streamText, type LanguageModel, type LanguageModelUsage, type ModelMessage, type TextStreamPart, type ToolSet } from "ai";
 import type { AgentConfig } from "../config/schema.js";
 import { createFileConfigStore, type AgentConfigStore } from "../config/store.js";
 import {
@@ -14,11 +14,13 @@ import {
 import { PermissionManager, type PermissionMode } from "../permission/PermissionManager.js";
 import { runPermissionCommand } from "../permission/commands.js";
 import { listSessionSummaries, parseSessionEvents, type SessionSummary } from "../session/events.js";
-import { SessionRecorder } from "../session/recorder.js";
+import { SessionRecorder, type ReasoningBlock } from "../session/recorder.js";
 import { replaySessionEvents, type SessionReplay } from "../session/replay.js";
+import { TurnStore, type InterruptedTurn } from "../session/turnStore.js";
 import { ensureAgentDirs, resolveSessionFile, sessionIdFromFile } from "../session/store.js";
 import type { ToolRegistry } from "../tools/registry.js";
-import { SdkToolExecutionCoordinator } from "./sdkToolExecutionCoordinator.js";
+import { runAgentLoop, type AgentLoopConfig, type AgentLoopResult } from "./agentLoop.js";
+import { SdkToolExecutionCoordinator, type AgentStepContext } from "./sdkToolExecutionCoordinator.js";
 import { buildSystemPrompt } from "./prompts.js";
 import type {
   AgentPermissionRequest,
@@ -29,14 +31,16 @@ import type {
 } from "./types.js";
 import { ContextMemory } from "./context/ContextMemory.js";
 import { LocalMemory } from "./context/LocalMemory.js";
+import { runMemoryCommand } from "./context/memoryCommands.js";
 import { WorkspaceContext } from "./context/WorkspaceContext.js";
 import type { ContextStatus } from "./context/types.js";
 import { createSdkTelemetry } from "../observability/telemetry.js";
-import { createSessionUsage, formatUsageSummary, summarizeUsage, type UsageModelInfo } from "../observability/usage.js";
-import type { SessionUsage } from "../session/metadata.js";
+import { createSessionUsage, formatUsageSummary, sumSessionUsage, summarizeUsage, type UsageModelInfo } from "../observability/usage.js";
+import type { SessionUsage, UsageSummary } from "../session/metadata.js";
 import { AsyncEventQueue } from "../runtime/AsyncEventQueue.js";
-import { modelContextBudget } from "../ai/capabilities.js";
+import { defaultModelContextWindow, modelContextBudget } from "../ai/capabilities.js";
 import { modelCapabilities } from "../ai/capabilities.js";
+import { createLanguageModelForConfig } from "../llm/factory.js";
 
 export interface AgentSessionOptions {
   workspaceRoot: string;
@@ -50,7 +54,15 @@ export interface AgentSessionOptions {
   modelManager?: ModelManager;
   taskStatePrompt?: () => Promise<string | undefined>;
   skillPrompt?: string;
+  /** 具名子代理定义元数据段（delegate_task 可用的 agent 列表）。 */
+  subagentPrompt?: string;
   skillPaths?: string[];
+  /** MCP 服务器 initialize 返回的 instructions 汇总；重连后会变化，因此每回合实时读取。 */
+  mcpPrompt?: () => string;
+  /** 模型自己维护的计划清单；每回合实时读取，历史压缩不会让它丢失。 */
+  todoPrompt?: () => string | undefined;
+  /** 回合内首次改动工作区前建快照，供 /undo 回退；不在 git 仓库时省略。 */
+  createCheckpoint?: (label: string) => Promise<unknown>;
 }
 
 export interface AgentRunOptions {
@@ -61,6 +73,13 @@ export interface AgentRunOptions {
   maxSteps?: number;
   /** A task harness may defer success memory until external acceptance checks pass. */
   deferSuccessfulMemory?: boolean;
+  /** Model-visible prompt when the public user input must remain separate. */
+  modelInput?: string;
+  /**
+   * 从已有 context 直接续跑，跳过上下文组装，也不再记一条用户消息。
+   * 对齐 pi 的 `agentLoopContinue`：续跑的是同一个回合，不是新的一轮对话。
+   */
+  continueFrom?: ModelMessage[];
   /** Public session message when the model input is an internal task-attempt prompt. */
   sessionUserMessage?: string;
   /** Whether this attempt should append a user message to the visible session transcript. */
@@ -83,6 +102,9 @@ export interface AgentSessionInfo {
   reasoningLabel: string;
   modelAlias: string;
   thinking: ThinkingSelection;
+  contextWindow?: number;
+  /** 单轮允许注入的输入 token 预算；`getInfo()` 一直带着它，界面用它算上下文用量。 */
+  maxInputTokens?: number;
   skills?: string[];
 }
 
@@ -99,9 +121,11 @@ export interface ResumedAgentSession extends SessionReplay {
  */
 export class AgentSession {
   private readonly contextMemory: ContextMemory;
+  private readonly localMemory: LocalMemory | undefined;
   private usageRecords: SessionUsage[] = [];
   private unpersistedRelatedUsage: SessionUsage[] = [];
   private recorder: SessionRecorder;
+  private turnStore: TurnStore;
   private activeOperation: string | undefined;
   private readonly lingeringExternalTools = new Map<Promise<unknown>, { tool: string; toolCallId: string }>();
 
@@ -121,24 +145,33 @@ export class AgentSession {
       this.recordModelUsage(usage, operation);
     };
     const telemetry = (functionId: string) => createSdkTelemetry(options.config, persistenceRoot, functionId);
-    const localMemory = options.config.context.memory.enabled
-      ? new LocalMemory(persistenceRoot, getModel, onUsage, telemetry, () => options.modelManager?.getModelSettings().maxRetries ?? 0)
+    const memoryConfig = options.config.context.memory;
+    const memoryModelAlias = memoryConfig.model;
+    // 记忆抽取/整理可以指定专用小模型；未配置时跟随会话模型。懒创建并缓存，避免每次写记忆都重建 adapter。
+    let memoryModel: LanguageModel | undefined;
+    const getMemoryModel = memoryModelAlias
+      ? (): LanguageModel => (memoryModel ??= createLanguageModelForConfig(options.config, memoryModelAlias))
+      : getModel;
+    this.localMemory = memoryConfig.enabled
+      ? new LocalMemory(persistenceRoot, getMemoryModel, onUsage, telemetry, () => options.modelManager?.getModelSettings().maxRetries ?? 0, memoryConfig.maxRecalled)
       : undefined;
     this.contextMemory = new ContextMemory(
       getModel,
       workspace,
-      localMemory,
-      options.config.context.maxInputTokens,
+      this.localMemory,
+      options.config.context.maxInputTokens ?? defaultModelContextWindow,
       options.config.context.instructionsMaxBytes,
       onUsage,
       telemetry,
       () => {
         const activeModel = options.config.models[options.config.defaultModel];
         if (!activeModel) {
+          // 模型别名缺失时只能退回保守窗口，真实预算永远以模型自身声明为准。
+          const fallback = options.config.context.maxInputTokens ?? defaultModelContextWindow;
           return {
             modelAlias: options.config.defaultModel,
-            contextWindow: options.config.context.maxInputTokens,
-            maxInputTokens: options.config.context.maxInputTokens,
+            contextWindow: fallback,
+            maxInputTokens: fallback,
             maxOutputTokens: undefined
           };
         }
@@ -147,10 +180,48 @@ export class AgentSession {
       () => options.modelManager?.getModelSettings().maxRetries ?? 0
     );
     this.recorder = options.recorder;
+    this.turnStore = new TurnStore(this.persistenceRoot(), options.recorder.sessionId);
   }
 
   async initialize(): Promise<void> {
     await this.contextMemory.initialize();
+  }
+
+  /** 技能元数据、具名子代理清单与 MCP instructions 共同构成 system prompt 的扩展段。 */
+  private extensionPrompt(): string | undefined {
+    const sections = [
+      this.options.skillPrompt?.trim(),
+      this.options.subagentPrompt?.trim(),
+      this.options.mcpPrompt?.().trim(),
+      this.options.todoPrompt?.()?.trim()
+    ].filter(Boolean);
+    return sections.length ? sections.join("\n\n") : undefined;
+  }
+
+  /** 上次被打断、尚未收尾的回合；没有则为 undefined。 */
+  async interruptedTurn(): Promise<InterruptedTurn | undefined> {
+    return await this.turnStore.load();
+  }
+
+  /**
+   * 从被打断的地方继续同一个回合。
+   *
+   * 用的是断点时的完整 context，所以已完成步骤的工具结果都还在，模型不需要重跑它们。
+   * 没有可续跑的状态时抛错而不是静默开一个新回合 —— 后者会让用户以为续上了，其实是重来。
+   */
+  async *continueInterruptedTurn(runOptions: AgentRunOptions = {}): AsyncGenerator<AgentSessionEvent> {
+    const turn = await this.turnStore.load();
+    if (!turn) throw new Error("There is no interrupted turn to continue.");
+    yield* this.runSdk(turn.prompt, { ...runOptions, continueFrom: turn.messages });
+  }
+
+  /** 持久记忆存储句柄；记忆工具与 /memory 命令共用（禁用时为 undefined）。 */
+  getLocalMemory(): LocalMemory | undefined {
+    return this.localMemory;
+  }
+
+  async runMemoryCommand(args: string[]): Promise<string> {
+    return await runMemoryCommand(this.localMemory, args);
   }
 
   async *run(input: string, runOptions: AgentRunOptions = {}): AsyncGenerator<AgentSessionEvent> {
@@ -164,6 +235,7 @@ export class AgentSession {
       ? AbortSignal.any([runOptions.abortSignal, turnController.signal])
       : turnController.signal;
     const effectiveRunOptions: AgentRunOptions = { ...runOptions, abortSignal };
+    const modelInput = runOptions.modelInput ?? input;
     const usageBeforePreparation = this.usageRecords.length;
     let userMessageRecorded = false;
     const recordUserMessage = (): void => {
@@ -202,14 +274,19 @@ export class AgentSession {
     const settings = this.options.modelManager?.getModelSettings();
     const mode = runOptions.mode ?? "chat";
     let messages: ModelMessage[];
+    if (runOptions.continueFrom?.length) {
+      // 续跑用的是被打断那一刻的 context，重新组装会丢掉已完成步骤的工具结果。
+      messages = [...runOptions.continueFrom];
+      userMessageRecorded = true;
+    } else {
     try {
       const durableTaskPrompt = await this.options.taskStatePrompt?.();
       const systemPrompt = [
-        buildSystemPrompt(mode === "plan" ? "plan" : "qa", this.options.skillPrompt),
+        buildSystemPrompt(mode === "plan" ? "plan" : "qa", this.extensionPrompt()),
         durableTaskPrompt
       ].filter((section): section is string => Boolean(section)).join("\n\n");
       messages = await this.contextMemory.prepareTurn(
-        input,
+        modelInput,
         systemPrompt,
         abortSignal,
         supportedAttachments(this.options.config, runOptions.attachments)
@@ -225,6 +302,7 @@ export class AgentSession {
       yield doneEvent(outcome);
       return;
     }
+    }
     if (abortSignal.aborted) {
       recordUserMessage();
       const outcome = abortedTurn("Current turn interrupted during context preparation.", 0);
@@ -239,7 +317,7 @@ export class AgentSession {
     if (!Number.isSafeInteger(maxSteps) || maxSteps < 1 || maxSteps > this.options.config.agent.maxSteps) {
       throw new RangeError(`Agent attempt maxSteps must be between 1 and ${String(this.options.config.agent.maxSteps)}.`);
     }
-    const stepContext = { assistantContent: "", reasoningContent: "" };
+    const stepContext: AgentStepContext = { assistantContent: "", reasoningContent: "", reasoningProviderOptions: undefined, reasoningBlocks: [] };
     const queue = new AsyncEventQueue<AgentSessionEvent>();
     const runtime = this.runtimeContext(effectiveRunOptions);
     const allowedToolNames = mode === "plan"
@@ -252,57 +330,80 @@ export class AgentSession {
       () => ({ ...stepContext }),
       allowedToolNames
     );
-    const agentSettings = {
+    const loopConfig: AgentLoopConfig = {
       model,
       tools: coordinator.createTools(),
-      allowSystemInMessages: true,
-      stopWhen: stepCountIs(maxSteps),
-      maxRetries: settings?.maxRetries ?? 0,
-      providerOptions: settings?.providerOptions,
-      reasoning: settings?.reasoning,
-      timeout: settings?.timeoutMs,
-      maxOutputTokens: settings?.maxOutputTokens,
-      telemetry: createSdkTelemetry(this.options.config, this.persistenceRoot(), "biny.agent"),
-      // ToolLoopAgent forwards unknown stream options to streamText at runtime;
-      // suppress its console.error default so Ink remains the only output sink.
-      onError: () => undefined
-    } as ToolLoopAgentSettings<never, ToolSet> & { onError: () => undefined };
-    const agent = new ToolLoopAgent<never, ToolSet>(agentSettings);
+      maxSteps,
+      streamOptions: {
+        maxRetries: settings?.maxRetries ?? 0,
+        providerOptions: settings?.providerOptions,
+        reasoning: settings?.reasoning,
+        timeout: settings?.timeoutMs,
+        maxOutputTokens: settings?.maxOutputTokens,
+        telemetry: createSdkTelemetry(this.options.config, this.persistenceRoot(), "biny.agent")
+      },
+      // 回合内上下文治理的落点。剪枝失败不该打断这一步，退回原 messages 让 provider 自己报错。
+      transformContext: async (stepMessages) => {
+        try {
+          return this.contextMemory.pruneToolResultsForStep(stepMessages);
+        } catch {
+          return stepMessages;
+        }
+      },
+      onPart: (part) => queue.push({ type: "sdk", part }),
+      onStepEnd: async (step) => {
+        // 每步各自是一次 provider 请求，用量按步记录而不是等回合结束一次性归并。
+        stepUsageRecords.push(this.recordModelUsage(step.usage, "agent"));
+        if (step.usage.inputTokens !== undefined) this.contextMemory.recordProviderUsage(step.usage);
+        // 落盘这一步结束时的完整 context：进程在这之后挂掉，下次可以从这里继续。
+        await this.turnStore.save(runOptions.sessionUserMessage ?? input, step.messages, step.index + 1)
+          .catch(() => undefined);
+      }
+    };
+    const stepUsageRecords: SessionUsage[] = [];
 
     recordUserMessage();
     yield { type: "status", status: "thinking" };
 
-    let result: Awaited<ReturnType<typeof agent.stream>>;
-    try {
-      result = await agent.stream({ messages, abortSignal });
-    } catch (error) {
-      const message = errorMessage(error);
-      const outcome = runOptions.abortSignal?.aborted
-        ? abortedTurn(message || "Current turn interrupted.", 0)
-        : failedTurn(message, 0, isTimeoutFailure(error) ? "timeout" : "provider_error");
-      this.recordError(message);
-      yield { type: "error", message };
-      yield { type: "status", status: outcome.status === "aborted" ? "aborted" : "error" };
-      yield doneEvent(outcome);
-      return;
-    }
-
+    let loopResult: AgentLoopResult | undefined;
     let streamError: unknown;
     let observedSteps = 0;
     const invalidToolCalls: Array<{ toolName: string; toolCallId: string; input: unknown }> = [];
     let duplicateToolCallError: Error | undefined;
     let streamFailureReported = false;
-    streamTask = (async (): Promise<void> => {
-      try {
-        for await (const part of result.fullStream) {
+    // 整个回合的 reasoning 展示文本；stepContext.reasoningContent 每步会清空。
+    let turnReasoningContent = "";
+    // 一步里可能有多个 reasoning block，每个各自签名，必须分开保留而不是拼成一段。
+    const reasoningBlockIds = new Map<string, ReasoningBlock>();
+    const reasoningBlock = (id: string): ReasoningBlock => {
+      const existing = reasoningBlockIds.get(id);
+      if (existing) return existing;
+      const created: ReasoningBlock = { text: "" };
+      reasoningBlockIds.set(id, created);
+      (stepContext.reasoningBlocks ??= []).push(created);
+      return created;
+    };
+    const handlePart = (part: TextStreamPart<ToolSet>): void => {
           if (part.type === "start-step") {
             observedSteps += 1;
             stepContext.assistantContent = "";
             stepContext.reasoningContent = "";
+            stepContext.reasoningProviderOptions = undefined;
+            stepContext.reasoningBlocks = [];
+            reasoningBlockIds.clear();
           } else if (part.type === "text-delta") {
             stepContext.assistantContent += part.text;
           } else if (part.type === "reasoning-delta") {
             stepContext.reasoningContent += part.text;
+            turnReasoningContent += part.text;
+            stepContext.reasoningProviderOptions = part.providerMetadata ?? stepContext.reasoningProviderOptions;
+            const block = reasoningBlock(part.id);
+            block.text += part.text;
+            if (part.providerMetadata) block.providerOptions = part.providerMetadata;
+          } else if (part.type === "reasoning-start" || part.type === "reasoning-end") {
+            stepContext.reasoningProviderOptions = part.providerMetadata ?? stepContext.reasoningProviderOptions;
+            const block = reasoningBlock(part.id);
+            if (part.providerMetadata) block.providerOptions = part.providerMetadata;
           } else if (part.type === "error") {
             streamError = part.error;
           }
@@ -317,12 +418,19 @@ export class AgentSession {
             }
             if (part.invalid) invalidToolCalls.push({ toolName: part.toolName, toolCallId: part.toolCallId, input: part.input });
           }
-          queue.push({ type: "sdk", part: part as TextStreamPart<ToolSet> });
-        }
+          queue.push({ type: "sdk", part });
+    };
+    streamTask = (async (): Promise<void> => {
+      try {
+        loopResult = await runAgentLoop(messages, { ...loopConfig, onPart: handlePart }, abortSignal);
       } catch (error) {
-        streamError = error;
-        streamFailureReported = true;
-        queue.push({ type: "error", message: error instanceof Error ? error.message : String(error) });
+        // 重复 tool call 这类情况已经推过 fatal error 并主动 abort 了；循环随后抛出的
+        // 中断异常是同一件事的后果，不能再报一次。首个原因也要保留，不被中断异常覆盖。
+        streamError ??= error;
+        if (!streamFailureReported) {
+          streamFailureReported = true;
+          queue.push({ type: "error", message: error instanceof Error ? error.message : String(error) });
+        }
       } finally {
         if (!duplicateToolCallError) {
           await Promise.all(invalidToolCalls.map(async (call) => {
@@ -343,39 +451,40 @@ export class AgentSession {
     await streamTask;
 
     try {
-      const [content, reasoningContent, responseMessages, usage, finalStep, steps] = await Promise.all([
-        result.text,
-        result.reasoningText,
-        result.responseMessages,
-        result.usage,
-        result.finalStep,
-        result.steps
-      ]);
       // A provider can surface an error as a fullStream part while still
-      // resolving the convenience promises with partial output. Do not let a
-      // partial answer commit history or look like a successful turn.
+      // producing partial output. Do not let a partial answer commit history or
+      // look like a successful turn.
       if (streamError !== undefined) throw streamError;
-      this.contextMemory.recordProviderUsage(finalStep.usage.inputTokens !== undefined ? finalStep.usage : usage);
-      const nextMessages = [...messages, ...responseMessages];
-      this.contextMemory.replaceHistory(nextMessages);
-      const usageRecord = this.recordModelUsage(usage, "agent");
+      if (!loopResult) throw new Error("Agent loop ended without a result.");
+      const content = loopResult.text;
+      const steps = loopResult.steps;
+      // 循环自己拼 context：每步的 responseMessages 已经按序并入，剪枝后的 messages 也
+      // 在里面，所以直接用循环的最终结果，而不是 [初始 messages + 全部响应]。
+      this.contextMemory.replaceHistory(loopResult.messages);
+      // 每步的用量已在 onStepEnd 逐条记账；回合级记录用它们的合计，避免重复计费。
+      const usageRecord = sumSessionUsage(stepUsageRecords);
       this.recorder.record({
         type: "assistant_message",
         content,
-        reasoningContent: reasoningContent ?? undefined,
+        reasoningContent: turnReasoningContent || undefined,
+        // reasoningContent 是整个回合的展示文本；可回放的部分只有最后一步这些带签名的块。
+        reasoningProviderOptions: stepContext.reasoningProviderOptions,
+        reasoningBlocks: stepContext.reasoningBlocks,
         usage: usageRecord,
         relatedUsage: this.takeRelatedUsage(),
         contextState: this.contextMemory.snapshot()
       });
       const outcome = finishedTurn(
         content,
-        finalStep.finishReason,
+        loopResult.finishReason,
         steps.length,
         maxSteps,
         usageRecord
       );
       if (outcome.status === "completed") {
-        if (!runOptions.deferSuccessfulMemory) this.contextMemory.queueSuccessfulTask(input, content);
+        if (!runOptions.deferSuccessfulMemory) {
+          this.rememberSuccessfulTask(runOptions.sessionUserMessage ?? input, content);
+        }
         yield { type: "status", status: "completed" };
       } else if (outcome.status === "incomplete") {
         yield { type: "status", status: "incomplete" };
@@ -384,6 +493,7 @@ export class AgentSession {
         yield { type: "error", message: outcome.error ?? "Agent run failed." };
         yield { type: "status", status: "error" };
       }
+      await this.turnStore.clear().catch(() => undefined);
       yield doneEvent(outcome);
     } catch (error) {
       const failure = streamError ?? error;
@@ -444,7 +554,7 @@ export class AgentSession {
       }
       let messages: ModelMessage[];
       try {
-        messages = await this.contextMemory.prepareTurn(task, buildSystemPrompt("oneShotPlan", this.options.skillPrompt), abortSignal);
+        messages = await this.contextMemory.prepareTurn(task, buildSystemPrompt("oneShotPlan", this.extensionPrompt()), abortSignal);
       } catch (error) {
         recordUserMessage();
         throw error;
@@ -484,7 +594,7 @@ export class AgentSession {
       if (finalStep.finishReason !== "stop") {
         throw new Error(`Plan generation did not reach a terminal model stop (finishReason=${finalStep.finishReason}).`);
       }
-      this.contextMemory.queueSuccessfulTask(userContent, output);
+      this.rememberSuccessfulTask(userContent, output);
       return output;
     } catch (error) {
       this.recordError(error);
@@ -549,6 +659,11 @@ export class AgentSession {
     return await this.contextMemory.status();
   }
 
+  /** 本会话累计用量的快照；evals 和宿主用它做度量，拿到的是副本不是内部数组。 */
+  usageSummary(): UsageSummary {
+    return summarizeUsage(this.usageRecords);
+  }
+
   usageReport(): string {
     return formatUsageSummary(summarizeUsage(this.usageRecords));
   }
@@ -561,7 +676,9 @@ export class AgentSession {
     this.recordModelUsage(usage, operation, modelAlias);
   }
 
+  /** 自动沉淀受 context.memory.autoRemember 控制；显式 save_memory 工具不受影响。 */
   rememberSuccessfulTask(task: string, answer: string): void {
+    if (!this.options.config.context.memory.autoRemember) return;
     this.contextMemory.queueSuccessfulTask(task, answer);
   }
 
@@ -629,7 +746,7 @@ export class AgentSession {
     try {
       this.options.permissionManager.setMode(mode);
       this.options.config.permission.mode = mode;
-      await this.configStore().save(this.options.config);
+      await this.savePermissionMode(mode);
     } catch (error) {
       this.options.permissionManager.setMode(previousMode);
       this.options.config.permission.mode = previousMode;
@@ -644,10 +761,11 @@ export class AgentSession {
     const previousMode = this.options.permissionManager.getStatus().mode;
     try {
       const output = runPermissionCommand(this.options.permissionManager, args);
-      if (this.options.permissionManager.getStatus().mode !== previousMode) {
-        this.options.config.permission.mode = this.options.permissionManager.getStatus().mode;
+      const nextMode = this.options.permissionManager.getStatus().mode;
+      if (nextMode !== previousMode) {
+        this.options.config.permission.mode = nextMode;
         try {
-          await this.configStore().save(this.options.config);
+          await this.savePermissionMode(nextMode);
         } catch (error) {
           this.options.permissionManager.setMode(previousMode);
           this.options.config.permission.mode = previousMode;
@@ -773,6 +891,7 @@ export class AgentSession {
       toolRegistry: this.options.toolRegistry,
       permissionManager: this.options.permissionManager,
       confirmPermission: runOptions.confirmPermission,
+      createCheckpoint: this.options.createCheckpoint,
       quarantineExternalTool: (tool, toolCallId, settlement) => {
         if (this.lingeringExternalTools.has(settlement)) return;
         this.lingeringExternalTools.set(settlement, { tool, toolCallId });
@@ -791,6 +910,21 @@ export class AgentSession {
 
   private configStore(): AgentConfigStore {
     return this.options.configStore ?? createFileConfigStore(this.persistenceRoot());
+  }
+
+  /**
+   * 只把权限模式写回配置文件。
+   *
+   * 内存里的 config 是运行时创建时读到的快照，之后可能已经落后于磁盘（桌面端多个项目共用
+   * 同一份配置，别的运行时切模型、刷新 OAuth token 都会改盘上的内容）。整份写回会把这些改动
+   * 覆盖掉——表现出来就是「改一次权限模式，模型被切回旧的默认模型」。因此这里读盘后只改
+   * `permission.mode` 再保存。
+   */
+  private async savePermissionMode(mode: PermissionMode): Promise<void> {
+    const store = this.configStore();
+    const persisted = await store.load();
+    persisted.permission.mode = mode;
+    await store.save(persisted);
   }
 }
 

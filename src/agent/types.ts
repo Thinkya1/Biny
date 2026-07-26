@@ -77,6 +77,8 @@ export interface AgentRuntimeContext {
   toolRegistry: ToolRegistry;
   permissionManager?: PermissionManager;
   confirmPermission?: (request: AgentPermissionRequest) => Promise<AgentPermissionResult>;
+  /** 回合内首次改动工作区前建快照；未提供或抛错时工具照常执行。 */
+  createCheckpoint?: (label: string) => Promise<unknown>;
   quarantineExternalTool?: (tool: string, toolCallId: string, settlement: Promise<unknown>) => void;
   abortSignal?: AbortSignal;
 }

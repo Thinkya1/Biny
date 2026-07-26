@@ -104,6 +104,40 @@ export class ContextMemory {
     this.history.splice(0, this.history.length, ...messages.filter((message) => message.role !== "system"));
   }
 
+  /**
+   * 回合内的上下文治理。turn 中途不能做整段摘要压缩：那要改动消息结构，很容易让
+   * tool-call 和 tool-result 配不上对，也会碰到带签名的 reasoning 块。
+   *
+   * 这里只做一件安全的事 —— 把**较早**的 tool result 正文替换成一个占位说明，从最旧的
+   * 开始，直到估算落回预算内。消息条数、角色、toolCallId 全部不变，配对关系天然保住；
+   * 原文早就在 session JSONL 和 `.agent/tool-results` 里，占位符只影响下一次推理看到
+   * 什么，不影响已记录的事实。
+   *
+   * 保留 `keepRecentToolResults` 条最近的结果不动：模型当下正要用的就是它们。
+   */
+  pruneToolResultsForStep(messages: ModelMessage[], keepRecentToolResults = 2): ModelMessage[] {
+    const limit = Math.floor(this.inputBudget() * midTurnPruneThreshold);
+    if (estimateMessageTokens(messages) <= limit) return messages;
+
+    const prunableIndexes = messages.reduce<number[]>((indexes, message, index) => {
+      if (message.role === "tool" && !isPrunedToolResult(message)) indexes.push(index);
+      return indexes;
+    }, []).slice(0, Math.max(0, messages.length - keepRecentToolResults));
+    if (!prunableIndexes.length) return messages;
+
+    const pruned = [...messages];
+    let total = estimateMessageTokens(pruned);
+    for (const index of prunableIndexes.slice(0, Math.max(0, prunableIndexes.length - keepRecentToolResults))) {
+      const original = pruned[index];
+      if (!original || original.role !== "tool") continue;
+      const replacement = prunedToolResultMessage(original);
+      total -= messageTokenCost(original) - messageTokenCost(replacement);
+      pruned[index] = replacement;
+      if (total <= limit) break;
+    }
+    return pruned;
+  }
+
   getBudget(): ContextBudgetStatus {
     this.syncBudgetMetadata();
     return cloneBudget(this.lastBudget);
@@ -298,7 +332,7 @@ export class ContextMemory {
   private async findRelevantMemory(input: string, paths: string[], signal?: AbortSignal): Promise<MemoryMatch[]> {
     if (!this.localMemory) return [];
     try {
-      return await this.localMemory.findRelevant(input, paths, 3, signal);
+      return await this.localMemory.findRelevant(input, paths, this.localMemory.recallLimit, signal);
     } catch {
       signal?.throwIfAborted();
       return [];
@@ -508,7 +542,12 @@ function assembleContext(
   addSystem("explicit paths", formatExplicitPaths(workspace.explicitPaths), false);
   addSystem("recent workspace activity", formatRecentActivity(workspace.recentActivity), false);
   addSystem("conversation summary", summary ? `Conversation handoff summary:\n${summary}` : "", false);
-  addSystem("stable memory", formatMemoryMatches(memoryMatches), false);
+  // 记忆条目要带上来源说明，模型才知道这是跨会话的项目记忆而不是当前对话内容。
+  addSystem(
+    "stable memory",
+    memoryMatches.length ? `Stable project memory (recalled from .agent/memory):\n${formatMemoryMatches(memoryMatches)}` : "",
+    false
+  );
 
   const selectedHistory = selectHistory(history, remaining);
   remaining -= estimateMessageTokens(selectedHistory);
@@ -633,6 +672,27 @@ function groupConversationTurns(messages: ModelMessage[]): ModelMessage[][] {
     turns.at(-1)?.push(message);
   }
   return turns;
+}
+
+/** 回合内剪枝的触发线：越过输入预算的这个比例就开始把旧工具结果换成占位符。 */
+const midTurnPruneThreshold = 0.7;
+const prunedToolResultMarker = "[earlier tool result elided to fit the context window; the full result is in the session log]";
+
+type ToolMessage = Extract<ModelMessage, { role: "tool" }>;
+
+function isPrunedToolResult(message: ToolMessage): boolean {
+  return message.content.every((part) => part.type === "tool-result"
+    && part.output.type === "text"
+    && part.output.value === prunedToolResultMarker);
+}
+
+function prunedToolResultMessage(message: ToolMessage): ToolMessage {
+  return {
+    ...message,
+    content: message.content.map((part) => part.type === "tool-result"
+      ? { ...part, output: { type: "text" as const, value: prunedToolResultMarker } }
+      : part)
+  };
 }
 
 function messageTokenCost(message: ModelMessage): number {

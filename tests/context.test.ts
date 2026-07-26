@@ -49,6 +49,17 @@ class ContextTestModel {
         keywords: ["context", "refresh", "workflow"]
       });
     }
+    if (prompt.includes("Consolidate this project memory topic file")) {
+      return JSON.stringify({
+        entries: [{
+          title: "Weather workflow",
+          summary: "使用 wttr.in 获取天气，请求失败时最多重试三次并渲染 Markdown 表格。",
+          decisions: [],
+          paths: [],
+          keywords: ["weather", "retry"]
+        }]
+      });
+    }
     if (prompt.includes("Summarize this coding-agent")) {
       return JSON.stringify({
         goal: "Keep context bounded.",
@@ -141,6 +152,7 @@ async function main(): Promise<void> {
   await testAutomaticContextRejectsExternalSymlinks();
   await testAutomaticContextSupportsSymlinkedWorkspaceRoot();
   await testBudgetAndCompaction();
+  await testMidTurnToolResultPruning();
   await testContextPreparationAbortStopsAutoCompaction();
   await testRestoreWithoutPersistedBudgetUsesHistoryEstimate();
   await testSessionReplayAndAgentResume();
@@ -153,6 +165,7 @@ async function main(): Promise<void> {
   await testMemoryRedactionDedupAndWriter();
   await testMemoryQueueLifecycleAndUsagePersistence();
   await testMemoryStorageBoundaries();
+  await testMemoryEntryManagementAndCjkSearch();
   await testCredentialAndSymlinkBoundaries();
   await testToolWriteMarksSnapshotAndRepoMapDirty();
 }
@@ -279,6 +292,62 @@ async function testAutomaticContextSupportsSymlinkedWorkspaceRoot(): Promise<voi
   });
 }
 
+/**
+ * 回合内剪枝：只把较早的 tool result 正文换成占位符，消息条数、角色和 toolCallId 都不动，
+ * tool-call / tool-result 的配对不能被破坏。
+ */
+async function testMidTurnToolResultPruning(): Promise<void> {
+  await withTempWorkspace(async (workspaceRoot) => {
+    const provider = new ContextTestModel();
+    const workspace = new WorkspaceContext(workspaceRoot, [], 32 * 1024);
+    const memory = new ContextMemory(() => provider.model, workspace, undefined, 200, 32 * 1024);
+
+    const messages: ModelMessage[] = [{ role: "user", content: "inspect the repo" }];
+    for (let index = 0; index < 5; index += 1) {
+      messages.push({
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: `call-${String(index)}`, toolName: "read_file", input: { path: `f${String(index)}.ts` } }]
+      });
+      messages.push({
+        role: "tool",
+        content: [{ type: "tool-result", toolCallId: `call-${String(index)}`, toolName: "read_file", output: { type: "text", value: "body ".repeat(200) } }]
+      });
+    }
+
+    const before = estimateMessageTokens(messages);
+    const pruned = memory.pruneToolResultsForStep(messages);
+    assert.equal(pruned.length, messages.length, "pruning must not drop messages");
+    assert.equal(estimateMessageTokens(pruned) < before, true, "pruning must shrink the estimate");
+
+    // 每个 tool-call 仍然有配对的 tool-result，且 toolCallId 一一对应。
+    const callIds = pruned.flatMap((message) => message.role === "assistant" && Array.isArray(message.content)
+      ? message.content.filter((part) => part.type === "tool-call").map((part) => part.toolCallId)
+      : []);
+    const resultIds = pruned.flatMap((message) => message.role === "tool"
+      ? message.content.filter((part) => part.type === "tool-result").map((part) => part.toolCallId)
+      : []);
+    assert.deepEqual(callIds, resultIds);
+
+    // 最近的工具结果保持原样：模型当下要用的就是它们。
+    const lastResult = pruned.at(-1);
+    assert.equal(lastResult?.role, "tool");
+    assert.equal(String(toolResultValue(lastResult)).startsWith("body "), true);
+    // 最早的已被换成占位符。
+    assert.equal(/elided to fit the context window/.test(String(toolResultValue(pruned[2]))), true);
+
+    // 预算充裕时不动任何东西，且剪枝是幂等的。
+    const roomy = new ContextMemory(() => provider.model, workspace, undefined, 1_000_000, 32 * 1024);
+    assert.equal(roomy.pruneToolResultsForStep(messages), messages);
+    assert.equal(estimateMessageTokens(memory.pruneToolResultsForStep(pruned)), estimateMessageTokens(pruned));
+  });
+}
+
+function toolResultValue(message: ModelMessage | undefined): unknown {
+  if (!message || message.role !== "tool") return undefined;
+  const part = message.content.find((entry) => entry.type === "tool-result");
+  return part && part.output.type === "text" ? part.output.value : undefined;
+}
+
 async function testBudgetAndCompaction(): Promise<void> {
   await withTempWorkspace(async (workspaceRoot) => {
     const provider = new ContextTestModel();
@@ -381,14 +450,33 @@ async function testSessionReplayAndAgentResume(): Promise<void> {
         content: "inspect src/index.ts",
         contextUsage: { maxTokens: 24_000, usedTokens: 1_234, omitted: [], autoCompacted: false }
       },
-      { type: "tool_call", tool: "read_file", args: { path: "src/index.ts" }, toolCallId: "call-7", sequence: 7, assistantContent: "I will inspect the entry.", reasoningContent: "The entry file is the first target." },
+      {
+        type: "tool_call",
+        tool: "read_file",
+        args: { path: "src/index.ts" },
+        toolCallId: "call-7",
+        sequence: 7,
+        assistantContent: "I will inspect the entry.",
+        reasoningContent: "The entry file is the first target.",
+        reasoningProviderOptions: { anthropic: { signature: "signed-entry-reasoning" } }
+      },
       { type: "tool_result", tool: "read_file", result: { path: "src/index.ts", content: "export {}" }, toolCallId: "call-7", sequence: 7 },
-      { type: "tool_call", tool: "read_file", args: { path: "src/worker.ts" }, toolCallId: "call-8", sequence: 8, assistantContent: "I will inspect the worker.", reasoningContent: "The worker is the second target." },
+      {
+        type: "tool_call",
+        tool: "read_file",
+        args: { path: "src/worker.ts" },
+        toolCallId: "call-8",
+        sequence: 8,
+        assistantContent: "I will inspect the worker.",
+        reasoningContent: "The worker is the second target.",
+        reasoningProviderOptions: { anthropic: { signature: "signed-worker-reasoning" } }
+      },
       { type: "tool_result", tool: "read_file", result: { path: "src/worker.ts", content: "export class Worker {}" }, toolCallId: "call-8", sequence: 8 },
       {
         type: "assistant_message",
         content: "The files define the entry and worker.",
         reasoningContent: "Both requested files were inspected.",
+        reasoningProviderOptions: { anthropic: { signature: "signed-final-reasoning" } },
         usage: {
           operation: "agent",
           modelAlias: "deepseek-v4-flash",
@@ -703,10 +791,13 @@ async function testSessionReadLimits(): Promise<void> {
     await fs.writeFile(oversizedFile, "", "utf8");
     await fs.truncate(oversizedFile, maxSessionFileBytes + 1);
 
+    // 校验与写入路径保持严格：这些地方发现超限就该停下。
     await assert.rejects(readSessionEvents(oversizedFile), /maximum size/u);
-    await assert.rejects(readStoredSessionEvents(workspaceRoot, "oversized-session"), /maximum size/u);
-    await assert.rejects(readSessionSnapshot(workspaceRoot, "oversized-session"), /maximum size/u);
     await assert.rejects(repairSessionTailForAppend(oversizedFile), /maximum size/u);
+    // 打开路径改为读尾部并标注截断。超限就整条会话打不开，而用户是在想恢复它的时候才发现，
+    // 这个失败模式比只拿到最近历史糟糕得多。
+    const oversizedSnapshot = await readSessionSnapshot(workspaceRoot, "oversized-session");
+    assert.equal(oversizedSnapshot.truncated, true);
     const oversizedRecorder = new SessionRecorder(workspaceRoot, "oversized-session");
     assert.throws(() => oversizedRecorder.readText(), /maximum size/u);
     await oversizedRecorder.close();
@@ -982,6 +1073,51 @@ async function testMemoryQueueLifecycleAndUsagePersistence(): Promise<void> {
     await agent.close();
     const replay = await replaySession(recorder.filePath);
     assert.equal(replay.usage.some((usage) => usage.operation === "memory"), true);
+  });
+}
+
+async function testMemoryEntryManagementAndCjkSearch(): Promise<void> {
+  await withTempWorkspace(async (workspaceRoot) => {
+    const provider = new ContextTestModel();
+    const store = new LocalMemory(workspaceRoot, () => provider.model);
+    await store.write({
+      topic: "project",
+      title: "Weather workflow",
+      summary: "使用 wttr.in 获取天气并渲染 Markdown 表格。",
+      decisions: [],
+      paths: [],
+      keywords: ["weather"]
+    });
+    await store.write({
+      topic: "project",
+      title: "Weather retries",
+      summary: "wttr.in 请求失败时最多重试三次并按指数退避。",
+      decisions: [],
+      paths: [],
+      keywords: ["retry"]
+    });
+
+    // 中文查询没有空格分界，必须靠 bigram 命中记忆内容。
+    const matches = await store.findRelevant("天气怎么获取", []);
+    assert.equal(matches.length > 0, true);
+    assert.equal(matches[0]?.topic, "project");
+
+    const entries = await store.listEntries();
+    assert.equal(entries.length, 2);
+    assert.equal(entries.every((entry) => entry.topic === "project"), true);
+    assert.equal(entries.some((entry) => entry.title === "Weather retries"), true);
+
+    const compaction = await store.compactTopics(["project"]);
+    assert.equal(compaction[0]?.before, 2);
+    assert.equal(compaction[0]?.after, 1);
+    assert.equal(compaction[0]?.error, undefined);
+    assert.equal((await store.listEntries()).length, 1);
+
+    // 删掉最后一条后，话题文件与索引行应一起消失。
+    assert.equal(await store.deleteEntry("project", 0), true);
+    assert.equal((await store.listTopics()).includes("project"), false);
+    assert.equal((await store.readIndex())?.includes("project.md") ?? false, false);
+    assert.equal(await store.deleteEntry("project", 0), false);
   });
 }
 

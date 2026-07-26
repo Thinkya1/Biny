@@ -1,3 +1,9 @@
+/**
+ * token 用量与费用统计。
+ *
+ * 费用计算的原则是「算不准就不给数字」：只要有一段 token 缺对应单价，就把 `pricingKnown`
+ * 置为 false 并且不返回金额，避免展示出一个偏低的假费用。
+ */
 import type { LanguageModelUsage } from "ai";
 import type { ModelPricing } from "../config/schema.js";
 import type { SessionUsage, UsageOperation, UsageSummary } from "../session/metadata.js";
@@ -37,6 +43,10 @@ export function createSessionUsage(
   };
 }
 
+/**
+ * 按单价算费用。缓存命中的 token 单价与普通输入不同，所以先从输入里扣掉缓存读写部分，
+ * 再各按各自单价累加。任一段有 token 却缺单价，就整体判为「未知」。
+ */
 export function calculateUsageCost(
   usage: Pick<SessionUsage, "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheWriteTokens">,
   pricing: ModelPricing | undefined
@@ -47,6 +57,7 @@ export function calculateUsageCost(
   const outputTokens = usage.outputTokens;
   const cacheReadTokens = usage.cacheReadTokens ?? 0;
   const cacheWriteTokens = usage.cacheWriteTokens ?? 0;
+  // 服务商没回报任何 token 时不能算成 $0，只能记为未知。
   const hasTokenData = inputTokens !== undefined || outputTokens !== undefined || usage.cacheReadTokens !== undefined || usage.cacheWriteTokens !== undefined;
   if (!hasTokenData) return { costUsd: undefined, known: false };
   let known = true;
@@ -107,6 +118,7 @@ export function summarizeUsage(records: SessionUsage[]): UsageSummary {
     reasoningTokens,
     cacheReadTokens,
     cacheWriteTokens,
+    // 只要有一次调用算不出价，总额就不展示：部分求和会明显低于真实开销。
     costUsd: unpricedCalls === 0 && records.length > 0 ? costUsd : undefined,
     pricingKnown: records.length > 0 && unpricedCalls === 0,
     pricedCalls,
@@ -128,4 +140,43 @@ export function formatUsageSummary(summary: UsageSummary): string {
     `Cost: ${summary.pricingKnown && summary.costUsd !== undefined ? `$${summary.costUsd.toFixed(6)}` : "unknown (configure model pricing)"}`,
     `Priced calls: ${String(summary.pricedCalls)}; unpriced calls: ${String(summary.unpricedCalls)}`
   ].join("\n");
+}
+
+/**
+ * 合并同一回合内多次 provider 请求的用量。
+ *
+ * 自有 agent loop 下每一步都是一次独立请求，各自有一条用量记录；回合级的 assistant
+ * 消息和终态需要它们的合计。任一条价格未知，合计就整体判为未知 —— 和 `calculateUsageCost`
+ * 一样，宁可不给数字也不给偏低的假数字。
+ */
+export function sumSessionUsage(records: readonly SessionUsage[]): SessionUsage {
+  const last = records[records.length - 1];
+  if (!last) {
+    throw new RangeError("Cannot summarize an empty set of usage records.");
+  }
+  if (records.length === 1) return last;
+  const pricingKnown = records.every((record) => record.pricingKnown);
+  return {
+    operation: last.operation,
+    modelAlias: last.modelAlias,
+    provider: last.provider,
+    model: last.model,
+    inputTokens: sumDefined(records, "inputTokens"),
+    outputTokens: sumDefined(records, "outputTokens"),
+    totalTokens: sumDefined(records, "totalTokens"),
+    reasoningTokens: sumDefined(records, "reasoningTokens"),
+    cacheReadTokens: sumDefined(records, "cacheReadTokens"),
+    cacheWriteTokens: sumDefined(records, "cacheWriteTokens"),
+    costUsd: pricingKnown ? sumDefined(records, "costUsd") : undefined,
+    pricingKnown,
+    time: last.time
+  };
+}
+
+function sumDefined(
+  records: readonly SessionUsage[],
+  field: "inputTokens" | "outputTokens" | "totalTokens" | "reasoningTokens" | "cacheReadTokens" | "cacheWriteTokens" | "costUsd"
+): number | undefined {
+  const values = records.map((record) => record[field]).filter((value): value is number => value !== undefined);
+  return values.length ? values.reduce((total, value) => total + value, 0) : undefined;
 }

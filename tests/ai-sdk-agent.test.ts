@@ -418,15 +418,20 @@ async function testAgentRunsToolAndKeepsSessionEvents(): Promise<void> {
 
 async function testInternalAttemptPersistsOnlyPublicPrompt(): Promise<void> {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (): Promise<Response> => sseResponse([
+  const requests: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    requests.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+    return sseResponse([
     { choices: [{ index: 0, delta: { content: "done" }, finish_reason: null }] },
     { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
     "[DONE]"
-  ])) as typeof fetch;
+    ]);
+  }) as typeof fetch;
 
   const { agent, cleanup, sessionFile } = await createAgent();
   try {
-    await collect(agent.run("internal verifier prompt", {
+    await collect(agent.run("用户原始提示词", {
+      modelInput: "internal verifier prompt",
       sessionUserMessage: "用户原始提示词",
       confirmPermission: async () => ({ approved: true, scope: "once" })
     }));
@@ -435,6 +440,7 @@ async function testInternalAttemptPersistsOnlyPublicPrompt(): Promise<void> {
     assert.equal(sessionEvents[0]?.type, "user_message");
     assert.equal(sessionEvents[0]?.content, "用户原始提示词");
     assert.doesNotMatch(sessionEvents[0]?.content ?? "", /internal verifier prompt/u);
+    assert.match(JSON.stringify(requests), /internal verifier prompt/u);
   } finally {
     globalThis.fetch = originalFetch;
     await cleanup(agent, true);
