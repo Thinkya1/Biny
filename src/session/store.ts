@@ -1,14 +1,14 @@
 /**
  * Session 存储定位模块。
  *
- * `.agent/sessions`、`.agent/logs`、`.agent/runs`、`.agent/tasks` 和 `.agent/processes` 的目录创建、session 文件名生成、latest 解析以及 session id
+ * `.agent/sessions`、`.agent/logs`、`.agent/runs`、`.agent/tasks`、`.agent/processes` 和 `.agent/tool-results`、`.agent/todos` 的目录创建、session 文件名生成、latest 解析以及 session id
  * 前缀匹配都在这里处理。命令层只需要给出 workspace 和可选 session 参数，不必关心文件布局。
  */
 import { randomBytes } from "node:crypto";
 import { constants, promises as fs, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
-import { readBoundedSessionHandle } from "./limits.js";
+import { readSessionTail } from "./limits.js";
 
 const sessionMetadataConcurrency = 8;
 
@@ -29,6 +29,8 @@ export interface SessionFileSnapshot {
   fileName: string;
   bytes: Buffer;
   stat: Stats;
+  /** 文件超过大小上限、只读回了尾部时为 true。 */
+  truncated: boolean;
 }
 
 export interface SessionDeleteHooks {
@@ -53,7 +55,7 @@ export async function ensureAgentDirs(workspaceRoot: string): Promise<void> {
     throw new Error("Session storage .agent resolves outside the canonical persistence root.");
   }
 
-  for (const name of ["sessions", "logs", "runs", "tasks", "processes"] as const) {
+  for (const name of ["sessions", "logs", "runs", "tasks", "processes", "tool-results", "todos", "turns", "evals"] as const) {
     const directory = path.join(agentPath, name);
     await ensureRealDirectory(directory, `.agent/${name}`);
     if (await fs.realpath(directory) !== path.join(canonicalAgent, name)) {
@@ -353,9 +355,11 @@ async function readSessionSnapshotAt(location: SessionStorageLocation, fileName:
   const handle = await openSessionHandle(location, fileName);
   try {
     await assertSessionBinding(location, fileName, handle);
-    const bytes = await readBoundedSessionHandle(handle, fileName);
+    // 超限时读尾部而不是抛错：否则一条很长的会话就彻底打不开，而用户是在想恢复它的时候
+    // 才发现的。`truncated` 让调用方能如实告知只拿到了最近的部分。
+    const { bytes, truncated } = await readSessionTail(handle, fileName);
     const stat = await assertSessionBinding(location, fileName, handle);
-    return { filePath: path.join(location.sessions.path, fileName), fileName, bytes, stat };
+    return { filePath: path.join(location.sessions.path, fileName), fileName, bytes, stat, truncated };
   } finally {
     await handle.close();
   }

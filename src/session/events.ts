@@ -15,9 +15,14 @@ import {
 } from "./limits.js";
 import { listSessionFiles, readSessionSnapshot } from "./store.js";
 import type { SessionEvent } from "./recorder.js";
+import { publicUserMessage } from "./publicMessage.js";
 
 const sessionListReadConcurrency = 8;
 const sessionUsageSchema = z.record(z.unknown());
+const reasoningBlockSchema = z.object({
+  text: z.string(),
+  providerOptions: z.record(z.unknown()).optional()
+});
 const sessionContextSchema = z.record(z.unknown());
 const sessionEventSchema = z.discriminatedUnion("type", [
   z.object({
@@ -34,6 +39,8 @@ const sessionEventSchema = z.discriminatedUnion("type", [
     type: z.literal("assistant_message"),
     content: z.string(),
     reasoningContent: z.string().optional(),
+    reasoningProviderOptions: z.record(z.unknown()).optional(),
+    reasoningBlocks: z.array(reasoningBlockSchema).optional(),
     usage: sessionUsageSchema.optional(),
     relatedUsage: z.array(sessionUsageSchema).optional(),
     contextState: sessionContextSchema.optional(),
@@ -48,6 +55,8 @@ const sessionEventSchema = z.discriminatedUnion("type", [
     sequence: z.number().finite().optional(),
     assistantContent: z.string().optional(),
     reasoningContent: z.string().optional(),
+    reasoningProviderOptions: z.record(z.unknown()).optional(),
+    reasoningBlocks: z.array(reasoningBlockSchema).optional(),
     auditOnly: z.boolean().optional(),
     time: z.string().optional()
   }).passthrough(),
@@ -95,14 +104,24 @@ export async function readSessionEvents(filePath: string): Promise<SessionEvent[
 export async function readStoredSessionEvents(
   workspaceRoot: string,
   session: string | undefined
-): Promise<{ filePath: string; events: SessionEvent[] }> {
+): Promise<{ filePath: string; events: SessionEvent[]; truncated: boolean }> {
   const snapshot = await readSessionSnapshot(workspaceRoot, session);
-  return { filePath: snapshot.filePath, events: parseSessionEvents(snapshot.bytes.toString("utf8")) };
+  const events = parseSessionEvents(snapshot.bytes.toString("utf8"), { overflow: "truncate" });
+  return { filePath: snapshot.filePath, events, truncated: snapshot.truncated ?? false };
 }
 
-export function parseSessionEvents(raw: string): SessionEvent[] {
+export interface ParseSessionEventsOptions {
+  /**
+   * `reject`（默认）超限即抛错，用于校验和写入路径。
+   * `truncate` 保留最近的事件，用于"至少要能打开这条会话"的读取路径。
+   */
+  overflow?: "reject" | "truncate";
+}
+
+export function parseSessionEvents(raw: string, options: ParseSessionEventsOptions = {}): SessionEvent[] {
+  const overflow = options.overflow ?? "reject";
   const totalBytes = Buffer.byteLength(raw, "utf8");
-  if (totalBytes > maxSessionFileBytes) {
+  if (totalBytes > maxSessionFileBytes && overflow === "reject") {
     throw new Error(`Session exceeds the maximum size of ${String(maxSessionFileBytes)} bytes.`);
   }
   const events: SessionEvent[] = [];
@@ -131,7 +150,11 @@ export function parseSessionEvents(raw: string): SessionEvent[] {
       throw new Error(`Invalid JSONL event at line ${String(lineNumber)}: ${error instanceof Error ? error.message : String(error)}`);
     }
     if (events.length >= maxSessionEvents) {
-      throw new Error(`Session cannot contain more than ${String(maxSessionEvents)} events.`);
+      if (overflow === "reject") {
+        throw new Error(`Session cannot contain more than ${String(maxSessionEvents)} events.`);
+      }
+      // 保留最近的事件：恢复会话时有用的是尾部，不是开头。
+      events.shift();
     }
     events.push(validateSessionEvent(parsed, lineNumber));
     if (!terminated) break;
@@ -183,7 +206,7 @@ export async function listSessionSummaries(workspaceRoot: string): Promise<Sessi
         const snapshot = await readSessionSnapshot(workspaceRoot, fileName);
         const events = parseSessionEvents(snapshot.bytes.toString("utf8"));
         if (!events.some((event) => event.type === "user_message")) continue;
-        const firstUserMessage = events.find((event) => event.type === "user_message")?.content ?? "";
+        const firstUserMessage = publicUserMessage(events.find((event) => event.type === "user_message")?.content ?? "");
         const lastAssistant = [...events].reverse().find((event): event is Extract<SessionEvent, { type: "assistant_message" }> => event.type === "assistant_message" && Boolean(event.content));
         const lastAssistantMessage = lastAssistant?.content ?? "";
         const firstTime = events.find((event) => typeof event.time === "string")?.time;
