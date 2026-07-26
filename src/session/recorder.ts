@@ -30,11 +30,21 @@ import type { SessionContextState, SessionContextUsage, SessionUsage } from "./m
 
 export type { SessionContextState, SessionContextUsage, SessionUsage, UsageOperation } from "./metadata.js";
 
+/**
+ * One provider reasoning block with the opaque metadata that makes it
+ * replayable. Providers sign blocks individually, so concatenating several of
+ * them under one signature produces history the provider will reject.
+ */
+export interface ReasoningBlock {
+  text: string;
+  providerOptions?: Record<string, unknown>;
+}
+
 export type SessionEvent =
   // session 事件类型要保持稳定；resume、未来上下文压缩和记忆功能都会依赖这几个基础类型。
   | { type: "user_message"; content: string; skills?: string[]; contextUsage?: SessionContextUsage; contextState?: SessionContextState; preparationUsage?: SessionUsage[]; auditOnly?: boolean; time?: string }
-  | { type: "assistant_message"; content: string; reasoningContent?: string; usage?: SessionUsage; relatedUsage?: SessionUsage[]; contextState?: SessionContextState; auditOnly?: boolean; time?: string }
-  | { type: "tool_call"; tool: string; args: unknown; toolCallId?: string; sequence?: number; assistantContent?: string; reasoningContent?: string; auditOnly?: boolean; time?: string }
+  | { type: "assistant_message"; content: string; reasoningContent?: string; reasoningProviderOptions?: Record<string, unknown>; reasoningBlocks?: ReasoningBlock[]; usage?: SessionUsage; relatedUsage?: SessionUsage[]; contextState?: SessionContextState; auditOnly?: boolean; time?: string }
+  | { type: "tool_call"; tool: string; args: unknown; toolCallId?: string; sequence?: number; assistantContent?: string; reasoningContent?: string; reasoningProviderOptions?: Record<string, unknown>; reasoningBlocks?: ReasoningBlock[]; auditOnly?: boolean; time?: string }
   | { type: "tool_result"; tool: string; result: unknown; toolCallId?: string; sequence?: number; relatedUsage?: SessionUsage[]; auditOnly?: boolean; time?: string }
   | { type: "error"; message: string; detail?: unknown; relatedUsage?: SessionUsage[]; time?: string };
 
@@ -170,6 +180,19 @@ export class SessionRecorder {
   }
 }
 
+/**
+ * Redaction rewrites text, which invalidates the provider signature covering
+ * it. A block whose text changed keeps its content but loses the metadata, so
+ * replay omits it instead of resending history the provider will reject.
+ */
+function redactReasoningBlocks(blocks: ReasoningBlock[] | undefined): ReasoningBlock[] | undefined {
+  return blocks?.map((block) => {
+    const text = redactSecrets(block.text);
+    if (text !== block.text || block.providerOptions === undefined) return { text };
+    return { text, providerOptions: redactSensitiveValue(block.providerOptions) as Record<string, unknown> };
+  });
+}
+
 function redactSessionEvent(event: SessionEvent): SessionEvent {
   if (event.type === "user_message") {
     return {
@@ -185,6 +208,8 @@ function redactSessionEvent(event: SessionEvent): SessionEvent {
       ...event,
       content: redactSecrets(event.content),
       reasoningContent: event.reasoningContent === undefined ? undefined : redactSecrets(event.reasoningContent),
+      reasoningProviderOptions: event.reasoningProviderOptions === undefined ? undefined : redactSensitiveValue(event.reasoningProviderOptions) as Record<string, unknown>,
+      reasoningBlocks: redactReasoningBlocks(event.reasoningBlocks),
       contextState: event.contextState === undefined
         ? undefined
         : redactSensitiveValue(event.contextState) as SessionContextState
@@ -195,7 +220,9 @@ function redactSessionEvent(event: SessionEvent): SessionEvent {
       ...event,
       args: redactSensitiveValue(event.args),
       assistantContent: event.assistantContent === undefined ? undefined : redactSecrets(event.assistantContent),
-      reasoningContent: event.reasoningContent === undefined ? undefined : redactSecrets(event.reasoningContent)
+      reasoningContent: event.reasoningContent === undefined ? undefined : redactSecrets(event.reasoningContent),
+      reasoningProviderOptions: event.reasoningProviderOptions === undefined ? undefined : redactSensitiveValue(event.reasoningProviderOptions) as Record<string, unknown>,
+      reasoningBlocks: redactReasoningBlocks(event.reasoningBlocks)
     };
   }
   if (event.type === "tool_result") {
@@ -280,7 +307,7 @@ function removeDraftFile(filePath: string, identity: Pick<Stats, "dev" | "ino">)
   }
 }
 
-function createSessionId(): string {
+export function createSessionId(): string {
   // 文件名中避免使用冒号，兼容不同平台的路径规则。
   const now = new Date();
   const stamp = [
