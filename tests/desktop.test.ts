@@ -966,6 +966,16 @@ async function createDesktopTestServices(root: string): Promise<{
   await storage.initialize();
   const state = new DesktopStateStore(path.join(root, "desktop-state.json"));
   await state.load();
+  // 落一份自带 key 的配置，让 runtime 能在没有任何环境变量的机器上初始化。
+  // 默认配置的 deepseek 只给了 apiKeyEnv，干净环境（比如 CI）下 ModelManager 直接构造失败，
+  // 断言就会拿到"没配模型"而不是被测的那个错误。这些测试都不需要真的调用模型。
+  await saveConfig(root, {
+    ...defaultConfig,
+    defaultModel: "test-model",
+    providers: { active: { type: "openai", apiKey: "test-key", baseUrl: "https://api.openai.com/v1" } },
+    models: { "test-model": { provider: "active", model: "test-model" } },
+    thinking: { ...defaultConfig.thinking, enabled: false }
+  });
   const configStore = createFileConfigStore(root);
   return { configStore, projects: new DesktopProjectService(state, storage, configStore), state };
 }
