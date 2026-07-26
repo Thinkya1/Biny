@@ -4,9 +4,12 @@
  * `run_command` 在当前工作区执行本地 shell 命令，并把 stdout、stderr 和退出码统一返回。
  * 命令是否安全、是否需要确认由权限层处理，这里只负责受限超时和输出收集。
  */
+import { homedir, tmpdir } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import { z } from "zod";
 import { ToolAccesses } from "../access.js";
+import { describeSandbox, sandboxCommand, type SandboxOptions } from "./sandbox.js";
+import type { SandboxConfig } from "../../config/schema.js";
 import type { Tool, ToolContext, ToolUpdate } from "../types.js";
 import { resolveWorkspaceDirectory } from "../../workspace/resolvePath.js";
 
@@ -22,6 +25,8 @@ export interface RunCommandArgs {
 
 export interface RunCommandResult {
   status: "completed" | "failed" | "timed_out";
+  /** 这次执行实际生效的沙箱边界；未生效时说明原因。 */
+  sandbox?: string;
   stdout: string;
   stderr: string;
   exitCode: number;
@@ -30,13 +35,16 @@ export interface RunCommandResult {
 
 export interface RunShellCommandOptions {
   signal?: AbortSignal;
+  /** 追加到子进程环境的变量；不提供时继承当前进程环境。 */
+  env?: Record<string, string>;
   onUpdate?: (update: ToolUpdate) => void;
   timeoutMs?: number;
   terminationGraceMs?: number;
   killSettleMs?: number;
 }
 
-export function createRunCommandTool(context: ToolContext): Tool<RunCommandArgs, RunCommandResult> {
+export function createRunCommandTool(context: ToolContext, sandbox?: SandboxConfig): Tool<RunCommandArgs, RunCommandResult> {
+  const sandboxOptions: SandboxOptions = { mode: sandbox?.mode ?? "off", allowNetwork: sandbox?.allowNetwork ?? true };
   return {
     name: "run_command",
     description: "Run a finite local shell command in the workspace. Commands have a bounded timeout; use start_process for long-running servers instead of &, nohup, or disown.",
@@ -64,7 +72,15 @@ export function createRunCommandTool(context: ToolContext): Tool<RunCommandArgs,
         async execute({ signal, onUpdate }) {
           const currentCwd = resolveWorkspaceDirectory(context.workspaceRoot, args.cwd ?? inferredCwd ?? ".", context.ignore);
           if (currentCwd !== commandCwd) throw new Error("The command working directory changed after the tool call was prepared.");
-          return await runShellCommand(args.cwd || !inferredCwd ? commandCwd : context.workspaceRoot, args.command, { signal, onUpdate });
+          const cwd = args.cwd || !inferredCwd ? commandCwd : context.workspaceRoot;
+          const sandboxed = sandboxCommand(args.command, context.workspaceRoot, sandboxOptions, {
+            platform: process.platform,
+            home: homedir(),
+            temporaryDirectory: tmpdir()
+          });
+          const result = await runShellCommand(cwd, sandboxed.command, { signal, onUpdate });
+          // 如实回报这次到底有没有边界，避免"沙箱模式"这个名字暗示一个不存在的保护。
+          return { ...result, sandbox: sandboxed.applied ? describeSandbox(sandboxOptions, process.platform) : `not applied (${sandboxed.reason ?? "unknown"})` };
         }
       };
     }
@@ -102,7 +118,8 @@ export async function runShellCommand(cwd: string, command: string, options: Run
       cwd,
       shell: true,
       detached: process.platform !== "win32",
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      ...(options.env ? { env: { ...process.env, ...options.env } } : {})
     });
 
     const appendDiagnostic = (message: string) => {
