@@ -54,6 +54,8 @@ export function inferReasoningEfforts(modelId: string): ReasoningEffort[] {
   if (!normalized) return [];
   // 只看最后一段，避免聚合服务的厂商前缀（如 `openai/gpt-4o-mini`）误伤。
   const identifier = normalized.split("/").pop() ?? normalized;
+  if (/^deepseek-v4-flash$/iu.test(identifier)) return [];
+  if (/^deepseek-v4-pro$/iu.test(identifier)) return ["low", "medium", "high"];
   return reasoningModelPatterns.some((pattern) => pattern.test(identifier)) ? ["high", "max"] : [];
 }
 

@@ -12,7 +12,7 @@ import { createMoonshotAI } from "@ai-sdk/moonshotai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { LanguageModel } from "ai";
-import { modelCapabilities, nativeReasoningEffort, reasoningBudgetTokens } from "../ai/capabilities.js";
+import { modelCapabilities, modelReasoningConfig, nativeReasoningEffort, reasoningBudgetTokens } from "../ai/capabilities.js";
 import { providerProtocol } from "../ai/provider.js";
 import { createRetryFetch } from "../ai/retry.js";
 import { providerProfile } from "./profiles.js";
@@ -50,7 +50,7 @@ export function createModelSettings(config: AgentConfig, alias = config.defaultM
   const baseUrl = resolved.provider.baseUrl ?? profile.baseUrl;
   if (!baseUrl) throw new Error(`No model endpoint configured. Set providers.${resolved.providerAlias}.baseUrl.`);
   const capabilities = modelCapabilities(resolved.model);
-  const enabled = config.thinking.enabled && capabilities.reasoning;
+  const enabled = config.thinking.enabled && capabilities.reasoning && modelReasoningConfig(resolved.model) !== undefined;
   const effort = enabled ? config.thinking.effort : undefined;
   const retry = resolved.provider.retry ?? { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0 };
 
@@ -83,9 +83,12 @@ function resolveApiKey(configuredKey: string | undefined, configuredEnv: string 
 
 function missingKeyMessage(providerAlias: string, configuredEnv: string | undefined, defaultEnv: string | undefined): string {
   const envName = configuredEnv ?? defaultEnv;
+  const credentialHint = process.platform === "darwin"
+    ? `macOS Keychain 中的 provider:${providerAlias}:apiKey 或 ${envName ?? "配置的环境变量"}`
+    : (envName ?? `providers.${providerAlias}.apiKeyEnv 环境变量`);
   return envName
-    ? `No model available. Set providers.${providerAlias}.apiKey or ${envName} in your environment.`
-    : `No model available. Set providers.${providerAlias}.apiKey in agent.config.json.`;
+    ? `No model available. Set ${credentialHint}.`
+    : `No model available. Set ${credentialHint}.`;
 }
 
 function createLanguageModel(

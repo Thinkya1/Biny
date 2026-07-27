@@ -108,7 +108,7 @@ export class ContextMemory {
    * 回合内的上下文治理。turn 中途不能做整段摘要压缩：那要改动消息结构，很容易让
    * tool-call 和 tool-result 配不上对，也会碰到带签名的 reasoning 块。
    *
-   * 这里只做一件安全的事 —— 把**较早**的 tool result 正文替换成一个占位说明，从最旧的
+   * 这里只做一件安全的事 —— 把较早的 tool result 正文替换成一个占位说明，从最旧的
    * 开始，直到估算落回预算内。消息条数、角色、toolCallId 全部不变，配对关系天然保住；
    * 原文早就在 session JSONL 和 `.agent/tool-results` 里，占位符只影响下一次推理看到
    * 什么，不影响已记录的事实。

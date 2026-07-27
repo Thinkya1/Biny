@@ -6,7 +6,7 @@
  *
  * 安全约束：`state` 用常量时间比较，防止时序侧信道；待处理的授权有 10 分钟有效期；本地回调
  * 服务器只接受预期的 state，用完立即关闭。拿到的 token 由调用方交给 DesktopConfigStore
- * 加密保存，这里不落盘。
+ * 写入统一凭据存储（macOS Keychain），这里不落盘。
  */
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type Server } from "node:http";

@@ -30,8 +30,8 @@ Preload / contextBridge
   │ ipcRenderer.invoke + 只读事件订阅
   ▼
 Electron Main
-  ├── DesktopUserDataStore（配置/附件/非项目会话、旧项目会话迁回项目目录）
-  ├── DesktopConfigStore（模型设置与受系统保护的凭据）
+  ├── DesktopUserDataStore（附件/非项目会话、旧项目会话迁回项目目录）
+  ├── DesktopConfigStore（全局模型设置与 macOS Keychain 凭据）
   ├── DesktopStateStore（项目、窗口、侧栏、会话 UI 元数据）
   ├── DesktopProjectService（Git、项目会话文件、附件、系统打开）
   └── DesktopAgentManager
@@ -60,13 +60,15 @@ Electron Main
 
 ## 用户数据目录
 
-桌面端用户级工作区：`app.getPath("userData")/workspaces/default`。在 macOS 上通常是 `~/Library/Application Support/Biny/workspaces/default`。
+桌面端 UI 数据目录：`app.getPath("userData")/workspaces/default`。在 macOS 上通常是 `~/Library/Application Support/Biny/workspaces/default`。模型配置单独使用全局 `~/.biny/agent/`，并可由 `BINY_AGENT_DIR` 覆盖。
 
-- `agent.config.json`：模型、服务地址和默认模型等非敏感设置。
-- `credentials.json`：使用 Electron `safeStorage` 加密后的 API Key 与 OAuth refresh token；不会出现在 `agent.config.json` 中。
 - `desktop-state.json`：项目列表、窗口尺寸、面板宽度和会话 UI 元数据。
 - `global/.agent/sessions/`：非项目会话（不绑定某个打开的项目路径）。
 - `projects/<project-id>/.agent/attachments/`：该项目的桌面端附件（仍隔离在用户数据目录）。
+
+全局 `agent.config.json` 只保存 provider/model 元数据和运行设置。macOS 的 API key、OAuth access/refresh token 通过 `com.biny.agent` Keychain service 保存，CLI/TUI 与 Electron 使用相同的 account 命名；非 macOS 使用 `apiKeyEnv` 环境变量，不写本地凭据文件。
+
+模型的 reasoning effort 是模型级能力元数据，不是全局固定档位。TUI 的 `/model` 会先选模型，再展示该模型声明的选项；Desktop 输入区也只在当前模型有可调 effort 时显示思考菜单。
 
 ## 项目会话目录
 
@@ -77,8 +79,8 @@ Electron Main
 
 首次打开项目时，若用户数据目录里仍有旧版 `projects/<project-id>/.agent/` 会话（不含 attachments），会**单向合并**到 `<project>/.agent/`：目标中已有的文件优先保留，缺失的旧文件被复制过来。之后新会话只写入项目目录。
 
-首次打开没有可用默认模型的项目时，桌面端会先进入模型配置页；只有默认模型具备有效凭据和服务地址后，才能开始任务。
-旧的 `desktop-state.json` 与项目内 `agent.config.json` 仍可按既有逻辑迁入用户数据目录；桌面端模型配置以用户数据目录为准，不会把 API key 写回项目。
+首次打开没有可用默认模型的项目时，桌面端会先进入模型配置页；只有默认模型具备有效凭据和服务地址后，才能开始任务。项目 `.biny/settings.json` 可以覆盖默认模型和运行参数，但不能配置 provider 或凭据。
+旧的 `desktop-state.json` 会按既有逻辑迁移；项目内旧 `agent.config.json` 和旧桌面模型配置保持原样，`biny doctor` 只提示位置和迁移建议，不会自动复制或覆盖全局配置。
 
 ## Agent 事件协议
 

@@ -237,19 +237,32 @@ const extensionsSchema = z.object({
 
 const webSearchSchema = z.object({
   enabled: z.boolean().default(true),
-  provider: z.enum(["duckduckgo", "tavily", "brave", "anysearch"]).default("anysearch"),
+  provider: z.enum(["duckduckgo", "google", "tavily", "brave", "anysearch"]).default("anysearch"),
   apiKey: z.string().min(1).optional(),
   apiKeyEnv: z.string().min(1).optional(),
   timeoutMs: z.number().int().min(1_000).max(60_000).default(10_000),
   maxResults: z.number().int().min(1).max(10).default(5)
 }).default({
   enabled: true,
-  provider: "duckduckgo",
+  provider: "anysearch",
   apiKey: undefined,
   apiKeyEnv: undefined,
   timeoutMs: 10_000,
   maxResults: 5
 });
+
+/**
+ * 共享 cookie jar：桌面端内嵌浏览器登录后写入，`web_search` 的 Google provider 和
+ * `web_fetch` 读取，用来访问需要登录态的页面。
+ *
+ * 打开它意味着模型选定的 URL 会带上真实登录凭据（只发给域名匹配的站点）。`web_fetch`
+ * 默认不在免确认工具白名单里，每次抓取仍要用户确认，这是这项能力的主要约束。
+ */
+const webCookiesSchema = z.object({
+  enabled: z.boolean().default(true),
+  /** jar 文件位置；留空用桌面端 userData 下的共享路径，桌面端与 CLI 因此读到同一份。 */
+  path: z.string().min(1).optional()
+}).default({ enabled: true, path: undefined });
 
 const webFetchSchema = z.object({
   enabled: z.boolean().default(true),
@@ -317,7 +330,8 @@ const diagnosticsSchema = z.object({
 
 const webSchema = z.object({
   search: webSearchSchema,
-  fetch: webFetchSchema
+  fetch: webFetchSchema,
+  cookies: webCookiesSchema
 }).default({
   search: {
     enabled: true,
@@ -333,7 +347,8 @@ const webSchema = z.object({
     maxBytes: 2 * 1024 * 1024,
     maxRedirects: 5,
     allowPrivateNetwork: false
-  }
+  },
+  cookies: { enabled: true, path: undefined }
 });
 
 const modelThinkingSchema = z.object({
@@ -519,6 +534,7 @@ export type CheckpointsConfig = z.infer<typeof checkpointsSchema>;
 export type DiagnosticsConfig = z.infer<typeof diagnosticsSchema>;
 export type WebFetchConfig = z.infer<typeof webFetchSchema>;
 export type WebSearchConfig = z.infer<typeof webSearchSchema>;
+export type WebCookiesConfig = z.infer<typeof webCookiesSchema>;
 export type WebConfig = z.infer<typeof webSchema>;
 
 const defaultWorkspaceIgnore = [
@@ -550,9 +566,8 @@ export const defaultConfig: AgentConfig = {
       displayName: "DeepSeek V4 Flash",
       description: "Fast and affordable model for everyday work.",
       supportsTools: true,
-      capabilities: { tools: true, reasoning: true, streaming: true },
+      capabilities: { tools: true, reasoning: false, streaming: true },
       contextWindow: 128_000,
-      thinking: { efforts: ["high", "max"], defaultEffort: "high", mapping: { high: "high", max: "max" }, budgetTokens: { high: 4_096, max: 8_192 } }
     },
     "deepseek-v4-pro": {
       provider: "deepseek",
@@ -562,10 +577,10 @@ export const defaultConfig: AgentConfig = {
       supportsTools: true,
       capabilities: { tools: true, reasoning: true, streaming: true },
       contextWindow: 128_000,
-      thinking: { efforts: ["high", "max"], defaultEffort: "high", mapping: { high: "high", max: "max" }, budgetTokens: { high: 4_096, max: 8_192 } }
+      thinking: { efforts: ["low", "medium", "high"], defaultEffort: "high", mapping: { low: "low", medium: "medium", high: "high" }, budgetTokens: { low: 2_048, medium: 4_096, high: 8_192 } }
     }
   },
-  thinking: { enabled: true, effort: "high" },
+  thinking: { enabled: false, effort: "high" },
   agent: {
     maxSteps: 32,
     maxAttempts: 3,
@@ -616,7 +631,8 @@ export const defaultConfig: AgentConfig = {
       maxBytes: 2 * 1024 * 1024,
       maxRedirects: 5,
       allowPrivateNetwork: false
-    }
+    },
+    cookies: { enabled: true, path: undefined }
   },
   telemetry: { enabled: true, recordInputs: false, recordOutputs: false },
   extensions: {
@@ -653,7 +669,11 @@ function migrateLegacyConfig(value: unknown): unknown {
     timeoutMs: typeof legacy.timeoutMs === "number" ? legacy.timeoutMs : undefined
   };
   const thinkingCapability = legacy.provider === "deepseek"
-    ? { efforts: ["high", "max"], defaultEffort: "high" }
+    ? modelAlias === "deepseek-v4-flash"
+      ? undefined
+      : modelAlias === "deepseek-v4-pro"
+        ? { efforts: ["low", "medium", "high"], defaultEffort: "high" }
+        : { efforts: ["high", "max"], defaultEffort: "high" }
     : undefined;
   const models: Record<string, unknown> = {
     [modelAlias]: {
@@ -671,19 +691,19 @@ function migrateLegacyConfig(value: unknown): unknown {
       model: "deepseek-v4-flash",
       displayName: "DeepSeek V4 Flash",
       supportsTools: true,
-      thinking: thinkingCapability
+      thinking: undefined
     };
     models["deepseek-v4-pro"] ??= {
       provider: providerAlias,
       model: "deepseek-v4-pro",
       displayName: "DeepSeek V4 Pro",
       supportsTools: true,
-      thinking: thinkingCapability
+      thinking: { efforts: ["low", "medium", "high"], defaultEffort: "high" }
     };
   }
 
   const legacyReasoning = isRecord(legacy.reasoning) ? legacy.reasoning : undefined;
-  const thinking = legacy.provider === "deepseek"
+  const thinking = legacy.provider === "deepseek" && thinkingCapability
     ? {
       enabled: typeof legacyReasoning?.enabled === "boolean" ? legacyReasoning.enabled : true,
       effort: legacyReasoning?.effort === "max" ? "max" : "high"

@@ -128,8 +128,7 @@ export class DesktopProjectService {
   }
 
   async listModels(project: DesktopProject): Promise<ModelChoice[]> {
-    void project;
-    return listModelChoices(await this.configStore.load());
+    return listModelChoices(await this.configStore.load(project.path));
   }
 
   async listSessions(

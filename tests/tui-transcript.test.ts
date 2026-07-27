@@ -32,6 +32,7 @@ import {
 } from "../src/tui/theme/index.js";
 import { CHAT_SLASH_COMMANDS } from "../src/cli/commands/chatSlash.js";
 import { isConcurrentTuiSlashCommand, TUI_SLASH_COMMANDS } from "../src/tui/slashCommands.js";
+import { modelThinkingOptions } from "../src/tui/modelOptions.js";
 import {
   confirmedPermissionChoice,
   createPermissionPromptInteractionState,
@@ -94,10 +95,18 @@ async function main(): Promise<void> {
   testFooterAndChromeLayout();
   testStatusAndShortcutHints();
   testWelcomeRendersOnboarding();
+  testModelThinkingOptionsUseModelCapabilities();
   testDialogsRenderAndHandleKeys();
   testPermissionDialogRequiresFullYes();
   testDiffStylesUseThemeTokens();
   testTranscriptTextHelpers();
+}
+
+function testModelThinkingOptionsUseModelCapabilities(): void {
+  const proOptions = modelThinkingOptions({ efforts: ["low", "medium", "high"] });
+  assert.deepEqual(proOptions.map((option) => option.value), ["low", "medium", "high"]);
+  assert.equal(proOptions[1]?.label, "Medium");
+  assert.deepEqual(modelThinkingOptions({ efforts: [] }), []);
 }
 
 function testPermissionConfirmationContract(): void {

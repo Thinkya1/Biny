@@ -70,7 +70,8 @@ assert.equal(attempts, 2);
 assert.deepEqual(inferReasoningEfforts("grok-4.5"), ["high", "max"]);
 assert.deepEqual(inferReasoningEfforts("gpt-5.4"), ["high", "max"]);
 assert.deepEqual(inferReasoningEfforts("claude-sonnet-4.6"), ["high", "max"]);
-assert.deepEqual(inferReasoningEfforts("deepseek-v4-flash"), ["high", "max"]);
+assert.deepEqual(inferReasoningEfforts("deepseek-v4-flash"), []);
+assert.deepEqual(inferReasoningEfforts("deepseek-v4-pro"), ["low", "medium", "high"]);
 assert.deepEqual(inferReasoningEfforts("openai/gpt-5.4"), ["high", "max"]); // aggregator vendor prefix
 assert.deepEqual(inferReasoningEfforts("grok-3-mini"), ["high", "max"]);
 assert.deepEqual(inferReasoningEfforts("gpt-4o-mini"), []);

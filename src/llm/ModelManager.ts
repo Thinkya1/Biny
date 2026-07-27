@@ -93,7 +93,7 @@ export class ModelManager {
     // 以盘上的配置为基准，而不是内存里的快照：同一份配置可能已被别的运行时改过
     // （桌面端多项目共用配置、权限模式变更、OAuth token 刷新等），整份写回内存快照会把那些
     // 改动覆盖掉。读不到就退回内存快照，行为与以前一致。
-    const persisted = await this.configStore.load().catch(() => this.config);
+    const persisted = await this.configStore.load(this.workspaceRoot).catch(() => this.config);
     const model = persisted.models[alias];
     if (!model) throw new Error(`Unknown model alias: ${alias}`);
     const selection = resolveThinkingSelection(persisted, alias, thinking);
@@ -108,14 +108,14 @@ export class ModelManager {
 
     // Validate endpoint and credentials before changing memory or the config file.
     const nextSettings = createModelSettings(candidate);
-    await this.configStore.save(candidate);
+    await this.configStore.save(candidate, this.workspaceRoot);
     Object.assign(this.config, candidate);
     this.activeSettings = nextSettings;
     return this.getInfo();
   }
 
   async refreshFromDisk(): Promise<ModelRuntimeInfo> {
-    const nextConfig = await this.configStore.load();
+    const nextConfig = await this.configStore.load(this.workspaceRoot);
     const nextSettings = createModelSettings(nextConfig);
     Object.assign(this.config, nextConfig);
     this.activeSettings = nextSettings;
@@ -172,7 +172,10 @@ export function hasUsableModelConfiguration(config: AgentConfig, alias = config.
 
 export function modelRuntimeInfo(config: AgentConfig): ModelRuntimeInfo {
   const resolved = resolveModelConfig(config);
-  const thinking: ThinkingSelection = config.thinking.enabled ? config.thinking.effort : "off";
+  const reasoning = modelReasoningConfig(resolved.model);
+  const thinking: ThinkingSelection = config.thinking.enabled && reasoning?.efforts.includes(config.thinking.effort)
+    ? config.thinking.effort
+    : "off";
   return {
     modelAlias: resolved.alias,
     provider: resolved.provider.type,
@@ -192,8 +195,12 @@ export function resolveThinkingSelection(
   const model = config.models[alias];
   if (!model) throw new Error(`Unknown model alias: ${alias}`);
   if (requested === undefined) {
-    if (alias === config.defaultModel) return config.thinking.enabled ? config.thinking.effort : "off";
-    return modelReasoningConfig(model)?.defaultEffort ?? "off";
+    const reasoning = modelReasoningConfig(model);
+    if (!reasoning) return "off";
+    if (alias === config.defaultModel && config.thinking.enabled && reasoning.efforts.includes(config.thinking.effort)) {
+      return config.thinking.effort;
+    }
+    return reasoning.defaultEffort;
   }
   if (requested === "off") return "off";
   if (!modelReasoningConfig(model)?.efforts.includes(requested)) {

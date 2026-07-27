@@ -11,7 +11,7 @@ import { useCallback, useDeferredValue, useEffect, useRef, useState } from "reac
 import { createPortal } from "react-dom";
 import { inferReasoningEfforts } from "../../../../ai/capabilities.js";
 import type { ModelChoice, ThinkingSelection } from "../../../../llm/ModelManager.js";
-import type { DesktopFontPreference, DesktopMemoryCompactionResult, DesktopMemoryOverview, DesktopMemorySearchMatch, DesktopMemorySettings, DesktopModelCatalogResult, DesktopModelConfigurationInput, DesktopModelConnection, DesktopModelConnectionTestResult, DesktopModelLoginProvider, DesktopModelLoginStartResult, DesktopProject, DesktopSessionSummary, DesktopSlashResult, DesktopThemePreference, DesktopWebSearchProvider, DesktopWebSearchSettings, DesktopWebSearchSettingsInput, DesktopWorkspaceSnapshot } from "../../../protocol.js";
+import type { DesktopCookieJarStatus, DesktopFontPreference, DesktopMemoryCompactionResult, DesktopMemoryOverview, DesktopMemorySearchMatch, DesktopMemorySettings, DesktopModelCatalogResult, DesktopModelConfigurationInput, DesktopModelConnection, DesktopModelConnectionTestResult, DesktopModelLoginProvider, DesktopModelLoginStartResult, DesktopProject, DesktopSessionSummary, DesktopSlashResult, DesktopThemePreference, DesktopWebSearchProvider, DesktopWebSearchSettings, DesktopWebSearchSettingsInput, DesktopWorkspaceSnapshot } from "../../../protocol.js";
 import { clampFontSize, MAX_FONT_SIZE, MIN_FONT_SIZE, SYSTEM_FONT_FAMILY } from "../../../fontPreference.js";
 import {
   catalogForConnection,
@@ -97,6 +97,11 @@ interface SettingsOverlayProps {
   onOpenExternal(url: string): Promise<void>;
   onLoadWebSearchSettings(): Promise<DesktopWebSearchSettings>;
   onSaveWebSearchSettings(input: DesktopWebSearchSettingsInput): Promise<DesktopWebSearchSettings>;
+  onLoadCookieJarStatus(): Promise<DesktopCookieJarStatus>;
+  onOpenBrowser(url?: string): Promise<void>;
+  onExportCookies(): Promise<DesktopCookieJarStatus>;
+  onImportCookies(): Promise<DesktopCookieJarStatus>;
+  onClearCookies(): Promise<DesktopCookieJarStatus>;
   onStartModelLogin(provider: DesktopModelLoginProvider): Promise<DesktopModelLoginStartResult>;
   onCompleteModelLogin(provider: DesktopModelLoginProvider, authRequestId: string, pastedAuthorization?: string): Promise<void>;
   onCancelModelLogin(provider: DesktopModelLoginProvider, authRequestId: string): Promise<void>;
@@ -158,6 +163,11 @@ export function SettingsOverlay({
   onOpenExternal,
   onLoadWebSearchSettings,
   onSaveWebSearchSettings,
+  onLoadCookieJarStatus,
+  onOpenBrowser,
+  onExportCookies,
+  onImportCookies,
+  onClearCookies,
   onStartModelLogin,
   onCompleteModelLogin,
   onCancelModelLogin
@@ -274,7 +284,17 @@ export function SettingsOverlay({
             onNotify={setMessage}
           /> : null}
           {tab === "关于" ? <SettingsAbout version={version} /> : null}
-          {tab === "联网搜索" ? <SettingsWebSearch onLoad={onLoadWebSearchSettings} onNotify={setMessage} onOpenExternal={onOpenExternal} onSave={onSaveWebSearchSettings} /> : null}
+          {tab === "联网搜索" ? <SettingsWebSearch
+            onLoad={onLoadWebSearchSettings}
+            onNotify={setMessage}
+            onOpenExternal={onOpenExternal}
+            onSave={onSaveWebSearchSettings}
+            onLoadCookieJarStatus={onLoadCookieJarStatus}
+            onOpenBrowser={onOpenBrowser}
+            onExportCookies={onExportCookies}
+            onImportCookies={onImportCookies}
+            onClearCookies={onClearCookies}
+          /> : null}
           {tab === "使用统计" || tab === "每日回顾" || tab === "语音" || tab === "开放网关" || tab === "远程接入" || tab === "健康" ? <SettingsComingSoon tab={tab} /> : null}
           {message ? <div className="settings-message">{message}</div> : null}
         </main>
@@ -466,6 +486,7 @@ function connectionStatus(connection: DesktopModelConnection | undefined): { lab
 function credentialHint(connection: DesktopModelConnection | undefined): string {
   if (!connection) return "尚未保存该连接的凭据";
   if (connection.credentialSource === "env") return `使用环境变量 ${connection.apiKeyEnv ?? ""} 中的密钥`;
+  if (connection.credentialSource === "keychain") return "已保存在 macOS Keychain，粘贴新值可替换";
   if (connection.hasCredential) return "已设置，粘贴新值可替换";
   return connection.requiresApiKey ? "尚未设置密钥，粘贴后点击“更新密钥”" : "该服务通常无需密钥";
 }
@@ -1570,6 +1591,7 @@ function SettingsAppearance({ theme, onThemeChange, font, onFontChange }: {
 
 const webSearchProviderOptions: Array<{ value: DesktopWebSearchProvider; title: string; detail: string; envKeyName?: string; keyUrl?: string }> = [
   { value: "anysearch", title: "AnySearch", detail: "支持匿名额度的聚合搜索，可选配置密钥提升额度", envKeyName: "ANYSEARCH_API_KEY" },
+  { value: "google", title: "Google", detail: "解析 Google 网页搜索结果；用下方浏览器登录后成功率更高" },
   { value: "duckduckgo", title: "DuckDuckGo", detail: "免密钥，直接解析网页版搜索结果；偶尔会被反爬限制" },
   { value: "tavily", title: "Tavily", detail: "面向 AI 应用的搜索 API，免费额度约每月 1000 次", envKeyName: "TAVILY_API_KEY", keyUrl: "https://app.tavily.com/" },
   { value: "brave", title: "Brave Search", detail: "官方 Web Search API，需在控制台创建订阅密钥", envKeyName: "BRAVE_SEARCH_API_KEY", keyUrl: "https://api-dashboard.search.brave.com/" }
@@ -1581,11 +1603,16 @@ const webSearchProviderOptions: Array<{ value: DesktopWebSearchProvider; title: 
  * key 从不回填到输入框：主进程只回报「是否已配置」，不返回明文。因此输入框为空意为
  * 「不改动」，要清空已存的 key 需要显式勾选 `clearKey`。
  */
-function SettingsWebSearch({ onLoad, onSave, onNotify, onOpenExternal }: {
+function SettingsWebSearch({ onLoad, onSave, onNotify, onOpenExternal, onLoadCookieJarStatus, onOpenBrowser, onExportCookies, onImportCookies, onClearCookies }: {
   onLoad(): Promise<DesktopWebSearchSettings>;
   onSave(input: DesktopWebSearchSettingsInput): Promise<DesktopWebSearchSettings>;
   onNotify(message: string): void;
   onOpenExternal(url: string): Promise<void>;
+  onLoadCookieJarStatus(): Promise<DesktopCookieJarStatus>;
+  onOpenBrowser(url?: string): Promise<void>;
+  onExportCookies(): Promise<DesktopCookieJarStatus>;
+  onImportCookies(): Promise<DesktopCookieJarStatus>;
+  onClearCookies(): Promise<DesktopCookieJarStatus>;
 }): React.JSX.Element {
   const [settings, setSettings] = useState<DesktopWebSearchSettings>();
   const [loadError, setLoadError] = useState<string>();
@@ -1596,6 +1623,10 @@ function SettingsWebSearch({ onLoad, onSave, onNotify, onOpenExternal }: {
   const [maxResults, setMaxResults] = useState(5);
   const [timeoutMs, setTimeoutMs] = useState(10_000);
   const [saving, setSaving] = useState(false);
+  const [cookieJar, setCookieJar] = useState<DesktopCookieJarStatus>();
+  const [cookieLoadError, setCookieLoadError] = useState<string>();
+  const [cookieBusy, setCookieBusy] = useState(false);
+  const [browserUrl, setBrowserUrl] = useState("https://www.google.com/");
 
   const adopt = (next: DesktopWebSearchSettings): void => {
     setSettings(next);
@@ -1615,6 +1646,21 @@ function SettingsWebSearch({ onLoad, onSave, onNotify, onOpenExternal }: {
       .catch((error: unknown) => { if (!cancelled) setLoadError(error instanceof Error ? error.message : String(error)); });
     return () => { cancelled = true; };
   }, [onLoad]);
+
+  // Cookie 不属于某个项目，但设置页重开时要重新读取：用户可能刚在浏览器窗口完成登录。
+  useEffect(() => {
+    let cancelled = false;
+    onLoadCookieJarStatus()
+      .then((next) => {
+        if (cancelled) return;
+        setCookieJar(next);
+        setCookieLoadError(undefined);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setCookieLoadError(error instanceof Error ? error.message : String(error));
+      });
+    return () => { cancelled = true; };
+  }, [onLoadCookieJarStatus]);
 
   if (loadError) return <div className="settings-sections"><section><h3>无法加载联网搜索设置</h3><p>{loadError}</p></section></div>;
   if (!settings) return <div className="settings-sections"><section><p>正在加载设置…</p></section></div>;
@@ -1654,6 +1700,49 @@ function SettingsWebSearch({ onLoad, onSave, onNotify, onOpenExternal }: {
     }
   };
 
+  const refreshCookieJar = async (): Promise<void> => {
+    const next = await onLoadCookieJarStatus();
+    setCookieJar(next);
+    setCookieLoadError(undefined);
+  };
+
+  const runCookieOperation = async (operation: () => Promise<DesktopCookieJarStatus>, success: string): Promise<void> => {
+    if (cookieBusy) return;
+    setCookieBusy(true);
+    try {
+      const next = await operation();
+      setCookieJar(next);
+      setCookieLoadError(undefined);
+      onNotify(success);
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCookieBusy(false);
+    }
+  };
+
+  const openEmbeddedBrowser = async (url?: string): Promise<void> => {
+    if (cookieBusy) return;
+    setCookieBusy(true);
+    try {
+      await onOpenBrowser(url);
+      await refreshCookieJar();
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCookieBusy(false);
+    }
+  };
+
+  const cookieSummary = cookieJar
+    ? cookieJar.total
+      ? `已同步 ${String(cookieJar.total)} 个 Cookie`
+      : "暂未登录任何网站"
+    : "正在读取 Cookie 状态…";
+  const cookieUpdatedAt = cookieJar?.updatedAt
+    ? `最近同步：${new Date(cookieJar.updatedAt).toLocaleString("zh-CN", { hour12: false })}`
+    : undefined;
+
   return (
     <div className="settings-sections">
       <section>
@@ -1670,12 +1759,12 @@ function SettingsWebSearch({ onLoad, onSave, onNotify, onOpenExternal }: {
             <button aria-checked={provider === candidate.value} className="permission-setting-row" key={candidate.value} onClick={() => { setProvider(candidate.value); setApiKeyInput(""); setClearKey(false); }} role="radio" type="button">
               <span className={`radio${provider === candidate.value ? " is-selected" : ""}`} />
               <span><strong>{candidate.title}</strong><small>{candidate.detail}</small></span>
-              <em className="settings-nav-badge">{candidate.value === "duckduckgo" ? "免密钥" : candidate.value === "anysearch" ? "可匿名" : "API Key"}</em>
+              <em className="settings-nav-badge">{candidate.value === "duckduckgo" ? "免密钥" : candidate.value === "anysearch" ? "可匿名" : candidate.value === "google" ? "浏览器登录" : "API Key"}</em>
             </button>
           ))}
         </div>
       </section>
-      {provider !== "duckduckgo" ? (
+      {option?.envKeyName ? (
         <section>
           <h3>API 密钥</h3>
           <div className="secret-input-row">
@@ -1712,6 +1801,45 @@ function SettingsWebSearch({ onLoad, onSave, onNotify, onOpenExternal }: {
           <select className="web-search-select" onChange={(event) => setTimeoutMs(Number(event.target.value))} value={timeoutMs}>
             {[...new Set([5_000, 10_000, 20_000, 30_000, timeoutMs])].sort((a, b) => a - b).map((duration) => <option key={duration} value={duration}>{duration / 1_000} 秒</option>)}
           </select>
+        </div>
+      </section>
+      <section>
+        <h3>浏览器与 Cookie</h3>
+        <div className="setting-row">
+          <span><strong>Google 设置</strong><small>在内嵌浏览器里完成同意、验证或登录，Google 搜索会自动带上对应 Cookie</small></span>
+          <button className="ghost-button" disabled={cookieBusy} onClick={() => void openEmbeddedBrowser("https://www.google.com/")} type="button">打开 Google</button>
+        </div>
+        <div className="setting-row">
+          <span><strong>Cookie 状态</strong><small>{cookieSummary}{cookieUpdatedAt ? ` · ${cookieUpdatedAt}` : ""}</small></span>
+          <button className="ghost-button" disabled={cookieBusy} onClick={() => void runCookieOperation(onLoadCookieJarStatus, "Cookie 状态已刷新")} type="button">刷新</button>
+        </div>
+        {cookieJar?.domains.length ? (
+          <div aria-label="已登录站点" className="cookie-domain-list">
+            {cookieJar.domains.map(({ domain, count }) => <span className="cookie-domain" key={domain}>{domain}<small>{count}</small></span>)}
+          </div>
+        ) : null}
+        {cookieLoadError ? <p className="web-search-key-status">无法读取 Cookie：{cookieLoadError}</p> : null}
+        <div className="settings-button-row">
+          <button disabled={cookieBusy} onClick={() => void runCookieOperation(onImportCookies, "Cookie 已导入并同步给 Agent")} type="button">导入 Cookie</button>
+          <button disabled={cookieBusy} onClick={() => void runCookieOperation(onExportCookies, "Cookie 已导出")} type="button">导出 Cookie</button>
+          <button className="ghost-button is-danger" disabled={cookieBusy || !cookieJar?.total} onClick={() => void runCookieOperation(onClearCookies, "全部 Cookie 已清除")} type="button">清除全部</button>
+        </div>
+        <p className="web-search-key-status">支持 Cookie-Editor JSON。Cookie 只会按域名、路径和 HTTPS 规则发送给匹配的网站。</p>
+      </section>
+      <section>
+        <h3>WebFetch 浏览器</h3>
+        <p className="web-search-key-status">打开任意网页后登录；该登录态会同步给 <code>web_fetch</code> 和 Google 搜索。</p>
+        <div className="web-browser-url-row">
+          <input
+            autoCapitalize="none"
+            autoComplete="off"
+            onChange={(event) => setBrowserUrl(event.target.value)}
+            placeholder="https://example.com/"
+            spellCheck={false}
+            type="url"
+            value={browserUrl}
+          />
+          <button disabled={cookieBusy || !browserUrl.trim()} onClick={() => void openEmbeddedBrowser(browserUrl.trim())} type="button">打开浏览器</button>
         </div>
       </section>
       <div className="settings-button-row">

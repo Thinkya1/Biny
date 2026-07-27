@@ -6,10 +6,11 @@
  * 跳转也要逐跳重新校验 —— 一次跳到 `169.254.169.254` 就能读到云实例凭证。
  */
 import { z } from "zod";
-import type { WebFetchConfig } from "../../config/schema.js";
+import type { WebCookiesConfig, WebFetchConfig } from "../../config/schema.js";
 import { ToolAccesses } from "../access.js";
 import type { Tool } from "../types.js";
 import { assertFetchableUrl } from "./addressPolicy.js";
+import { cookieHeaderFor, defaultCookieJarPath, readCookieJar, type StoredCookie } from "./cookieJar.js";
 import { htmlTitle, htmlToText } from "./html.js";
 
 const defaultLength = 24_000;
@@ -34,11 +35,12 @@ export interface WebFetchResult {
   truncatedAtByteLimit: boolean;
 }
 
-export function createWebFetchTool(config?: WebFetchConfig): Tool<WebFetchArgs, WebFetchResult> {
+export function createWebFetchTool(config?: WebFetchConfig, cookies?: WebCookiesConfig): Tool<WebFetchArgs, WebFetchResult> {
   const timeoutMs = config?.timeoutMs ?? 15_000;
   const maxBytes = config?.maxBytes ?? 2 * 1024 * 1024;
   const maxRedirects = config?.maxRedirects ?? 5;
   const allowPrivateNetwork = config?.allowPrivateNetwork ?? false;
+  const cookieJarPath = cookies?.enabled === false ? undefined : cookies?.path ?? defaultCookieJarPath();
   return {
     name: "web_fetch",
     description: `Fetch a public http(s) URL and return its readable text. HTML is converted to text. Returns at most ${String(maxLength)} characters; page through longer documents with offset.`,
@@ -67,7 +69,8 @@ export function createWebFetchTool(config?: WebFetchConfig): Tool<WebFetchArgs, 
         description: `Fetch ${target.toString()}`,
         approvalRule: `web_fetch(${target.origin})`,
         async execute({ signal }) {
-          const fetched = await fetchDocument(target, { timeoutMs, maxBytes, maxRedirects, allowPrivateNetwork }, signal);
+          const jar = cookieJarPath ? await readCookieJar(cookieJarPath) : [];
+          const fetched = await fetchDocument(target, { timeoutMs, maxBytes, maxRedirects, allowPrivateNetwork, jar }, signal);
           const text = isHtml(fetched.contentType) ? htmlToText(fetched.body) : fetched.body;
           const offset = Math.min(args.offset ?? 0, text.length);
           const content = text.slice(offset, offset + (args.length ?? defaultLength));
@@ -94,6 +97,8 @@ interface FetchLimits {
   maxBytes: number;
   maxRedirects: number;
   allowPrivateNetwork: boolean;
+  /** 共享 cookie jar 的内容；每一跳按当跳地址重新匹配，jar 为空即等于不带 cookie。 */
+  jar: StoredCookie[];
 }
 
 interface FetchedDocument {
@@ -119,10 +124,17 @@ async function fetchDocument(url: URL, limits: FetchLimits, signal?: AbortSignal
     let current = url;
     for (let redirect = 0; redirect <= limits.maxRedirects; redirect += 1) {
       await assertFetchableUrl(current, { allowPrivateNetwork: limits.allowPrivateNetwork });
+      const headers: Record<string, string> = {
+        accept: "text/html,text/plain,application/json;q=0.9,*/*;q=0.8",
+        "user-agent": "Biny/web_fetch"
+      };
+      // Cookie 按当前这一跳的地址重新匹配：跳到别的域名时不能把上一跳的登录凭据带过去。
+      const cookie = cookieHeaderFor(limits.jar, current);
+      if (cookie) headers.cookie = cookie;
       // 手动处理跳转：交给 fetch 自动跟随就没有机会校验中间跳板的地址。
       const response = await fetch(current, {
         redirect: "manual",
-        headers: { accept: "text/html,text/plain,application/json;q=0.9,*/*;q=0.8", "user-agent": "Biny/web_fetch" },
+        headers,
         signal: controller.signal
       });
       const location = response.headers.get("location");

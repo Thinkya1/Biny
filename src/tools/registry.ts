@@ -6,7 +6,7 @@
  */
 import type { JsonObjectSchema } from "./schema.js";
 import type { ToolDefinition } from "./definition.js";
-import type { SandboxConfig, WebFetchConfig, WebSearchConfig } from "../config/schema.js";
+import type { SandboxConfig, WebCookiesConfig, WebFetchConfig, WebSearchConfig } from "../config/schema.js";
 import type { Tool, ToolContext, ToolExecution, ToolSource } from "./types.js";
 import { createReadFileTool } from "./file/readFile.js";
 import { createWriteFileTool } from "./file/writeFile.js";
@@ -102,7 +102,8 @@ export function createToolRegistry(
   webSearchConfig?: WebSearchConfig,
   managedProcessService?: ManagedProcessService,
   webFetchConfig?: WebFetchConfig,
-  sandboxConfig?: SandboxConfig
+  sandboxConfig?: SandboxConfig,
+  webCookiesConfig?: WebCookiesConfig
 ): ToolRegistry {
   // 这里集中注册内置工具；外部扩展在 CommandRuntime 装配完成后追加到同一 registry。
   const registry = new ToolRegistry();
@@ -124,8 +125,8 @@ export function createToolRegistry(
   if (managedProcessService) {
     for (const tool of createManagedProcessTools(context, managedProcessService)) registry.register(tool);
   }
-  if (webSearchConfig?.enabled !== false) registry.register(createWebSearchTool(webSearchConfig));
-  if (webFetchConfig?.enabled !== false) registry.register(createWebFetchTool(webFetchConfig));
+  if (webSearchConfig?.enabled !== false) registry.register(createWebSearchTool(webSearchConfig, webCookiesConfig));
+  if (webFetchConfig?.enabled !== false) registry.register(createWebFetchTool(webFetchConfig, webCookiesConfig));
   return registry;
 }
 

@@ -17,6 +17,7 @@ import path from "node:path";
 import { generateText } from "ai";
 import { fetchModelCatalog } from "../../../ai/modelCatalog.js";
 import { providerDefinition } from "../../../ai/provider.js";
+import { loadProjectSettings } from "../../../config/projectSettings.js";
 import { configSchema, type AgentConfig, type ProviderConfig } from "../../../config/schema.js";
 import type { AgentConfigStore } from "../../../config/store.js";
 import { createModelSettings } from "../../../llm/factory.js";
@@ -25,6 +26,7 @@ import { providerProfile } from "../../../llm/profiles.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
 import { webSearchKeyEnvNames } from "../../../tools/web/search.js";
 import { formatSubagentAgentList } from "../../../extensions/report.js";
+import { formatSubagentTaskReport } from "../../../runtime/subagentTaskReport.js";
 import {
   createInteractiveAgentRuntime,
   type AgentRunOutcome,
@@ -88,7 +90,7 @@ export class DesktopAgentManager {
     await this.state.upsertProject(project);
     const runtime = this.runtimes.get(projectId)?.runtime;
     const [config, sessions] = await Promise.all([
-      this.configStore.load().catch(() => undefined),
+      this.configStore.load(project.path).catch(() => undefined),
       this.projects.listSessions(project, runtime?.getSnapshot(), this.projectEvents(projectId))
     ]);
     const models = config ? listConfiguredModelChoices(config) : [];
@@ -143,7 +145,7 @@ export class DesktopAgentManager {
     mode: AgentRunMode,
     attachments: DesktopAttachment[]
   ): Promise<DesktopRunReceipt> {
-    await this.requireConfiguredModel();
+    await this.requireConfiguredModel(projectId);
     await this.refreshOAuthCredentials(projectId);
     const runtime = await this.ensureRuntime(projectId);
     const snapshot = runtime.getSnapshot();
@@ -186,7 +188,7 @@ export class DesktopAgentManager {
     mode: AgentRunMode,
     attachments: DesktopAttachment[]
   ): Promise<DesktopRunReceipt> {
-    await this.requireConfiguredModel();
+    await this.requireConfiguredModel(projectId);
     await this.refreshOAuthCredentials(projectId);
     const runtime = await this.ensureRuntime(projectId);
     if (runtime.getInfo().sessionId !== sessionId) {
@@ -259,11 +261,11 @@ export class DesktopAgentManager {
     }
     this.projects.requireProject(projectId);
     const authenticated = await this.modelLogin.complete(provider, authRequestId, pastedAuthorization);
-    const current = await this.configStore.load();
+    const current = await this.loadProjectConfig(projectId);
     const candidate = this.buildConfigWithAuthenticatedLogin(current, authenticated);
     const test = await this.testCandidate(candidate, candidate.defaultModel);
     if (!test.ok) throw new Error(`账号已授权，但模型验证失败：${test.message}`);
-    await this.configStore.save(candidate);
+    await this.saveProjectConfig(projectId, candidate);
     this.runtimeErrors.delete(projectId);
     if (managed) {
       managed.unsubscribe();
@@ -284,9 +286,9 @@ export class DesktopAgentManager {
       throw new Error("任务运行期间不能修改模型配置。");
     }
     this.projects.requireProject(projectId);
-    const current = await this.configStore.load();
+    const current = await this.loadProjectConfig(projectId);
     const next = this.buildConfigWithModel(current, input);
-    await this.configStore.save(next);
+    await this.saveProjectConfig(projectId, next);
     this.runtimeErrors.delete(projectId);
     if (managed) {
       managed.unsubscribe();
@@ -302,8 +304,12 @@ export class DesktopAgentManager {
       throw new Error("任务运行期间不能修改模型配置。");
     }
     this.projects.requireProject(projectId);
-    const current = await this.configStore.load();
+    const current = await this.loadProjectConfig(projectId);
     if (!current.models[alias]) throw new Error(`未知模型：${alias}`);
+    const projectSettings = await loadProjectSettings(this.projects.requireProject(projectId).path);
+    if (projectSettings.defaultModel === alias) {
+      throw new Error(`不能删除项目 .biny/settings.json 当前引用的模型：${alias}`);
+    }
     const remaining = Object.entries(current.models).filter(([key]) => key !== alias);
     if (!remaining.length) throw new Error("至少需要保留一个可用模型。");
     const nextDefault = current.defaultModel === alias ? remaining[0]![0] : current.defaultModel;
@@ -312,7 +318,7 @@ export class DesktopAgentManager {
       defaultModel: nextDefault,
       models: Object.fromEntries(remaining)
     });
-    await this.configStore.save(next);
+    await this.saveProjectConfig(projectId, next);
     this.runtimeErrors.delete(projectId);
     if (managed) {
       managed.unsubscribe();
@@ -324,7 +330,7 @@ export class DesktopAgentManager {
 
   async webSearchSettings(projectId: string): Promise<DesktopWebSearchSettings> {
     this.projects.requireProject(projectId);
-    const config = await this.configStore.load();
+    const config = await this.loadProjectConfig(projectId);
     return describeWebSearchSettings(config.web.search);
   }
 
@@ -334,7 +340,7 @@ export class DesktopAgentManager {
       throw new Error("任务运行期间不能修改联网搜索配置。");
     }
     this.projects.requireProject(projectId);
-    const current = await this.configStore.load();
+    const current = await this.loadProjectConfig(projectId);
     // 密钥槽位是各 provider 共用的：换 provider 时必须丢弃旧密钥和自定义 env 名，
     // 否则上一家的密钥会被原样发给新服务商，并遮蔽环境变量里的正确密钥。
     const sameProvider = input.provider === current.web.search.provider;
@@ -353,7 +359,7 @@ export class DesktopAgentManager {
         }
       }
     });
-    await this.configStore.save(next);
+    await this.saveProjectConfig(projectId, next);
     // 工具注册表在 runtime 装配时读取搜索配置，关闭后下次使用即按新配置重建。
     if (managed) {
       managed.unsubscribe();
@@ -366,7 +372,7 @@ export class DesktopAgentManager {
   /** 记忆面板总览：设置来自配置文件；条目列表需要活的 runtime（记忆禁用时不创建）。 */
   async memoryOverview(projectId: string): Promise<DesktopMemoryOverview> {
     this.projects.requireProject(projectId);
-    const config = await this.configStore.load();
+    const config = await this.loadProjectConfig(projectId);
     const settings = describeMemorySettings(config);
     if (!settings.enabled) return { settings, totalEntries: 0, topics: [], entries: [] };
     const runtime = await this.ensureRuntime(projectId);
@@ -387,7 +393,7 @@ export class DesktopAgentManager {
       throw new Error("任务运行期间不能修改记忆设置。");
     }
     this.projects.requireProject(projectId);
-    const current = await this.configStore.load();
+    const current = await this.loadProjectConfig(projectId);
     const next = configSchema.parse({
       ...current,
       context: {
@@ -400,7 +406,7 @@ export class DesktopAgentManager {
         }
       }
     });
-    await this.configStore.save(next);
+    await this.saveProjectConfig(projectId, next);
     // 记忆配置在 runtime 装配时读取；关闭后下次使用即按新配置重建。
     if (managed) {
       managed.unsubscribe();
@@ -449,7 +455,7 @@ export class DesktopAgentManager {
    */
   async fetchModelCatalog(projectId: string, providerAlias: string): Promise<DesktopModelCatalogResult> {
     this.projects.requireProject(projectId);
-    const config = await this.configStore.load();
+    const config = await this.loadProjectConfig(projectId);
     const provider = config.providers[providerAlias];
     if (!provider) throw new Error(`未找到服务商配置：${providerAlias}`);
     const fetchedAt = new Date().toISOString();
@@ -467,7 +473,7 @@ export class DesktopAgentManager {
 
   async testModelConfiguration(projectId: string, input: DesktopModelConfigurationInput): Promise<DesktopModelConnectionTestResult> {
     this.projects.requireProject(projectId);
-    const current = await this.configStore.load();
+    const current = await this.loadProjectConfig(projectId);
     const candidate = this.buildConfigWithModel(current, input);
     return await this.testCandidate(candidate, input.alias);
   }
@@ -564,9 +570,13 @@ export class DesktopAgentManager {
     return await (await this.ensureRuntime(projectId)).compactConversation(hint);
   }
 
-  /** 桌面端只读斜杠命令：报告类命令直接读 runtime 状态，不产生会话消息。 */
+  /**
+   * 桌面端斜杠命令。报告类命令直接读 runtime 状态，不产生会话消息；
+   * `/subagent <task>` 与 `/review` 会实际派发一个子代理任务（权限档位随会话权限推导，
+   * 与 TUI 相同），结果同样只进弹层、不写入会话。
+   */
   async runSlashCommand(projectId: string, sessionId: string | undefined, input: string): Promise<DesktopSlashResult> {
-    await this.requireConfiguredModel();
+    await this.requireConfiguredModel(projectId);
     const runtime = await this.ensureRuntime(projectId);
     // /context、/usage 依赖当前会话：用户查看的会话与 runtime 不一致且空闲时先切换。
     if (sessionId && runtime.getInfo().sessionId !== sessionId) {
@@ -614,10 +624,45 @@ export class DesktopAgentManager {
       case "/memory":
         return { command, title: "记忆", content: await runtime.runMemoryCommand(args) };
       case "/subagent": {
-        if (args[0]?.toLowerCase() === "agents") {
+        const action = args[0]?.toLowerCase();
+        if (action === "agents") {
           return { command, title: "子代理", content: formatSubagentAgentList(await runtime.listSubagentAgents()) };
         }
-        throw new Error("桌面端当前仅支持 /subagent agents 查看具名子代理定义。");
+        if (action === "status") {
+          return { command, title: "子代理", content: formatSubagentTaskReport(runtime.listSubagentTasks()) };
+        }
+        if (action === "cancel") {
+          const taskId = args[1]?.trim();
+          if (!taskId) throw new Error("用法：/subagent cancel <task-id>");
+          const cancelled = runtime.cancelSubagentTask(taskId, "Cancelled from the desktop app.");
+          return {
+            command,
+            title: "子代理",
+            content: cancelled ? `已取消子代理任务 ${taskId}。` : `没有找到可取消的子代理任务：${taskId}。`
+          };
+        }
+        if (action === "start") {
+          const backgroundTask = args.slice(1).join(" ").trim();
+          if (!backgroundTask) throw new Error("用法：/subagent start <任务>");
+          const submitted = runtime.startSubagentTask(backgroundTask);
+          // 后台任务的结果通过 /subagent status 查看；这里只挂一个空 catch 防止未处理拒绝。
+          submitted.completion.catch(() => undefined);
+          return {
+            command,
+            title: "子代理",
+            content: `已启动后台子代理任务 ${submitted.taskId}。用 /subagent status 查看进度，/subagent cancel ${submitted.taskId} 取消。`
+          };
+        }
+        const task = args.join(" ").trim();
+        if (!task) {
+          return { command, title: "子代理", content: "用法：/subagent <任务> | start <任务> | status | cancel <task-id> | agents" };
+        }
+        return { command, title: "子代理", content: await runtime.runSubagentTask(task) || "子代理没有返回内容。" };
+      }
+      case "/review": {
+        const task = args.join(" ").trim()
+          || "Review the current git changes for correctness, regressions, missing tests, and concrete risks. Return concise findings with exact file paths and line numbers.";
+        return { command, title: "代码评审", content: await runtime.runSubagentTask(task) || "No review findings." };
       }
       default:
         throw new Error(`未知命令：${command ?? input}`);
@@ -772,8 +817,8 @@ export class DesktopAgentManager {
     return runtime;
   }
 
-  private async requireConfiguredModel(): Promise<void> {
-    const config = await this.configStore.load();
+  private async requireConfiguredModel(projectId: string): Promise<void> {
+    const config = await this.loadProjectConfig(projectId);
     if (!hasUsableModelConfiguration(config)) {
       throw new Error("请先在设置的“模型”中配置一个可用模型，再开始任务。");
     }
@@ -824,7 +869,7 @@ export class DesktopAgentManager {
 
   private async refreshOAuthCredentials(projectId: string): Promise<void> {
     this.projects.requireProject(projectId);
-    const current = await this.configStore.load();
+    const current = await this.loadProjectConfig(projectId);
     let refreshedConfig: AgentConfig | undefined;
     for (const [alias, provider] of Object.entries(current.providers)) {
       const oauth = provider.oauth;
@@ -847,7 +892,15 @@ export class DesktopAgentManager {
         }
       };
     }
-    if (refreshedConfig) await this.configStore.save(refreshedConfig);
+    if (refreshedConfig) await this.saveProjectConfig(projectId, refreshedConfig);
+  }
+
+  private async loadProjectConfig(projectId: string): Promise<AgentConfig> {
+    return await this.configStore.load(this.projects.requireProject(projectId).path);
+  }
+
+  private async saveProjectConfig(projectId: string, config: AgentConfig): Promise<void> {
+    await this.configStore.save(config, this.projects.requireProject(projectId).path);
   }
 
   private projectEvents(projectId: string): Map<string, AgentHostEvent[]> {
@@ -869,7 +922,9 @@ function modelAliasForAuthenticatedModel(providerAlias: string, modelId: string)
  * never crosses the IPC bridge.
  */
 function describeWebSearchSettings(search: AgentConfig["web"]["search"]): DesktopWebSearchSettings {
-  const envKeyName = search.provider === "duckduckgo" ? undefined : search.apiKeyEnv ?? webSearchKeyEnvNames[search.provider];
+  const envKeyName = search.provider === "duckduckgo" || search.provider === "google"
+    ? undefined
+    : search.apiKeyEnv ?? webSearchKeyEnvNames[search.provider];
   return {
     enabled: search.enabled,
     provider: search.provider,
@@ -908,8 +963,8 @@ function describeModelConnections(config: AgentConfig): DesktopModelConnection[]
   });
 }
 
-function describeCredentialSource(provider: ProviderConfig, apiKeyEnv: string | undefined): "config" | "env" | undefined {
-  if (provider.apiKey) return "config";
+function describeCredentialSource(provider: ProviderConfig, apiKeyEnv: string | undefined): "keychain" | "config" | "env" | undefined {
+  if (provider.apiKey) return process.platform === "darwin" ? "keychain" : "config";
   if (apiKeyEnv && process.env[apiKeyEnv]) return "env";
   return undefined;
 }

@@ -25,6 +25,7 @@ export interface WebSearchView {
 
 const providerLabels: Record<string, string> = {
   duckduckgo: "DuckDuckGo",
+  google: "Google",
   tavily: "Tavily",
   brave: "Brave Search",
   anysearch: "AnySearch"

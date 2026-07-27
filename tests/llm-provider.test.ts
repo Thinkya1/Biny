@@ -22,65 +22,68 @@ async function main(): Promise<void> {
 async function testConfigFileStorageBoundaries(): Promise<void> {
   const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "biny-config-storage-"));
   const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), "biny-config-outside-"));
+  const globalRoot = await fs.mkdtemp(path.join(os.tmpdir(), "biny-global-agent-"));
   try {
-    const configPath = path.join(workspaceRoot, CONFIG_FILE);
-    await ensureConfig(workspaceRoot);
+    const configPath = path.join(globalRoot, CONFIG_FILE);
+    await ensureConfig(workspaceRoot, { globalDir: globalRoot });
     if (process.platform !== "win32") assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600);
 
     await fs.chmod(configPath, 0o644);
-    await loadConfig(workspaceRoot);
+    await loadConfig(workspaceRoot, { globalDir: globalRoot });
     if (process.platform !== "win32") assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600);
 
     const savedConfig = configSchema.parse({
       ...defaultConfig,
-      providers: {
-        ...defaultConfig.providers,
-        deepseek: { ...defaultConfig.providers.deepseek, apiKey: "not-a-real-test-key" }
-      }
+      providers: defaultConfig.providers
     });
-    await saveConfig(workspaceRoot, savedConfig);
-    assert.equal((await loadConfig(workspaceRoot)).providers.deepseek?.apiKey, "not-a-real-test-key");
+    await saveConfig(workspaceRoot, savedConfig, { globalDir: globalRoot });
+    assert.equal((await loadConfig(workspaceRoot, { globalDir: globalRoot })).providers.deepseek?.apiKey, undefined);
     if (process.platform !== "win32") assert.equal((await fs.stat(configPath)).mode & 0o777, 0o600);
 
     const oversizedConfig = configSchema.parse({
       ...savedConfig,
       providers: {
         ...savedConfig.providers,
-        oversized: { type: "openai", apiKey: "x".repeat(maxConfigFileBytes) }
+        oversized: { type: "openai" }
+      },
+      models: {
+        ...savedConfig.models,
+        oversized: { provider: "oversized", model: "oversized", description: "x".repeat(maxConfigFileBytes) }
       }
     });
-    await assert.rejects(saveConfig(workspaceRoot, oversizedConfig), /exceeds the .*byte size limit/i);
-    assert.equal((await loadConfig(workspaceRoot)).providers.deepseek?.apiKey, "not-a-real-test-key");
+    await assert.rejects(saveConfig(workspaceRoot, oversizedConfig, { globalDir: globalRoot }), /exceeds the .*byte size limit/i);
+    assert.equal((await loadConfig(workspaceRoot, { globalDir: globalRoot })).providers.deepseek?.apiKey, undefined);
 
     await fs.writeFile(configPath, Buffer.alloc(maxConfigFileBytes + 1, 0x20), { mode: 0o600 });
-    await assert.rejects(loadConfig(workspaceRoot), /exceeding the .*byte size limit/i);
-    await saveConfig(workspaceRoot, savedConfig);
+    await assert.rejects(loadConfig(workspaceRoot, { globalDir: globalRoot }), /exceeding the .*byte size limit/i);
+    await saveConfig(workspaceRoot, savedConfig, { globalDir: globalRoot });
 
     const victim = path.join(outsideRoot, "victim.json");
     const victimContent = `${JSON.stringify(defaultConfig, null, 2)}\n`;
     await fs.writeFile(victim, victimContent, { encoding: "utf8", mode: 0o600 });
     await fs.rm(configPath);
     await fs.symlink(victim, configPath);
-    await assert.rejects(loadConfig(workspaceRoot), /symbolic link or hardlink/);
-    await assert.rejects(ensureConfig(workspaceRoot), /symbolic link or hardlink/);
-    await assert.rejects(saveConfig(workspaceRoot, savedConfig), /symbolic link or hardlink/);
+    await assert.rejects(loadConfig(workspaceRoot, { globalDir: globalRoot }), /symbolic link or hardlink/);
+    await assert.rejects(ensureConfig(workspaceRoot, { globalDir: globalRoot }), /symbolic link or hardlink/);
+    await assert.rejects(saveConfig(workspaceRoot, savedConfig, { globalDir: globalRoot }), /symbolic link or hardlink/);
     assert.equal(await fs.readFile(victim, "utf8"), victimContent);
 
     await fs.rm(configPath);
     await fs.link(victim, configPath);
-    await assert.rejects(loadConfig(workspaceRoot), /single-link regular file/);
-    await assert.rejects(ensureConfig(workspaceRoot), /single-link regular file/);
-    await assert.rejects(saveConfig(workspaceRoot, savedConfig), /single-link regular file/);
+    await assert.rejects(loadConfig(workspaceRoot, { globalDir: globalRoot }), /single-link regular file/);
+    await assert.rejects(ensureConfig(workspaceRoot, { globalDir: globalRoot }), /single-link regular file/);
+    await assert.rejects(saveConfig(workspaceRoot, savedConfig, { globalDir: globalRoot }), /single-link regular file/);
     assert.equal(await fs.readFile(victim, "utf8"), victimContent);
 
     await fs.rm(configPath);
     const aliasRoot = path.join(outsideRoot, "workspace-alias");
     await fs.symlink(workspaceRoot, aliasRoot);
-    await ensureConfig(aliasRoot);
-    assert.equal((await loadConfig(aliasRoot)).defaultModel, defaultConfig.defaultModel);
+    await ensureConfig(aliasRoot, { globalDir: globalRoot });
+    assert.equal((await loadConfig(aliasRoot, { globalDir: globalRoot })).defaultModel, defaultConfig.defaultModel);
   } finally {
     await fs.rm(workspaceRoot, { recursive: true, force: true });
     await fs.rm(outsideRoot, { recursive: true, force: true });
+    await fs.rm(globalRoot, { recursive: true, force: true });
   }
 }
 

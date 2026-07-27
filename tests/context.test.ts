@@ -523,7 +523,7 @@ async function testSessionReplayAndAgentResume(): Promise<void> {
     });
     await agent.initialize();
     assert.equal(agent.getInfo().modelLabel, "deepseek-v4-flash");
-    assert.equal(agent.getInfo().reasoningLabel, "High");
+    assert.equal(agent.getInfo().reasoningLabel, "Off");
     const resumed = await agent.resume("saved-session");
     assert.equal(resumed.sessionId, "saved-session");
     assert.equal(agent.getInfo().sessionId, "saved-session");

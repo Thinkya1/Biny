@@ -564,6 +564,19 @@ export function App(): React.JSX.Element {
     return await window.biny.saveWebSearchSettings(projectId, input);
   }, []);
 
+  // 浏览器与 cookie 是全局能力（登录态不属于某个项目），因此不需要 projectId。
+  const loadCookieJarStatus = useCallback(async () => {
+    const cookieJarStatus = window.biny.cookieJarStatus;
+    if (typeof cookieJarStatus !== "function") throw new Error(desktopApiVersionMismatchMessage);
+    return await cookieJarStatus();
+  }, []);
+
+  const openBrowser = useCallback(async (url?: string) => {
+    const open = window.biny.openBrowser;
+    if (typeof open !== "function") throw new Error(desktopApiVersionMismatchMessage);
+    await open(url);
+  }, []);
+
   const loadMemoryOverview = useCallback(async () => {
     const projectId = projectRef.current;
     if (!projectId) throw new Error("请先打开一个项目。");
@@ -822,6 +835,11 @@ export function App(): React.JSX.Element {
         onRemoveModelConfiguration={removeModelConfiguration}
         onLoadWebSearchSettings={loadWebSearchSettings}
         onSaveWebSearchSettings={saveWebSearchSettings}
+        onLoadCookieJarStatus={loadCookieJarStatus}
+        onOpenBrowser={openBrowser}
+        onExportCookies={async () => await window.biny.exportCookies()}
+        onImportCookies={async () => await window.biny.importCookies()}
+        onClearCookies={async () => await window.biny.clearCookies()}
         onFetchModelCatalog={fetchModelCatalog}
         onStartModelLogin={startModelLogin}
         onCompleteModelLogin={completeModelLogin}

@@ -77,8 +77,8 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   // Project sessions default to the workspace (`.agent/sessions`). Callers may override for non-project/global storage.
   const persistenceRoot = options.persistenceRoot ?? workspaceRoot;
   const configStore = options.configStore ?? createFileConfigStore(persistenceRoot);
-  const config = await configStore.load();
-  const modelManager = new ModelManager(persistenceRoot, config, configStore);
+  const config = await configStore.load(workspaceRoot);
+  const modelManager = new ModelManager(workspaceRoot, config, configStore);
   await ensureAgentDirs(persistenceRoot);
   const recorder = new SessionRecorder(persistenceRoot);
   const taskRuns = await TaskRunStore.open(persistenceRoot);
@@ -89,14 +89,15 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     config.web.search,
     managedProcesses,
     config.web.fetch,
-    config.sandbox
+    config.sandbox,
+    config.web.cookies
   );
   // 快照挂在工作区的 git 仓库上；非 git 目录下这项能力直接不可用。
   const checkpoints = config.checkpoints.enabled ? await CheckpointStore.open(workspaceRoot) : undefined;
   const todos = new TodoStore(persistenceRoot, recorder.sessionId);
   await todos.initialize();
   toolRegistry.registerBuiltinTool(createTodoTool(todos));
-  const permissionManager = new PermissionManager({ ...config.permission, source: "agent.config.json" });
+  const permissionManager = new PermissionManager({ ...config.permission, source: "global agent.config.json + project .biny/settings.json" });
   const mcpHost = new McpToolHost();
   let skills: SkillBundle | undefined;
   let agent: AgentSession | undefined;

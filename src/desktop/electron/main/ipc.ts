@@ -25,6 +25,7 @@ import { clampFontSize } from "../../fontPreference.js";
 import type { DesktopBootstrap, DesktopSessionMenuAction, DesktopThemePreference } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
 import { DesktopAgentManager } from "./DesktopAgentManager.js";
+import { DesktopBrowserService } from "./DesktopBrowserService.js";
 import { DesktopProjectService } from "./DesktopProjectService.js";
 import { DesktopStateStore } from "./DesktopStateStore.js";
 import { DesktopTerminalManager } from "./DesktopTerminalManager.js";
@@ -34,6 +35,7 @@ interface IpcContext {
   projects: DesktopProjectService;
   agents: DesktopAgentManager;
   terminals: DesktopTerminalManager;
+  browser: DesktopBrowserService;
   getWindow(): BrowserWindow | undefined;
   bootstrap(): Promise<DesktopBootstrap>;
 }
@@ -89,7 +91,7 @@ const externalUrlSchema = z.string().url().refine((value) => {
 }, "Only HTTP(S) links can be opened externally.");
 const webSearchSettingsSchema = z.object({
   enabled: z.boolean(),
-  provider: z.enum(["duckduckgo", "tavily", "brave", "anysearch"]),
+  provider: z.enum(["duckduckgo", "google", "tavily", "brave", "anysearch"]),
   apiKey: z.string().max(4_000).optional(),
   apiKeyEnv: z.string().trim().min(1).max(120).optional(),
   timeoutMs: z.number().int().min(1_000).max(60_000),
@@ -347,6 +349,33 @@ export function registerDesktopIpc(context: IpcContext): void {
 
   handle(desktopIpc.saveWebSearchSettings, async (_event, projectId: unknown, input: unknown) => {
     return await context.agents.saveWebSearchSettings(idSchema.parse(projectId), webSearchSettingsSchema.parse(input));
+  });
+
+  handle(desktopIpc.openBrowser, async (_event, url: unknown) => {
+    await context.browser.open(url === undefined ? undefined : externalUrlSchema.parse(url));
+  });
+
+  handle(desktopIpc.cookieJarStatus, async () => await context.browser.status());
+
+  handle(desktopIpc.exportCookies, async () => await context.browser.exportToFile(context.getWindow()));
+
+  handle(desktopIpc.importCookies, async () => await context.browser.importFromFile(context.getWindow()));
+
+  handle(desktopIpc.clearCookies, async () => {
+    const options: MessageBoxOptions = {
+      type: "warning",
+      title: "清除 Cookie",
+      message: "确定要清除全部 Cookie 吗？",
+      detail: "浏览器窗口和 agent 工具都会退出所有已登录的网站。此操作无法撤销。",
+      buttons: ["清除", "取消"],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true
+    };
+    const window = context.getWindow();
+    const confirmation = window ? await dialog.showMessageBox(window, options) : await dialog.showMessageBox(options);
+    if (confirmation.response !== 0) return await context.browser.status();
+    return await context.browser.clear();
   });
 
   handle(desktopIpc.memoryOverview, async (_event, projectId: unknown) => {

@@ -31,6 +31,7 @@ import { createTuiRuntime, type TuiRuntime } from "./runtime/createTuiRuntime.js
 import { readGitBranch } from "./runtime/gitBranch.js";
 import { sessionEventsToTranscript } from "./sessionTranscript.js";
 import { TUI_SLASH_COMMANDS } from "./slashCommands.js";
+import { modelThinkingOptions } from "./modelOptions.js";
 import { createInitialTuiState, tuiReducer } from "./state.js";
 import { editorTheme, theme } from "./theme/index.js";
 import { foldableTranscriptItems, latestExpandableTranscript } from "./transcriptText.js";
@@ -583,7 +584,40 @@ export class BinyTui {
         description: `${model.provider}  ${model.description ?? model.model}`
       })),
       onSelect: (item) => {
-        void this.applyModel(item.value);
+        void this.selectModel(item.value);
+      }
+    });
+  }
+
+  private async selectModel(alias: string): Promise<void> {
+    const runtime = this.runtime;
+    if (!runtime) return;
+    const model = runtime.listModels().find((candidate) => candidate.alias === alias);
+    if (!model) {
+      this.showTextViewer("Model", `Unknown model alias: ${alias}`);
+      return;
+    }
+    if (!model.efforts.length) {
+      await this.applyModel(alias, "off");
+      return;
+    }
+
+    const current = runtime.getInfo();
+    const currentThinking = current.modelAlias === alias && current.thinking !== "off"
+      ? current.thinking
+      : model.defaultThinking;
+    const options = modelThinkingOptions(model);
+    this.showSelect({
+      title: `Select Reasoning Level for ${model.model}`,
+      hint: "↑↓ navigate · enter select · esc back",
+      selectedIndex: Math.max(0, options.findIndex((option) => option.value === currentThinking)),
+      items: options.map((option) => ({
+        value: option.value,
+        label: option.value === currentThinking ? `${option.label} ← current` : option.label,
+        description: option.description
+      })),
+      onSelect: (item) => {
+        void this.applyModel(alias, item.value as ThinkingSelection);
       }
     });
   }

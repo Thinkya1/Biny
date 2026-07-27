@@ -6,8 +6,10 @@
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import os from "node:os";
 import path from "node:path";
-import { CONFIG_FILE, loadConfig } from "../../config/loader.js";
+import { CONFIG_FILE, loadGlobalConfig } from "../../config/loader.js";
+import { globalAgentDir, globalConfigPath, projectSettingsPath } from "../../config/paths.js";
 import { pathExists } from "../../utils/fs.js";
 
 const execFileAsync = promisify(execFile);
@@ -18,8 +20,10 @@ export async function doctorCommand(workspaceRoot: string): Promise<void> {
     ["node", process.version],
     ["pnpm", await commandVersion("pnpm", ["--version"])],
     ["git", await commandVersion("git", ["--version"])],
-    [CONFIG_FILE, (await pathExists(path.join(workspaceRoot, CONFIG_FILE))) ? "found" : "missing"],
-    ["credentials", await credentialStatus(workspaceRoot)],
+    [globalConfigPath(), (await pathExists(globalConfigPath())) ? "found" : "missing"],
+    [projectSettingsPath(workspaceRoot), (await pathExists(projectSettingsPath(workspaceRoot))) ? "found" : "missing"],
+    ["legacy project config", await legacyConfigStatus(workspaceRoot)],
+    ["credentials", await credentialStatus()],
     [".agent", (await pathExists(path.join(workspaceRoot, ".agent"))) ? "found" : "missing"]
   ];
 
@@ -28,15 +32,25 @@ export async function doctorCommand(workspaceRoot: string): Promise<void> {
   }
 }
 
-async function credentialStatus(workspaceRoot: string): Promise<string> {
+async function credentialStatus(): Promise<string> {
   try {
-    const config = await loadConfig(workspaceRoot);
-    return Object.values(config.providers).some((provider) => Boolean(provider.apiKey))
+    const config = await loadGlobalConfig();
+    return Object.values(config.providers).some((provider) => Boolean(provider.apiKey)) || Boolean(config.web.search.apiKey)
       ? `warning: inline API key found in ${CONFIG_FILE}; use apiKeyEnv and rotate the key`
       : "no inline API keys";
   } catch (error) {
     return `unable to inspect configuration: ${error instanceof Error ? error.message : String(error)}`;
   }
+}
+
+async function legacyConfigStatus(workspaceRoot: string): Promise<string> {
+  const projectPath = path.join(workspaceRoot, CONFIG_FILE);
+  const desktopPath = process.platform === "darwin"
+    ? path.join(os.homedir(), "Library", "Application Support", "Biny", "workspaces", "default", CONFIG_FILE)
+    : path.join(globalAgentDir(), "..", "workspaces", "default", CONFIG_FILE);
+  if (await pathExists(projectPath)) return `found at ${projectPath}; not migrated automatically`
+  if (await pathExists(desktopPath)) return `found at ${desktopPath}; not migrated automatically`;
+  return "none";
 }
 
 async function commandVersion(command: string, args: string[]): Promise<string> {

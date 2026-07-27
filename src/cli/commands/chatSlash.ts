@@ -21,7 +21,7 @@ export const CHAT_SLASH_COMMANDS: SlashCommand[] = [
   { name: "/context", description: "Show loaded context and budget", category: "system" },
   { name: "/usage", description: "Show SDK token usage and cost", category: "system" },
   { name: "/compact", description: "Compact older conversation history", category: "system" },
-  { name: "/model", description: "Switch model and thinking effort", category: "system" },
+  { name: "/model", description: "Choose a model and its supported thinking effort", category: "system" },
   { name: "/status", description: "Show model, permissions and extensions", category: "system" },
   { name: "/mcp", description: "List MCP servers and tools, or `reconnect <server>`", category: "extension" },
   { name: "/skills", description: "List available skills (project & global)", category: "extension" },
@@ -161,7 +161,7 @@ export async function executeChatSlashCommand(runtime: CommandRuntime, text: str
         const unavailable = model.available ? "" : "  (needs credentials)";
         console.log(`  ${model.alias.padEnd(24)}${model.provider}  ${model.efforts.join("/") || "no thinking"}${unavailable}${current}`);
       }
-      console.log("Usage: /model <alias> [off|high|max]");
+      console.log("Usage: /model <alias> [off|model-supported-effort]");
       return true;
     }
     const info = await (host ?? agent).switchModel(args[0], parseThinkingSelection(args[1]));

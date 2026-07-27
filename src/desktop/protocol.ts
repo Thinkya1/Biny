@@ -51,6 +51,11 @@ export const desktopIpc = {
   compact: "desktop:agent:compact",
   webSearchSettings: "desktop:web-search:settings",
   saveWebSearchSettings: "desktop:web-search:save",
+  openBrowser: "desktop:browser:open",
+  cookieJarStatus: "desktop:browser:cookies:status",
+  exportCookies: "desktop:browser:cookies:export",
+  importCookies: "desktop:browser:cookies:import",
+  clearCookies: "desktop:browser:cookies:clear",
   memoryOverview: "desktop:memory:overview",
   saveMemorySettings: "desktop:memory:save-settings",
   searchMemory: "desktop:memory:search",
@@ -231,7 +236,7 @@ export interface DesktopModelConnection {
   baseUrl?: string;
   requiresApiKey: boolean;
   hasCredential: boolean;
-  credentialSource?: "config" | "env";
+  credentialSource?: "keychain" | "config" | "env";
   apiKeyEnv?: string;
   authMode?: "api-key" | "oauth-bearer";
   oauthProvider?: DesktopModelLoginProvider;
@@ -289,6 +294,18 @@ export interface DesktopWebSearchSettingsInput {
   maxResults: number;
 }
 
+/**
+ * 内嵌浏览器 cookie 的概览。cookie 值本身不过桥，只报数量和域名 —— 它们等同于登录凭据，
+ * 渲染层也没有需要读到明文的场景。
+ */
+export interface DesktopCookieJarStatus {
+  total: number;
+  /** 按 cookie 数量排序的前几个域名，用于展示「当前登录了哪些站点」。 */
+  domains: Array<{ domain: string; count: number }>;
+  /** 共享 jar 文件的最后写入时间；从未同步过时为 undefined。 */
+  updatedAt?: string;
+}
+
 /** 记忆设置的渲染端视图；与 `context.memory` 配置一一对应。 */
 export interface DesktopMemorySettings {
   enabled: boolean;
@@ -331,9 +348,11 @@ export interface DesktopMemoryCompactionResult {
 export interface DesktopSlashCommand {
   name: string;
   description: string;
+  /** 需要参数的命令：从菜单选中时补进输入框让用户接着写，而不是直接执行。 */
+  requiresArgs?: boolean;
 }
 
-/** 桌面端输入框支持的只读斜杠命令；执行走 runSlashCommand IPC。 */
+/** 桌面端输入框支持的斜杠命令；执行走 runSlashCommand IPC。 */
 export const DESKTOP_SLASH_COMMANDS: DesktopSlashCommand[] = [
   { name: "/status", description: "查看模型、权限与扩展状态" },
   { name: "/context", description: "查看已加载上下文与预算" },
@@ -342,7 +361,8 @@ export const DESKTOP_SLASH_COMMANDS: DesktopSlashCommand[] = [
   { name: "/skills", description: "查看可用技能" },
   { name: "/plugins", description: "查看已加载插件" },
   { name: "/memory", description: "查看持久记忆；可加 show/add/forget/search/compact 参数" },
-  { name: "/subagent agents", description: "查看具名子代理定义" }
+  { name: "/subagent", description: "派发子代理任务；可加 start / status / cancel <task-id> / agents", requiresArgs: true },
+  { name: "/review", description: "用只读子代理评审当前改动" }
 ];
 
 export interface DesktopSlashResult {
@@ -406,6 +426,12 @@ export interface DesktopApi {
   compact(projectId: string, hint?: string): Promise<string>;
   webSearchSettings(projectId: string): Promise<DesktopWebSearchSettings>;
   saveWebSearchSettings(projectId: string, input: DesktopWebSearchSettingsInput): Promise<DesktopWebSearchSettings>;
+  /** 打开内嵌浏览器窗口；`url` 省略时打开首页。登录态由浏览器 partition 保存并同步给 agent 工具。 */
+  openBrowser(url?: string): Promise<void>;
+  cookieJarStatus(): Promise<DesktopCookieJarStatus>;
+  exportCookies(): Promise<DesktopCookieJarStatus>;
+  importCookies(): Promise<DesktopCookieJarStatus>;
+  clearCookies(): Promise<DesktopCookieJarStatus>;
   memoryOverview(projectId: string): Promise<DesktopMemoryOverview>;
   saveMemorySettings(projectId: string, input: DesktopMemorySettings): Promise<DesktopMemoryOverview>;
   searchMemory(projectId: string, query: string): Promise<DesktopMemorySearchMatch[]>;

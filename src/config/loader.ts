@@ -1,14 +1,16 @@
 /**
  * Configuration loading and persistence.
  *
- * agent.config.json may contain API credentials, so every read/write pins a
- * single-link regular file under the canonical workspace and enforces 0600.
+ * 全局 agent.config.json 可能包含旧版本遗留的 API 凭据，因此每次读写都固定到全局 agent 目录下
+ * 的单链接普通文件并强制 0600。新写入由配置存储层先把凭据移出配置文件。
  */
 import { randomBytes } from "node:crypto";
 import { constants, promises as fs, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { configSchema, defaultConfig, type AgentConfig } from "./schema.js";
+import { globalAgentDir } from "./paths.js";
+import { loadProjectSettings, type ProjectSettings } from "./projectSettings.js";
 
 export const CONFIG_FILE = "agent.config.json";
 export const maxConfigFileBytes = 1024 * 1024;
@@ -20,8 +22,42 @@ interface ConfigLocation {
   inode: number;
 }
 
-export async function loadConfig(workspaceRoot: string): Promise<AgentConfig> {
-  const location = await resolveConfigLocation(workspaceRoot);
+export interface ConfigPathOptions {
+  /** 测试或嵌入宿主可显式指定全局根目录；正常 CLI/TUI/Desktop 使用 BINY_AGENT_DIR 或默认路径。 */
+  globalDir?: string;
+}
+
+/** 加载全局配置，再叠加当前项目的运行参数覆盖。 */
+export async function loadConfig(workspaceRoot: string, options: ConfigPathOptions = {}): Promise<AgentConfig> {
+  const globalConfig = await loadGlobalConfig(options);
+  const projectSettings = await loadProjectSettings(workspaceRoot);
+  if (projectSettings.defaultModel && !globalConfig.models[projectSettings.defaultModel]) {
+    throw new Error(
+      `Project defaultModel "${projectSettings.defaultModel}" is not configured in global ${CONFIG_FILE}.`
+    );
+  }
+  return configSchema.parse(deepMerge(globalConfig, projectSettings));
+}
+
+/** 只读取全局配置，不读取项目覆盖；供保存配置时保持全局字段的原始值。 */
+export async function loadGlobalConfig(options: ConfigPathOptions = {}): Promise<AgentConfig> {
+  try {
+    return await loadConfigFile(options.globalDir ?? globalAgentDir());
+  } catch (error) {
+    if (isNotFound(error)) return configSchema.parse(defaultConfig);
+    throw error;
+  }
+}
+
+/** 读取指定目录下的旧式配置文件，供桌面测试兼容层和 doctor 诊断使用。 */
+export async function loadConfigFile(root: string): Promise<AgentConfig> {
+  let location: ConfigLocation;
+  try {
+    location = await resolveConfigLocation(root);
+  } catch (error) {
+    if (isNotFound(error)) return configSchema.parse(defaultConfig);
+    throw error;
+  }
   let handle: FileHandle | undefined;
   try {
     handle = await openExistingConfig(location);
@@ -36,13 +72,26 @@ export async function loadConfig(workspaceRoot: string): Promise<AgentConfig> {
   }
 }
 
-export async function saveConfig(workspaceRoot: string, config: AgentConfig): Promise<void> {
+export async function saveConfig(workspaceRoot: string, config: AgentConfig, options: ConfigPathOptions = {}): Promise<void> {
   const parsed = configSchema.parse(config);
-  const serialized = `${JSON.stringify(parsed, null, 2)}\n`;
+  const projectSettings = await loadProjectSettings(workspaceRoot);
+  const globalConfig = Object.keys(projectSettings).length
+    ? await loadGlobalConfigOrDefault(options)
+    : configSchema.parse(defaultConfig);
+  const toPersist = preserveGlobalValuesForProjectOverrides(globalConfig, parsed, projectSettings);
+  await saveConfigFile(options.globalDir ?? globalAgentDir(), toPersist);
+}
+
+/** 保存指定目录下的完整配置文件；凭据字段会被显式清空，不会写入 JSON。 */
+export async function saveConfigFile(root: string, config: AgentConfig): Promise<void> {
+  const parsed = configSchema.parse(config);
+  const settings = withoutCredentials(parsed);
+  const serialized = `${JSON.stringify(settings, null, 2)}\n`;
   if (Buffer.byteLength(serialized, "utf8") > maxConfigFileBytes) {
     throw new Error(`${CONFIG_FILE} exceeds the ${String(maxConfigFileBytes)}-byte size limit.`);
   }
-  const location = await resolveConfigLocation(workspaceRoot);
+  await ensureConfigDirectory(root);
+  const location = await resolveConfigLocation(root);
   await validateOptionalExistingConfig(location, true);
   const temporaryPath = path.join(
     location.root,
@@ -70,8 +119,11 @@ export async function saveConfig(workspaceRoot: string, config: AgentConfig): Pr
   }
 }
 
-export async function ensureConfig(workspaceRoot: string): Promise<void> {
-  const location = await resolveConfigLocation(workspaceRoot);
+export async function ensureConfig(workspaceRoot: string, options: ConfigPathOptions = {}): Promise<void> {
+  void workspaceRoot;
+  const root = options.globalDir ?? globalAgentDir();
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  const location = await resolveConfigLocation(root);
   let existing: FileHandle | undefined;
   try {
     existing = await openExistingConfig(location);
@@ -88,7 +140,7 @@ export async function ensureConfig(workspaceRoot: string): Promise<void> {
     await assertConfigRoot(location);
     created = await fs.open(location.filePath, writeNewFlags(), 0o600);
     await assertConfigBinding(location, created);
-    await created.writeFile(`${JSON.stringify(defaultConfig, null, 2)}\n`, "utf8");
+    await created.writeFile(`${JSON.stringify(withoutCredentials(configSchema.parse(defaultConfig)), null, 2)}\n`, "utf8");
     await created.chmod(0o600);
     await created.sync();
   } catch (error) {
@@ -271,4 +323,85 @@ function isAlreadyExists(error: unknown): boolean {
 
 function isSymbolicLinkError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error.code === "ELOOP" || error.code === "EMLINK");
+}
+
+async function ensureConfigDirectory(root: string): Promise<void> {
+  try {
+    const stat = await fs.lstat(root);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Configuration root must be a real directory.");
+  } catch (error) {
+    if (!isNotFound(error)) throw error;
+    await fs.mkdir(root, { recursive: true, mode: 0o700 });
+    const stat = await fs.lstat(root);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Configuration root must be a real directory.");
+  }
+  await fs.chmod(root, 0o700);
+}
+
+async function loadGlobalConfigOrDefault(options: ConfigPathOptions): Promise<AgentConfig> {
+  return await loadGlobalConfig(options);
+}
+
+function deepMerge<T extends Record<string, unknown>>(base: T, overlay: Record<string, unknown>): T {
+  const result: Record<string, unknown> = structuredClone(base);
+  for (const [key, value] of Object.entries(overlay)) {
+    if (isRecord(value) && isRecord(result[key])) {
+      result[key] = deepMerge(result[key], value);
+    } else {
+      result[key] = structuredClone(value);
+    }
+  }
+  return result as T;
+}
+
+/**
+ * 保存合并配置时，项目覆盖保持在项目文件中。只有调用方明确改变了某个覆盖字段，才把该字段
+ * 当作新的全局值保存；否则恢复它原本的全局值，避免一次权限保存把项目默认模型复制进全局配置。
+ */
+function preserveGlobalValuesForProjectOverrides(
+  globalConfig: AgentConfig,
+  submitted: AgentConfig,
+  projectSettings: ProjectSettings
+): AgentConfig {
+  const currentEffective = deepMerge(globalConfig, projectSettings);
+  const next = structuredClone(submitted);
+  preserveOverrideLeaves(next as unknown as Record<string, unknown>, globalConfig as unknown as Record<string, unknown>, currentEffective as unknown as Record<string, unknown>, projectSettings as unknown as Record<string, unknown>);
+  return configSchema.parse(next);
+}
+
+function preserveOverrideLeaves(
+  submitted: Record<string, unknown>,
+  globalConfig: Record<string, unknown>,
+  effective: Record<string, unknown>,
+  overrides: Record<string, unknown>
+): void {
+  for (const [key, override] of Object.entries(overrides)) {
+    if (isRecord(override)) {
+      const submittedChild = isRecord(submitted[key]) ? submitted[key] : {};
+      const globalChild = isRecord(globalConfig[key]) ? globalConfig[key] : {};
+      const effectiveChild = isRecord(effective[key]) ? effective[key] : {};
+      preserveOverrideLeaves(submittedChild, globalChild, effectiveChild, override);
+      submitted[key] = submittedChild;
+    } else if (deepEqual(submitted[key], effective[key])) {
+      submitted[key] = structuredClone(globalConfig[key]);
+    }
+  }
+}
+
+function withoutCredentials(config: AgentConfig): AgentConfig {
+  const safe = structuredClone(config);
+  safe.web.search.apiKey = undefined;
+  for (const provider of Object.values(safe.providers)) {
+    provider.apiKey = undefined;
+    if (provider.oauth) provider.oauth.refreshToken = undefined;
+  }
+  return safe;
+}
+
+function deepEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

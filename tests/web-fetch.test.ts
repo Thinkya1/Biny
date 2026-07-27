@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { blockedAddressReason, assertFetchableUrl } from "../src/tools/web/addressPolicy.js";
+import { writeCookieJar } from "../src/tools/web/cookieJar.js";
 import { createWebFetchTool, type WebFetchResult } from "../src/tools/web/fetch.js";
 import { htmlTitle, htmlToText } from "../src/tools/web/html.js";
 
@@ -10,6 +14,7 @@ async function main(): Promise<void> {
   await testFetchesTextAndPages();
   await testRedirectToInternalTargetIsRefused();
   await testByteLimitTruncatesInsteadOfHanging();
+  await testFetchUsesOnlyMatchingCookiesPerRedirect();
   console.log("web fetch tests passed");
 }
 
@@ -89,6 +94,34 @@ async function testByteLimitTruncatesInsteadOfHanging(): Promise<void> {
   });
 }
 
+/** Cookie 必须按每一跳的域名重新匹配，不能把 example.com 的登录态带到 example.org。 */
+async function testFetchUsesOnlyMatchingCookiesPerRedirect(): Promise<void> {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "biny-web-fetch-cookies-"));
+  const jarPath = path.join(directory, "cookies.json");
+  const headers: string[] = [];
+  try {
+    await writeCookieJar(jarPath, [
+      { name: "first", value: "one", domain: ".example.com", path: "/", secure: true, httpOnly: true },
+      { name: "second", value: "two", domain: ".example.org", path: "/", secure: true, httpOnly: true }
+    ]);
+    await withFetch(async (input, init) => {
+      const url = String(input);
+      headers.push(new Headers(init?.headers).get("cookie") ?? "");
+      if (url.startsWith("https://example.com")) {
+        return new Response(null, { status: 302, headers: { location: "https://example.org/after-redirect" } });
+      }
+      return new Response("redirected", { status: 200, headers: { "content-type": "text/plain" } });
+    }, async () => {
+      const tool = createWebFetchTool(undefined, { enabled: true, path: jarPath });
+      const result = await run(tool, { url: "https://example.com/start" });
+      assert.equal(result.content, "redirected");
+    });
+    assert.deepEqual(headers, ["first=one", "second=two"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 async function run(
   tool: ReturnType<typeof createWebFetchTool>,
   args: { url: string; offset?: number; length?: number }
@@ -98,7 +131,7 @@ async function run(
   return await execution.execute({ toolCallId: "fetch-test" });
 }
 
-async function withFetch(handler: typeof fetch | ((input: unknown) => Promise<Response>), body: () => Promise<void>): Promise<void> {
+async function withFetch(handler: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>, body: () => Promise<void>): Promise<void> {
   const original = globalThis.fetch;
   globalThis.fetch = handler as typeof fetch;
   try {

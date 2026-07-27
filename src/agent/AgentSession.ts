@@ -922,9 +922,9 @@ export class AgentSession {
    */
   private async savePermissionMode(mode: PermissionMode): Promise<void> {
     const store = this.configStore();
-    const persisted = await store.load();
+    const persisted = await store.load(this.options.workspaceRoot);
     persisted.permission.mode = mode;
-    await store.save(persisted);
+    await store.save(persisted, this.options.workspaceRoot);
   }
 }
 

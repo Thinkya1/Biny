@@ -7,15 +7,17 @@
  * 单实例锁：第二个实例直接退出，因为多个进程同时读写同一份桌面状态和 session 会互相覆盖。
  */
 import path from "node:path";
-import { app, BrowserWindow, dialog, nativeImage, Notification, safeStorage, shell } from "electron";
+import { app, BrowserWindow, dialog, nativeImage, Notification, shell } from "electron";
 import type { DesktopBootstrap } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
 import { DesktopAgentManager } from "./DesktopAgentManager.js";
+import { DesktopBrowserService } from "./DesktopBrowserService.js";
 import { DesktopConfigStore } from "./DesktopConfigStore.js";
 import { DesktopProjectService } from "./DesktopProjectService.js";
 import { DesktopStateStore } from "./DesktopStateStore.js";
 import { DesktopTerminalManager } from "./DesktopTerminalManager.js";
 import { DesktopUserDataStore } from "./DesktopUserDataStore.js";
+import { globalAgentDir } from "../../../config/paths.js";
 import { registerDesktopIpc } from "./ipc.js";
 import { installApplicationMenu } from "./menu.js";
 import { createDesktopWindow, type WindowCloseDecision } from "./window.js";
@@ -49,13 +51,8 @@ async function startDesktopApplication(): Promise<void> {
   await storage.migrateLegacyState(path.join(legacyDataRoot, "desktop-state.json"), path.join(desktopRoot, "desktop-state.json"));
   const state = new DesktopStateStore(path.join(desktopRoot, "desktop-state.json"));
   await state.load();
-  // 凭据加解密委托给系统钥匙串（safeStorage），配置文件里不落明文 key。
-  const configStore = new DesktopConfigStore(desktopRoot, {
-    isAvailable: () => safeStorage.isEncryptionAvailable(),
-    encrypt: (value) => safeStorage.encryptString(value).toString("base64"),
-    decrypt: (value) => safeStorage.decryptString(Buffer.from(value, "base64"))
-  });
-  await storage.migrateLegacyConfig(state.projects(), configStore);
+  // 模型配置与 CLI/TUI 共用全局目录；凭据由 config/credentials.ts 统一接入 macOS Keychain。
+  const configStore = new DesktopConfigStore(globalAgentDir());
   const projects = new DesktopProjectService(state, storage, configStore);
   let mainWindow: BrowserWindow | undefined;
   let preparingQuit = false;
@@ -75,6 +72,9 @@ async function startDesktopApplication(): Promise<void> {
   const terminals = new DesktopTerminalManager((event) => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(desktopIpc.terminalEvent, event);
   });
+  // 内嵌浏览器把 cookie 同步到这份共享 jar，agent 的 web 工具默认读同一个位置。
+  const defaultCookieJarPath = path.join(desktopRoot, "cookies.json");
+  const browser = new DesktopBrowserService(async () => (await configStore.load()).web.cookies.path ?? defaultCookieJarPath);
 
   /** 渲染进程启动时拉取的一次性初始状态：项目列表、当前项目、布局尺寸等。 */
   const bootstrap = async (): Promise<DesktopBootstrap> => {
@@ -127,7 +127,7 @@ async function startDesktopApplication(): Promise<void> {
     return mainWindow;
   };
 
-  registerDesktopIpc({ state, projects, agents, terminals, getWindow: () => mainWindow, bootstrap });
+  registerDesktopIpc({ state, projects, agents, terminals, browser, getWindow: () => mainWindow, bootstrap });
   installApplicationMenu(() => mainWindow);
   createWindow();
 
@@ -166,6 +166,7 @@ async function startDesktopApplication(): Promise<void> {
         agents.cancelAll();
       }
       terminals.disposeAll();
+      await browser.dispose();
       mainWindow?.destroy();
       try {
         await Promise.race([

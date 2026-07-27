@@ -5,11 +5,10 @@
  * 属于项目的 session / run / 记忆仍然放在 `<项目>/.agent` 里，这样同一个工作区在桌面端和
  * TUI 里看到的是同一份历史。
  *
- * 另外承担历史数据迁移：早期版本把状态和配置放在别的位置，这里负责搬过来并合并。
+ * 另外承担历史状态和会话迁移；旧模型配置不在启动时自动搬运，避免静默复制凭据。
  */
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { CONFIG_FILE, loadConfig } from "../../../config/loader.js";
 import { agentDir, ensureAgentDirs } from "../../../session/store.js";
 import type { DesktopProject } from "../../protocol.js";
 import { DesktopConfigStore } from "./DesktopConfigStore.js";
@@ -72,13 +71,9 @@ export class DesktopUserDataStore {
   }
 
   async migrateLegacyConfig(projects: DesktopProject[], configStore: DesktopConfigStore): Promise<void> {
-    if (await exists(configStore.configPath())) return;
-    for (const project of projects) {
-      const legacyPath = path.join(project.path, CONFIG_FILE);
-      if (!await exists(legacyPath)) continue;
-      await configStore.save(await loadConfig(project.path));
-      return;
-    }
+    // 配置迁移不再由启动流程自动执行，避免把旧项目凭据静默复制到全局目录；doctor 只负责提示。
+    void projects;
+    void configStore;
   }
 
   /**

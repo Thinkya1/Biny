@@ -13,7 +13,7 @@ export const TUI_SLASH_COMMANDS: SlashCommand[] = [
   { name: "/context", description: "Show loaded context and budget", category: "system" },
   { name: "/usage", description: "Show SDK token usage and cost", category: "system" },
   { name: "/compact", description: "Compact older conversation history", category: "system" },
-  { name: "/model", description: "Switch model and thinking effort", category: "system" },
+  { name: "/model", description: "Choose a model and its supported thinking effort", category: "system" },
   { name: "/status", description: "Show model, permissions and extensions", category: "system" },
   { name: "/mcp", description: "List configured MCP servers and tools", category: "extension" },
   { name: "/skills", description: "List available skills (project & global)", category: "extension" },

@@ -11,7 +11,7 @@ import type { CommandRuntime } from "../src/runtime/CommandRuntime.js";
 import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.js";
 import { RootRunLedger } from "../src/runtime/RootRunLedger.js";
 import type { AgentHostEvent } from "../src/runtime/agentEvents.js";
-import { saveConfig } from "../src/config/loader.js";
+import { loadConfigFile, saveConfigFile } from "../src/config/loader.js";
 import { createFileConfigStore } from "../src/config/store.js";
 import { defaultConfig } from "../src/config/schema.js";
 import { DesktopAgentManager } from "../src/desktop/electron/main/DesktopAgentManager.js";
@@ -66,6 +66,7 @@ testWorkspaceFileMarkers();
 await testFilePanelSizing();
 await testDesktopThemePreference();
 await testDesktopModelConfiguration();
+await testDesktopSubagentSlashCommands();
 await testDesktopReportsRuntimeLeaseConflict();
 await testDesktopCredentialsAreSeparated();
 await testDesktopWebSearchSettings();
@@ -600,6 +601,42 @@ async function testDesktopModelConfiguration(): Promise<void> {
   }
 }
 
+async function testDesktopSubagentSlashCommands(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-subagent-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-subagent-data-"));
+  try {
+    const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
+    const project = await projects.createProject(workspaceRoot);
+    await mkdir(path.join(workspaceRoot, ".biny", "agents"), { recursive: true });
+    await writeFile(
+      path.join(workspaceRoot, ".biny", "agents", "planner.md"),
+      "---\nname: planner\ndescription: 拆解任务并给出执行计划\n---\n先读代码再给结论。\n"
+    );
+    const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
+
+    // 桌面端 /subagent 与 TUI 同构：agents / status / cancel / 用法提示都不该再抛「仅支持 agents」。
+    const list = await agents.runSlashCommand(project.id, undefined, "/subagent agents");
+    assert.match(list.content, /planner/);
+
+    const status = await agents.runSlashCommand(project.id, undefined, "/subagent status");
+    assert.match(status.content, /No subagent tasks/);
+
+    const cancelMissing = await agents.runSlashCommand(project.id, undefined, "/subagent cancel task-404");
+    assert.match(cancelMissing.content, /没有找到可取消的子代理任务：task-404/);
+
+    await assert.rejects(agents.runSlashCommand(project.id, undefined, "/subagent cancel"), /task-id/);
+    await assert.rejects(agents.runSlashCommand(project.id, undefined, "/subagent start"), /start/);
+
+    const usage = await agents.runSlashCommand(project.id, undefined, "/subagent");
+    assert.match(usage.content, /status \| cancel <task-id> \| agents/);
+
+    await agents.closeAll();
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
+  }
+}
+
 async function testDesktopReportsRuntimeLeaseConflict(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-runtime-lease-"));
   const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-runtime-lease-data-"));
@@ -708,6 +745,18 @@ async function testDesktopWebSearchSettings(): Promise<void> {
     assert.equal(switched.envKeyName, "BRAVE_SEARCH_API_KEY");
     assert.equal((await configStore.load()).web.search.apiKey, undefined);
 
+    const google = await agents.saveWebSearchSettings(project.id, {
+      enabled: true,
+      provider: "google",
+      apiKey: undefined,
+      apiKeyEnv: undefined,
+      timeoutMs: 8_000,
+      maxResults: 6
+    });
+    assert.equal(google.provider, "google");
+    assert.equal(google.hasApiKey, false);
+    assert.equal(google.envKeyName, undefined);
+
     await agents.closeAll();
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
@@ -765,7 +814,7 @@ async function testDesktopConnectionMetadata(): Promise<void> {
     const snapshot = await agents.workspaceSnapshot(project.id);
     const deepseek = snapshot.connections.find((item) => item.providerAlias === "deepseek");
     assert.equal(deepseek?.hasCredential, true);
-    assert.equal(deepseek?.credentialSource, "config");
+    assert.equal(deepseek?.credentialSource, process.platform === "darwin" ? "keychain" : "config");
     assert.equal(deepseek?.baseUrl, "https://api.deepseek.com");
     // Presence only — the key itself must never reach the renderer.
     assert.doesNotMatch(JSON.stringify(snapshot.connections), /connection-metadata-secret|oauth-access-token/);
@@ -889,7 +938,7 @@ async function testLegacyDesktopDataMigration(): Promise<void> {
     };
     const config = structuredClone(defaultConfig);
     config.defaultModel = "deepseek-v4-pro";
-    await saveConfig(projectRoot, config);
+    await saveConfigFile(projectRoot, config);
 
     const storage = new DesktopUserDataStore(desktopRoot);
     await storage.initialize();
@@ -950,7 +999,9 @@ async function testLegacyDesktopDataMigration(): Promise<void> {
     assert.equal(globalRoot, path.join(desktopRoot, "global"));
     await access(path.join(globalRoot, ".agent", "sessions"));
 
-    assert.equal((await configStore.load()).defaultModel, "deepseek-v4-pro");
+    // 旧项目配置只用于 doctor 提示，启动不会自动迁移或覆盖全局模型配置。
+    assert.equal((await configStore.load()).defaultModel, defaultConfig.defaultModel);
+    assert.equal((await loadConfigFile(projectRoot)).defaultModel, "deepseek-v4-pro");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
     await rm(desktopRoot, { recursive: true, force: true });
@@ -966,17 +1017,25 @@ async function createDesktopTestServices(root: string): Promise<{
   await storage.initialize();
   const state = new DesktopStateStore(path.join(root, "desktop-state.json"));
   await state.load();
-  // 落一份自带 key 的配置，让 runtime 能在没有任何环境变量的机器上初始化。
-  // 默认配置的 deepseek 只给了 apiKeyEnv，干净环境（比如 CI）下 ModelManager 直接构造失败，
-  // 断言就会拿到"没配模型"而不是被测的那个错误。这些测试都不需要真的调用模型。
-  await saveConfig(root, {
+  const testCredentials = new Map<string, string>();
+  const configStore = createFileConfigStore(root, {
+    globalDir: root,
+    credentialStore: {
+      persistent: true,
+      get: async (account) => testCredentials.get(account),
+      set: async (account, value) => { testCredentials.set(account, value); },
+      delete: async (account) => { testCredentials.delete(account); }
+    }
+  });
+  // 通过测试凭据存储注入 key，让 runtime 能在没有任何环境变量的机器上初始化；生产实现使用
+  // macOS Keychain，配置文件本身不会包含明文 key。
+  await configStore.save({
     ...defaultConfig,
     defaultModel: "test-model",
     providers: { active: { type: "openai", apiKey: "test-key", baseUrl: "https://api.openai.com/v1" } },
     models: { "test-model": { provider: "active", model: "test-model" } },
     thinking: { ...defaultConfig.thinking, enabled: false }
   });
-  const configStore = createFileConfigStore(root);
   return { configStore, projects: new DesktopProjectService(state, storage, configStore), state };
 }
 

@@ -9,7 +9,7 @@ import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { AgentRunMode, AgentSessionInfo } from "../../../../agent/AgentSession.js";
 import type { ModelChoice, ThinkingSelection } from "../../../../llm/ModelManager.js";
 import type { PermissionMode } from "../../../../permission/PermissionManager.js";
-import type { DesktopAttachment, DesktopProject } from "../../../protocol.js";
+import type { DesktopAttachment, DesktopProject, DesktopSlashCommand } from "../../../protocol.js";
 import { DESKTOP_SLASH_COMMANDS } from "../../../protocol.js";
 import { catalogForConnection } from "../providerCatalog.js";
 import { useClosingPresence } from "../useClosingPresence.js";
@@ -149,15 +149,27 @@ export const Composer = memo(function Composer({
     }
   };
 
+  // 需要参数的命令（如 /subagent <task>）从菜单选中时只补全名称，让用户接着写参数。
+  const chooseSlashCommand = (command: DesktopSlashCommand): void => {
+    if (command.requiresArgs) {
+      setInput(`${command.name} `);
+      textareaRef.current?.focus();
+      return;
+    }
+    void runSlash(command.name);
+  };
+
   const submit = async (): Promise<void> => {
     const value = input.trim();
     if (!project || !value || busy) return;
-    // 报告命令只在整条输入匹配时执行；/mcp reconnect 与 /memory 是允许带参数的
-    // 桌面端维护命令。其他以 / 开头的自然语言或多行内容仍按消息发送。
+    // 报告命令只在整条输入匹配时执行；/mcp reconnect、/memory、/subagent 与 /review
+    // 是允许带参数的桌面端命令。其他以 / 开头的自然语言或多行内容仍按消息发送。
     const slashCommand = DESKTOP_SLASH_COMMANDS.find((command) => command.name === value);
     const mcpReconnect = /^\/mcp\s+reconnect\s+\S+$/i.test(value);
     const memoryWithArgs = /^\/memory\s+(list|show|add|forget)(\s|$)/i.test(value);
-    if (slashCommand || mcpReconnect || memoryWithArgs) {
+    const subagentWithArgs = /^\/subagent\s+\S/i.test(value);
+    const reviewWithArgs = /^\/review\s+\S/i.test(value);
+    if (slashCommand || mcpReconnect || memoryWithArgs || subagentWithArgs || reviewWithArgs) {
       await runSlash(slashCommand?.name ?? value);
       return;
     }
@@ -248,7 +260,7 @@ export const Composer = memo(function Composer({
               <button
                 className={`menu-option${index === slashIndex ? " is-selected" : ""}`}
                 key={command.name}
-                onClick={() => void runSlash(command.name)}
+                onClick={() => chooseSlashCommand(command)}
                 onMouseEnter={() => setSlashIndex(index)}
                 role="menuitem"
                 type="button"
@@ -286,7 +298,7 @@ export const Composer = memo(function Composer({
               if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey)) {
                 event.preventDefault();
                 const selected = slashMatches[Math.min(slashIndex, slashMatches.length - 1)];
-                if (selected) void runSlash(selected.name);
+                if (selected) chooseSlashCommand(selected);
                 return;
               }
             }
@@ -379,15 +391,17 @@ export const Composer = memo(function Composer({
             ) : null}
             <button
               aria-label={running ? "暂停生成" : "发送任务"}
-              className={`send-button${running ? " is-stop" : ""}`}
+              className="send-button"
               disabled={running ? false : !input.trim() || !project || busy || activeElsewhere}
               onClick={() => { if (running) void onStop(); else void submit(); }}
               title={running ? "暂停当前生成" : sessionId ? "发送" : "创建任务并发送"}
               type="button"
             >
+              {/* 两个图标的字号不同是有意的：箭头是线条、方块是实心，同字号下实心块看着会小一圈，
+                  17 / 20 才让两个状态在圆里占的分量一致。 */}
               <span className="t-icon-swap" data-state={running ? "b" : "a"}>
-                <span className="t-icon" data-icon="a"><Icon name="arrow-up" size={15} /></span>
-                <span className="t-icon" data-icon="b"><Icon name="stop" size={15} /></span>
+                <span className="t-icon" data-icon="a"><Icon name="arrow-up" size={17} /></span>
+                <span className="t-icon" data-icon="b"><Icon name="stop" size={20} /></span>
               </span>
             </button>
           </div>

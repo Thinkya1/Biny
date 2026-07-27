@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { AgentSession } from "../src/agent/AgentSession.js";
 import { loadConfig, saveConfig } from "../src/config/loader.js";
+import { createFileConfigStore } from "../src/config/store.js";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
 import { PermissionManager, type PermissionRequestContext } from "../src/permission/PermissionManager.js";
 import { subagentAccessMode } from "../src/runtime/subagentAccess.js";
@@ -97,6 +98,7 @@ function testSubagentAccessInheritsMode(): void {
  */
 async function testPermissionModeWriteKeepsOtherSettings(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-permission-config-"));
+  const globalRoot = await mkdtemp(path.join(os.tmpdir(), "biny-permission-global-"));
   try {
     await ensureAgentDirs(workspaceRoot);
     const onDisk = configSchema.parse({
@@ -110,12 +112,14 @@ async function testPermissionModeWriteKeepsOtherSettings(): Promise<void> {
       thinking: { enabled: false, effort: "high" },
       permission: { ...defaultConfig.permission, mode: "ask" }
     });
-    await saveConfig(workspaceRoot, onDisk);
+    await saveConfig(workspaceRoot, onDisk, { globalDir: globalRoot });
+    const configStore = createFileConfigStore(workspaceRoot, { globalDir: globalRoot });
 
     const staleSnapshot = configSchema.parse({ ...onDisk, defaultModel: "stale-model" });
     const agent = new AgentSession({
       workspaceRoot,
       config: staleSnapshot,
+      configStore,
       toolRegistry: new ToolRegistry(),
       permissionManager: new PermissionManager(staleSnapshot.permission),
       recorder: new SessionRecorder(workspaceRoot)
@@ -123,11 +127,12 @@ async function testPermissionModeWriteKeepsOtherSettings(): Promise<void> {
     await agent.setPermissionMode("auto");
     await agent.close();
 
-    const persisted = await loadConfig(workspaceRoot);
+    const persisted = await loadConfig(workspaceRoot, { globalDir: globalRoot });
     assert.equal(persisted.permission.mode, "auto");
     assert.equal(persisted.defaultModel, "disk-model");
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(globalRoot, { recursive: true, force: true });
   }
 }
 

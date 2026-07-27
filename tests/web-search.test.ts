@@ -1,13 +1,19 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
 import { analyzePermissionRequest } from "../src/permission/policy.js";
 import { createToolRegistry } from "../src/tools/registry.js";
-import { createWebSearchTool, parseDuckDuckGoResults, parseTavilyResults } from "../src/tools/web/search.js";
+import { writeCookieJar } from "../src/tools/web/cookieJar.js";
+import { createWebSearchTool, parseDuckDuckGoResults, parseGoogleResults, parseTavilyResults } from "../src/tools/web/search.js";
 
 async function main(): Promise<void> {
   testDuckDuckGoParser();
+  testGoogleParser();
   testTavilyParser();
   await testDuckDuckGoSearch();
+  await testGoogleSearchWithCookies();
   await testBraveSearch();
   await testTavilySearch();
   await testAnySearch();
@@ -28,6 +34,20 @@ function testDuckDuckGoParser(): void {
     url: "https://example.com/",
     snippet: "A useful summary."
   }]);
+}
+
+function testGoogleParser(): void {
+  const results = parseGoogleResults(`
+    <a href="/url?q=https%3A%2F%2Fexample.com%2Fguide&amp;sa=U"><h3>Example &amp; guide</h3></a>
+    <div>Useful <b>first</b> result.</div>
+    <a href="https://example.org/reference"><h3>Reference</h3></a>
+    <div>Second result.</div>
+  `, 5);
+
+  assert.deepEqual(results, [
+    { title: "Example & guide", url: "https://example.com/guide", snippet: "Useful first result." },
+    { title: "Reference", url: "https://example.org/reference", snippet: "Second result." }
+  ]);
 }
 
 function testTavilyParser(): void {
@@ -81,6 +101,54 @@ async function testDuckDuckGoSearch(): Promise<void> {
     assert.match(requestedUrl?.searchParams.get("q") ?? "", /site:weather\.gov/);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+}
+
+async function testGoogleSearchWithCookies(): Promise<void> {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "biny-google-search-"));
+  const jarPath = path.join(directory, "cookies.json");
+  const originalFetch = globalThis.fetch;
+  let requestedUrl: URL | undefined;
+  let requestedHeaders: Headers | undefined;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    requestedUrl = new URL(String(input));
+    requestedHeaders = new Headers(init?.headers);
+    return new Response(`
+      <a href="/url?q=https%3A%2F%2Fexample.com%2Farticle"><h3>Google result</h3></a>
+      <div>A result returned by Google.</div>
+    `, { status: 200, headers: { "content-type": "text/html" } });
+  }) as typeof fetch;
+
+  try {
+    await writeCookieJar(jarPath, [{
+      name: "SID",
+      value: "google-test-cookie",
+      domain: ".google.com",
+      path: "/",
+      secure: true,
+      httpOnly: true
+    }]);
+    const tool = createWebSearchTool({
+      enabled: true,
+      provider: "google",
+      apiKey: undefined,
+      apiKeyEnv: undefined,
+      timeoutMs: 1_000,
+      maxResults: 5
+    }, { enabled: true, path: jarPath });
+    const execution = await tool.resolveExecution({ query: "Biny", maxResults: 2, domains: ["example.com"], recency: "week" });
+    assert.equal("isError" in execution, false);
+    if ("isError" in execution) return;
+    const result = await execution.execute({ toolCallId: "search-google", signal: undefined });
+    assert.equal(result.provider, "google");
+    assert.deepEqual(result.results, [{ title: "Google result", url: "https://example.com/article", snippet: "A result returned by Google." }]);
+    assert.equal(requestedUrl?.origin, "https://www.google.com");
+    assert.equal(requestedUrl?.searchParams.get("tbs"), "qdr:w");
+    assert.match(requestedUrl?.searchParams.get("q") ?? "", /site:example\.com/);
+    assert.equal(requestedHeaders?.get("cookie"), "SID=google-test-cookie");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(directory, { recursive: true, force: true });
   }
 }
 

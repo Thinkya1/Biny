@@ -37,7 +37,7 @@
 ```bash
 git clone https://github.com/Thinkya1/Biny.git
 cd Biny && pnpm install
-pnpm dev -- init                      # 生成 agent.config.json
+pnpm dev -- init                      # 生成 ~/.biny/agent/agent.config.json
 export DEEPSEEK_API_KEY="你的 key"
 pnpm dev                              # 打开 TUI
 ```
@@ -48,7 +48,10 @@ pnpm dev                              # 打开 TUI
 
 桌面端在 **设置 → 模型** 里管理连接和默认模型，API key 与 OAuth 凭据由 macOS 系统钥匙串保护。
 
-CLI / TUI 读项目根目录的 `agent.config.json`。**只写环境变量名，别把真实 key 写进配置文件**：
+CLI / TUI / Desktop 共用全局 `~/.biny/agent/agent.config.json`。也可以用 `BINY_AGENT_DIR` 指定全局目录。
+项目只在 `<project>/.biny/settings.json` 覆盖运行参数；其中的 `defaultModel` 必须引用全局已有 alias，不能写 `providers`、`models`、API key 或 OAuth 信息。
+
+macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON 不保存凭据；其他平台请使用环境变量。全局配置示例（**只写环境变量名，别把真实 key 写进配置文件**）：
 
 ```json
 {
@@ -62,11 +65,26 @@ CLI / TUI 读项目根目录的 `agent.config.json`。**只写环境变量名，
 }
 ```
 
-`type` 可以是 `deepseek`、`openai`、`anthropic`、`gemini`、`kimi`、`qwen`、`ollama`、`openai-compatible` 等；自建网关用 `openai-compatible` 并补上 `baseUrl`。配置文件按 `0600` 保存，`biny doctor` 会提示 inline key 风险（不会打印 key 内容）。
+`type` 可以是 `deepseek`、`openai`、`anthropic`、`gemini`、`kimi`、`qwen`、`ollama`、`openai-compatible` 等；自建网关用 `openai-compatible` 并补上 `baseUrl`。配置文件按 `0600` 保存，`biny doctor` 会检测旧的工作区/桌面配置并给出迁移提示，但不会自动复制旧配置或凭据。
 
-联网搜索默认走 AnySearch（`ANYSEARCH_API_KEY`，也可用匿名额度），另支持 DuckDuckGo、Brave 和 Tavily，在 `web.search` 里切换。
+项目覆盖示例：
 
-更细的调优项——上下文预算、步数与成本上限、子代理、Skill / MCP / Plugin、诊断钩子、沙箱——都在 `agent.config.json` 里，schema 见 [`src/config/schema.ts`](./src/config/schema.ts)。
+```json
+{
+  "defaultModel": "coder",
+  "thinking": { "enabled": false },
+  "agent": { "maxSteps": 16 },
+  "permission": { "mode": "read-only" },
+  "context": { "memory": { "maxRecalled": 1 } },
+  "sandbox": { "mode": "workspace-write" }
+}
+```
+
+TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 reasoning effort，才会继续打开对应的档位选择器。列表不会把所有模型强行显示成同一套档位：例如 DeepSeek V4 Pro 使用自身声明的三档 `low`、`medium`、`high`，DeepSeek V4 Flash 不显示思考档位。这里的名称是模型/Provider 支持的配置选项，不代表跨模型可比较的真实推理程度。
+
+联网搜索默认走 AnySearch（`ANYSEARCH_API_KEY`，也可用匿名额度），另支持 Google、DuckDuckGo、Brave 和 Tavily，在 `web.search` 里切换。桌面端的 **设置 → 联网搜索** 提供独立浏览器和 Cookie-Editor JSON 导入/导出；在其中登录后，Google 搜索与 `web_fetch` 会按域名、路径和 HTTPS 规则使用对应 Cookie。
+
+全局配置中的 provider/model、上下文预算、步数与成本上限、子代理、Skill / MCP / Plugin、诊断钩子等设置，schema 见 [`src/config/schema.ts`](./src/config/schema.ts)；项目覆盖只允许运行参数。
 
 ## 数据存在哪
 
@@ -77,7 +95,7 @@ CLI / TUI 读项目根目录的 `agent.config.json`。**只写环境变量名，
 <project>/.agent/            runs、tasks、logs、memory 等
 ```
 
-桌面端的全局数据（模型配置、凭据、项目列表、附件）在 `~/Library/Application Support/Biny/workspaces/default/`。
+全局模型配置在 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）；全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表、UI 状态、附件和非项目会话仍在 `~/Library/Application Support/Biny/workspaces/default/`；项目 session、run、memory 等运行数据仍在项目 `.agent/`。
 
 同一个 Session 同一时刻只能由一个运行时执行，另一个会返回占用提示；不同 Session 可以并行。
 
