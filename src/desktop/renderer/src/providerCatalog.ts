@@ -21,6 +21,8 @@ export interface CatalogModel {
   supportsAudio?: boolean;
   contextWindow?: number;
   maxOutputTokens?: number;
+  thinkingLevelMap?: DesktopModelConfigurationInput["thinkingLevelMap"];
+  apiBackend?: DesktopModelConfigurationInput["apiBackend"];
 }
 
 export interface ProviderCatalogItem {

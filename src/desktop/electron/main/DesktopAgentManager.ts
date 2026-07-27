@@ -16,6 +16,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { generateText } from "ai";
 import { fetchModelCatalog } from "../../../ai/modelCatalog.js";
+import { thinkingLevelMapForModel } from "../../../ai/capabilities.js";
 import { providerDefinition } from "../../../ai/provider.js";
 import { loadProjectSettings } from "../../../config/projectSettings.js";
 import { configSchema, type AgentConfig, type ProviderConfig } from "../../../config/schema.js";
@@ -557,7 +558,9 @@ export class DesktopAgentManager {
           },
           contextWindow: input.contextWindow,
           maxOutputTokens: input.maxOutputTokens,
-          thinking: input.supportsThinking ? { efforts: ["high", "max"], defaultEffort: "high" } : undefined
+          apiBackend: input.apiBackend,
+          thinkingLevelMap: input.thinkingLevelMap ?? thinkingLevelMapForModel(input.model, input.supportsThinking),
+          compatibility: input.compatibility
         }
       },
       // Thinking is validated against the *default* model, so it only has to be
@@ -836,7 +839,7 @@ export class DesktopAgentManager {
         model: model.id,
         displayName: model.displayName,
         supportsTools: true,
-        thinking: model.supportsThinking ? { efforts: ["high", "max"], defaultEffort: "high" } : undefined
+        thinkingLevelMap: thinkingLevelMapForModel(model.id, model.supportsThinking)
       }] as const;
     });
     const defaultModel = configuredModels[0]?.[0];

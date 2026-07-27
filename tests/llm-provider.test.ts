@@ -13,6 +13,7 @@ async function main(): Promise<void> {
   await testOpenAiEndpointAuthAndModelPayload();
   await testDeepSeekThinkingOptions();
   await testReasoningControlsForOtherProviders();
+  await testModelLevelAdapterOverrides();
   await testAnthropicMessagesAndToolSchema();
   await testMissingKeyAndCompatibilityEndpointAreHardErrors();
   await testModelSwitchValidatesBeforePersisting();
@@ -125,6 +126,37 @@ async function testReasoningControlsForOtherProviders(): Promise<void> {
   const anthropicSettings = createModelSettings(anthropic);
   assert.equal(anthropicSettings.providerOptions?.anthropic?.thinking?.type, "enabled");
   assert.equal(anthropicSettings.providerOptions?.anthropic?.thinking?.budgetTokens, 4_096);
+}
+
+async function testModelLevelAdapterOverrides(): Promise<void> {
+  const config = configSchema.parse({
+    ...defaultConfig,
+    defaultModel: "model-level",
+    providers: {
+      relay: {
+        type: "openai-compatible",
+        baseUrl: "https://relay.example/v1",
+        apiKey: "relay-key",
+        compatibility: { supportsDeveloperRole: true }
+      }
+    },
+    models: {
+      "model-level": {
+        provider: "relay",
+        model: "model-level",
+        apiBackend: "responses",
+        baseUrl: "https://model.example/v1",
+        headers: { "x-model-route": "model-level" },
+        compatibility: { maxTokensField: "max_completion_tokens" },
+        thinkingLevelMap: { off: "none", low: null, medium: "medium", high: "high" },
+        capabilities: { tools: true, reasoning: true, streaming: true }
+      }
+    },
+    thinking: { enabled: false, effort: "high" }
+  });
+  const settings = createModelSettings(config);
+  assert.equal(settings.model.provider, "openai.responses");
+  assert.equal(settings.model.modelId, "model-level");
 }
 
 async function testProviderMappingsUseNativeSdkModels(): Promise<void> {

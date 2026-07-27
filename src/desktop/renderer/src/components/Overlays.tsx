@@ -438,7 +438,9 @@ function mergeAvailableModels(
       supportsVision: model.capabilities?.vision ?? live?.supportsVision,
       supportsAudio: model.capabilities?.audio ?? live?.supportsAudio,
       contextWindow: model.contextWindow ?? live?.contextWindow,
-      maxOutputTokens: live?.maxOutputTokens
+      maxOutputTokens: live?.maxOutputTokens,
+      thinkingLevelMap: model.thinkingLevelMap ?? live?.thinkingLevelMap,
+      apiBackend: model.apiBackend ?? live?.apiBackend
     });
   }
   for (const model of [...liveModels, ...catalogModels]) {
@@ -458,7 +460,9 @@ function catalogModelFromEntry(entry: DesktopModelCatalogResult["models"][number
     supportsVision: entry.capabilities.vision,
     supportsAudio: entry.capabilities.audio,
     contextWindow: entry.contextWindow,
-    maxOutputTokens: entry.maxOutputTokens
+    maxOutputTokens: entry.maxOutputTokens,
+    thinkingLevelMap: entry.thinkingLevelMap,
+    apiBackend: entry.apiBackend
   };
 }
 
@@ -667,6 +671,8 @@ function SettingsModels({ models, connections: connectionInfos, runtime, onChang
       supportsAudio: catalogModel?.supportsAudio,
       contextWindow: catalogModel?.contextWindow,
       maxOutputTokens: catalogModel?.maxOutputTokens,
+      thinkingLevelMap: catalogModel?.thinkingLevelMap,
+      apiBackend: catalogModel?.apiBackend,
       makeDefault: options.makeDefault ?? false
     };
   };
@@ -792,7 +798,9 @@ function SettingsModels({ models, connections: connectionInfos, runtime, onChang
       supportsTools: active.supportsTools !== false,
       supportsThinking: active.efforts.length > 0,
       supportsVision: active.capabilities?.vision,
-      supportsAudio: active.capabilities?.audio
+      supportsAudio: active.capabilities?.audio,
+      thinkingLevelMap: active.thinkingLevelMap,
+      apiBackend: active.apiBackend
     });
     setDetailApiKey("");
     // A fresh key usually unlocks the provider's real model list.
@@ -816,7 +824,9 @@ function SettingsModels({ models, connections: connectionInfos, runtime, onChang
       supportsTools: active.supportsTools !== false,
       supportsThinking: active.efforts.length > 0,
       supportsVision: active.capabilities?.vision,
-      supportsAudio: active.capabilities?.audio
+      supportsAudio: active.capabilities?.audio,
+      thinkingLevelMap: active.thinkingLevelMap,
+      apiBackend: active.apiBackend
     });
   };
 
@@ -837,7 +847,9 @@ function SettingsModels({ models, connections: connectionInfos, runtime, onChang
       supportsVision: catalogModel.supportsVision,
       supportsAudio: catalogModel.supportsAudio,
       contextWindow: catalogModel.contextWindow,
-      maxOutputTokens: catalogModel.maxOutputTokens
+      maxOutputTokens: catalogModel.maxOutputTokens,
+      thinkingLevelMap: catalogModel.thinkingLevelMap,
+      apiBackend: catalogModel.apiBackend
     });
   };
 

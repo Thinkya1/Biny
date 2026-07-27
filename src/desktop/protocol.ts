@@ -9,7 +9,7 @@
  */
 import type { AgentRunMode } from "../agent/AgentSession.js";
 import type { ModelCatalogEntry } from "../ai/types.js";
-import type { ModelProvider, WebSearchConfig } from "../config/schema.js";
+import type { ModelApiBackend, ModelCompatibility, ModelProvider, ThinkingLevelMap, WebSearchConfig } from "../config/schema.js";
 import type { ModelChoice, ModelRuntimeInfo, ThinkingSelection } from "../llm/ModelManager.js";
 import type { PermissionMode, PermissionResult } from "../permission/PermissionManager.js";
 import type { AgentHostEvent, InteractiveRuntimeSnapshot } from "../runtime/agentEvents.js";
@@ -215,6 +215,9 @@ export interface DesktopModelConfigurationInput {
   supportsAudio?: boolean;
   contextWindow?: number;
   maxOutputTokens?: number;
+  apiBackend?: ModelApiBackend;
+  thinkingLevelMap?: ThinkingLevelMap;
+  compatibility?: ModelCompatibility;
   /**
    * Whether this configuration should also become the active default model.
    * Connecting a provider opts in; enabling an extra model, rotating a key or

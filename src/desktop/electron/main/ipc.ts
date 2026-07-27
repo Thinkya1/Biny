@@ -20,7 +20,7 @@ import {
   type SaveDialogOptions
 } from "electron";
 import { z } from "zod";
-import { modelProviderSchema, providerProtocolSchema, reasoningEffortSchema } from "../../../config/schema.js";
+import { modelApiBackendSchema, modelCompatibilitySchema, modelProviderSchema, providerProtocolSchema, reasoningEffortSchema } from "../../../config/schema.js";
 import { clampFontSize } from "../../fontPreference.js";
 import type { DesktopBootstrap, DesktopSessionMenuAction, DesktopThemePreference } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
@@ -68,6 +68,9 @@ const modelConfigurationSchema = z.object({
   supportsAudio: z.boolean().optional(),
   contextWindow: z.number().int().min(4_096).max(2_000_000).optional(),
   maxOutputTokens: z.number().int().min(1).max(131_072).optional(),
+  apiBackend: modelApiBackendSchema.optional(),
+  thinkingLevelMap: z.record(z.string().min(1), z.string().min(1).nullable()).optional(),
+  compatibility: modelCompatibilitySchema.optional(),
   makeDefault: z.boolean().optional()
 });
 const runModeSchema = z.enum(["chat", "plan"]);

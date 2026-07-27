@@ -4,7 +4,7 @@
  * 运行时解析 provider profile 和密钥来源，再创建对应协议 adapter。配置中的 apiKey
  * 优先于 apiKeyEnv；解析逻辑集中在这里，命令实现不需要关心具体模型厂商。
  */
-import type { AgentConfig, ModelAliasConfig, ProviderConfig } from "../config/schema.js";
+import type { AgentConfig, ModelAliasConfig, ModelApiBackend, ModelCompatibility, ProviderConfig } from "../config/schema.js";
 import { createAlibaba } from "@ai-sdk/alibaba";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createDeepSeek } from "@ai-sdk/deepseek";
@@ -47,15 +47,16 @@ export function createModelSettings(config: AgentConfig, alias = config.defaultM
     throw new Error(missingKeyMessage(resolved.providerAlias, resolved.provider.apiKeyEnv, profile.apiKeyEnv));
   }
 
-  const baseUrl = resolved.provider.baseUrl ?? profile.baseUrl;
+  const baseUrl = resolved.model.baseUrl ?? resolved.provider.baseUrl ?? profile.baseUrl;
   if (!baseUrl) throw new Error(`No model endpoint configured. Set providers.${resolved.providerAlias}.baseUrl.`);
+  validateEndpointAndCredentials(resolved.providerAlias, resolved.provider, profile, baseUrl, apiKey);
   const capabilities = modelCapabilities(resolved.model);
   const enabled = config.thinking.enabled && capabilities.reasoning && modelReasoningConfig(resolved.model) !== undefined;
   const effort = enabled ? config.thinking.effort : undefined;
   const retry = resolved.provider.retry ?? { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0 };
 
   return {
-    model: createLanguageModel(resolved.provider.type, providerProtocol(resolved.provider, profile), baseUrl, apiKey, resolved.model.model, resolved.provider, createRetryFetch(retry)),
+    model: createLanguageModel(resolved.provider.type, providerProtocolForModel(resolved.model, resolved.provider, profile), baseUrl, apiKey, resolved.model.model, resolved.provider, resolved.model, createRetryFetch(retry)),
     providerOptions: createProviderOptions(resolved.provider.type, resolved.provider, resolved.model, enabled, effort),
     reasoning: enabled ? effort === "max" ? "xhigh" : effort : "none",
     timeoutMs: resolved.provider.timeoutMs,
@@ -73,6 +74,20 @@ export function resolveModelConfig(config: AgentConfig, alias = config.defaultMo
   const provider = config.providers[model.provider];
   if (!provider) throw new Error(`Unknown provider alias: ${model.provider}`);
   return { alias, model, providerAlias: model.provider, provider };
+}
+
+/** 切换模型前使用的同步配置校验；真正发请求的连接测试由 Desktop 单独执行。 */
+export function validateModelConfiguration(config: AgentConfig, alias = config.defaultModel): void {
+  const resolved = resolveModelConfig(config, alias);
+  const profile = providerProfile(resolved.provider.type);
+  const apiKey = resolveApiKey(resolved.provider.apiKey, resolved.provider.apiKeyEnv, profile.apiKeyEnv);
+  validateEndpointAndCredentials(
+    resolved.providerAlias,
+    resolved.provider,
+    profile,
+    resolved.model.baseUrl ?? resolved.provider.baseUrl ?? profile.baseUrl,
+    apiKey
+  );
 }
 
 function resolveApiKey(configuredKey: string | undefined, configuredEnv: string | undefined, defaultEnv: string | undefined): string | undefined {
@@ -98,44 +113,169 @@ function createLanguageModel(
   apiKey: string | undefined,
   modelId: string,
   provider: ProviderConfig,
+  model: ModelAliasConfig,
   fetch: typeof globalThis.fetch
 ): LanguageModel {
-  if (providerType === "openai") return createOpenAI({ baseURL: baseUrl, apiKey, fetch }).chat(modelId);
-  if (providerType === "anthropic" || protocol === "anthropic" && providerType !== "claude-subscription") {
-    return createAnthropic({ baseURL: baseUrl, apiKey, fetch }).languageModel(modelId);
-  }
-  if (providerType === "claude-subscription") {
-    return createAnthropic({
-      baseURL: baseUrl,
-      authToken: apiKey,
-      fetch,
-      headers: claudeSubscriptionHeaders()
-    }).languageModel(modelId);
-  }
-  if (providerType === "openai-codex") {
-    return createOpenAI({
-      baseURL: baseUrl,
-      apiKey,
-      fetch,
-      headers: openAiCodexHeaders(apiKey)
-    }).responses(modelId);
-  }
-  if (providerType === "openai-compatible" && provider.apiBackend === "responses") {
-    return createOpenAI({ baseURL: baseUrl, apiKey, fetch }).responses(modelId);
-  }
-  if (providerType === "deepseek") return createDeepSeek({ baseURL: baseUrl, apiKey, fetch }).languageModel(modelId);
-  if (providerType === "kimi") return createMoonshotAI({ baseURL: baseUrl, apiKey, fetch }).languageModel(modelId);
-  if (providerType === "qwen") return createAlibaba({ baseURL: baseUrl, apiKey, fetch }).languageModel(modelId);
-
-  const compatible = createOpenAICompatible({
-    name: providerType,
-    baseURL: baseUrl,
+  const compatibility = mergeCompatibility(provider.compatibility, model.compatibility);
+  const apiBackend = model.apiBackend
+    ?? provider.apiBackend
+    ?? (providerType === "openai-codex" ? "responses" : protocol === "anthropic" ? "anthropic_messages" : "chat_completions");
+  const context: ProviderAdapterContext = {
+    providerType,
+    protocol,
+    apiBackend,
+    baseUrl,
     apiKey,
-    fetch,
-    includeUsage: true,
-    transformRequestBody: createCompatibilityTransform(provider.compatibility)
-  });
-  return compatible.languageModel(modelId);
+    modelId,
+    provider,
+    model,
+    headers: model.headers,
+    compatibility,
+    fetch
+  };
+  const adapter = providerAdapters.find((candidate) => candidate.matches(context));
+  if (!adapter) throw new Error(`No provider adapter for ${providerType}/${apiBackend}.`);
+  return adapter.create(context);
+}
+
+interface ProviderAdapterContext {
+  providerType: AgentConfig["providers"][string]["type"];
+  protocol: "anthropic" | "openai-compatible";
+  apiBackend: ModelApiBackend;
+  baseUrl: string;
+  apiKey: string | undefined;
+  modelId: string;
+  provider: ProviderConfig;
+  model: ModelAliasConfig;
+  headers: Record<string, string> | undefined;
+  compatibility: ModelCompatibility | undefined;
+  fetch: typeof globalThis.fetch;
+}
+
+export interface ProviderAdapter {
+  readonly name: string;
+  matches(context: ProviderAdapterContext): boolean;
+  create(context: ProviderAdapterContext): LanguageModel;
+}
+
+const providerAdapters: ProviderAdapter[] = [
+  {
+    name: "anthropic-messages",
+    matches: ({ providerType, apiBackend }) => apiBackend === "anthropic_messages" && providerType !== "claude-subscription",
+    create: (context) => createAnthropic({
+      baseURL: context.baseUrl,
+      apiKey: context.apiKey,
+      fetch: context.fetch,
+      headers: context.headers
+    }).languageModel(context.modelId)
+  },
+  {
+    name: "claude-subscription",
+    matches: ({ providerType }) => providerType === "claude-subscription",
+    create: (context) => createAnthropic({
+      baseURL: context.baseUrl,
+      authToken: context.apiKey,
+      fetch: context.fetch,
+      headers: { ...claudeSubscriptionHeaders(), ...context.headers }
+    }).languageModel(context.modelId)
+  },
+  {
+    name: "openai-responses",
+    matches: ({ apiBackend }) => apiBackend === "responses",
+    create: (context) => createOpenAI({
+      baseURL: context.baseUrl,
+      apiKey: context.apiKey,
+      fetch: context.fetch,
+      headers: context.providerType === "openai-codex"
+        ? { ...openAiCodexHeaders(context.apiKey), ...context.headers }
+        : context.headers
+    }).responses(context.modelId)
+  },
+  {
+    name: "deepseek",
+    matches: ({ providerType, apiBackend }) => providerType === "deepseek" && apiBackend === "chat_completions",
+    create: (context) => createDeepSeek({ ...baseProviderOptions(context) }).languageModel(context.modelId)
+  },
+  {
+    name: "moonshotai",
+    matches: ({ providerType, apiBackend }) => providerType === "kimi" && apiBackend === "chat_completions",
+    create: (context) => createMoonshotAI({ ...baseProviderOptions(context) }).languageModel(context.modelId)
+  },
+  {
+    name: "alibaba",
+    matches: ({ providerType, apiBackend }) => providerType === "qwen" && apiBackend === "chat_completions",
+    create: (context) => createAlibaba({ ...baseProviderOptions(context) }).languageModel(context.modelId)
+  },
+  {
+    name: "openai-chat",
+    matches: ({ providerType, apiBackend }) => providerType === "openai" && apiBackend === "chat_completions",
+    create: (context) => createOpenAI({ ...baseProviderOptions(context) }).chat(context.modelId)
+  },
+  {
+    name: "openai-compatible",
+    matches: ({ apiBackend }) => apiBackend === "chat_completions",
+    create: (context) => createOpenAICompatible({
+      name: context.providerType,
+      ...baseProviderOptions(context),
+      includeUsage: true,
+      transformRequestBody: createCompatibilityTransform(context.compatibility)
+    }).languageModel(context.modelId)
+  }
+];
+
+function baseProviderOptions(context: ProviderAdapterContext): {
+  baseURL: string;
+  apiKey: string | undefined;
+  fetch: typeof globalThis.fetch;
+  headers?: Record<string, string>;
+} {
+  return {
+    baseURL: context.baseUrl,
+    apiKey: context.apiKey,
+    fetch: context.fetch,
+    headers: context.headers
+  };
+}
+
+function providerProtocolForModel(
+  model: ModelAliasConfig,
+  provider: ProviderConfig,
+  profile: ReturnType<typeof providerProfile>
+): "anthropic" | "openai-compatible" {
+  if (model.apiBackend === "anthropic_messages") return "anthropic";
+  if (model.apiBackend === "chat_completions" || model.apiBackend === "responses") return "openai-compatible";
+  return providerProtocol(provider, profile);
+}
+
+function mergeCompatibility(
+  provider: ModelCompatibility | undefined,
+  model: ModelCompatibility | undefined
+): ModelCompatibility | undefined {
+  if (!provider && !model) return undefined;
+  return { ...provider, ...model };
+}
+
+function validateEndpointAndCredentials(
+  providerAlias: string,
+  provider: ProviderConfig,
+  profile: ReturnType<typeof providerProfile>,
+  endpoint: string | undefined,
+  apiKey: string | undefined
+): void {
+  if (!endpoint) throw new Error(`No model endpoint configured. Set providers.${providerAlias}.baseUrl.`);
+  let parsed: URL;
+  try {
+    parsed = new URL(endpoint);
+  } catch {
+    throw new Error(`Invalid model endpoint for provider ${providerAlias}: ${endpoint}`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`Model endpoint for provider ${providerAlias} must use http:// or https://.`);
+  }
+  if (parsed.username || parsed.password) throw new Error(`Model endpoint for provider ${providerAlias} must not contain credentials in the URL.`);
+  if ((provider.requiresApiKey ?? profile.requiresApiKey) && !apiKey) {
+    throw new Error(missingKeyMessage(providerAlias, provider.apiKeyEnv, profile.apiKeyEnv));
+  }
 }
 
 const CLAUDE_SUBSCRIPTION_BETA = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219";
@@ -185,9 +325,16 @@ function createProviderOptions(
   enabled: boolean,
   effort: AgentConfig["thinking"]["effort"] | undefined
 ): Record<string, any> | undefined {
-  if (provider.compatibility?.supportsReasoning === false) return undefined;
+  if (mergeCompatibility(provider.compatibility, model.compatibility)?.supportsReasoning === false) return undefined;
   const nativeEffort = effort === undefined ? undefined : nativeReasoningEffort(model, effort);
   const budgetTokens = effort === undefined ? 4_096 : reasoningBudgetTokens(model, effort);
+  const apiBackend = model.apiBackend
+    ?? provider.apiBackend
+    ?? (providerType === "openai-codex" ? "responses" : provider.protocol === "anthropic" || providerType === "anthropic" || providerType === "claude-subscription" ? "anthropic_messages" : "chat_completions");
+  if (apiBackend === "anthropic_messages") {
+    return { anthropic: { thinking: enabled ? { type: "enabled", budgetTokens } : { type: "disabled" } } };
+  }
+  if (apiBackend === "responses") return { openai: { reasoningEffort: enabled ? nativeEffort : "none" } };
   if (providerType === "deepseek") {
     return {
       deepseek: {
@@ -196,10 +343,7 @@ function createProviderOptions(
       }
     };
   }
-  if (providerType === "openai" || providerType === "openai-codex") return { openai: { reasoningEffort: enabled ? nativeEffort : "none" } };
-  if (provider.protocol === "anthropic" || providerType === "anthropic" || providerType === "claude-subscription") {
-    return { anthropic: { thinking: enabled ? { type: "enabled", budgetTokens } : { type: "disabled" } } };
-  }
+  if (providerType === "openai") return { openai: { reasoningEffort: enabled ? nativeEffort : "none" } };
   if (providerType === "qwen") return { alibaba: { enableThinking: enabled, thinkingBudget: enabled ? budgetTokens : undefined } };
   if (providerType === "kimi") {
     return { moonshotai: { thinking: { type: enabled ? "enabled" : "disabled", budgetTokens: enabled ? budgetTokens : undefined } } };
