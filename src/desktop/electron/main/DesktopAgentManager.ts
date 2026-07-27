@@ -21,7 +21,7 @@ import { providerDefinition } from "../../../ai/provider.js";
 import { loadProjectSettings } from "../../../config/projectSettings.js";
 import { configSchema, type AgentConfig, type ProviderConfig } from "../../../config/schema.js";
 import type { AgentConfigStore } from "../../../config/store.js";
-import { createModelSettings } from "../../../llm/factory.js";
+import { createModelSettings, validateModelConfiguration } from "../../../llm/factory.js";
 import { hasUsableModelConfiguration, listConfiguredModelChoices, type ModelRuntimeInfo, type ThinkingSelection } from "../../../llm/ModelManager.js";
 import { providerProfile } from "../../../llm/profiles.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
@@ -289,6 +289,9 @@ export class DesktopAgentManager {
     this.projects.requireProject(projectId);
     const current = await this.loadProjectConfig(projectId);
     const next = this.buildConfigWithModel(current, input);
+    // 写入全局配置前先验证候选模型的 endpoint、协议和凭据；运行时切换还会再次经过
+    // ModelManager 的同一校验，避免设置页和 TUI/CLI 产生两套可用性规则。
+    if (input.makeDefault || next.defaultModel === input.alias) validateModelConfiguration(next, input.alias);
     await this.saveProjectConfig(projectId, next);
     this.runtimeErrors.delete(projectId);
     if (managed) {
