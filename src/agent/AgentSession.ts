@@ -725,6 +725,17 @@ export class AgentSession {
     }
   }
 
+  async refreshModelCatalog(providerAlias?: string): Promise<ModelChoice[]> {
+    const release = this.beginOperation("model catalog refresh");
+    try {
+      if (!this.options.modelManager) throw new Error("This agent runtime does not support model switching.");
+      await this.options.modelManager.refreshModelCatalog(providerAlias);
+      return this.options.modelManager.listModels();
+    } finally {
+      release();
+    }
+  }
+
   getInfo(): AgentSessionInfo {
     const model = this.options.modelManager?.getInfo() ?? modelRuntimeInfo(this.options.config);
     return {

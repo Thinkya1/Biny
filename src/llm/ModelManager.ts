@@ -5,36 +5,20 @@ import {
   type ReasoningEffort
 } from "../config/schema.js";
 import { createModelSettings, resolveModelConfig, type ModelSettings } from "./factory.js";
-import { providerProfile } from "./profiles.js";
 import type { LanguageModel } from "ai";
 import { fetchModelCatalog } from "../ai/modelCatalog.js";
-import { modelCapabilities, modelContextBudget, modelReasoningConfig } from "../ai/capabilities.js";
+import { modelContextBudget, modelReasoningConfig, modelThinkingLevelMap } from "../ai/capabilities.js";
 import { providerDefinition } from "../ai/provider.js";
 import type { ModelCatalogEntry } from "../ai/types.js";
+import {
+  hasUsableModelConfiguration as hasUsableRegisteredModel,
+  ModelRegistry,
+  type ModelChoice
+} from "./ModelRegistry.js";
+import { ModelResolver } from "./ModelResolver.js";
 
 export type ThinkingSelection = "off" | ReasoningEffort;
-
-export interface ModelChoice {
-  alias: string;
-  displayName: string;
-  description?: string;
-  provider: string;
-  providerType: string;
-  model: string;
-  supportsTools?: boolean;
-  capabilities?: ReturnType<typeof modelCapabilities>;
-  contextWindow?: number;
-  /** 单轮允许注入的输入 token 预算；界面用它做上下文用量的分母（运行时还没起来时也能算）。 */
-  maxInputTokens?: number;
-  efforts: ReasoningEffort[];
-  defaultThinking: ThinkingSelection;
-  /**
-   * False when the alias is configured but its provider has no usable endpoint
-   * or credential yet. Selecting it would fail on the first request, so every
-   * surface either hides it (desktop) or marks it unusable (TUI / CLI).
-   */
-  available: boolean;
-}
+export type { ModelChoice } from "./ModelRegistry.js";
 
 export interface ModelRuntimeInfo {
   modelAlias: string;
@@ -49,17 +33,19 @@ export interface ModelRuntimeInfo {
 /** Keeps one validated AI SDK model while the selected provider changes. */
 export class ModelManager {
   private activeSettings: ModelSettings;
+  private readonly registry: ModelRegistry;
 
   constructor(
     private readonly workspaceRoot: string,
     private readonly config: AgentConfig,
     private readonly configStore: AgentConfigStore = createFileConfigStore(workspaceRoot)
   ) {
+    this.registry = new ModelRegistry(config);
     this.activeSettings = createModelSettings(config);
   }
 
   listModels(): ModelChoice[] {
-    return listModelChoices(this.config);
+    return this.registry.listModels();
   }
 
   getInfo(): ModelRuntimeInfo {
@@ -82,11 +68,13 @@ export class ModelManager {
   async refreshModelCatalog(providerAlias = resolveModelConfig(this.config).providerAlias): Promise<ModelCatalogEntry[]> {
     const provider = this.config.providers[providerAlias];
     if (!provider) throw new Error(`Unknown provider alias: ${providerAlias}`);
-    return await fetchModelCatalog({
+    const entries = await fetchModelCatalog({
       alias: providerAlias,
       config: provider,
       definition: providerDefinition(provider.type)
     });
+    this.registry.registerCatalog(providerAlias, entries);
+    return entries;
   }
 
   async switchModel(alias: string, thinking?: ThinkingSelection): Promise<ModelRuntimeInfo> {
@@ -94,23 +82,32 @@ export class ModelManager {
     // （桌面端多项目共用配置、权限模式变更、OAuth token 刷新等），整份写回内存快照会把那些
     // 改动覆盖掉。读不到就退回内存快照，行为与以前一致。
     const persisted = await this.configStore.load(this.workspaceRoot).catch(() => this.config);
-    const model = persisted.models[alias];
-    if (!model) throw new Error(`Unknown model alias: ${alias}`);
-    const selection = resolveThinkingSelection(persisted, alias, thinking);
+    const persistedRegistry = new ModelRegistry(persisted);
+    for (const [providerAlias, entries] of this.registry.catalogsSnapshot()) persistedRegistry.registerCatalog(providerAlias, entries);
+    // 解析允许先找到模型，再由 createModelSettings 给出具体的 endpoint/credential 错误；
+    // 这样 CLI/TUI 不会把缺少哪个环境变量的信息吞掉。
+    const resolved = new ModelResolver(persistedRegistry).resolve(alias);
+    const modelAlias = resolved.alias;
+    const model = resolved.model;
+    const selection = resolveThinkingSelection({ ...persisted, models: { ...persisted.models, [modelAlias]: model } }, modelAlias, thinking);
     const effort = selection === "off"
-      ? model.thinking?.defaultEffort ?? persisted.thinking.effort
+      ? modelReasoningConfig(model)?.defaultEffort ?? persisted.thinking.effort
       : selection;
     const candidate = configSchema.parse({
       ...persisted,
-      defaultModel: alias,
+      defaultModel: modelAlias,
+      models: { ...persisted.models, [modelAlias]: model },
       thinking: { enabled: selection !== "off", effort }
     });
 
     // Validate endpoint and credentials before changing memory or the config file.
     const nextSettings = createModelSettings(candidate);
     await this.configStore.save(candidate, this.workspaceRoot);
-    Object.assign(this.config, candidate);
-    this.activeSettings = nextSettings;
+    // 项目覆盖的 defaultModel/thinking 仍然优先；保存后重新读取有效配置，避免内存状态
+    // 短暂显示一个实际上被项目覆盖遮住的模型。
+    const effective = await this.configStore.load(this.workspaceRoot).catch(() => candidate);
+    Object.assign(this.config, effective);
+    this.activeSettings = effective === candidate ? nextSettings : createModelSettings(effective);
     return this.getInfo();
   }
 
@@ -124,34 +121,7 @@ export class ModelManager {
 }
 
 export function listModelChoices(config: AgentConfig): ModelChoice[] {
-  const entries = [
-    ...Object.entries(config.models).filter(([alias]) => alias === config.defaultModel),
-    ...Object.entries(config.models).filter(([alias]) => alias !== config.defaultModel)
-  ];
-  const seenModels = new Set<string>();
-  return entries.flatMap(([alias, model]) => {
-    const modelKey = `${model.provider}\u0000${model.model}`;
-    if (seenModels.has(modelKey)) return [];
-    seenModels.add(modelKey);
-    const provider = config.providers[model.provider];
-    const capabilities = modelCapabilities(model);
-    const reasoning = modelReasoningConfig(model);
-    return [{
-      alias,
-      displayName: model.displayName ?? model.model,
-      description: model.description,
-      provider: model.provider,
-      providerType: provider?.type ?? model.provider,
-      model: model.model,
-      supportsTools: capabilities.tools,
-      capabilities,
-      contextWindow: model.contextWindow,
-      maxInputTokens: modelContextBudget(model, config.context.maxInputTokens, alias).maxInputTokens,
-      efforts: [...(reasoning?.efforts ?? [])],
-      defaultThinking: reasoning?.defaultEffort ?? "off",
-      available: hasUsableModelConfiguration(config, alias)
-    }];
-  });
+  return new ModelRegistry(config).listModels();
 }
 
 export function listConfiguredModelChoices(config: AgentConfig): ModelChoice[] {
@@ -159,15 +129,7 @@ export function listConfiguredModelChoices(config: AgentConfig): ModelChoice[] {
 }
 
 export function hasUsableModelConfiguration(config: AgentConfig, alias = config.defaultModel): boolean {
-  const model = config.models[alias];
-  const provider = model ? config.providers[model.provider] : undefined;
-  if (!provider) return false;
-  const profile = providerProfile(provider.type);
-  const endpoint = provider.baseUrl ?? profile.baseUrl;
-  if (!endpoint) return false;
-  if (!(provider.requiresApiKey ?? profile.requiresApiKey)) return true;
-  const envName = provider.apiKeyEnv ?? profile.apiKeyEnv;
-  return Boolean(provider.apiKey || (envName && process.env[envName]));
+  return hasUsableRegisteredModel(config, alias);
 }
 
 export function modelRuntimeInfo(config: AgentConfig): ModelRuntimeInfo {
@@ -202,8 +164,14 @@ export function resolveThinkingSelection(
     }
     return reasoning.defaultEffort;
   }
-  if (requested === "off") return "off";
-  if (!modelReasoningConfig(model)?.efforts.includes(requested)) {
+  const levelMap = modelThinkingLevelMap(model);
+  if (requested === "off") {
+    if (model.thinkingLevelMap && levelMap.off === undefined || levelMap.off === null) {
+      throw new Error(`Model ${alias} does not support disabling thinking.`);
+    }
+    return "off";
+  }
+  if (levelMap[requested] === undefined || levelMap[requested] === null || !modelReasoningConfig(model)?.efforts.includes(requested)) {
     throw new Error(`Model ${alias} does not support ${requested} thinking effort.`);
   }
   return requested;

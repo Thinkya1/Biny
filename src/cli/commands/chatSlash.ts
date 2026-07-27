@@ -150,6 +150,7 @@ export async function executeChatSlashCommand(runtime: CommandRuntime, text: str
   }
   if (command === "/model") {
     if (!args[0]) {
+      await (host ?? agent).refreshModelCatalog().catch(() => undefined);
       const info = agent.getInfo();
       console.log(`Current model: ${info.modelLabel}`);
       console.log(`Thinking: ${info.reasoningLabel}`);

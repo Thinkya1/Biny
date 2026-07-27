@@ -28,6 +28,7 @@ export interface TuiRuntime {
   listModels(): ModelChoice[];
   switchModel(alias: string, thinking?: ThinkingSelection): Promise<ModelRuntimeInfo>;
   refreshModelFromDisk(): Promise<ModelRuntimeInfo>;
+  refreshModelCatalog(providerAlias?: string): Promise<ModelChoice[]>;
   sendPrompt(prompt: string, mode?: AgentRunMode): Promise<AgentRunOutcome>;
   resumeSession(session: string): Promise<ResumedAgentSession>;
   listSessions(): Promise<SessionSummary[]>;
@@ -92,6 +93,9 @@ export async function createTuiRuntime(workspaceRoot: string): Promise<TuiRuntim
       const info = await host.refreshModelFromDisk();
       emitModelChanged(info);
       return info;
+    },
+    async refreshModelCatalog(providerAlias?: string): Promise<ModelChoice[]> {
+      return await host.refreshModelCatalog(providerAlias);
     },
     async sendPrompt(prompt: string, mode: AgentRunMode = "chat"): Promise<AgentRunOutcome> {
       // Follow Pi's single AgentSession model: a prompt submitted while the

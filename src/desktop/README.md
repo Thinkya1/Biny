@@ -68,7 +68,7 @@ Electron Main
 
 全局 `agent.config.json` 只保存 provider/model 元数据和运行设置。macOS 的 API key、OAuth access/refresh token 通过 `com.biny.agent` Keychain service 保存，CLI/TUI 与 Electron 使用相同的 account 命名；非 macOS 使用 `apiKeyEnv` 环境变量，不写本地凭据文件。
 
-模型的 reasoning effort 是模型级能力元数据，不是全局固定档位。TUI 的 `/model` 会先选模型，再展示该模型声明的选项；Desktop 输入区也只在当前模型有可调 effort 时显示思考菜单。
+模型的 reasoning effort 是模型级能力元数据，不是全局固定档位。TUI 的 `/model` 会先选模型，再展示该模型声明的选项；Desktop 输入区也只在当前模型有可调 effort 时显示思考菜单。Desktop 设置里的 provider `/models` 结果与静态配置合并，启用模型后写入同一份全局模型元数据。
 
 ## 项目会话目录
 

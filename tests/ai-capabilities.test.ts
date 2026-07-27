@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { inferReasoningEfforts, modelCapabilities, modelContextBudget, nativeReasoningEffort, reasoningBudgetTokens } from "../src/ai/capabilities.js";
+import { inferReasoningEfforts, modelCapabilities, modelContextBudget, modelReasoningConfig, modelThinkingLevelMap, nativeReasoningEffort, reasoningBudgetTokens, thinkingLevelMapForModel } from "../src/ai/capabilities.js";
 import { parseModelCatalog } from "../src/ai/modelCatalog.js";
 import { createRetryFetch } from "../src/ai/retry.js";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
+import { ModelRegistry } from "../src/llm/ModelRegistry.js";
+import { ModelResolver } from "../src/llm/ModelResolver.js";
 
 const config = configSchema.parse({
   ...structuredClone(defaultConfig),
@@ -34,6 +36,27 @@ assert.equal(budget.modelAlias, "small");
 assert.equal(modelCapabilities(model).vision, true);
 assert.equal(nativeReasoningEffort(model, "high"), "high");
 assert.equal(reasoningBudgetTokens(model, "high"), 3_072);
+
+assert.deepEqual(modelThinkingLevelMap(defaultConfig.models["deepseek-v4-flash"]!), { off: "none" });
+assert.equal(modelReasoningConfig(defaultConfig.models["deepseek-v4-flash"]!), undefined);
+assert.deepEqual(modelThinkingLevelMap(defaultConfig.models["deepseek-v4-pro"]!), { off: "none", low: "low", medium: "medium", high: "high" });
+assert.deepEqual(thinkingLevelMapForModel("deepseek-v4-pro"), { off: "none", low: "low", medium: "medium", high: "high" });
+assert.deepEqual(thinkingLevelMapForModel("deepseek-v4-flash"), { off: "none" });
+
+const registry = new ModelRegistry(structuredClone(defaultConfig));
+registry.registerCatalog("deepseek", [{
+  id: "deepseek-v4-pro-preview",
+  displayName: "DeepSeek V4 Pro Preview",
+  provider: "deepseek",
+  contextWindow: 128_000,
+  maxOutputTokens: 8_192,
+  capabilities: { tools: true, reasoning: true, streaming: true },
+  reasoningEfforts: ["low", "medium", "high"]
+}]);
+const catalogChoice = registry.listModels().find((choice) => choice.alias === "deepseek/deepseek-v4-pro-preview");
+assert.equal(catalogChoice?.source, "catalog");
+assert.deepEqual(catalogChoice?.efforts, ["low", "medium", "high"]);
+assert.equal(new ModelResolver(registry).resolve("deepseek/deepseek-v4-pro-preview").source, "catalog");
 
 const catalog = parseModelCatalog({
   data: [{

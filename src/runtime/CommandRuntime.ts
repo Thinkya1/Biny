@@ -330,7 +330,7 @@ function subagentRuntimeInfo(config: AgentConfig): ModelRuntimeInfo {
   if (!alias) return modelRuntimeInfo(config);
   const model = config.models[alias];
   if (!model) throw new Error(`Unknown subagent model alias: ${alias}`);
-  const thinking = model.thinking?.defaultEffort ?? "off";
+  const thinking = modelReasoningConfig(model)?.defaultEffort ?? "off";
   return modelRuntimeInfo({
     ...config,
     defaultModel: alias,

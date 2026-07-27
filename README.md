@@ -65,7 +65,31 @@ macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON �
 }
 ```
 
-`type` 可以是 `deepseek`、`openai`、`anthropic`、`gemini`、`kimi`、`qwen`、`ollama`、`openai-compatible` 等；自建网关用 `openai-compatible` 并补上 `baseUrl`。配置文件按 `0600` 保存，`biny doctor` 会检测旧的工作区/桌面配置并给出迁移提示，但不会自动复制旧配置或凭据。
+`type` 可以是 `deepseek`、`openai`、`anthropic`、`gemini`、`kimi`、`qwen`、`ollama`、`openai-compatible` 等；自建网关用 `openai-compatible` 并补上 `baseUrl`。单个模型还可以用 `apiBackend`、`baseUrl`、`headers`、`compatibility` 覆盖 provider 默认值，但不能写 API key。配置文件按 `0600` 保存，`biny doctor` 会检测旧的工作区/桌面配置并给出迁移提示，但不会自动复制旧配置或凭据。
+
+模型档位使用模型级 `thinkingLevelMap`，值是 provider 接受的参数名；缺省或 `null` 表示该档位不可用。例如：
+
+```json
+{
+  "models": {
+    "deepseek-v4-pro": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-pro",
+      "thinkingLevelMap": {
+        "off": "none",
+        "low": "low",
+        "medium": "medium",
+        "high": "high"
+      }
+    },
+    "deepseek-v4-flash": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "thinkingLevelMap": { "off": "none" }
+    }
+  }
+}
+```
 
 项目覆盖示例：
 
@@ -80,7 +104,7 @@ macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON �
 }
 ```
 
-TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 reasoning effort，才会继续打开对应的档位选择器。列表不会把所有模型强行显示成同一套档位：例如 DeepSeek V4 Pro 使用自身声明的三档 `low`、`medium`、`high`，DeepSeek V4 Flash 不显示思考档位。这里的名称是模型/Provider 支持的配置选项，不代表跨模型可比较的真实推理程度。
+TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 reasoning effort，才会继续打开对应的档位选择器。列表不会把所有模型强行显示成同一套档位：例如 DeepSeek V4 Pro 使用自身声明的三档 `low`、`medium`、`high`，DeepSeek V4 Flash 不显示思考档位。这里的名称是模型/Provider 支持的配置选项，不代表跨模型可比较的真实推理程度。模型目录刷新后，实时模型会进入同一注册表，也可以用 `provider/model-id` 引用；选中的实时模型元数据会写入全局模型配置。
 
 联网搜索默认走 AnySearch（`ANYSEARCH_API_KEY`，也可用匿名额度），另支持 Google、DuckDuckGo、Brave 和 Tavily，在 `web.search` 里切换。桌面端的 **设置 → 联网搜索** 提供独立浏览器和 Cookie-Editor JSON 导入/导出；在其中登录后，Google 搜索与 `web_fetch` 会按域名、路径和 HTTPS 规则使用对应 Cookie。
 

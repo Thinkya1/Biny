@@ -4,15 +4,46 @@
  * 配置里能力字段大多是可选的，这里负责把「配置 + 模型 ID 启发式 + 默认值」收敛成确定的
  * 能力集合、上下文预算和思考档位，让上层不必到处写兜底判断。
  */
-import type { ModelAliasConfig, ReasoningEffort } from "../config/schema.js";
+import type { ModelAliasConfig, ModelThinkingConfig, ReasoningEffort, ThinkingLevelMap } from "../config/schema.js";
 import type { ModelCapabilities, ModelContextBudget } from "./types.js";
 
 export const defaultModelContextWindow = 32_768;
 export const defaultModelOutputTokens = 8_192;
 
-/** `reasoning` 是新字段，`thinking` 是旧配置名，读取时优先新字段。 */
-export function modelReasoningConfig(model: ModelAliasConfig): ModelAliasConfig["thinking"] {
-  return model.reasoning ?? model.thinking;
+/**
+ * 模型级 canonical map。它表达的是 provider 可接受的参数，而不是模型真实“思考程度”。
+ * 旧配置只有 `thinking`/`reasoning` 时，在这里转换为同一份 map，避免上层继续分叉。
+ */
+export function modelThinkingLevelMap(model: ModelAliasConfig): ThinkingLevelMap {
+  if (model.thinkingLevelMap) return { ...model.thinkingLevelMap };
+  const reasoning = model.reasoning ?? model.thinking;
+  if (!reasoning) return {};
+  const map: ThinkingLevelMap = { off: "none" };
+  for (const effort of reasoning.efforts) map[effort] = reasoning.mapping?.[effort] ?? effort;
+  return map;
+}
+
+/** `reasoning` 是新字段，`thinking` 是旧配置名；两者都落到 canonical map 上。 */
+export function modelReasoningConfig(model: ModelAliasConfig): ModelThinkingConfig | undefined {
+  const map = modelThinkingLevelMap(model);
+  const efforts = Object.entries(map)
+    .filter(([level, native]) => level !== "off" && native !== null)
+    .map(([level]) => level as ReasoningEffort);
+  if (!efforts.length) return undefined;
+
+  const legacy = model.reasoning ?? model.thinking;
+  const defaultEffort = legacy?.defaultEffort && efforts.includes(legacy.defaultEffort)
+    ? legacy.defaultEffort
+    : efforts.includes("high") ? "high" : efforts[0]!;
+  const mapping = Object.fromEntries(
+    efforts.map((effort) => [effort, map[effort] ?? effort])
+  ) as Partial<Record<ReasoningEffort, string>>;
+  return {
+    efforts,
+    defaultEffort,
+    mapping,
+    budgetTokens: legacy?.budgetTokens
+  };
 }
 
 /**
@@ -57,6 +88,19 @@ export function inferReasoningEfforts(modelId: string): ReasoningEffort[] {
   if (/^deepseek-v4-flash$/iu.test(identifier)) return [];
   if (/^deepseek-v4-pro$/iu.test(identifier)) return ["low", "medium", "high"];
   return reasoningModelPatterns.some((pattern) => pattern.test(identifier)) ? ["high", "max"] : [];
+}
+
+/** 把目录/桌面配置里的支持提示转换成模型级 canonical map。 */
+export function thinkingLevelMapForModel(modelId: string, supportsThinking = true): ThinkingLevelMap {
+  if (!supportsThinking || /^deepseek-v4-flash$/iu.test(modelId.trim().split("/").pop() ?? modelId)) {
+    return { off: "none" };
+  }
+  const efforts = inferReasoningEfforts(modelId);
+  const resolved = efforts.length ? efforts : ["high", "max"] as ReasoningEffort[];
+  return {
+    off: "none",
+    ...Object.fromEntries(resolved.map((effort) => [effort, effort]))
+  };
 }
 
 /**
@@ -110,7 +154,8 @@ export function nativeReasoningEffort(
   model: ModelAliasConfig,
   effort: ReasoningEffort
 ): string {
-  return modelReasoningConfig(model)?.mapping?.[effort] ?? effort;
+  const native = modelThinkingLevelMap(model)[effort];
+  return native ?? modelReasoningConfig(model)?.mapping?.[effort] ?? effort;
 }
 
 /** 按思考预算 token 计费的协议（如 Anthropic）需要具体数值，这里给出各档默认值。 */

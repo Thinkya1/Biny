@@ -77,6 +77,27 @@ export const modelProviderSchema = z.enum([
 
 export const providerProtocolSchema = z.enum(["anthropic", "openai-compatible"]);
 export const reasoningEffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]);
+export const thinkingLevelSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+export const modelApiBackendSchema = z.enum(["chat_completions", "responses", "anthropic_messages"]);
+
+export const modelCompatibilitySchema = z.object({
+  supportsDeveloperRole: z.boolean().optional(),
+  supportsReasoning: z.boolean().optional(),
+  supportsVision: z.boolean().optional(),
+  maxTokensField: z.enum(["max_tokens", "max_completion_tokens"]).optional()
+});
+
+const thinkingLevelMapSchema = z.record(z.string(), z.string().min(1).nullable()).superRefine((map, context) => {
+  for (const key of Object.keys(map)) {
+    if (!thinkingLevelSchema.options.includes(key as z.infer<typeof thinkingLevelSchema>)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [key],
+        message: `Unknown thinking level: ${key}.`
+      });
+    }
+  }
+});
 
 const thinkingSchema = z.object({
   enabled: z.boolean().default(true),
@@ -105,12 +126,7 @@ const providerConfigSchema = z.object({
   }).optional(),
   modelsEndpoint: z.string().url().optional(),
   apiBackend: z.enum(["chat_completions", "responses"]).optional(),
-  compatibility: z.object({
-    supportsDeveloperRole: z.boolean().optional(),
-    supportsReasoning: z.boolean().optional(),
-    supportsVision: z.boolean().optional(),
-    maxTokensField: z.enum(["max_tokens", "max_completion_tokens"]).optional()
-  }).optional()
+  compatibility: modelCompatibilitySchema.optional()
 }).superRefine((provider, context) => {
   if (provider.type === "openai-compatible" && !provider.baseUrl) {
     context.addIssue({
@@ -381,6 +397,13 @@ const modelAliasSchema = z.object({
   }).optional(),
   contextWindow: z.number().int().min(4_096).max(2_000_000).optional(),
   maxOutputTokens: z.number().int().min(1).max(131_072).optional(),
+  /** Model-level API and compatibility override the provider defaults. */
+  apiBackend: modelApiBackendSchema.optional(),
+  baseUrl: z.string().url().optional(),
+  headers: z.record(z.string()).optional(),
+  compatibility: modelCompatibilitySchema.optional(),
+  /** Pi-style canonical capability map. Missing/null levels are unsupported. */
+  thinkingLevelMap: thinkingLevelMapSchema.optional(),
   thinking: modelThinkingSchema.optional(),
   reasoning: modelThinkingSchema.optional(),
   pricing: modelPricingSchema.optional()
@@ -433,7 +456,11 @@ const canonicalConfigSchema = z.object({
   }
 
   const activeReasoning = activeModel ? activeModel.reasoning ?? activeModel.thinking : undefined;
-  if (config.thinking.enabled && activeReasoning === undefined) {
+  const activeThinkingLevels = activeModel?.thinkingLevelMap;
+  const activeSupportsReasoning = activeThinkingLevels
+    ? Object.entries(activeThinkingLevels).some(([level, native]) => level !== "off" && native !== null)
+    : activeReasoning !== undefined;
+  if (config.thinking.enabled && !activeSupportsReasoning) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["thinking", "enabled"],
@@ -447,7 +474,12 @@ const canonicalConfigSchema = z.object({
       message: `Model ${config.defaultModel} does not expose reasoning capability metadata.`
     });
   }
-  if (config.thinking.enabled && activeReasoning && !activeReasoning.efforts.includes(config.thinking.effort)) {
+  const activeEfforts = activeThinkingLevels
+    ? Object.entries(activeThinkingLevels)
+      .filter(([level, native]) => level !== "off" && native !== null)
+      .map(([level]) => level)
+    : activeReasoning?.efforts ?? [];
+  if (config.thinking.enabled && !activeEfforts.includes(config.thinking.effort)) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["thinking", "effort"],
@@ -523,6 +555,11 @@ export type ModelProvider = z.infer<typeof modelProviderSchema>;
 export type ProviderConfig = z.infer<typeof providerConfigSchema>;
 export type ModelAliasConfig = z.infer<typeof modelAliasSchema>;
 export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
+export type ThinkingLevel = z.infer<typeof thinkingLevelSchema>;
+export type ThinkingLevelMap = z.infer<typeof thinkingLevelMapSchema>;
+export type ModelApiBackend = z.infer<typeof modelApiBackendSchema>;
+export type ModelCompatibility = z.infer<typeof modelCompatibilitySchema>;
+export type ModelThinkingConfig = z.infer<typeof modelThinkingSchema>;
 export type ModelReasoningConfig = z.infer<typeof thinkingSchema>;
 export type ModelPricing = z.infer<typeof modelPricingSchema>;
 export type McpServerConfig = z.infer<typeof mcpServerSchema>;
@@ -568,6 +605,7 @@ export const defaultConfig: AgentConfig = {
       supportsTools: true,
       capabilities: { tools: true, reasoning: false, streaming: true },
       contextWindow: 128_000,
+      thinkingLevelMap: { off: "none" },
     },
     "deepseek-v4-pro": {
       provider: "deepseek",
@@ -577,6 +615,7 @@ export const defaultConfig: AgentConfig = {
       supportsTools: true,
       capabilities: { tools: true, reasoning: true, streaming: true },
       contextWindow: 128_000,
+      thinkingLevelMap: { off: "none", low: "low", medium: "medium", high: "high" },
       thinking: { efforts: ["low", "medium", "high"], defaultEffort: "high", mapping: { low: "low", medium: "medium", high: "high" }, budgetTokens: { low: 2_048, medium: 4_096, high: 8_192 } }
     }
   },

@@ -572,6 +572,8 @@ export class BinyTui {
       return;
     }
     await runtime.refreshModelFromDisk();
+    // 实时目录只是增强项；离线或未配置凭据时继续展示全局配置中的模型。
+    await runtime.refreshModelCatalog().catch(() => undefined);
     const info = runtime.getInfo();
     const models = runtime.listModels();
     this.showSelect({

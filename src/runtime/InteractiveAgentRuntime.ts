@@ -38,7 +38,7 @@ import type {
   RuntimeOperation
 } from "./agentEvents.js";
 
-type ExclusiveRuntimeOperation = RuntimeOperation | "permission" | "plan" | "memory";
+type ExclusiveRuntimeOperation = RuntimeOperation | "permission" | "plan" | "memory" | "model_catalog";
 
 export interface SubmittedAgentRun {
   runId: string;
@@ -157,6 +157,10 @@ export class InteractiveAgentRuntime {
 
   async refreshModelFromDisk(): Promise<ModelRuntimeInfo> {
     return await this.runMaintenanceOperation("refresh_model", async () => await this.commandRuntime.agent.refreshModelFromDisk());
+  }
+
+  async refreshModelCatalog(providerAlias?: string): Promise<ModelChoice[]> {
+    return await this.runMaintenanceOperation("model_catalog", async () => await this.commandRuntime.agent.refreshModelCatalog(providerAlias));
   }
 
   submitPrompt(input: string, mode: AgentRunMode = "chat", attachments: AgentAttachment[] = []): SubmittedAgentRun {
@@ -464,7 +468,11 @@ export class InteractiveAgentRuntime {
       info: this.getInfo(),
       permissionMode: this.getPermissionMode(),
       // permission/memory 是即时命令，不作为公共快照里的长操作暴露。
-      activeOperation: this.activeOperation === "permission" || this.activeOperation === "memory" ? undefined : this.activeOperation,
+      activeOperation: this.activeOperation === "permission"
+        || this.activeOperation === "memory"
+        || this.activeOperation === "model_catalog"
+        ? undefined
+        : this.activeOperation,
       activeRun: this.rootRunScheduler.activeRun
         ? publicRunSnapshot(this.rootRunScheduler.activeRun)
         : this.directRun ? publicRunSnapshot(this.directRun) : undefined,

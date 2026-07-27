@@ -7,7 +7,7 @@
  *
  * 这里只读取凭据用于请求，不写配置、不落盘 key。
  */
-import type { ReasoningEffort } from "../config/schema.js";
+import type { ModelApiBackend, ModelCompatibility, ReasoningEffort, ThinkingLevelMap } from "../config/schema.js";
 import { inferReasoningEfforts } from "./capabilities.js";
 import { providerProtocol } from "./provider.js";
 import { createRetryFetch } from "./retry.js";
@@ -64,7 +64,12 @@ export function parseModelCatalog(
       ?? numberValue(item.maxOutputTokens)
       ?? numberValue(item.max_completion_tokens)
       ?? numberValue(item.maxCompletionTokens);
-    const reasoningEfforts = Array.isArray(item.reasoning_efforts)
+    const declaredThinkingLevelMap = parseThinkingLevelMap(item.thinkingLevelMap ?? item.thinking_level_map);
+    const reasoningEfforts = declaredThinkingLevelMap
+      ? Object.keys(declaredThinkingLevelMap)
+        .filter((level) => level !== "off" && declaredThinkingLevelMap[level] !== null)
+        .filter(isReasoningEffort)
+      : Array.isArray(item.reasoning_efforts)
       ? item.reasoning_efforts.filter(isReasoningEffort)
       : Array.isArray(item.reasoningEfforts)
         ? item.reasoningEfforts.filter(isReasoningEffort)
@@ -73,7 +78,7 @@ export function parseModelCatalog(
       // 否则 grok-4.5 / GPT-5 这类模型在界面上只剩一个「默认」档。
       : inferReasoningEfforts(item.id);
     const modalities = Array.isArray(item.modalities) ? item.modalities : [];
-    return [{
+    const entry: ModelCatalogEntry = {
       id: item.id,
       displayName: stringValue(item.display_name) ?? stringValue(item.name) ?? item.id,
       provider,
@@ -87,7 +92,17 @@ export function parseModelCatalog(
         streaming: true
       },
       reasoningEfforts
-    }];
+    };
+    const apiBackend = parseApiBackend(item.apiBackend ?? item.api ?? item.endpoint_type);
+    const baseUrl = stringValue(item.base_url) ?? stringValue(item.baseUrl);
+    const headers = stringRecord(item.headers);
+    const compatibility = parseCompatibility(item.compatibility);
+    if (declaredThinkingLevelMap) entry.thinkingLevelMap = declaredThinkingLevelMap;
+    if (apiBackend) entry.apiBackend = apiBackend;
+    if (baseUrl) entry.baseUrl = baseUrl;
+    if (headers) entry.headers = headers;
+    if (compatibility) entry.compatibility = compatibility;
+    return [entry];
   });
 }
 
@@ -116,6 +131,45 @@ function numberValue(value: unknown): number | undefined {
 
 function booleanValue(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
+}
+
+function parseThinkingLevelMap(value: unknown): ThinkingLevelMap | undefined {
+  if (!isRecord(value)) return undefined;
+  const map: ThinkingLevelMap = {};
+  for (const [key, native] of Object.entries(value)) {
+    if (key !== "off" && !isReasoningEffort(key)) continue;
+    if (native === null) map[key] = null;
+    else if (typeof native === "string" && native.trim()) map[key] = native;
+  }
+  return Object.keys(map).length ? map : undefined;
+}
+
+function parseApiBackend(value: unknown): ModelApiBackend | undefined {
+  if (value === "chat_completions" || value === "responses" || value === "anthropic_messages") return value;
+  if (value === "openai-responses") return "responses";
+  if (value === "anthropic-messages") return "anthropic_messages";
+  return undefined;
+}
+
+function stringRecord(value: unknown): Record<string, string> | undefined {
+  if (!isRecord(value)) return undefined;
+  const result: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string") result[key] = item;
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+
+function parseCompatibility(value: unknown): ModelCompatibility | undefined {
+  if (!isRecord(value)) return undefined;
+  return {
+    supportsDeveloperRole: booleanValue(value.supportsDeveloperRole),
+    supportsReasoning: booleanValue(value.supportsReasoning),
+    supportsVision: booleanValue(value.supportsVision),
+    maxTokensField: value.maxTokensField === "max_tokens" || value.maxTokensField === "max_completion_tokens"
+      ? value.maxTokensField
+      : undefined
+  };
 }
 
 /**
