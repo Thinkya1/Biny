@@ -8,18 +8,6 @@ import type { PermissionManager, PermissionPrompt, PermissionResult } from "../p
 import type { SessionUsage } from "../session/metadata.js";
 import type { ContextMemory } from "./context/ContextMemory.js";
 
-export type IntentType = "qa" | "read_file" | "write_file" | "edit_file" | "search_files" | "git_diff" | "run_command";
-
-export interface Intent {
-  // type 决定 agent loop 后续走问答、工具调用还是权限确认流程。
-  type: IntentType;
-  // 以下字段按 intent 类型使用，保持可选便于规则识别逐步补齐。
-  filePath?: string;
-  content?: string;
-  query?: string;
-  command?: string;
-}
-
 // Preserve Agent-facing event names while the shared permission contract lives in permission/.
 export type AgentPermissionRequest = PermissionPrompt;
 export type AgentPermissionResult = PermissionResult;

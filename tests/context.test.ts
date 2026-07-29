@@ -156,6 +156,7 @@ async function main(): Promise<void> {
   await testContextPreparationAbortStopsAutoCompaction();
   await testRestoreWithoutPersistedBudgetUsesHistoryEstimate();
   await testSessionReplayAndAgentResume();
+  await testLegacyAgentStateMigrates();
   await testSessionPathBoundaries();
   await testSessionReadLimits();
   await testDeleteSessionReplacementRace();
@@ -175,6 +176,8 @@ function testConversationBoundaryPrompt(): void {
   assert.match(prompt, /messages, tool calls, file reads, command results, plans, and approvals before the latest user message are inherited history/);
   assert.match(prompt, /Only the latest user message is the active task/);
   assert.match(prompt, /Never say "I just read\.\.\."/);
+  assert.doesNotMatch(prompt, /prefer web_search/u);
+  assert.match(buildSystemPrompt("qa", undefined, ["web_search"]), /prefer web_search/u);
 }
 
 async function testInstructionHierarchyAndCap(): Promise<void> {
@@ -223,7 +226,7 @@ async function testRepoMapExactCandidate(): Promise<void> {
     await fs.writeFile(path.join(workspaceRoot, "src", "worker.ts"), "export class Worker {}\nexport function createWorker() { return new Worker(); }\n", "utf8");
     await fs.writeFile(path.join(workspaceRoot, "tests", "worker.test.ts"), "export function testWorker() {}\n", "utf8");
 
-    const workspace = new WorkspaceContext(workspaceRoot, [".agent"], 32 * 1024);
+    const workspace = new WorkspaceContext(workspaceRoot, [".biny"], 32 * 1024);
     const turn = await workspace.prepareTurn("startAgent");
     assert.equal(turn.repoMapCandidates[0]?.path, "src/index.ts");
     assert.equal(turn.repoMapCandidates[0]?.symbols.includes("startAgent"), true);
@@ -534,8 +537,8 @@ async function testSessionReplayAndAgentResume(): Promise<void> {
     await agent.runTask("continue the review");
     assert.equal(provider.requests.at(-1)?.some((message) => hasToolCall(message, "call-7")), true);
     assert.equal(provider.requests.at(-1)?.some((message) => messageReasoning(message) === "The worker is the second target."), true);
-    const pendingPlan = agent.createPlan("plan the next review");
-    await assert.rejects(agent.compactConversation(), /while plan creation is running/);
+    const pendingPlan = agent.runTask("plan the next review", { mode: "plan" });
+    await assert.rejects(agent.compactConversation(), /while agent turn is running/);
     await pendingPlan;
     const savedBeforeSwitch = await fs.readFile(filePath, "utf8");
     const secondFile = sessionFilePath(workspaceRoot, "second-session");
@@ -669,6 +672,28 @@ async function testSessionAndToolDisplayRedaction(): Promise<void> {
   });
 }
 
+async function testLegacyAgentStateMigrates(): Promise<void> {
+  await withTempWorkspace(async (workspaceRoot) => {
+    const legacyRoot = path.join(workspaceRoot, ".agent");
+    await fs.mkdir(path.join(legacyRoot, "sessions"), { recursive: true });
+    await fs.mkdir(path.join(legacyRoot, "attachments"), { recursive: true });
+    await fs.writeFile(path.join(legacyRoot, "sessions", "legacy.jsonl"), `${JSON.stringify({ type: "user_message", content: "legacy history" })}\n`, "utf8");
+    await fs.writeFile(path.join(legacyRoot, "attachments", "legacy.png"), "legacy image", "utf8");
+
+    await ensureAgentDirs(workspaceRoot);
+    const migratedSession = path.join(workspaceRoot, ".biny", "sessions", "legacy.jsonl");
+    const migratedAttachment = path.join(workspaceRoot, ".biny", "attachments", "legacy.png");
+    assert.match(await fs.readFile(migratedSession, "utf8"), /legacy history/u);
+    assert.equal(await fs.readFile(migratedAttachment, "utf8"), "legacy image");
+
+    // 新目录是事实来源：重复初始化只能补缺，不能让遗留文件反向覆盖新数据。
+    await fs.writeFile(migratedSession, "new session wins\n", "utf8");
+    await fs.writeFile(path.join(legacyRoot, "sessions", "legacy.jsonl"), "legacy must not overwrite\n", "utf8");
+    await ensureAgentDirs(workspaceRoot);
+    assert.equal(await fs.readFile(migratedSession, "utf8"), "new session wins\n");
+  });
+}
+
 async function testSessionPathBoundaries(): Promise<void> {
   await withTempWorkspace(async (workspaceRoot) => {
     await ensureAgentDirs(workspaceRoot);
@@ -679,7 +704,7 @@ async function testSessionPathBoundaries(): Promise<void> {
     assert.equal(await resolveSessionFile(workspaceRoot, "2026-07-18-safe"), canonicalSafeFile);
     assert.equal(await resolveSessionFile(workspaceRoot, "2026-07"), canonicalSafeFile);
     assert.equal(await resolveSessionFile(workspaceRoot, "2026-07-18-safe.jsonl"), canonicalSafeFile);
-    assert.equal(await resolveSessionFile(workspaceRoot, ".agent/sessions/2026-07-18-safe.jsonl"), canonicalSafeFile);
+    assert.equal(await resolveSessionFile(workspaceRoot, ".biny/sessions/2026-07-18-safe.jsonl"), canonicalSafeFile);
     assert.equal(await resolveSessionFile(workspaceRoot, "latest"), canonicalSafeFile);
     assert.match((await readSessionSnapshot(workspaceRoot, "2026-07-18-safe")).bytes.toString("utf8"), /safe session/);
     assert.equal((await readStoredSessionEvents(workspaceRoot, "2026-07-18-safe")).events[0]?.type, "user_message");
@@ -700,11 +725,11 @@ async function testSessionPathBoundaries(): Promise<void> {
     assert.throws(() => sessionFilePath(workspaceRoot, ".."), /Invalid session id/);
     await assert.rejects(resolveSessionFile(workspaceRoot, safeFile), /Invalid session reference/);
     await assert.rejects(resolveSessionFile(workspaceRoot, "../outside.jsonl"), /Invalid session reference/);
-    await assert.rejects(resolveSessionFile(workspaceRoot, ".agent/sessions/../outside.jsonl"), /Invalid session reference/);
+    await assert.rejects(resolveSessionFile(workspaceRoot, ".biny/sessions/../outside.jsonl"), /Invalid session reference/);
 
-    const sessionsDir = path.join(workspaceRoot, ".agent", "sessions");
+    const sessionsDir = path.join(workspaceRoot, ".biny", "sessions");
     await fs.mkdir(path.join(sessionsDir, "directory.jsonl"));
-    await assert.rejects(resolveSessionFile(workspaceRoot, ".agent/sessions/directory.jsonl"), /regular \.jsonl file/);
+    await assert.rejects(resolveSessionFile(workspaceRoot, ".biny/sessions/directory.jsonl"), /regular \.jsonl file/);
 
     const outsideRoot = await mkdtemp(path.join(os.tmpdir(), "biny-session-outside-"));
     try {
@@ -732,7 +757,7 @@ async function testSessionPathBoundaries(): Promise<void> {
       assert.match((await readSessionSnapshot(workspaceAlias, "2026-07-18-safe")).bytes.toString("utf8"), /safe session/);
 
       const pinnedRecorder = new SessionRecorder(workspaceRoot, "pinned-before-parent-swap");
-      const originalSessionsDir = path.join(workspaceRoot, ".agent", "sessions-original");
+      const originalSessionsDir = path.join(workspaceRoot, ".biny", "sessions-original");
       await fs.rename(sessionsDir, originalSessionsDir);
       await fs.symlink(outsideRoot, sessionsDir);
       assert.throws(
@@ -756,7 +781,7 @@ async function testSessionPathBoundaries(): Promise<void> {
         recorder: new SessionRecorder(workspaceRoot)
       });
       await agent.initialize();
-      await assert.rejects(agent.resume(".agent/sessions/linked.jsonl"), /regular \.jsonl file/);
+      await assert.rejects(agent.resume(".biny/sessions/linked.jsonl"), /regular \.jsonl file/);
       assert.equal(await fs.readFile(outsideFile, "utf8"), outsideContent);
       await agent.close();
 
@@ -771,8 +796,8 @@ async function testSessionPathBoundaries(): Promise<void> {
       await assert.rejects(fs.access(path.join(outsideRoot, "must-not-escape.jsonl")));
 
       await fs.rm(sessionsDir, { force: true });
-      await fs.rm(path.join(workspaceRoot, ".agent"), { recursive: true, force: true });
-      await fs.symlink(outsideRoot, path.join(workspaceRoot, ".agent"));
+      await fs.rm(path.join(workspaceRoot, ".biny"), { recursive: true, force: true });
+      await fs.symlink(outsideRoot, path.join(workspaceRoot, ".biny"));
       await assert.rejects(ensureAgentDirs(workspaceRoot), /real directory, not a symbolic link/);
       await assert.rejects(fs.access(path.join(outsideRoot, "sessions")));
       assert.equal(await fs.readFile(outsideFile, "utf8"), outsideContent);
@@ -920,7 +945,7 @@ async function testCredentialAndSymlinkBoundaries(): Promise<void> {
       assert.throws(() => resolveWorkspacePath(workspaceRoot, "dangling-secret.txt", []), /dangling symbolic link/);
 
       await ensureAgentDirs(workspaceRoot);
-      const telemetryPath = path.join(workspaceRoot, ".agent", "telemetry.jsonl");
+      const telemetryPath = path.join(workspaceRoot, ".biny", "telemetry.jsonl");
       const telemetryVictim = path.join(outsideRoot, "telemetry-victim.txt");
       await fs.writeFile(telemetryVictim, "telemetry-victim-unchanged", "utf8");
       await fs.symlink(telemetryVictim, telemetryPath);
@@ -931,7 +956,7 @@ async function testCredentialAndSymlinkBoundaries(): Promise<void> {
       await createLocalTelemetry(telemetryPath).onError?.(new Error("not written"));
       assert.equal(await fs.readFile(telemetryVictim, "utf8"), "telemetry-victim-unchanged");
 
-      const historyPath = path.join(workspaceRoot, ".agent", "input-history.jsonl");
+      const historyPath = path.join(workspaceRoot, ".biny", "input-history.jsonl");
       const historyVictim = path.join(outsideRoot, "history-victim.txt");
       await fs.writeFile(historyVictim, "history-victim-unchanged", "utf8");
       await fs.symlink(historyVictim, historyPath);
@@ -943,8 +968,8 @@ async function testCredentialAndSymlinkBoundaries(): Promise<void> {
       await assert.rejects(appendInputHistory(workspaceRoot, "must not escape"), /single-link regular file/);
       assert.equal(await fs.readFile(historyVictim, "utf8"), "history-victim-unchanged");
       await fs.rm(historyPath);
-      const agentPath = path.join(workspaceRoot, ".agent");
-      const originalAgentPath = path.join(workspaceRoot, ".agent-original");
+      const agentPath = path.join(workspaceRoot, ".biny");
+      const originalAgentPath = path.join(workspaceRoot, ".biny-original");
       await fs.rename(agentPath, originalAgentPath);
       await fs.symlink(outsideRoot, agentPath);
       await assert.rejects(appendInputHistory(workspaceRoot, "must not escape through parent"), /real directory/);
@@ -981,7 +1006,7 @@ async function testMemoryRedactionDedupAndWriter(): Promise<void> {
     });
     assert.equal(duplicate.written, false);
 
-    const debugFile = path.join(workspaceRoot, ".agent", "memory", "debugging.md");
+    const debugFile = path.join(workspaceRoot, ".biny", "memory", "debugging.md");
     const stored = await fs.readFile(debugFile, "utf8");
     assert.equal(stored.includes("sk-supersecretvalue123"), false);
     assert.match(stored, /\[redacted\]/);
@@ -1057,6 +1082,7 @@ async function testMemoryQueueLifecycleAndUsagePersistence(): Promise<void> {
 
     const config = testConfig();
     config.context.memory.enabled = true;
+    config.context.memory.autoRemember = true;
     const provider = new ContextTestModel();
     await ensureAgentDirs(workspaceRoot);
     const recorder = new SessionRecorder(workspaceRoot, "memory-usage");
@@ -1138,7 +1164,7 @@ async function testMemoryStorageBoundaries(): Promise<void> {
       const victim = path.join(outsideRoot, "victim.md");
       const victimContent = "outside-memory-must-stay-unchanged";
       await fs.writeFile(victim, victimContent, "utf8");
-      const memoryDir = path.join(workspaceRoot, ".agent", "memory");
+      const memoryDir = path.join(workspaceRoot, ".biny", "memory");
 
       await fs.symlink(outsideRoot, memoryDir);
       await assert.rejects(store.findRelevant("outside-memory", []), /real directory, not a symbolic link/);

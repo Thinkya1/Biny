@@ -4,10 +4,9 @@
  * 内置文件、搜索和命令工具会在这里集中注册，agent loop 通过名称查找并执行工具。注册表也保留
  * 工具来源信息让内置、MCP、skill、plugin 和 subagent 工具复用同一调用路径。
  */
-import type { JsonObjectSchema } from "./schema.js";
 import type { ToolDefinition } from "./definition.js";
 import type { SandboxConfig, WebCookiesConfig, WebFetchConfig, WebSearchConfig } from "../config/schema.js";
-import type { Tool, ToolContext, ToolExecution, ToolSource } from "./types.js";
+import type { Tool, ToolContext, ToolSource } from "./types.js";
 import { createReadFileTool } from "./file/readFile.js";
 import { createWriteFileTool } from "./file/writeFile.js";
 import { createEditFileTool } from "./file/editFile.js";
@@ -33,16 +32,15 @@ export interface RegisteredTool {
   tool: Tool;
 }
 
-export class ToolManager {
+export class ToolRegistry {
   private readonly tools = new Map<string, RegisteredTool>();
 
-  register(tool: Tool | LegacyTool, source: ToolSource = "builtin"): void {
+  register(tool: Tool, source: ToolSource = "builtin"): void {
     // source 只记录注册来源；权限、session 和调度仍由统一 coordinator 处理。
-    const normalized = normalizeTool(tool);
-    if (this.tools.has(normalized.name)) {
-      throw new Error(`Tool already registered: ${normalized.name}`);
+    if (this.tools.has(tool.name)) {
+      throw new Error(`Tool already registered: ${tool.name}`);
     }
-    this.tools.set(normalized.name, { source, tool: normalized });
+    this.tools.set(tool.name, { source, tool });
   }
 
   registerBuiltinTool(tool: Tool): void {
@@ -95,8 +93,6 @@ export class ToolManager {
   }
 }
 
-export class ToolRegistry extends ToolManager {}
-
 export function createToolRegistry(
   context: ToolContext,
   webSearchConfig?: WebSearchConfig,
@@ -128,31 +124,4 @@ export function createToolRegistry(
   if (webSearchConfig?.enabled !== false) registry.register(createWebSearchTool(webSearchConfig, webCookiesConfig));
   if (webFetchConfig?.enabled !== false) registry.register(createWebFetchTool(webFetchConfig, webCookiesConfig));
   return registry;
-}
-
-interface LegacyTool<TArgs = unknown, TResult = unknown> extends Omit<Tool<TArgs, TResult>, "parameters" | "resolveExecution"> {
-  parameters?: JsonObjectSchema;
-  execute(args: TArgs): Promise<TResult>;
-}
-
-function normalizeTool(tool: Tool | LegacyTool): Tool {
-  if ("resolveExecution" in tool && typeof tool.resolveExecution === "function") return tool;
-  const legacy = tool as LegacyTool;
-  return {
-    name: legacy.name,
-    description: legacy.description,
-    parameters: legacy.parameters ?? { type: "object", additionalProperties: true },
-    schema: legacy.schema,
-    source: legacy.source,
-    capability: legacy.capability,
-    risk: legacy.risk,
-    resolveExecution(args: unknown): ToolExecution {
-      return {
-        approvalRule: legacy.name,
-        async execute() {
-          return await legacy.execute(args);
-        }
-      };
-    }
-  };
 }

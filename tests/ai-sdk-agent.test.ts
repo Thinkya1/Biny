@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
@@ -13,9 +13,14 @@ import { ensureAgentDirs } from "../src/session/store.js";
 import { createReadFileTool } from "../src/tools/file/readFile.js";
 import { ToolRegistry } from "../src/tools/registry.js";
 import type { Tool } from "../src/tools/types.js";
+import { saveAttachment } from "../src/attachments/store.js";
 
 async function main(): Promise<void> {
   await testAgentStreamsFinalAnswer();
+  await testUnsupportedImageAttachmentFailsBeforeProviderCall();
+  await testImageAttachmentStoresOnlyReferenceInSession();
+  await testAttachmentStorageRejectsSymlink();
+  await testImageAttachmentIsRehydratedOnResume();
   await testInternalAttemptPersistsOnlyPublicPrompt();
   await testAgentRunsToolAndKeepsSessionEvents();
   await testPlanModeExposesOnlyReadTools();
@@ -38,6 +43,90 @@ async function main(): Promise<void> {
   await testPreAbortedRunStopsBeforeRequest();
   await testPreAbortedPlanRecordsAttempt();
   await testConsumerReturnAbortsAndDrainsStream();
+}
+
+async function testUnsupportedImageAttachmentFailsBeforeProviderCall(): Promise<void> {
+  const { agent, sessionFile, cleanup } = await createAgent();
+  try {
+    const events = await collect(agent.run("请分析图片", {
+      attachments: [{ name: "shot.png", mimeType: "image/png", path: "@attachments/shot.png", size: 3, data: "abc" }]
+    }));
+    assert.equal(events.some((event) => event.type === "error" && /vision/u.test(event.message)), true);
+    assert.equal(events.find((event) => event.type === "done")?.outcome.status, "failed");
+    await agent.close();
+    const session = await readFile(sessionFile, "utf8");
+    assert.match(session, /"type":"user_message"/u);
+    assert.match(session, /@attachments\/shot\.png/u);
+    assert.match(session, /vision/u);
+  } finally {
+    await cleanup(agent, true);
+  }
+}
+
+async function testAttachmentStorageRejectsSymlink(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-attachment-storage-"));
+  const outsideRoot = await mkdtemp(path.join(os.tmpdir(), "biny-attachment-storage-outside-"));
+  try {
+    await ensureAgentDirs(workspaceRoot);
+    await rm(path.join(workspaceRoot, ".biny", "attachments"), { recursive: true, force: true });
+    await symlink(outsideRoot, path.join(workspaceRoot, ".biny", "attachments"), "dir");
+    await assert.rejects(saveAttachment(workspaceRoot, "shot.png", "image/png", Buffer.from("image")), /real directory, not a symbolic link/u);
+    assert.deepEqual(await readdir(outsideRoot), []);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(outsideRoot, { recursive: true, force: true });
+  }
+}
+
+async function testImageAttachmentStoresOnlyReferenceInSession(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (): Promise<Response> => sseResponse([
+    { choices: [{ index: 0, delta: { content: "image received" }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    "[DONE]"
+  ])) as typeof fetch;
+  const { agent, sessionFile, cleanup } = await createAgent(undefined, (config) => {
+    config.models["test-model"]!.capabilities = { vision: true };
+  });
+  try {
+    await collect(agent.run("请分析图片", {
+      attachments: [{ name: "shot.png", mimeType: "image/png", path: "@attachments/shot.png", size: 3, data: "base64-image-payload" }]
+    }));
+    await agent.close();
+    const session = await readFile(sessionFile, "utf8");
+    assert.match(session, /@attachments\/shot\.png/u);
+    assert.doesNotMatch(session, /base64-image-payload/u);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanup(agent, true);
+  }
+}
+
+async function testImageAttachmentIsRehydratedOnResume(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (): Promise<Response> => sseResponse([
+    { choices: [{ index: 0, delta: { content: "image received" }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    "[DONE]"
+  ])) as typeof fetch;
+  const { agent, workspaceRoot, cleanup } = await createAgent(undefined, (config) => {
+    config.models["test-model"]!.capabilities = { vision: true };
+  });
+  try {
+    const bytes = Buffer.from("persisted-image-bytes");
+    const reference = await saveAttachment(workspaceRoot, "shot.png", "image/png", bytes);
+    await collect(agent.run("请分析图片", {
+      attachments: [{ ...reference, data: bytes.toString("base64") }]
+    }));
+
+    const resumed = await agent.resume(agent.getInfo().sessionId);
+    const restored = JSON.stringify(resumed.messages);
+    assert.match(restored, new RegExp(bytes.toString("base64"), "u"));
+    assert.match(restored, /"filename":"shot\.png"/u);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanup(agent);
+  }
 }
 
 async function testStepLimitIsIncompleteAndDoesNotQueueSuccessfulMemory(): Promise<void> {
@@ -98,7 +187,10 @@ async function testHarnessCanDeferSuccessfulMemoryUntilAcceptance(): Promise<voi
     "[DONE]"
   ])) as typeof fetch;
 
-  const { agent, cleanup } = await createAgent();
+  const { agent, cleanup } = await createAgent(undefined, (config) => {
+    config.context.memory.enabled = true;
+    config.context.memory.autoRemember = true;
+  });
   const memory = (agent as unknown as {
     contextMemory: { queueSuccessfulTask(input: string, output: string): void };
   }).contextMemory;
@@ -359,7 +451,9 @@ async function testAgentStreamsFinalAnswer(): Promise<void> {
     ]);
   }) as typeof fetch;
 
-  const { agent, cleanup, sessionFile, workspaceRoot } = await createAgent();
+  const { agent, cleanup, sessionFile, workspaceRoot } = await createAgent(undefined, (config) => {
+    config.telemetry.enabled = true;
+  });
   try {
     const events = await collect(runAgent(agent, "hi"));
     assert.equal(calls, 1);
@@ -370,7 +464,7 @@ async function testAgentStreamsFinalAnswer(): Promise<void> {
     const assistant = sessionEvents.find((event) => event.type === "assistant_message");
     assert.equal(assistant?.usage?.inputTokens, 12);
     assert.equal(assistant?.contextState?.budget?.source, "provider");
-    const telemetry = await readFile(path.join(workspaceRoot, ".agent", "telemetry.jsonl"), "utf8");
+    const telemetry = await readFile(path.join(workspaceRoot, ".biny", "telemetry.jsonl"), "utf8");
     assert.match(telemetry, /"type":"end"/);
   } finally {
     globalThis.fetch = originalFetch;
@@ -994,12 +1088,16 @@ async function testPreAbortedPlanRecordsAttempt(): Promise<void> {
   const controller = new AbortController();
   controller.abort();
   try {
-    await assert.rejects(agent.createPlan("inspect cancellation", undefined, controller.signal), /interrupted before execution/i);
+    const events = await collect(agent.run("inspect cancellation", {
+      mode: "plan",
+      abortSignal: controller.signal
+    }));
     assert.equal(calls, 0);
+    assert.equal(events.find((event) => event.type === "done")?.outcome.status, "aborted");
     await agent.close();
     const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; content?: string });
-    assert.deepEqual(sessionEvents.map((event) => event.type), ["user_message", "error"]);
-    assert.equal(sessionEvents[0]?.content, "plan: inspect cancellation");
+    assert.deepEqual(sessionEvents.map((event) => event.type), ["user_message"]);
+    assert.equal(sessionEvents[0]?.content, "inspect cancellation");
   } finally {
     globalThis.fetch = originalFetch;
     await cleanup(agent, true);
@@ -1148,7 +1246,8 @@ async function createAgent(
     model: createLanguageModelForConfig(config),
     toolRegistry: registry,
     permissionManager,
-    recorder
+    recorder,
+    attachmentRoot: workspaceRoot
   });
   await agent.initialize();
   return {

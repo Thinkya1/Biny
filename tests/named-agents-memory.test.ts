@@ -281,7 +281,7 @@ async function testMemoryTools(): Promise<void> {
     assert.ok(!("isError" in saveExecution));
     const saved = await saveExecution.execute({ toolCallId: "save-1" }) as { saved: boolean; path?: string };
     assert.equal(saved.saved, true);
-    assert.equal(saved.path, path.join(".agent", "memory", "workflows.md"));
+    assert.equal(saved.path, path.join(".biny", "memory", "workflows.md"));
 
     // 无效参数走 isError 分支而不是抛异常。
     const invalid = await saveTool.resolveExecution({ topic: "x", title: "y", summary: "short" });

@@ -16,6 +16,7 @@ import { modelCapabilities, modelReasoningConfig, nativeReasoningEffort, reasoni
 import { providerProtocol } from "../ai/provider.js";
 import { createRetryFetch } from "../ai/retry.js";
 import { providerProfile } from "./profiles.js";
+import { CLAUDE_SUBSCRIPTION_BETA, openAiCodexHeaders } from "./subscriptionAuth.js";
 
 export interface ResolvedModelConfig {
   alias: string;
@@ -278,8 +279,6 @@ function validateEndpointAndCredentials(
   }
 }
 
-const CLAUDE_SUBSCRIPTION_BETA = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219";
-
 function claudeSubscriptionHeaders(): Record<string, string> {
   return {
     "User-Agent": "claude-cli/2.1.153 (external, cli)",
@@ -287,35 +286,6 @@ function claudeSubscriptionHeaders(): Record<string, string> {
     "anthropic-dangerous-direct-browser-access": "true",
     "x-app": "cli"
   };
-}
-
-function openAiCodexHeaders(accessToken: string | undefined): Record<string, string> {
-  const accountId = accessToken ? extractOpenAiAccountId(accessToken) : undefined;
-  const headers: Record<string, string> = {
-    "OpenAI-Beta": "responses=experimental",
-    originator: "codex_cli_rs",
-    "User-Agent": "codex_cli_rs/0.0.0 (Biny)"
-  };
-  if (accountId) headers["ChatGPT-Account-Id"] = accountId;
-  return headers;
-}
-
-function extractOpenAiAccountId(token: string): string | undefined {
-  const payload = token.split(".")[1];
-  if (!payload) return undefined;
-  try {
-    const padded = payload + "=".repeat((4 - (payload.length % 4)) % 4);
-    const parsed = JSON.parse(Buffer.from(padded.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) as Record<string, unknown>;
-    const nested = parsed["https://api.openai.com/auth"];
-    if (nested && typeof nested === "object") {
-      const accountId = (nested as Record<string, unknown>).chatgpt_account_id;
-      if (typeof accountId === "string" && accountId) return accountId;
-    }
-    const accountId = parsed.chatgpt_account_id;
-    return typeof accountId === "string" && accountId ? accountId : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function createProviderOptions(

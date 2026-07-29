@@ -44,22 +44,22 @@ const contextSchema = z.object({
   // 不配置时按当前模型的上下文窗口自动推导；配置了就作为额外上限。
   maxInputTokens: z.number().int().min(2_048).max(2_000_000).optional(),
   // A turn retains this much cumulative tool output in model context. Later
-  // results are archived under .agent/tool-results with a bounded preview.
+  // results are archived under .biny/tool-results with a bounded preview.
   maxTurnToolResultBytes: z.number().int().min(1_024).max(16 * 1024 * 1024).default(128 * 1024),
   instructionsMaxBytes: z.number().int().min(1_024).max(131_072).default(32 * 1024),
   memory: z.object({
-    enabled: z.boolean().default(true),
+    enabled: z.boolean().default(false),
     // 任务成功后是否自动抽取一条记忆；关闭后仍可检索与手动 save_memory。
-    autoRemember: z.boolean().default(true),
+    autoRemember: z.boolean().default(false),
     // 每回合自动注入上下文的最大记忆条数。
     maxRecalled: z.number().int().min(1).max(20).default(3),
     // 记忆抽取/整理使用的模型别名；缺省跟随会话模型。
     model: z.string().min(1).optional()
-  }).default({ enabled: true, autoRemember: true, maxRecalled: 3, model: undefined })
+  }).default({ enabled: false, autoRemember: false, maxRecalled: 3, model: undefined })
 }).default({
   maxTurnToolResultBytes: 128 * 1024,
   instructionsMaxBytes: 32 * 1024,
-  memory: { enabled: true, autoRemember: true, maxRecalled: 3, model: undefined }
+  memory: { enabled: false, autoRemember: false, maxRecalled: 3, model: undefined }
 });
 
 export const modelProviderSchema = z.enum([
@@ -210,7 +210,7 @@ const extensionsSchema = z.object({
   skills: z.array(z.string().trim().min(1)).max(32).default([".biny/skills", ".agent/skills"]),
   plugins: z.array(z.string().trim().min(1)).max(32).default([]),
   subagent: z.object({
-    enabled: z.boolean().default(true),
+    enabled: z.boolean().default(false),
     maxSteps: z.number().int().min(1).max(32).default(16),
     maxOutputTokens: z.number().int().min(256).max(32_768).default(8_000),
     maxConcurrentSubagents: z.number().int().min(1).max(8).default(2),
@@ -222,7 +222,7 @@ const extensionsSchema = z.object({
     // 具名子代理定义目录（workspace 相对路径）；全局 ~/.biny/agents 始终生效。
     agentPaths: z.array(z.string().trim().min(1)).max(32).default([".biny/agents", ".agent/agents"])
   }).default({
-    enabled: true,
+    enabled: false,
     maxSteps: 16,
     maxOutputTokens: 8_000,
     maxConcurrentSubagents: 2,
@@ -238,7 +238,7 @@ const extensionsSchema = z.object({
   skills: [".biny/skills", ".agent/skills"],
   plugins: [],
   subagent: {
-    enabled: true,
+    enabled: false,
     maxSteps: 16,
     maxOutputTokens: 8_000,
     maxConcurrentSubagents: 2,
@@ -252,14 +252,14 @@ const extensionsSchema = z.object({
 });
 
 const webSearchSchema = z.object({
-  enabled: z.boolean().default(true),
+  enabled: z.boolean().default(false),
   provider: z.enum(["duckduckgo", "google", "tavily", "brave", "anysearch"]).default("anysearch"),
   apiKey: z.string().min(1).optional(),
   apiKeyEnv: z.string().min(1).optional(),
   timeoutMs: z.number().int().min(1_000).max(60_000).default(10_000),
   maxResults: z.number().int().min(1).max(10).default(5)
 }).default({
-  enabled: true,
+  enabled: false,
   provider: "anysearch",
   apiKey: undefined,
   apiKeyEnv: undefined,
@@ -275,20 +275,20 @@ const webSearchSchema = z.object({
  * 默认不在免确认工具白名单里，每次抓取仍要用户确认，这是这项能力的主要约束。
  */
 const webCookiesSchema = z.object({
-  enabled: z.boolean().default(true),
+  enabled: z.boolean().default(false),
   /** jar 文件位置；留空用桌面端 userData 下的共享路径，桌面端与 CLI 因此读到同一份。 */
   path: z.string().min(1).optional()
-}).default({ enabled: true, path: undefined });
+}).default({ enabled: false, path: undefined });
 
 const webFetchSchema = z.object({
-  enabled: z.boolean().default(true),
+  enabled: z.boolean().default(false),
   timeoutMs: z.number().int().min(1_000).max(120_000).default(15_000),
   maxBytes: z.number().int().min(1_024).max(32 * 1024 * 1024).default(2 * 1024 * 1024),
   maxRedirects: z.number().int().min(0).max(10).default(5),
   // 只在用户明确要抓本机开发服务时开启：关掉的是私网/环回/云元数据地址的防线。
   allowPrivateNetwork: z.boolean().default(false)
 }).default({
-  enabled: true,
+  enabled: false,
   timeoutMs: 15_000,
   maxBytes: 2 * 1024 * 1024,
   maxRedirects: 5,
@@ -326,9 +326,9 @@ const checkpointsSchema = z.object({
 }).default({ enabled: true });
 
 const diagnosticsSchema = z.object({
-  enabled: z.boolean().default(true),
+  enabled: z.boolean().default(false),
   /** 自动识别项目本地已安装的检查工具（目前是 TypeScript）；只用本地二进制，不联网安装。 */
-  autoDetect: z.boolean().default(true),
+  autoDetect: z.boolean().default(false),
   autoDetectTimeoutMs: z.number().int().min(1_000).max(600_000).default(120_000),
   maxOutputBytes: z.number().int().min(256).max(1024 * 1024).default(8 * 1024),
   commands: z.array(z.object({
@@ -337,8 +337,8 @@ const diagnosticsSchema = z.object({
     timeoutMs: z.number().int().min(1_000).max(600_000).default(120_000)
   })).max(8).default([])
 }).default({
-  enabled: true,
-  autoDetect: true,
+  enabled: false,
+  autoDetect: false,
   autoDetectTimeoutMs: 120_000,
   maxOutputBytes: 8 * 1024,
   commands: []
@@ -350,7 +350,7 @@ const webSchema = z.object({
   cookies: webCookiesSchema
 }).default({
   search: {
-    enabled: true,
+    enabled: false,
     provider: "anysearch",
     apiKey: undefined,
     apiKeyEnv: undefined,
@@ -358,13 +358,13 @@ const webSchema = z.object({
     maxResults: 5
   },
   fetch: {
-    enabled: true,
+    enabled: false,
     timeoutMs: 15_000,
     maxBytes: 2 * 1024 * 1024,
     maxRedirects: 5,
     allowPrivateNetwork: false
   },
-  cookies: { enabled: true, path: undefined }
+  cookies: { enabled: false, path: undefined }
 });
 
 const modelThinkingSchema = z.object({
@@ -426,10 +426,10 @@ const canonicalConfigSchema = z.object({
   hooks: hooksSchema,
   web: webSchema,
   telemetry: z.object({
-    enabled: z.boolean().default(true),
+    enabled: z.boolean().default(false),
     recordInputs: z.boolean().default(false),
     recordOutputs: z.boolean().default(false)
-  }).default({ enabled: true, recordInputs: false, recordOutputs: false }),
+  }).default({ enabled: false, recordInputs: false, recordOutputs: false }),
   extensions: extensionsSchema
 }).superRefine((config, context) => {
   const activeModel = config.models[config.defaultModel];
@@ -580,6 +580,7 @@ const defaultWorkspaceIgnore = [
   "dist",
   "build",
   ".env",
+  ".biny",
   ".agent",
   ".DS_Store",
   "PROJECT_DESCRIPTION.local.md",
@@ -644,8 +645,8 @@ export const defaultConfig: AgentConfig = {
   sandbox: { mode: "off", allowNetwork: true },
   hooks: { beforeTool: [], afterTool: [] },
   diagnostics: {
-    enabled: true,
-    autoDetect: true,
+    enabled: false,
+    autoDetect: false,
     autoDetectTimeoutMs: 120_000,
     maxOutputBytes: 8 * 1024,
     commands: []
@@ -653,11 +654,11 @@ export const defaultConfig: AgentConfig = {
   context: {
     maxTurnToolResultBytes: 128 * 1024,
     instructionsMaxBytes: 32 * 1024,
-    memory: { enabled: true, autoRemember: true, maxRecalled: 3, model: undefined }
+    memory: { enabled: false, autoRemember: false, maxRecalled: 3, model: undefined }
   },
   web: {
     search: {
-      enabled: true,
+      enabled: false,
       provider: "anysearch",
       apiKey: undefined,
       apiKeyEnv: undefined,
@@ -665,21 +666,21 @@ export const defaultConfig: AgentConfig = {
       maxResults: 5
     },
     fetch: {
-      enabled: true,
+      enabled: false,
       timeoutMs: 15_000,
       maxBytes: 2 * 1024 * 1024,
       maxRedirects: 5,
       allowPrivateNetwork: false
     },
-    cookies: { enabled: true, path: undefined }
+    cookies: { enabled: false, path: undefined }
   },
-  telemetry: { enabled: true, recordInputs: false, recordOutputs: false },
+  telemetry: { enabled: false, recordInputs: false, recordOutputs: false },
   extensions: {
     mcp: {},
     skills: [".biny/skills", ".agent/skills"],
     plugins: [],
     subagent: {
-      enabled: true,
+      enabled: false,
       maxSteps: 16,
       maxOutputTokens: 8_000,
       maxConcurrentSubagents: 2,

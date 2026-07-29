@@ -305,7 +305,10 @@ function testWebSearchPermission(): void {
 }
 
 function testWebSearchRegistration(): void {
-  const registry = createToolRegistry({ workspaceRoot: "/tmp", ignore: [] }, defaultConfig.web.search);
+  const registry = createToolRegistry(
+    { workspaceRoot: "/tmp", ignore: [] },
+    { ...defaultConfig.web.search, enabled: true }
+  );
   assert.equal(registry.get("web_search").name, "web_search");
 
   const disabledRegistry = createToolRegistry({ workspaceRoot: "/tmp", ignore: [] }, {

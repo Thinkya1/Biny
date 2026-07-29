@@ -88,7 +88,6 @@ export class SdkToolExecutionCoordinator {
   private readonly duplicateToolCallIds = new Set<string>();
   private readonly duplicateExecutionCounts = new Map<string, number>();
   private permissionTail: Promise<void> = Promise.resolve();
-  private fallbackSequence = 0;
   /** Bytes actually handed back to the model this turn; drives the budget. */
   private inlineToolResultBytes = 0;
   /** Bytes tools produced this turn, archived or not; reported for diagnostics. */
@@ -699,7 +698,7 @@ export class SdkToolExecutionCoordinator {
   }
 
   private nextSequence(): number {
-    return this.context.recorder.nextToolCallSequence?.() ?? ++this.fallbackSequence;
+    return this.context.recorder.nextToolCallSequence();
   }
 
   private duplicateAuditId(toolCallId: string, sequence: number): string {

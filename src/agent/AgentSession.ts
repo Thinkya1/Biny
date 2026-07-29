@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { streamText, type LanguageModel, type LanguageModelUsage, type ModelMessage, type TextStreamPart, type ToolSet } from "ai";
+import type { LanguageModel, LanguageModelUsage, ModelMessage, TextStreamPart, ToolSet } from "ai";
 import type { AgentConfig } from "../config/schema.js";
 import { createFileConfigStore, type AgentConfigStore } from "../config/store.js";
 import {
@@ -41,6 +41,8 @@ import { AsyncEventQueue } from "../runtime/AsyncEventQueue.js";
 import { defaultModelContextWindow, modelContextBudget } from "../ai/capabilities.js";
 import { modelCapabilities } from "../ai/capabilities.js";
 import { createLanguageModelForConfig } from "../llm/factory.js";
+import { readAttachment, type AgentAttachment } from "../attachments/store.js";
+import type { AttachmentReference } from "../attachments/store.js";
 
 export interface AgentSessionOptions {
   workspaceRoot: string;
@@ -52,7 +54,6 @@ export interface AgentSessionOptions {
   permissionManager: PermissionManager;
   recorder: SessionRecorder;
   modelManager?: ModelManager;
-  taskStatePrompt?: () => Promise<string | undefined>;
   skillPrompt?: string;
   /** 具名子代理定义元数据段（delegate_task 可用的 agent 列表）。 */
   subagentPrompt?: string;
@@ -63,6 +64,8 @@ export interface AgentSessionOptions {
   todoPrompt?: () => string | undefined;
   /** 回合内首次改动工作区前建快照，供 /undo 回退；不在 git 仓库时省略。 */
   createCheckpoint?: (label: string) => Promise<unknown>;
+  /** 会话恢复时按虚拟路径重新读取项目级附件。 */
+  attachmentRoot?: string;
 }
 
 export interface AgentRunOptions {
@@ -87,11 +90,7 @@ export interface AgentRunOptions {
   attachments?: AgentAttachment[];
 }
 
-export interface AgentAttachment {
-  name: string;
-  mimeType: string;
-  data: string;
-}
+export type { AgentAttachment } from "../attachments/store.js";
 
 export interface AgentSessionInfo {
   workspaceRoot: string;
@@ -108,7 +107,10 @@ export interface AgentSessionInfo {
   skills?: string[];
 }
 
-export type AgentRunMode = "chat" | "plan";
+/** 普通交互统一走 chat；plan 仅改变工具策略；autonomous 只给 CLI 的强制 durable 策略使用。 */
+export type AgentRunMode = "chat" | "plan" | "autonomous";
+/** Desktop/TUI 的交互策略；durable 执行由 `biny run` 明确触发。 */
+export type InteractiveAgentRunMode = Exclude<AgentRunMode, "autonomous">;
 
 export interface ResumedAgentSession extends SessionReplay {
   filePath: string;
@@ -212,7 +214,11 @@ export class AgentSession {
   async *continueInterruptedTurn(runOptions: AgentRunOptions = {}): AsyncGenerator<AgentSessionEvent> {
     const turn = await this.turnStore.load();
     if (!turn) throw new Error("There is no interrupted turn to continue.");
-    yield* this.runSdk(turn.prompt, { ...runOptions, continueFrom: turn.messages });
+    yield* this.run(turn.prompt, {
+      ...runOptions,
+      continueFrom: turn.messages,
+      recordSessionUserMessage: false
+    });
   }
 
   /** 持久记忆存储句柄；记忆工具与 /memory 命令共用（禁用时为 undefined）。 */
@@ -225,10 +231,6 @@ export class AgentSession {
   }
 
   async *run(input: string, runOptions: AgentRunOptions = {}): AsyncGenerator<AgentSessionEvent> {
-    yield* this.runSdk(input, runOptions);
-  }
-
-  async *runSdk(input: string, runOptions: AgentRunOptions = {}): AsyncGenerator<AgentSessionEvent> {
     const release = this.beginOperation("agent turn");
     const turnController = new AbortController();
     const abortSignal = runOptions.abortSignal
@@ -245,6 +247,7 @@ export class AgentSession {
       this.recorder.record({
         type: "user_message",
         content: runOptions.sessionUserMessage ?? input,
+        attachments: sessionAttachments(runOptions.attachments),
         skills: this.options.skillPaths,
         contextUsage: this.contextMemory.getBudget(),
         contextState: this.contextMemory.persistedState(),
@@ -279,17 +282,20 @@ export class AgentSession {
       messages = [...runOptions.continueFrom];
       userMessageRecorded = true;
     } else {
+    // 先把用户原始输入（以及附件引用）写进 JSONL，再组装上下文或检查模型能力。
+    // 这样即使模型不支持图片、上下文构建失败或进程随后中断，恢复会话时仍能看到这次输入。
+    recordUserMessage();
     try {
-      const durableTaskPrompt = await this.options.taskStatePrompt?.();
-      const systemPrompt = [
-        buildSystemPrompt(mode === "plan" ? "plan" : "qa", this.extensionPrompt()),
-        durableTaskPrompt
-      ].filter((section): section is string => Boolean(section)).join("\n\n");
+      const systemPrompt = buildSystemPrompt(
+        mode === "plan" ? "plan" : "qa",
+        this.extensionPrompt(),
+        this.options.toolRegistry.list().map((tool) => tool.name)
+      );
       messages = await this.contextMemory.prepareTurn(
         modelInput,
         systemPrompt,
         abortSignal,
-        supportedAttachments(this.options.config, runOptions.attachments)
+        this.supportedAttachments(runOptions.attachments)
       );
     } catch (error) {
       recordUserMessage();
@@ -353,7 +359,7 @@ export class AgentSession {
       onPart: (part) => queue.push({ type: "sdk", part }),
       onStepEnd: async (step) => {
         // 每步各自是一次 provider 请求，用量按步记录而不是等回合结束一次性归并。
-        stepUsageRecords.push(this.recordModelUsage(step.usage, "agent"));
+        stepUsageRecords.push(this.recordModelUsage(step.usage, mode === "plan" ? "plan" : "agent"));
         if (step.usage.inputTokens !== undefined) this.contextMemory.recordProviderUsage(step.usage);
         // 落盘这一步结束时的完整 context：进程在这之后挂掉，下次可以从这里继续。
         await this.turnStore.save(runOptions.sessionUserMessage ?? input, step.messages, step.index + 1)
@@ -530,80 +536,6 @@ export class AgentSession {
     return outcome ?? failedTurn("Agent stream ended without a terminal result.", 0);
   }
 
-  async createPlan(task: string, onDelta?: (delta: string) => void, abortSignal?: AbortSignal): Promise<string> {
-    const release = this.beginOperation("plan creation");
-    const userContent = `plan: ${task}`;
-    const usageBeforePreparation = this.usageRecords.length;
-    let userMessageRecorded = false;
-    const recordUserMessage = (): void => {
-      if (userMessageRecorded) return;
-      userMessageRecorded = true;
-      this.recorder.record({
-        type: "user_message",
-        content: userContent,
-        skills: this.options.skillPaths,
-        contextUsage: this.contextMemory.getBudget(),
-        contextState: this.contextMemory.persistedState(),
-        preparationUsage: this.usageRecords.slice(usageBeforePreparation)
-      });
-    };
-    try {
-      if (abortSignal?.aborted) {
-        recordUserMessage();
-        throw new Error("Plan creation was interrupted before execution.");
-      }
-      let messages: ModelMessage[];
-      try {
-        messages = await this.contextMemory.prepareTurn(task, buildSystemPrompt("oneShotPlan", this.extensionPrompt()), abortSignal);
-      } catch (error) {
-        recordUserMessage();
-        throw error;
-      }
-      recordUserMessage();
-      const model = this.options.modelManager?.getModel() ?? this.options.model;
-      if (!model) throw new Error("Vercel AI SDK model is not configured.");
-      const result = streamText({
-        model,
-        messages,
-        allowSystemInMessages: true,
-        abortSignal,
-        maxRetries: this.options.modelManager?.getModelSettings().maxRetries ?? 0,
-        providerOptions: this.options.modelManager?.getModelSettings().providerOptions,
-        reasoning: this.options.modelManager?.getModelSettings().reasoning,
-        timeout: this.options.modelManager?.getModelSettings().timeoutMs,
-        maxOutputTokens: this.options.modelManager?.getModelSettings().maxOutputTokens,
-        telemetry: createSdkTelemetry(this.options.config, this.persistenceRoot(), "biny.plan"),
-        onError: () => undefined
-      });
-      for await (const delta of result.textStream) onDelta?.(delta);
-      const output = await result.text;
-      const [usage, finalStep] = await Promise.all([result.usage, result.finalStep]);
-      this.contextMemory.recordProviderUsage(finalStep.usage.inputTokens !== undefined ? finalStep.usage : usage);
-      this.contextMemory.replaceHistory([
-        ...this.contextMemory.getHistory(),
-        { role: "user", content: userContent },
-        { role: "assistant", content: output }
-      ]);
-      this.recorder.record({
-        type: "assistant_message",
-        content: output,
-        reasoningContent: undefined,
-        usage: this.recordModelUsage(usage, "plan"),
-        contextState: this.contextMemory.snapshot()
-      });
-      if (finalStep.finishReason !== "stop") {
-        throw new Error(`Plan generation did not reach a terminal model stop (finishReason=${finalStep.finishReason}).`);
-      }
-      this.rememberSuccessfulTask(userContent, output);
-      return output;
-    } catch (error) {
-      this.recordError(error);
-      throw error;
-    } finally {
-      release();
-    }
-  }
-
   async resume(session: string | undefined): Promise<ResumedAgentSession> {
     const release = this.beginOperation("session resume");
     try {
@@ -632,9 +564,10 @@ export class AgentSession {
       this.options.permissionManager.resetSession();
       this.usageRecords = [...replay.usage];
       this.unpersistedRelatedUsage = [];
-      this.contextMemory.restore(replay.messages, replay.contextState ?? replay.contextUsage);
+      const messages = await this.rehydrateSessionAttachments(replay.messages, replay.events);
+      this.contextMemory.restore(messages, replay.contextState ?? replay.contextUsage);
       this.recorder = replacementRecorder;
-      return { ...replay, filePath, sessionId: replacementRecorder.sessionId };
+      return { ...replay, messages, filePath, sessionId: replacementRecorder.sessionId };
     } catch (error) {
       await replacementRecorder?.close().catch(() => undefined);
       if (previousClosed) {
@@ -666,6 +599,23 @@ export class AgentSession {
 
   usageReport(): string {
     return formatUsageSummary(summarizeUsage(this.usageRecords));
+  }
+
+  /** 当前激活模型不支持媒体时返回明确错误；输入本身已先写入会话，方便恢复和切换模型后重试。 */
+  assertAttachmentsSupported(attachments: AgentAttachment[]): void {
+    if (!attachments.length) return;
+    const modelAlias = this.options.modelManager?.getInfo().modelAlias ?? this.options.config.defaultModel;
+    const model = this.options.config.models[modelAlias];
+    if (!model) throw new Error(`当前模型配置不存在：${modelAlias}`);
+    const capabilities = modelCapabilities(model);
+    const image = attachments.find((attachment) => attachment.mimeType.startsWith("image/"));
+    if (image && !capabilities.vision) {
+      throw new Error(`当前模型 ${modelAlias} 未声明 vision 能力，无法发送图片附件。请切换到支持图片的模型，或在模型配置中明确启用 capabilities.vision。`);
+    }
+    const audio = attachments.find((attachment) => attachment.mimeType.startsWith("audio/"));
+    if (audio && !capabilities.audio) {
+      throw new Error(`当前模型 ${modelAlias} 未声明 audio 能力，无法发送音频附件。请切换到支持音频的模型，或在模型配置中明确启用 capabilities.audio。`);
+    }
   }
 
   observeModelUsage(
@@ -937,6 +887,47 @@ export class AgentSession {
     persisted.permission.mode = mode;
     await store.save(persisted, this.options.workspaceRoot);
   }
+
+  private supportedAttachments(attachments: AgentAttachment[] | undefined): AgentAttachment[] {
+    const native = attachments?.filter((attachment) => Boolean(attachment.data)) ?? [];
+    this.assertAttachmentsSupported(native);
+    return native;
+  }
+
+  private async rehydrateSessionAttachments(messages: ModelMessage[], events: SessionReplay["events"]): Promise<ModelMessage[]> {
+    if (!this.options.attachmentRoot) return messages;
+    const userEvents = events.filter((event): event is Extract<typeof event, { type: "user_message" }> => event.type === "user_message" && !event.auditOnly);
+    let userIndex = 0;
+    const hydrated: ModelMessage[] = [];
+    for (const message of messages) {
+      if (message.role !== "user") {
+        hydrated.push(message);
+        continue;
+      }
+      const event = userEvents[userIndex];
+      userIndex += 1;
+      const attachments = await Promise.all((event?.attachments ?? []).map(async (attachment) => await readAttachment(this.options.attachmentRoot!, attachment)));
+      const files = attachments.filter((attachment): attachment is AgentAttachment => attachment !== undefined);
+      this.assertAttachmentsSupported(files);
+      if (!files.length || typeof message.content !== "string") {
+        hydrated.push(message);
+        continue;
+      }
+      hydrated.push({
+        role: "user",
+        content: [
+          { type: "text", text: message.content },
+          ...files.map((attachment) => ({
+            type: "file" as const,
+            data: { type: "data" as const, data: attachment.data },
+            mediaType: attachment.mimeType,
+            filename: attachment.name
+          }))
+        ]
+      });
+    }
+    return hydrated;
+  }
 }
 
 function modelIdentifier(model: LanguageModel): string {
@@ -1049,14 +1040,9 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function supportedAttachments(config: AgentConfig, attachments: AgentAttachment[] | undefined): AgentAttachment[] {
-  if (!attachments?.length) return [];
-  const model = config.models[config.defaultModel];
-  if (!model) return [];
-  const capabilities = modelCapabilities(model);
-  return attachments.filter((attachment) => {
-    if (attachment.mimeType.startsWith("image/")) return capabilities.vision;
-    if (attachment.mimeType.startsWith("audio/")) return capabilities.audio;
-    return capabilities.vision;
-  });
+function sessionAttachments(attachments: AgentAttachment[] | undefined): AttachmentReference[] | undefined {
+  const references = attachments
+    ?.filter((attachment) => Boolean(attachment.path))
+    .map(({ name, mimeType, path: virtualPath, size }) => ({ name, mimeType, path: virtualPath!, size }));
+  return references?.length ? references : undefined;
 }
