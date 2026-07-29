@@ -10,9 +10,11 @@ import { compileTaskContract } from "../src/harness/TaskContractCompiler.js";
 import { TaskRunStore } from "../src/harness/TaskRunStore.js";
 import type { CommandRuntime } from "../src/runtime/CommandRuntime.js";
 import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.js";
+import { ExecutionService } from "../src/runtime/ExecutionService.js";
 import type { AgentHostEvent } from "../src/runtime/agentEvents.js";
 
 await testIncompleteAttemptAutomaticallyContinues();
+await testChatDoesNotCreateDurableTask();
 await testInternalAttemptPromptStaysOutOfPublicMessage();
 await testAttemptEvidenceIsBounded();
 await testRemainingStepBudgetCapsNextAttempt();
@@ -30,7 +32,7 @@ async function testIncompleteAttemptAutomaticallyContinues(): Promise<void> {
     const modelInputs: Array<string | undefined> = [];
     const remembered: Array<{ task: string; answer: string }> = [];
     let attempts = 0;
-    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (input, options): AsyncGenerator<AgentSessionEvent> {
+    const runtime = createTaskRuntime(store, fakeRuntime(root, store, async function* (input, options): AsyncGenerator<AgentSessionEvent> {
       inputs.push(input);
       modelInputs.push(options.modelInput);
       attempts += 1;
@@ -53,7 +55,7 @@ async function testIncompleteAttemptAutomaticallyContinues(): Promise<void> {
     const events: AgentHostEvent[] = [];
     runtime.subscribe((event) => events.push(event));
 
-    const submitted = runtime.submitPrompt("finish the requested task");
+    const submitted = runtime.submitPrompt("finish the requested task", "autonomous");
     const outcome = await submitted.completion;
     assert.equal(outcome.status, "completed");
     assert.equal(outcome.steps, 35);
@@ -79,12 +81,32 @@ async function testIncompleteAttemptAutomaticallyContinues(): Promise<void> {
   }
 }
 
+async function testChatDoesNotCreateDurableTask(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-task-runtime-chat-"));
+  try {
+    const store = await TaskRunStore.open(root);
+    const modes: Array<AgentRunOptions["mode"]> = [];
+    const runtime = createTaskRuntime(store, fakeRuntime(root, store, async function* (_input, options): AsyncGenerator<AgentSessionEvent> {
+      modes.push(options.mode);
+      yield done({ status: "completed", stopReason: "model_stop", finishReason: "stop", steps: 1, output: "direct answer" });
+    }));
+
+    const outcome = await runtime.submitPrompt("回答一个问题").completion;
+    assert.equal(outcome.status, "completed");
+    assert.deepEqual(modes, ["chat"]);
+    assert.equal((await store.list()).length, 0);
+    await runtime.close();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testInternalAttemptPromptStaysOutOfPublicMessage(): Promise<void> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-task-runtime-public-input-"));
   try {
     const store = await TaskRunStore.open(root);
     const calls: Array<{ input: string; modelInput?: string }> = [];
-    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (input, options): AsyncGenerator<AgentSessionEvent> {
+    const runtime = createTaskRuntime(store, fakeRuntime(root, store, async function* (input, options): AsyncGenerator<AgentSessionEvent> {
       calls.push({ input, modelInput: options.modelInput });
       yield done({
         status: "completed",
@@ -97,7 +119,7 @@ async function testInternalAttemptPromptStaysOutOfPublicMessage(): Promise<void>
     const events: AgentHostEvent[] = [];
     runtime.subscribe((event) => events.push(event));
 
-    await runtime.submitPrompt("修复这个函数").completion;
+    await runtime.submitPrompt("修复这个函数", "autonomous").completion;
 
     const userMessage = events.find((event): event is Extract<AgentHostEvent, { type: "message.user" }> => event.type === "message.user");
     assert.equal(userMessage?.content, "修复这个函数");
@@ -112,7 +134,7 @@ async function testInternalAttemptPromptStaysOutOfPublicMessage(): Promise<void>
 
 async function testAttemptEvidenceIsBounded(): Promise<void> {
   const agent = {
-    async *runSdk(): AsyncGenerator<AgentSessionEvent> {
+    async *run(): AsyncGenerator<AgentSessionEvent> {
       yield {
         type: "tool-started",
         toolCallId: "large-command",
@@ -158,7 +180,7 @@ async function testRemainingStepBudgetCapsNextAttempt(): Promise<void> {
     const store = await TaskRunStore.open(root);
     const attemptCaps: Array<number | undefined> = [];
     let attempts = 0;
-    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (_input, options): AsyncGenerator<AgentSessionEvent> {
+    const runtime = createTaskRuntime(store, fakeRuntime(root, store, async function* (_input, options): AsyncGenerator<AgentSessionEvent> {
       attemptCaps.push(options.maxSteps);
       attempts += 1;
       yield done(attempts === 1
@@ -178,7 +200,7 @@ async function testRemainingStepBudgetCapsNextAttempt(): Promise<void> {
           });
     }, 3, [], 40));
 
-    const outcome = await runtime.submitPrompt("finish within forty steps").completion;
+    const outcome = await runtime.submitPrompt("finish within forty steps", "autonomous").completion;
     assert.equal(outcome.status, "completed");
     assert.equal(outcome.steps, 40);
     assert.deepEqual(attemptCaps, [32, 8]);
@@ -194,7 +216,7 @@ async function testTaskAttemptBudgetIsNotCompletion(): Promise<void> {
     const store = await TaskRunStore.open(root);
     let attempts = 0;
     const remembered: Array<{ task: string; answer: string }> = [];
-    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
+    const runtime = createTaskRuntime(store, fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
       attempts += 1;
       yield done({
         status: "incomplete",
@@ -207,7 +229,7 @@ async function testTaskAttemptBudgetIsNotCompletion(): Promise<void> {
     const events: AgentHostEvent[] = [];
     runtime.subscribe((event) => events.push(event));
 
-    const submitted = runtime.submitPrompt("implement a larger feature");
+    const submitted = runtime.submitPrompt("implement a larger feature", "autonomous");
     const outcome = await submitted.completion;
     assert.equal(outcome.status, "incomplete");
     assert.equal(outcome.stopReason, "budget_exhausted");
@@ -229,7 +251,7 @@ async function testBudgetExhaustionPreservesAgentFailure(): Promise<void> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-task-runtime-failure-detail-"));
   try {
     const store = await TaskRunStore.open(root);
-    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
+    const runtime = createTaskRuntime(store, fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
       yield done({
         status: "failed",
         stopReason: "provider_error",
@@ -240,7 +262,7 @@ async function testBudgetExhaustionPreservesAgentFailure(): Promise<void> {
       });
     }, 1));
 
-    const outcome = await runtime.submitPrompt("回答这个问题").completion;
+    const outcome = await runtime.submitPrompt("回答这个问题", "autonomous").completion;
     assert.equal(outcome.status, "incomplete");
     assert.equal(outcome.stopReason, "budget_exhausted");
     assert.equal(outcome.error, "Upstream stream reset before the terminal response.");
@@ -257,7 +279,7 @@ async function testCodeTaskRequiresMutationEvenWhenChecksPass(): Promise<void> {
       scripts: { typecheck: "node -e 'process.exit(0)'" }
     }));
     const store = await TaskRunStore.open(root);
-    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
+    const runtime = createTaskRuntime(store, fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
       yield done({
         status: "completed",
         stopReason: "model_stop",
@@ -267,7 +289,7 @@ async function testCodeTaskRequiresMutationEvenWhenChecksPass(): Promise<void> {
       });
     }, 1));
 
-    const submitted = runtime.submitPrompt("修复这个函数");
+    const submitted = runtime.submitPrompt("修复这个函数", "autonomous");
     const outcome = await submitted.completion;
     assert.equal(outcome.status, "incomplete");
     assert.equal(outcome.stopReason, "budget_exhausted");
@@ -287,7 +309,7 @@ async function testCodeTaskCompletesWithWorkspaceMutationAndIndependentChecks():
       scripts: { typecheck: "node -e 'process.exit(0)'" }
     }));
     const store = await TaskRunStore.open(root);
-    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
+    const runtime = createTaskRuntime(store, fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
       yield {
         type: "tool-started",
         toolCallId: "write-feature",
@@ -314,7 +336,7 @@ async function testCodeTaskCompletesWithWorkspaceMutationAndIndependentChecks():
       });
     }, 1));
 
-    const submitted = runtime.submitPrompt("修复这个函数");
+    const submitted = runtime.submitPrompt("修复这个函数", "autonomous");
     const outcome = await submitted.completion;
     assert.equal(outcome.status, "completed");
     const task = await store.get(submitted.runId);
@@ -363,7 +385,7 @@ async function testContinuationReusesDurableAcceptanceCriteria(): Promise<void> 
       }]
     });
     await store.finish("previous-task", "budget_exhausted", "Previous attempt budget exhausted.");
-    const runtime = new InteractiveAgentRuntime(fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
+    const runtime = createTaskRuntime(store, fakeRuntime(root, store, async function* (): AsyncGenerator<AgentSessionEvent> {
       yield done({
         status: "completed",
         stopReason: "model_stop",
@@ -373,7 +395,7 @@ async function testContinuationReusesDurableAcceptanceCriteria(): Promise<void> 
       });
     }));
 
-    const submitted = runtime.submitPrompt("继续");
+    const submitted = runtime.submitPrompt("继续", "autonomous");
     const outcome = await submitted.completion;
     assert.equal(outcome.status, "completed");
     const resumed = await store.get(submitted.runId);
@@ -388,8 +410,8 @@ async function testContinuationReusesDurableAcceptanceCriteria(): Promise<void> 
 
 function fakeRuntime(
   workspaceRoot: string,
-  taskRuns: TaskRunStore,
-  runSdk: (input: string, options: AgentRunOptions) => AsyncGenerator<AgentSessionEvent>,
+  _taskRuns: TaskRunStore,
+  run: (input: string, options: AgentRunOptions) => AsyncGenerator<AgentSessionEvent>,
   maxAttempts = 3,
   remembered: Array<{ task: string; answer: string }> = [],
   maxTaskSteps = maxAttempts * 32
@@ -397,7 +419,7 @@ function fakeRuntime(
   const info: AgentSessionInfo = {
     workspaceRoot,
     sessionId: "session-1",
-    sessionFile: path.join(workspaceRoot, ".agent", "sessions", "session-1.jsonl"),
+    sessionFile: path.join(workspaceRoot, ".biny", "sessions", "session-1.jsonl"),
     provider: "test",
     modelLabel: "test/model",
     reasoningLabel: "Off",
@@ -407,7 +429,7 @@ function fakeRuntime(
   const agent = {
     getInfo: () => info,
     getPermissionMode: () => "ask" as const,
-    runSdk,
+    run,
     contextStatus: async () => ({
       loadedInstructions: [],
       instructionBytes: 0,
@@ -442,12 +464,17 @@ function fakeRuntime(
     },
     agent,
     managedProcesses: { listProcesses: async () => [], close: async () => [] },
-    taskRuns,
     extensionReport: () => "",
     setSubagentParentRunId: () => undefined,
     cancelSubagentTasks: () => undefined,
     close: async () => undefined
   } as unknown as CommandRuntime;
+}
+
+function createTaskRuntime(store: TaskRunStore, commandRuntime: CommandRuntime): InteractiveAgentRuntime {
+  return new InteractiveAgentRuntime(commandRuntime, {
+    autonomousExecutor: new ExecutionService(commandRuntime, store)
+  });
 }
 
 function done(outcome: AgentTurnOutcome): AgentSessionEvent {

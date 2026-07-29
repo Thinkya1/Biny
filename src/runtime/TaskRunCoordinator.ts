@@ -3,7 +3,6 @@ import type { AgentPermissionRequest, AgentPermissionResult, AgentSessionEvent, 
 import { AcceptanceVerifier } from "../harness/AcceptanceVerifier.js";
 import { AgentAttemptExecutor } from "../harness/AgentAttemptExecutor.js";
 import { cleanupTask } from "../harness/TaskCleanup.js";
-import { compileTaskContract } from "../harness/TaskContractCompiler.js";
 import { decideTaskAttempt, judgeTaskTerminal } from "../harness/TaskDecisionEngine.js";
 import { TaskAttemptLoop, type TaskAttemptBudget, type TaskHarnessRunResult } from "../harness/TaskAttemptLoop.js";
 import { advanceTaskPlan, type TaskPlanProgress } from "../harness/TaskPlanner.js";
@@ -15,14 +14,14 @@ import type { CommandRuntime } from "./CommandRuntime.js";
 
 export interface TaskRunCoordinatorOptions {
   runtime: CommandRuntime;
-  taskRunStore?: TaskRunStore;
+  taskRunStore: TaskRunStore;
 }
 
 export interface TaskRunCoordinatorExecution {
   runId: string;
   sessionId: string;
   input: string;
-  mode: AgentRunMode;
+  mode: Extract<AgentRunMode, "autonomous">;
   attachments?: AgentAttachment[];
   signal: AbortSignal;
   confirmPermission(request: AgentPermissionRequest): Promise<AgentPermissionResult>;
@@ -42,24 +41,18 @@ export interface TaskRunCoordinatorResult {
  */
 export class TaskRunCoordinator {
   private readonly runtime: CommandRuntime;
-  private readonly taskRunStore: TaskRunStore | undefined;
+  private readonly taskRunStore: TaskRunStore;
 
   constructor(options: TaskRunCoordinatorOptions) {
     this.runtime = options.runtime;
-    this.taskRunStore = options.taskRunStore ?? options.runtime.taskRuns;
+    this.taskRunStore = options.taskRunStore;
   }
 
   async execute(options: TaskRunCoordinatorExecution): Promise<TaskRunCoordinatorResult> {
-    // Keep lightweight host doubles and embedders compatible with the original
-    // interactive contract. The durable verifier requires the full CommandRuntime
-    // surface; a minimal AgentSession host should still be able to exercise
-    // permissions and event ordering without inventing workspace state.
-    if (!isDurableRuntime(this.runtime)) return await this.executeCompatibility(options);
-    await this.taskRunStore?.recoverInterruptedRuns(options.sessionId);
+    await this.taskRunStore.recoverInterruptedRuns(options.sessionId);
     const resolved = await resolveTaskContract(
       this.runtime.workspaceRoot,
       options.input,
-      options.mode,
       this.taskRunStore,
       this.runtime.config.workspace.ignore
     );
@@ -86,13 +79,13 @@ export class TaskRunCoordinator {
 
       const updateTaskPlan = async (progress: TaskPlanProgress): Promise<void> => {
         task.plan = advanceTaskPlan(task.plan, progress);
-        await this.taskRunStore?.updateContract(options.runId, task);
+        await this.taskRunStore.updateContract(options.runId, task);
       };
       const finalizeTaskCleanup = async (): Promise<TaskCleanupResult | undefined> => {
         if (cleanupCompleted) return undefined;
         const result = await cleanupTask(task, latestExecution?.toolEvidence ?? [], this.runtime.managedProcesses);
         task.cleanup = result.cleanup;
-        await this.taskRunStore?.recordCleanup(options.runId, result.cleanup, result.evidence);
+        await this.taskRunStore.recordCleanup(options.runId, result.cleanup, result.evidence);
         await updateTaskPlan({ taskType: task.taskType, cleanup: result.cleanup });
         cleanupCompleted = true;
         return result;
@@ -124,7 +117,7 @@ export class TaskRunCoordinator {
       const loop = new TaskAttemptLoop<TaskContract>({
         budget,
         execute: async (context) => {
-          await this.taskRunStore?.startAttempt(options.runId, {
+          await this.taskRunStore.startAttempt(options.runId, {
             attemptId: context.attemptId,
             attemptNumber: context.attemptNumber,
             feedback: context.feedback
@@ -133,7 +126,7 @@ export class TaskRunCoordinator {
           try {
             execution = await executor.execute(context);
           } catch (error) {
-            await this.taskRunStore?.completeAttempt(options.runId, context.attemptId, {
+            await this.taskRunStore.completeAttempt(options.runId, context.attemptId, {
               status: context.signal?.aborted ? "aborted" : "failed",
               runtimeSteps: 0,
               stopReason: context.signal?.aborted ? "aborted" : "provider_error",
@@ -143,7 +136,7 @@ export class TaskRunCoordinator {
           }
           executions.set(context.attemptId, execution);
           latestExecution = execution;
-          await this.taskRunStore?.completeAttempt(options.runId, context.attemptId, {
+          await this.taskRunStore.completeAttempt(options.runId, context.attemptId, {
             status: execution.outcomeStatus,
             output: execution.output,
             runtimeSteps: execution.runtimeSteps,
@@ -172,7 +165,7 @@ export class TaskRunCoordinator {
           const execution = executions.get(context.attemptId);
           if (!execution) return { passed: false, summary: "Attempt execution evidence is unavailable." };
           const result = await verifier.verify(task, execution);
-          await this.taskRunStore?.recordVerification(options.runId, context.attemptId, result.evidence);
+          await this.taskRunStore.recordVerification(options.runId, context.attemptId, result.evidence);
           await updateTaskPlan({
             taskType: task.taskType,
             attemptId: context.attemptId,
@@ -205,51 +198,6 @@ export class TaskRunCoordinator {
       }
       throw error;
     }
-  }
-
-  private async executeCompatibility(options: TaskRunCoordinatorExecution): Promise<TaskRunCoordinatorResult> {
-    const contract = compileTaskContract({
-      objective: options.input,
-      taskType: "conversation",
-      acceptanceCriteria: [],
-      verificationMode: "model_only"
-    });
-    let latest: AgentAttemptExecution | undefined;
-    let reasoningActive = false;
-    const executor = new AgentAttemptExecutor({
-      agent: this.runtime.agent,
-      runOptions: (context) => ({
-        abortSignal: context.signal,
-        confirmPermission: async (request) => await options.confirmPermission(request),
-        mode: options.mode,
-        attachments: options.attachments,
-        deferSuccessfulMemory: true
-      }),
-      prompt: () => options.input,
-      onEvent: (event) => {
-        reasoningActive = options.onAgentEvent(event);
-      }
-    });
-    const harness = await new TaskAttemptLoop<TaskContract>({
-      budget: { maxAttempts: 1 },
-      execute: async (context) => {
-        latest = await executor.execute(context);
-        return { output: latest.output, runtimeSteps: latest.runtimeSteps ?? 0, usage: latest.usage };
-      },
-      verify: async () => ({
-        passed: latest?.outcomeStatus === "completed",
-        summary: latest?.outcomeStatus === "completed" ? "Agent completed." : latest?.error ?? "Agent did not complete."
-      })
-    }).run(contract, options.signal, options.runId);
-    if (reasoningActive) options.onReasoningCompleted();
-    const settledHarness = harness.status === "budget_exhausted" && (latest?.outcomeStatus !== "completed" || harness.attempts.at(-1)?.error)
-      ? {
-        ...harness,
-        status: "failed" as const,
-        terminalReason: latest?.error ?? harness.attempts.at(-1)?.error ?? harness.terminalReason
-      }
-      : harness;
-    return { turn: harnessTurnOutcome(settledHarness, latest, latest?.usage) };
   }
 
   private async persistTaskHarnessResult(taskRunId: string, result: TaskHarnessRunResult, task: TaskContract): Promise<void> {
@@ -296,33 +244,12 @@ export class TaskRunCoordinator {
   }
 }
 
-function isDurableRuntime(runtime: CommandRuntime): boolean {
-  const candidate = runtime as unknown as Record<string, unknown>;
-  return typeof candidate.workspaceRoot === "string"
-    && typeof candidate.config === "object"
-    && candidate.config !== null
-    && candidate.managedProcesses !== undefined;
-}
-
 async function resolveTaskContract(
   workspaceRoot: string,
   input: string,
-  mode: AgentRunMode,
   store: TaskRunStore | undefined,
   ignore: string[]
 ): Promise<{ contract: TaskContract; priorToolEvidence: TaskToolEvidence[] }> {
-  if (mode === "plan") {
-    return {
-      contract: compileTaskContract({
-        objective: input,
-        taskType: "conversation",
-        acceptanceCriteria: [],
-        verificationMode: "model_only",
-        constraints: ["Return a concrete execution plan without modifying the workspace."]
-      }),
-      priorToolEvidence: []
-    };
-  }
   const inferred = await createTaskContract(workspaceRoot, input, ignore);
   if (!store || !isContinuationRequest(input)) return { contract: inferred, priorToolEvidence: [] };
   const previous = (await store.list()).find((snapshot) =>

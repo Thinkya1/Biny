@@ -40,7 +40,7 @@ export class AgentAttemptExecutor {
     const publicInput = runOptions.sessionUserMessage ?? prompt;
     // 验收用的提示词属于模型上下文，不是用户看到的消息，因此宿主事件和 session 记录里
     // 用 publicInput，真正发给模型的完整 prompt 走 modelInput（对应 publicUserMessage 的切分）。
-    for await (const event of this.options.agent.runSdk(publicInput, { ...runOptions, modelInput: prompt })) {
+    for await (const event of this.options.agent.run(publicInput, { ...runOptions, modelInput: prompt })) {
       this.options.onEvent?.(event, context);
       if (event.type === "tool-started") {
         evidence.set(event.toolCallId, {
