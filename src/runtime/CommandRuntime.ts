@@ -73,7 +73,7 @@ export interface CommandRuntimeOptions {
 }
 
 export async function createCommandRuntime(workspaceRoot: string, options: CommandRuntimeOptions = {}): Promise<CommandRuntime> {
-  // Project sessions default to the workspace (`.biny/sessions`). Callers may override for non-project/global storage.
+  // Session store 根据 workspace 定位全局项目分区；persistenceRoot 继续承载其余项目运行状态。
   const persistenceRoot = options.persistenceRoot ?? workspaceRoot;
   const projectAttachmentRoot = options.attachmentRoot ?? attachmentRoot(persistenceRoot);
   const configStore = options.configStore ?? createFileConfigStore(persistenceRoot);

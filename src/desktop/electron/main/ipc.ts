@@ -244,7 +244,7 @@ export function registerDesktopIpc(context: IpcContext): void {
       type: "warning",
       title: "删除会话",
       message: "确定要删除这个会话吗？",
-      detail: "会删除对应的 .biny/sessions JSONL 文件，但不会删除项目文件。此操作无法撤销。",
+      detail: "会删除全局项目会话目录中对应的 JSONL 文件，但不会删除项目文件。此操作无法撤销。",
       buttons: ["删除", "取消"],
       defaultId: 1,
       cancelId: 1,

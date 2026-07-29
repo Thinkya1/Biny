@@ -4,7 +4,6 @@
  * 创建终端和 pi-tui 渲染循环，交给 `BinyTui` 组装界面；界面退出后再打印 session
  * 摘要，避免和 TUI 输出混在一起。
  */
-import path from "node:path";
 import { ProcessTerminal, TUI } from "@earendil-works/pi-tui";
 import { BinyTui } from "./app.js";
 
@@ -28,10 +27,9 @@ export async function startTui(workspaceRoot: string, version?: string, initialS
   }
 
   if (summary) {
-    const relativeSessionFile = path.relative(workspaceRoot, summary.sessionFile);
     process.stdout.write([
       `Session: ${summary.sessionId}`,
-      `File: ${relativeSessionFile}`,
+      `File: ${summary.sessionFile}`,
       "",
       "Resume:",
       "  biny",

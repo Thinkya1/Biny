@@ -4,7 +4,6 @@
  * `resume` 可以接受 latest、session id 前缀或 JSONL 路径，然后按事件顺序打印历史用户消息、
  * assistant 消息、工具调用、工具结果和错误，帮助用户在普通终端里回看 session。
  */
-import path from "node:path";
 import { readStoredSessionEvents } from "../../session/events.js";
 import { ensureAgentDirs } from "../../session/store.js";
 import type { SessionEvent } from "../../session/recorder.js";
@@ -14,7 +13,7 @@ export async function resumeCommand(workspaceRoot: string, session: string | und
   await ensureAgentDirs(workspaceRoot);
   const { filePath, events } = await readStoredSessionEvents(workspaceRoot, session);
 
-  console.log(`Session: ${path.relative(workspaceRoot, filePath)}`);
+  console.log(`Session: ${filePath}`);
   for (const event of events) {
     printEvent(event);
   }

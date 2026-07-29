@@ -5,7 +5,7 @@ import path from "node:path";
 import { forkSession } from "../src/session/fork.js";
 import { SessionRecorder, type SessionEvent } from "../src/session/recorder.js";
 import { replaySession } from "../src/session/replay.js";
-import { ensureAgentDirs } from "../src/session/store.js";
+import { ensureAgentDirs, sessionFilePath } from "../src/session/store.js";
 
 async function main(): Promise<void> {
   const root = await mkdtemp(path.join(os.tmpdir(), "biny-fork-"));
@@ -51,7 +51,7 @@ async function testFullForkIsIndependent(root: string, source: string): Promise<
   appended.record({ type: "user_message", content: "only in the fork" });
   await appended.close();
 
-  const original = await readFile(path.join(root, ".biny", "sessions", `${source}.jsonl`), "utf8");
+  const original = await readFile(sessionFilePath(root, source), "utf8");
   assert.equal(original.includes("only in the fork"), false, "writing the fork must not touch the source session");
 }
 

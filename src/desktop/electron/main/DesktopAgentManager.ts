@@ -701,7 +701,7 @@ export class DesktopAgentManager {
     const project = this.projects.requireProject(projectId);
     if (project.missing) throw new Error(`Project path is unavailable: ${project.path}`);
     await this.refreshOAuthCredentials(projectId);
-    // 项目会话与附件都使用 `<项目>/.biny`，因此 Desktop/TUI/CLI 能恢复同一份多模态历史。
+    // session 走全局项目目录，附件仍在项目 `.biny`；三端通过同一个 workspace 定位同一份历史。
     const persistenceRoot = await this.projects.dataRoot(project);
     const runtime = await createInteractiveAgentRuntime(project.path, {
       persistenceRoot,

@@ -1,27 +1,20 @@
 /**
  * 桌面端专属数据目录（Electron userData 下）：配置、凭据、界面状态，以及不属于任何项目的会话。
  *
- * 属于项目的 session / run / 记忆仍然放在 `<项目>/.biny` 里，这样同一个工作区在桌面端和
- * TUI 里看到的是同一份历史。
+ * 属于项目的 session 放在全局项目会话目录；附件、run 和记忆仍在 `<项目>/.biny`。
  *
- * 另外承担历史状态和会话迁移；旧模型配置不在启动时自动搬运，避免静默复制凭据。
+ * 另外承担历史桌面状态迁移。
  */
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { agentDir, ensureAgentDirs } from "../../../session/store.js";
 import type { DesktopProject } from "../../protocol.js";
-import { DesktopConfigStore } from "./DesktopConfigStore.js";
 
 export class DesktopUserDataStore {
   constructor(readonly root: string) {}
 
   async initialize(): Promise<void> {
     await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
-  }
-
-  /** 项目的桌面端专属目录：统一到项目目录之前遗留的会话和附件。 */
-  projectDesktopRoot(project: DesktopProject): string {
-    return path.join(this.root, "projects", projectStorageId(project.id));
   }
 
   /** 未关联任何已打开项目的会话存放处。 */
@@ -69,31 +62,10 @@ export class DesktopUserDataStore {
     await fs.writeFile(destinationPath, `${JSON.stringify(mergedState, null, 2)}\n`, "utf8");
   }
 
-  async migrateLegacyConfig(projects: DesktopProject[], configStore: DesktopConfigStore): Promise<void> {
-    // 配置迁移不再由启动流程自动执行，避免把旧项目凭据静默复制到全局目录；doctor 只负责提示。
-    void projects;
-    void configStore;
-  }
-
-  /**
-   * Ensures project session storage lives under the project path and returns that root.
-   * One-time migration copies leftover userData project agent files into `<project>/.biny`
-   * when the destination file is missing, including attachment files referenced by old sessions.
-   */
+  /** 初始化项目本地运行目录及其对应的全局 session 目录。 */
   async ensureProjectData(project: DesktopProject): Promise<string> {
     const targetRoot = path.resolve(project.path);
     await ensureAgentDirs(targetRoot);
-
-    const targetAgentDirectory = agentDir(targetRoot);
-    const legacyDirectories = [
-      agentDir(this.projectDesktopRoot(project)),
-      path.join(this.projectDesktopRoot(project), ".agent")
-    ];
-    for (const legacyDirectory of legacyDirectories) {
-      if (await exists(legacyDirectory) && path.resolve(legacyDirectory) !== path.resolve(targetAgentDirectory)) {
-        await mergeDirectory(legacyDirectory, targetAgentDirectory);
-      }
-    }
     return targetRoot;
   }
 
@@ -113,10 +85,6 @@ export class DesktopUserDataStore {
   }
 }
 
-function projectStorageId(projectId: string): string {
-  return projectId.replace(/[^a-zA-Z0-9_-]/g, "_");
-}
-
 async function exists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath);
@@ -127,19 +95,6 @@ async function exists(filePath: string): Promise<boolean> {
   }
 }
 
-async function mergeDirectory(source: string, destination: string, skipNames = new Set<string>()): Promise<void> {
-  await fs.mkdir(destination, { recursive: true, mode: 0o700 });
-  for (const entry of await fs.readdir(source, { withFileTypes: true })) {
-    if (skipNames.has(entry.name)) continue;
-    const sourcePath = path.join(source, entry.name);
-    const destinationPath = path.join(destination, entry.name);
-    if (entry.isDirectory()) {
-      await mergeDirectory(sourcePath, destinationPath);
-    } else if (entry.isFile() && !await exists(destinationPath)) {
-      await fs.copyFile(sourcePath, destinationPath);
-    }
-  }
-}
 
 async function readJsonRecord(filePath: string): Promise<Record<string, unknown> | undefined> {
   try {

@@ -1,17 +1,19 @@
 /**
  * Session 存储定位模块。
  *
- * `.biny/sessions`、`.biny/logs`、`.biny/runs`、`.biny/tasks`、`.biny/processes` 和 `.biny/tool-results`、`.biny/todos` 的目录创建、session 文件名生成、latest 解析以及 session id
- * 前缀匹配都在这里处理。命令层只需要给出 workspace 和可选 session 参数，不必关心文件布局。
+ * 全局项目 session 目录以及 `.biny` 内其余运行目录的创建、session 文件名生成、latest
+ * 解析和 session id 前缀匹配都在这里处理。命令层只需要给出 workspace 和可选 session
+ * 参数，不必关心文件布局。
  */
 import { randomBytes } from "node:crypto";
-import { constants, promises as fs, type Stats } from "node:fs";
+import { constants, promises as fs, realpathSync, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { globalAgentDir, projectSessionsDir } from "../config/paths.js";
 import { readSessionTail } from "./limits.js";
 
 const sessionMetadataConcurrency = 8;
-const managedStateDirectories = ["sessions", "attachments", "logs", "runs", "tasks", "processes", "tool-results", "todos", "turns", "evals"] as const;
+const managedStateDirectories = ["attachments", "logs", "runs", "tasks", "processes", "tool-results", "todos", "turns", "evals"] as const;
 const legacyStateDirectories = new Set([...managedStateDirectories, "memory"]);
 const legacyStateFiles = new Set(["input-history.jsonl", "telemetry.jsonl", "checkpoints.json"]);
 
@@ -23,7 +25,8 @@ interface PathIdentity {
 
 interface SessionStorageLocation {
   workspace: PathIdentity;
-  agent: PathIdentity;
+  global: PathIdentity;
+  globalSessions: PathIdentity;
   sessions: PathIdentity;
 }
 
@@ -42,7 +45,7 @@ export interface SessionDeleteHooks {
 }
 
 export function agentDir(workspaceRoot: string): string {
-  // `.biny` 同时承载项目配置和运行状态；所有新运行记录都只写这里。
+  // `.biny` 承载项目配置和除 session JSONL 之外的运行状态。
   return path.join(workspaceRoot, ".biny");
 }
 
@@ -64,6 +67,7 @@ export async function ensureAgentDirs(workspaceRoot: string): Promise<void> {
       throw new Error(`Session storage .biny/${name} resolves outside the canonical .biny directory.`);
     }
   }
+  await ensureProjectSessionStorage(canonicalWorkspace);
   await migrateLegacyAgentState(canonicalWorkspace, canonicalAgent);
 }
 
@@ -134,7 +138,8 @@ export function sessionFilePath(workspaceRoot: string, sessionId: string): strin
   ) {
     throw new Error(`Invalid session id: ${sessionId}`);
   }
-  return path.join(agentDir(workspaceRoot), "sessions", `${sessionId}.jsonl`);
+  const canonicalWorkspace = realpathSync(path.resolve(workspaceRoot));
+  return path.join(projectSessionsDir(canonicalWorkspace), `${sessionId}.jsonl`);
 }
 
 export function sessionIdFromFile(filePath: string): string {
@@ -256,7 +261,7 @@ async function resolveSessionFileAt(location: SessionStorageLocation, session: s
   if (explicitFileName) {
     const filePath = await existingSessionFile(location, explicitFileName);
     if (filePath) return filePath;
-    throw new Error(`Session file not found: .biny/sessions/${explicitFileName}`);
+    throw new Error(`Session file not found: ${explicitFileName}`);
   }
 
   if (session.includes("\0") || session.includes("/") || session.includes("\\") || session === "." || session === "..") {
@@ -287,7 +292,7 @@ async function resolveSessionFileAt(location: SessionStorageLocation, session: s
 async function latestSessionFile(location: SessionStorageLocation): Promise<string> {
   // latest 基于修改时间而不是文件名，能覆盖恢复后继续追加的旧 session。
   const sessions = await listSessionFilesInDirectory(location);
-  if (!sessions.length) throw new Error("No sessions found in .biny/sessions.");
+  if (!sessions.length) throw new Error("No sessions found for the current project.");
   const stats: Array<{ fileName: string; filePath: string; mtimeMs: number } | undefined> = new Array(sessions.length);
   let nextIndex = 0;
   const workers = Array.from({ length: Math.min(sessionMetadataConcurrency, sessions.length) }, async () => {
@@ -313,7 +318,7 @@ async function latestSessionFile(location: SessionStorageLocation): Promise<stri
   const nonEmpty = stats.filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
   nonEmpty.sort((a, b) => a.mtimeMs - b.mtimeMs || a.fileName.localeCompare(b.fileName));
   const latest = nonEmpty.at(-1);
-  if (!latest) throw new Error("No sessions found in .biny/sessions.");
+  if (!latest) throw new Error("No sessions found for the current project.");
   return latest.filePath;
 }
 
@@ -325,33 +330,52 @@ function isLatestAlias(session: string): boolean {
 async function resolveSessionStorage(workspaceRoot: string): Promise<SessionStorageLocation> {
   const workspacePath = path.resolve(workspaceRoot);
   const canonicalWorkspace = await fs.realpath(workspacePath);
-  const agentPath = path.join(canonicalWorkspace, ".biny");
-  const sessionsPath = path.join(agentPath, "sessions");
-  const [workspaceStat, agentStat, sessionsStat] = await Promise.all([
+  const globalPath = await fs.realpath(globalAgentDir());
+  const globalSessionsPath = path.join(globalPath, "sessions");
+  const sessionsPath = projectSessionsDir(canonicalWorkspace);
+  const [workspaceStat, globalStat, globalSessionsStat, sessionsStat] = await Promise.all([
     fs.lstat(canonicalWorkspace),
-    fs.lstat(agentPath),
+    fs.lstat(globalPath),
+    fs.lstat(globalSessionsPath),
     fs.lstat(sessionsPath)
   ]);
   if (workspaceStat.isSymbolicLink() || !workspaceStat.isDirectory()) {
     throw new Error("Session persistence root must be a real directory.");
   }
-  if (agentStat.isSymbolicLink() || !agentStat.isDirectory()) {
-    throw new Error("Session storage .biny must be a real directory, not a symbolic link.");
+  if (globalStat.isSymbolicLink() || !globalStat.isDirectory()) {
+    throw new Error("Global session storage must be a real directory, not a symbolic link.");
+  }
+  if (globalSessionsStat.isSymbolicLink() || !globalSessionsStat.isDirectory()) {
+    throw new Error("Global project sessions root must be a real directory, not a symbolic link.");
   }
   if (sessionsStat.isSymbolicLink() || !sessionsStat.isDirectory()) {
-    throw new Error("Session storage .biny/sessions must be a real directory, not a symbolic link.");
+    throw new Error("Project session storage must be a real directory, not a symbolic link.");
   }
 
   const canonicalSessions = await fs.realpath(sessionsPath);
-  const expectedSessions = path.join(canonicalWorkspace, ".biny", "sessions");
+  const expectedSessions = projectSessionsDir(canonicalWorkspace);
   if (canonicalSessions !== expectedSessions) {
-    throw new Error("Session storage resolves outside the canonical .biny/sessions directory.");
+    throw new Error("Session storage resolves outside the current project's global session directory.");
   }
   return {
     workspace: { path: canonicalWorkspace, device: workspaceStat.dev, inode: workspaceStat.ino },
-    agent: { path: agentPath, device: agentStat.dev, inode: agentStat.ino },
+    global: { path: globalPath, device: globalStat.dev, inode: globalStat.ino },
+    globalSessions: { path: globalSessionsPath, device: globalSessionsStat.dev, inode: globalSessionsStat.ino },
     sessions: { path: canonicalSessions, device: sessionsStat.dev, inode: sessionsStat.ino }
   };
+}
+
+async function ensureProjectSessionStorage(canonicalWorkspace: string): Promise<void> {
+  const configuredGlobal = path.resolve(globalAgentDir());
+  await fs.mkdir(configuredGlobal, { recursive: true, mode: 0o700 });
+  const canonicalGlobal = await fs.realpath(configuredGlobal);
+  const globalSessionsPath = path.join(canonicalGlobal, "sessions");
+  await ensureRealDirectory(globalSessionsPath, "global sessions");
+  const sessionsPath = projectSessionsDir(canonicalWorkspace);
+  await ensureRealDirectory(sessionsPath, "current project sessions");
+  if (await fs.realpath(sessionsPath) !== sessionsPath) {
+    throw new Error("Project session storage resolves outside the global sessions directory.");
+  }
 }
 
 async function ensureRealDirectory(directory: string, label: string): Promise<void> {
@@ -402,7 +426,7 @@ async function existingSessionFile(location: SessionStorageLocation, fileName: s
 
   const canonicalFile = await fs.realpath(filePath);
   if (path.dirname(canonicalFile) !== location.sessions.path || path.basename(canonicalFile) !== fileName) {
-    throw new Error(`Session resolves outside the canonical .biny/sessions directory: ${fileName}`);
+    throw new Error(`Session resolves outside the current project's global session directory: ${fileName}`);
   }
   await assertSessionStorage(location);
   return canonicalFile;
@@ -461,9 +485,14 @@ async function assertSessionBinding(location: SessionStorageLocation, fileName: 
 
 async function assertSessionStorage(location: SessionStorageLocation): Promise<void> {
   await assertPathIdentity(location.workspace, "Session persistence root changed during access.");
-  await assertPathIdentity(location.agent, "Session storage .biny changed during access.");
-  await assertPathIdentity(location.sessions, "Session storage .biny/sessions changed during access.");
-  if (await fs.realpath(location.agent.path) !== location.agent.path || await fs.realpath(location.sessions.path) !== location.sessions.path) {
+  await assertPathIdentity(location.global, "Global session storage changed during access.");
+  await assertPathIdentity(location.globalSessions, "Global project sessions root changed during access.");
+  await assertPathIdentity(location.sessions, "Project session storage changed during access.");
+  if (
+    await fs.realpath(location.global.path) !== location.global.path
+    || await fs.realpath(location.globalSessions.path) !== location.globalSessions.path
+    || await fs.realpath(location.sessions.path) !== location.sessions.path
+  ) {
     throw new Error("Session storage changed during access.");
   }
 }
@@ -589,12 +618,7 @@ function explicitSessionFileName(session: string): string | undefined {
     return session;
   }
 
-  const normalized = path.normalize(session);
-  const expectedDirectory = path.join(".biny", "sessions");
-  if (path.dirname(normalized) !== expectedDirectory || !isSessionFileName(path.basename(normalized))) {
-    throw new Error(`Invalid session reference: ${session}`);
-  }
-  return path.basename(normalized);
+  throw new Error(`Invalid session reference: ${session}`);
 }
 
 function isSessionFileName(fileName: string): boolean {

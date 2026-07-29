@@ -51,7 +51,7 @@ pnpm dev                              # 打开 TUI
 
 桌面端在 **设置 → 模型** 里管理连接和默认模型，API key 与 OAuth 凭据由 macOS 系统钥匙串保护。
 
-CLI / TUI / Desktop 共用全局 `~/.biny/agent/agent.config.json`。也可以用 `BINY_AGENT_DIR` 指定全局目录。
+CLI / TUI / Desktop 共用全局 `~/.biny/agent/agent.config.json` 和项目会话目录。也可以用 `BINY_AGENT_DIR` 指定全局目录。
 项目只在 `<project>/.biny/settings.json` 覆盖运行参数；其中的 `defaultModel` 必须引用全局已有 alias，不能写 `providers`、`models`、API key 或 OAuth 信息。
 
 macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON 不保存凭据；其他平台请使用环境变量。全局配置示例（**只写环境变量名，别把真实 key 写进配置文件**）：
@@ -117,15 +117,15 @@ TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 re
 
 ## 数据存在哪
 
-会话和运行时数据写在项目里，桌面端和 CLI 共用：
+项目会话脱离工作区存放，桌面端和 CLI 按项目路径哈希访问同一份历史：
 
 ```text
-<project>/.biny/sessions/    问答历史
-<project>/.biny/attachments/ 图片、音频等会话附件
-<project>/.biny/             runs、tasks、logs、memory 等
+~/.biny/agent/sessions/<project-path-hash>/ 问答历史
+<project>/.biny/attachments/                图片、音频等会话附件
+<project>/.biny/                            settings、runs、tasks、logs、memory 等
 ```
 
-全局模型配置在 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）；全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表、UI 状态和非项目会话仍在 `~/Library/Application Support/Biny/workspaces/default/`；项目 session、附件、run、memory 等运行数据都在项目 `.biny/`。首次打开项目时会将旧 `.agent/` 中的 Biny 运行状态单向补入 `.biny/`，不会覆盖新文件，也不会跟随旧目录内的软链接。
+全局模型配置和项目 session 都在 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）；全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表和 UI 状态在 `~/Library/Application Support/Biny/workspaces/default/`，附件、run、memory 等其余项目数据仍在项目 `.biny/`。本次 session 目录切换不读取或复制旧的 `<project>/.biny/sessions/`。
 
 同一个 Session 同一时刻只能由一个运行时执行，另一个会返回占用提示；不同 Session 可以并行。
 

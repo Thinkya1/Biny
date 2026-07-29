@@ -343,7 +343,7 @@ export class DesktopProjectService {
     return project;
   }
 
-  /** 项目内的持久化根目录（`<项目>/.biny`），与 TUI / CLI 共用同一份数据。 */
+  /** 项目运行根；session store 会据此定位全局项目会话目录。 */
   async dataRoot(project: DesktopProject): Promise<string> {
     return await this.storage.ensureProjectData(project);
   }

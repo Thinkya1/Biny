@@ -156,8 +156,9 @@ async function main(): Promise<void> {
   await testContextPreparationAbortStopsAutoCompaction();
   await testRestoreWithoutPersistedBudgetUsesHistoryEstimate();
   await testSessionReplayAndAgentResume();
-  await testLegacyAgentStateMigrates();
+  await testLegacyNonSessionStateMigrates();
   await testSessionPathBoundaries();
+  await testGlobalSessionsStayProjectScoped();
   await testSessionReadLimits();
   await testDeleteSessionReplacementRace();
   await testFailedCurrentSessionResumeKeepsRecorderUsable();
@@ -672,7 +673,7 @@ async function testSessionAndToolDisplayRedaction(): Promise<void> {
   });
 }
 
-async function testLegacyAgentStateMigrates(): Promise<void> {
+async function testLegacyNonSessionStateMigrates(): Promise<void> {
   await withTempWorkspace(async (workspaceRoot) => {
     const legacyRoot = path.join(workspaceRoot, ".agent");
     await fs.mkdir(path.join(legacyRoot, "sessions"), { recursive: true });
@@ -681,16 +682,9 @@ async function testLegacyAgentStateMigrates(): Promise<void> {
     await fs.writeFile(path.join(legacyRoot, "attachments", "legacy.png"), "legacy image", "utf8");
 
     await ensureAgentDirs(workspaceRoot);
-    const migratedSession = path.join(workspaceRoot, ".biny", "sessions", "legacy.jsonl");
     const migratedAttachment = path.join(workspaceRoot, ".biny", "attachments", "legacy.png");
-    assert.match(await fs.readFile(migratedSession, "utf8"), /legacy history/u);
     assert.equal(await fs.readFile(migratedAttachment, "utf8"), "legacy image");
-
-    // 新目录是事实来源：重复初始化只能补缺，不能让遗留文件反向覆盖新数据。
-    await fs.writeFile(migratedSession, "new session wins\n", "utf8");
-    await fs.writeFile(path.join(legacyRoot, "sessions", "legacy.jsonl"), "legacy must not overwrite\n", "utf8");
-    await ensureAgentDirs(workspaceRoot);
-    assert.equal(await fs.readFile(migratedSession, "utf8"), "new session wins\n");
+    await assert.rejects(resolveSessionFile(workspaceRoot, "legacy"), /Session not found/u);
   });
 }
 
@@ -704,7 +698,7 @@ async function testSessionPathBoundaries(): Promise<void> {
     assert.equal(await resolveSessionFile(workspaceRoot, "2026-07-18-safe"), canonicalSafeFile);
     assert.equal(await resolveSessionFile(workspaceRoot, "2026-07"), canonicalSafeFile);
     assert.equal(await resolveSessionFile(workspaceRoot, "2026-07-18-safe.jsonl"), canonicalSafeFile);
-    assert.equal(await resolveSessionFile(workspaceRoot, ".biny/sessions/2026-07-18-safe.jsonl"), canonicalSafeFile);
+    await assert.rejects(resolveSessionFile(workspaceRoot, ".biny/sessions/2026-07-18-safe.jsonl"), /Invalid session reference/u);
     assert.equal(await resolveSessionFile(workspaceRoot, "latest"), canonicalSafeFile);
     assert.match((await readSessionSnapshot(workspaceRoot, "2026-07-18-safe")).bytes.toString("utf8"), /safe session/);
     assert.equal((await readStoredSessionEvents(workspaceRoot, "2026-07-18-safe")).events[0]?.type, "user_message");
@@ -727,9 +721,9 @@ async function testSessionPathBoundaries(): Promise<void> {
     await assert.rejects(resolveSessionFile(workspaceRoot, "../outside.jsonl"), /Invalid session reference/);
     await assert.rejects(resolveSessionFile(workspaceRoot, ".biny/sessions/../outside.jsonl"), /Invalid session reference/);
 
-    const sessionsDir = path.join(workspaceRoot, ".biny", "sessions");
+    const sessionsDir = path.dirname(safeFile);
     await fs.mkdir(path.join(sessionsDir, "directory.jsonl"));
-    await assert.rejects(resolveSessionFile(workspaceRoot, ".biny/sessions/directory.jsonl"), /regular \.jsonl file/);
+    await assert.rejects(resolveSessionFile(workspaceRoot, "directory.jsonl"), /regular \.jsonl file/);
 
     const outsideRoot = await mkdtemp(path.join(os.tmpdir(), "biny-session-outside-"));
     try {
@@ -757,7 +751,7 @@ async function testSessionPathBoundaries(): Promise<void> {
       assert.match((await readSessionSnapshot(workspaceAlias, "2026-07-18-safe")).bytes.toString("utf8"), /safe session/);
 
       const pinnedRecorder = new SessionRecorder(workspaceRoot, "pinned-before-parent-swap");
-      const originalSessionsDir = path.join(workspaceRoot, ".biny", "sessions-original");
+      const originalSessionsDir = `${sessionsDir}-original`;
       await fs.rename(sessionsDir, originalSessionsDir);
       await fs.symlink(outsideRoot, sessionsDir);
       assert.throws(
@@ -781,7 +775,7 @@ async function testSessionPathBoundaries(): Promise<void> {
         recorder: new SessionRecorder(workspaceRoot)
       });
       await agent.initialize();
-      await assert.rejects(agent.resume(".biny/sessions/linked.jsonl"), /regular \.jsonl file/);
+      await assert.rejects(agent.resume("linked.jsonl"), /regular \.jsonl file/);
       assert.equal(await fs.readFile(outsideFile, "utf8"), outsideContent);
       await agent.close();
 
@@ -803,6 +797,26 @@ async function testSessionPathBoundaries(): Promise<void> {
       assert.equal(await fs.readFile(outsideFile, "utf8"), outsideContent);
     } finally {
       await rm(outsideRoot, { recursive: true, force: true });
+    }
+  });
+}
+
+async function testGlobalSessionsStayProjectScoped(): Promise<void> {
+  await withTempWorkspace(async (workspaceRoot) => {
+    const otherWorkspace = await mkdtemp(path.join(os.tmpdir(), "biny-context-other-"));
+    try {
+      await Promise.all([ensureAgentDirs(workspaceRoot), ensureAgentDirs(otherWorkspace)]);
+      const firstPath = sessionFilePath(workspaceRoot, "shared-id");
+      const secondPath = sessionFilePath(otherWorkspace, "shared-id");
+      assert.notEqual(path.dirname(firstPath), path.dirname(secondPath));
+      await Promise.all([
+        fs.writeFile(firstPath, `${JSON.stringify({ type: "user_message", content: "first project" })}\n`, "utf8"),
+        fs.writeFile(secondPath, `${JSON.stringify({ type: "user_message", content: "second project" })}\n`, "utf8")
+      ]);
+      assert.match((await readSessionSnapshot(workspaceRoot, "latest")).bytes.toString("utf8"), /first project/u);
+      assert.match((await readSessionSnapshot(otherWorkspace, "latest")).bytes.toString("utf8"), /second project/u);
+    } finally {
+      await rm(otherWorkspace, { recursive: true, force: true });
     }
   });
 }

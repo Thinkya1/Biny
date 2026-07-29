@@ -25,7 +25,8 @@ import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { redactSecrets, redactSensitiveValue } from "../utils/secrets.js";
 import { assertSessionFileSize } from "./limits.js";
-import { agentDir, sessionFilePath } from "./store.js";
+import { sessionFilePath } from "./store.js";
+import { projectSessionsDir } from "../config/paths.js";
 import type { SessionContextState, SessionContextUsage, SessionUsage } from "./metadata.js";
 import type { AttachmentReference } from "../attachments/store.js";
 
@@ -240,23 +241,18 @@ function canonicalSessionFilePath(workspaceRoot: string, sessionId: string, requ
   const expectedName = path.basename(sessionFilePath(workspaceRoot, sessionId));
   const workspacePath = path.resolve(workspaceRoot);
   const canonicalWorkspace = realpathSync(workspacePath);
-  const agentPath = agentDir(canonicalWorkspace);
-  const sessionsPath = path.join(agentPath, "sessions");
-  const agentStat = lstatSync(agentPath);
+  const sessionsPath = projectSessionsDir(canonicalWorkspace);
   const sessionsStat = lstatSync(sessionsPath);
-  if (agentStat.isSymbolicLink() || !agentStat.isDirectory()) {
-    throw new Error("Session storage .biny must be a real directory, not a symbolic link.");
-  }
   if (sessionsStat.isSymbolicLink() || !sessionsStat.isDirectory()) {
-    throw new Error("Session storage .biny/sessions must be a real directory, not a symbolic link.");
+    throw new Error("Project session storage must be a real directory, not a symbolic link.");
   }
 
   const canonicalSessions = realpathSync(sessionsPath);
-  if (canonicalSessions !== path.join(canonicalWorkspace, ".biny", "sessions")) {
-    throw new Error("Session storage resolves outside the canonical .biny/sessions directory.");
+  if (canonicalSessions !== sessionsPath) {
+    throw new Error("Session storage resolves outside the current project's global session directory.");
   }
   if (realpathSync(path.dirname(requestedFilePath)) !== canonicalSessions || path.basename(requestedFilePath) !== expectedName) {
-    throw new Error(`Session file resolves outside the canonical .biny/sessions directory: ${expectedName}`);
+    throw new Error(`Session file resolves outside the current project's global session directory: ${expectedName}`);
   }
 
   const canonicalFile = path.join(canonicalSessions, expectedName);

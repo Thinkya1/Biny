@@ -1,7 +1,7 @@
 /**
  * 会话列表命令模块。
  *
- * `sessions` 读取本项目 `.biny/sessions` 下的 JSONL 文件，展示每个 session 的创建时间、
+ * `sessions` 读取本项目对应的全局 JSONL 文件，展示每个 session 的创建时间、
  * 最近更新时间、事件数、首条用户消息和最后一条 assistant 消息摘要。
  */
 import { ensureAgentDirs } from "../../session/store.js";

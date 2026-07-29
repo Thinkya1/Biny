@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { loadConfig, loadConfigFile, saveConfig, saveConfigFile } from "../src/config/loader.js";
-import { BINY_AGENT_DIR_ENV, globalAgentDir, globalConfigPath } from "../src/config/paths.js";
+import { BINY_AGENT_DIR_ENV, globalAgentDir, globalConfigPath, projectSessionsDir } from "../src/config/paths.js";
 import { defaultConfig } from "../src/config/schema.js";
 import { BINY_KEYCHAIN_SERVICE, MacKeychainCredentialStore } from "../src/config/credentials.js";
 
@@ -19,6 +19,11 @@ async function testGlobalPathResolution(): Promise<void> {
   assert.equal(globalAgentDir({ env: { [BINY_AGENT_DIR_ENV]: configured }, homeDir: "/unused" }), configured);
   assert.equal(globalConfigPath({ env: { [BINY_AGENT_DIR_ENV]: configured }, homeDir: "/unused" }), path.join(configured, "agent.config.json"));
   assert.equal(globalAgentDir({ env: {}, homeDir: "/tmp/biny-home" }), "/tmp/biny-home/.biny/agent");
+  const projectA = projectSessionsDir("/tmp/project-a", { env: { [BINY_AGENT_DIR_ENV]: configured } });
+  const projectB = projectSessionsDir("/tmp/project-b", { env: { [BINY_AGENT_DIR_ENV]: configured } });
+  assert.equal(path.dirname(projectA), path.join(configured, "sessions"));
+  assert.notEqual(projectA, projectB);
+  assert.equal(projectSessionsDir("/tmp/project-a", { env: { [BINY_AGENT_DIR_ENV]: configured } }), projectA);
 }
 
 async function testProjectOverridesAndGlobalPersistence(): Promise<void> {

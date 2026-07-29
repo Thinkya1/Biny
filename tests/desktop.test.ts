@@ -591,8 +591,9 @@ async function testDesktopModelConfiguration(): Promise<void> {
     await projects.listSessions(project, undefined, new Map());
     const attachment = await projects.saveAttachment(project, "notes.txt", "text/plain", new TextEncoder().encode("desktop only"));
     assert.match(attachment.path, /^@attachments\//);
-    // Project sessions and attachments live together, so TUI/CLI can reopen Desktop uploads.
-    await access(path.join(workspaceRoot, ".biny", "sessions"));
+    // Project sessions are global and project-scoped; attachments remain with the project.
+    await access(path.dirname(sessionFilePath(workspaceRoot, "path-probe")));
+    await assert.rejects(access(path.join(workspaceRoot, ".biny", "sessions")));
     await access(path.join(workspaceRoot, ".biny", "attachments"));
     await assert.rejects(access(path.join(desktopRoot, "projects", project.id, ".biny", "attachments")));
     await assert.rejects(access(path.join(workspaceRoot, "agent.config.json")));
@@ -968,26 +969,14 @@ async function testLegacyDesktopDataMigration(): Promise<void> {
     assert.equal(migratedState.sessionMetadata[`${project.id}:legacy-session`]?.title, "Legacy title");
     assert.equal(migratedState.sessionMetadata[`${stateProject.id}:state-session`]?.pinned, true);
 
-    await storage.migrateLegacyConfig([project], configStore);
-
-    // Old desktop builds stored project sessions under userData; open should copy them into the project.
-    const desktopProjectRoot = storage.projectDesktopRoot(project);
-    await mkdir(desktopProjectRoot, { recursive: true });
-    await ensureAgentDirs(desktopProjectRoot);
-    const legacySessionBody = `${JSON.stringify({ type: "user_message", content: "keep me" })}\n`;
-    await writeFile(sessionFilePath(desktopProjectRoot, "legacy-session"), legacySessionBody);
-    await mkdir(path.join(desktopProjectRoot, ".agent", "attachments"), { recursive: true });
-    await writeFile(path.join(desktopProjectRoot, ".agent", "attachments", "note.txt"), "attachment migrates with the session\n");
-
     const dataRoot = await storage.ensureProjectData(project);
     assert.equal(dataRoot, path.resolve(projectRoot));
-    assert.equal(await readFile(sessionFilePath(projectRoot, "legacy-session"), "utf8"), legacySessionBody);
-    await access(path.join(projectRoot, ".biny", "attachments", "note.txt"));
-    await access(path.join(desktopProjectRoot, ".agent", "attachments", "note.txt"));
+    await access(path.dirname(sessionFilePath(projectRoot, "path-probe")));
+    await assert.rejects(access(path.join(projectRoot, ".biny", "sessions")));
 
     const globalRoot = await storage.ensureGlobalData();
     assert.equal(globalRoot, path.join(desktopRoot, "global"));
-    await access(path.join(globalRoot, ".biny", "sessions"));
+    await access(path.dirname(sessionFilePath(globalRoot, "path-probe")));
 
     // 旧项目配置只用于 doctor 提示，启动不会自动迁移或覆盖全局模型配置。
     assert.equal((await configStore.load()).defaultModel, defaultConfig.defaultModel);
