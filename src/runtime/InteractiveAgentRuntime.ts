@@ -13,32 +13,31 @@ import type { ModelChoice, ModelRuntimeInfo, ThinkingSelection } from "../llm/Mo
 import { isFullYesConfirmation } from "../permission/confirmation.js";
 import type { PermissionMode, PermissionResult } from "../permission/PermissionManager.js";
 import type { SessionSummary } from "../session/events.js";
-import type { SessionUsage } from "../session/metadata.js";
 import type { ToolInputDisplay } from "../tools/types.js";
 import { redactSecrets, redactSensitiveValue } from "../utils/secrets.js";
-import type { TaskRunStore } from "../harness/TaskRunStore.js";
 import { AgentEventBus } from "./AgentEventBus.js";
 import { createCommandRuntime, type CommandRuntime, type CommandRuntimeOptions } from "./CommandRuntime.js";
 import {
-  SubagentTaskAbortedError,
   type SubagentTaskRunOptions,
   type SubagentTaskSnapshot,
   type SubmittedSubagentTask
 } from "./SubagentTaskManager.js";
-import { RootRunLedger, type RootRunLedgerSessionLease, type RootRunLedgerSnapshot, type RootRunLedgerStatus } from "./RootRunLedger.js";
 import { RootRunScheduler } from "./RootRunScheduler.js";
 import { resolveSessionFile, sessionIdFromFile } from "../session/store.js";
-import { TaskRunCoordinator } from "./TaskRunCoordinator.js";
+import { SessionLeaseStore, type SessionLease } from "./SessionLease.js";
 import type {
   ActiveRunSnapshot,
   AgentHostEvent,
   AgentPermissionEventRequest,
+  AgentRuntimeUpdate,
+  InteractiveRunState,
   InteractiveRuntimeSnapshot,
   PendingPermissionSnapshot,
   RuntimeOperation
 } from "./agentEvents.js";
+import { reduceInteractiveRunState } from "./agentEvents.js";
 
-type ExclusiveRuntimeOperation = RuntimeOperation | "permission" | "plan" | "memory" | "model_catalog";
+type ExclusiveRuntimeOperation = RuntimeOperation;
 
 export interface SubmittedAgentRun {
   runId: string;
@@ -55,15 +54,30 @@ export interface AgentRunOutcome extends AgentTurnOutcome {
 export interface InteractiveAgentRuntimeOptions {
   shutdownDrainMs?: number;
   maxQueuedRuns?: number;
-  /** Injected by the composition root; tests may omit durable persistence. */
-  runLedger?: RootRunLedger;
-  /** Injected by the composition root; tests may omit durable task persistence. */
-  taskRunStore?: TaskRunStore;
+  /** 由 composition root 注入；测试可省略跨进程租约。 */
+  sessionLeases?: SessionLeaseStore;
+  /** 仅 `biny run` 注入；普通 Chat/Plan 运行时不依赖自主执行模块。 */
+  autonomousExecutor?: AutonomousExecutor;
+}
+
+export interface AutonomousExecutor {
+  execute(options: {
+    runId: string;
+    sessionId: string;
+    input: string;
+    mode: "autonomous";
+    attachments: AgentAttachment[];
+    signal: AbortSignal;
+    confirmPermission(request: AgentPermissionEventRequest): Promise<AgentPermissionResult>;
+    onAgentEvent(event: AgentSessionEvent): boolean;
+    onReasoningCompleted(): void;
+  }): Promise<{ turn: AgentTurnOutcome }>;
 }
 
 interface QueuedAgentRun extends ActiveRunSnapshot {
   queuedAtMs: number;
   wasQueued: boolean;
+  continuation: boolean;
   attachments: AgentAttachment[];
 }
 
@@ -80,7 +94,7 @@ interface ActiveTool {
 }
 
 interface SessionLeaseState {
-  lease: RootRunLedgerSessionLease | undefined;
+  lease: SessionLease | undefined;
   acquired: boolean;
 }
 
@@ -93,17 +107,17 @@ export class InteractiveAgentRuntime {
   private static readonly maxQueuedRuns = 32;
   private static readonly defaultShutdownDrainMs = 2_000;
   private readonly events = new AgentEventBus<AgentHostEvent>();
+  private readonly updates = new AgentEventBus<AgentRuntimeUpdate>();
   private readonly rootRunScheduler: RootRunScheduler<QueuedAgentRun, AgentRunOutcome>;
-  private readonly runLedger: RootRunLedger | undefined;
-  private sessionLease: RootRunLedgerSessionLease | undefined;
-  private readonly taskRunCoordinator: TaskRunCoordinator;
+  private readonly sessionLeases: SessionLeaseStore | undefined;
+  private readonly autonomousExecutor: AutonomousExecutor | undefined;
+  private sessionLease: SessionLease | undefined;
+  private state: InteractiveRunState = { kind: "idle" };
+  private revision = 0;
   private readonly tools = new Map<string, ActiveTool>();
   private readonly permissionRequestIds = new Map<string, string>();
-  private backgroundSubagentCount = 0;
-  private directRun: ActiveRunSnapshot | undefined;
   private pendingPermission: PendingPermission | undefined;
   private abortController: AbortController | undefined;
-  private activeOperation: ExclusiveRuntimeOperation | undefined;
   private activeOperationCompletion: Promise<void> | undefined;
   private closePromise: Promise<void> | undefined;
   private commandRuntimeClosePromise: Promise<void> | undefined;
@@ -118,10 +132,12 @@ export class InteractiveAgentRuntime {
     if (!Number.isSafeInteger(this.shutdownDrainMs) || this.shutdownDrainMs < 0) {
       throw new Error("shutdownDrainMs must be a non-negative safe integer.");
     }
-    this.runLedger = options.runLedger;
-    this.taskRunCoordinator = new TaskRunCoordinator({
-      runtime: commandRuntime,
-      taskRunStore: options.taskRunStore
+    this.sessionLeases = options.sessionLeases;
+    this.autonomousExecutor = options.autonomousExecutor;
+    this.events.subscribe((event) => {
+      this.state = reduceInteractiveRunState(this.state, event);
+      this.revision += 1;
+      this.updates.emit({ event, snapshot: this.getSnapshot() });
     });
     this.rootRunScheduler = new RootRunScheduler({
       maxQueuedRuns: options.maxQueuedRuns ?? InteractiveAgentRuntime.maxQueuedRuns,
@@ -164,10 +180,34 @@ export class InteractiveAgentRuntime {
   }
 
   submitPrompt(input: string, mode: AgentRunMode = "chat", attachments: AgentAttachment[] = []): SubmittedAgentRun {
+    return this.enqueueRun(input, mode, attachments, false);
+  }
+
+  async continueInterruptedTurn(): Promise<AgentRunOutcome | undefined> {
+    if (this.state.kind !== "idle") {
+      throw new Error("Cannot continue an interrupted turn while the runtime is busy.");
+    }
+    const interrupted = await this.commandRuntime.interruptedTurn();
+    if (!interrupted) return undefined;
+    return await this.enqueueRun(interrupted.prompt, "chat", [], true).completion;
+  }
+
+  private enqueueRun(
+    input: string,
+    mode: AgentRunMode,
+    attachments: AgentAttachment[],
+    continuation: boolean
+  ): SubmittedAgentRun {
     if (this.closed) throw new Error("Agent runtime is closed.");
-    if (this.activeOperation) throw new Error(`Cannot submit a prompt while ${publicOperationName(this.activeOperation)} is running.`);
-    if (this.backgroundSubagentCount) throw new Error("Cannot submit a prompt while a subagent task is running for this session.");
+    if (this.state.kind === "maintenance") {
+      throw new Error(`Cannot submit a prompt while ${publicOperationName(this.state.operation)} is running.`);
+    }
+    if (this.state.kind === "background_subagent") {
+      throw new Error("Cannot submit a prompt while a subagent task is running for this session.");
+    }
     if (!input.trim()) throw new Error("Agent prompt cannot be empty.");
+    // 能力校验交给 AgentSession。它会先把输入和附件引用写入 JSONL，再返回明确的
+    // vision/audio 错误，避免用户粘贴的内容在失败时从会话历史里消失。
     const sessionId = this.getInfo().sessionId;
     this.acquireSessionLease(sessionId);
     const runId = randomUUID();
@@ -183,10 +223,10 @@ export class InteractiveAgentRuntime {
       status: "queued",
       startedAt: new Date(queuedAtMs).toISOString(),
       queuedAtMs,
-      wasQueued: this.rootRunScheduler.activeRun !== undefined || this.rootRunScheduler.queueLength > 0
+      wasQueued: this.rootRunScheduler.activeRun !== undefined || this.rootRunScheduler.queueLength > 0,
+      continuation
     };
     try {
-      this.admitRootRun(run);
       const submitted = this.rootRunScheduler.submit(run);
       if (submitted.queued) {
         this.events.emit({
@@ -194,7 +234,7 @@ export class InteractiveAgentRuntime {
           type: "run.queued",
           messageId: run.messageId,
           input: run.input,
-          mode: run.mode,
+          mode: "autonomous",
           position: this.rootRunScheduler.queueLength,
           queueLength: this.rootRunScheduler.queueLength
         });
@@ -205,22 +245,21 @@ export class InteractiveAgentRuntime {
       void submitted.completion.then(releaseWhenIdle, releaseWhenIdle);
       return { runId, messageId, queued: submitted.queued, completion: submitted.completion };
     } catch (error) {
-      this.persistTerminalRun(run, "failed", 0, undefined, `Run admission rejected: ${errorMessage(error)}`);
       this.releaseSessionLeaseIfIdle();
       throw error;
     }
   }
 
   cancelCurrentRun(): void {
-    const activeRun = this.rootRunScheduler.activeRun ?? this.directRun;
+    const activeRun = this.rootRunScheduler.activeRun;
     if (activeRun) this.cancelRun(activeRun.runId);
-    else if (this.activeOperation) this.abortController?.abort();
+    else if (this.state.kind === "maintenance") this.abortController?.abort();
     for (const queued of this.rootRunScheduler.queuedRuns) this.cancelRun(queued.runId);
   }
 
   async waitForIdle(): Promise<void> {
     try {
-      while (this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength || this.directRun || this.activeOperation) {
+      while (this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength || this.state.kind === "maintenance") {
         if (this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength) {
           await this.rootRunScheduler.waitForIdle();
         } else if (this.activeOperationCompletion) {
@@ -241,13 +280,6 @@ export class InteractiveAgentRuntime {
       this.pendingPermission?.resolve({ approved: false, scope: "once", message: "Current turn interrupted." });
       this.pendingPermission = undefined;
       return this.rootRunScheduler.cancel(runId);
-    }
-    if (this.directRun?.runId === runId && this.abortController) {
-      this.abortController.abort();
-      this.commandRuntime.cancelSubagentTasks(runId, "Current turn interrupted.");
-      this.pendingPermission?.resolve({ approved: false, scope: "once", message: "Current turn interrupted." });
-      this.pendingPermission = undefined;
-      return true;
     }
     const queued = this.rootRunScheduler.queuedRuns.find((run) => run.runId === runId);
     const cancelled = this.rootRunScheduler.cancel(runId, "Cancelled before execution.");
@@ -308,7 +340,7 @@ export class InteractiveAgentRuntime {
   }
 
   async runMemoryCommand(args: string[]): Promise<string> {
-    // add/forget 会改写 .agent/memory，与活动回合的自动记忆写入互斥，走维护操作队列。
+    // add/forget 会改写 .biny/memory，与活动回合的自动记忆写入互斥，走维护操作队列。
     return await this.runMaintenanceOperation("memory", async () => await this.commandRuntime.agent.runMemoryCommand(args));
   }
 
@@ -374,11 +406,6 @@ export class InteractiveAgentRuntime {
     return this.commandRuntime.listSubagentTasks();
   }
 
-  /** Durable root-run history, intentionally separate from stable session JSONL events. */
-  listRootRunSnapshots(): RootRunLedgerSnapshot[] {
-    return this.runLedger?.listSnapshots() ?? [];
-  }
-
   cancelSubagentTask(taskId: string, reason?: string): boolean {
     return this.commandRuntime.cancelSubagentTask(taskId, reason);
   }
@@ -391,28 +418,47 @@ export class InteractiveAgentRuntime {
     const controller = new AbortController();
     return await this.runMaintenanceOperation(
       "subagent",
-      async () => await this.executeDirectSubagentTask(task, controller),
+      async () => {
+        try {
+          return await this.commandRuntime.runSubagentTask(task, {
+            taskId: randomUUID(),
+            signal: controller.signal
+          });
+        } catch (error) {
+          if (!(error instanceof Error)) throw new Error(redactSecrets(String(error)));
+          const publicMessage = redactSecrets(error.message);
+          if (publicMessage === error.message) throw error;
+          try {
+            Object.defineProperty(error, "message", { value: publicMessage, configurable: true });
+          } catch {
+            const publicError = new Error(publicMessage);
+            publicError.name = error.name;
+            throw publicError;
+          }
+          throw error;
+        }
+      },
       controller
     );
   }
 
   startSubagentTask(task: string, options?: SubagentTaskRunOptions): SubmittedSubagentTask {
     if (this.closed) throw new Error("Agent runtime is closed.");
-    if (this.activeOperation || this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength || this.directRun) {
+    if (this.state.kind !== "idle") {
       throw new Error("Cannot start a background subagent while the runtime is busy.");
     }
     const leaseState = this.acquireSessionLease(this.getInfo().sessionId);
-    this.backgroundSubagentCount += 1;
+    this.setState({ kind: "background_subagent", count: 1 });
     try {
       const submitted = this.commandRuntime.startSubagentTask(task, options);
       const release = (): void => {
-        this.backgroundSubagentCount = Math.max(0, this.backgroundSubagentCount - 1);
+        this.setState({ kind: "idle" });
         this.releaseSessionLeaseIfIdle();
       };
       void submitted.completion.then(release, release);
       return submitted;
     } catch (error) {
-      this.backgroundSubagentCount = Math.max(0, this.backgroundSubagentCount - 1);
+      this.setState({ kind: "idle" });
       this.releaseSessionLease(leaseState);
       throw error;
     }
@@ -453,42 +499,21 @@ export class InteractiveAgentRuntime {
     );
   }
 
-  async createPlan(task: string, onDelta?: (delta: string) => void, abortSignal?: AbortSignal): Promise<string> {
-    const controller = new AbortController();
-    const signal = abortSignal ? AbortSignal.any([abortSignal, controller.signal]) : controller.signal;
-    return await this.runMaintenanceOperation(
-      "plan",
-      async () => await this.commandRuntime.agent.createPlan(task, onDelta, signal),
-      controller
-    );
-  }
-
   getSnapshot(): InteractiveRuntimeSnapshot {
     return {
+      revision: this.revision,
       info: this.getInfo(),
       permissionMode: this.getPermissionMode(),
-      // permission/memory 是即时命令，不作为公共快照里的长操作暴露。
-      activeOperation: this.activeOperation === "permission"
-        || this.activeOperation === "memory"
-        || this.activeOperation === "model_catalog"
-        ? undefined
-        : this.activeOperation,
-      activeRun: this.rootRunScheduler.activeRun
-        ? publicRunSnapshot(this.rootRunScheduler.activeRun)
-        : this.directRun ? publicRunSnapshot(this.directRun) : undefined,
-      pendingPermission: this.pendingPermission ? {
-        sessionId: this.pendingPermission.sessionId,
-        runId: this.pendingPermission.runId,
-        requestId: this.pendingPermission.requestId,
-        toolCallId: this.pendingPermission.toolCallId,
-        request: { ...this.pendingPermission.request }
-      } : undefined,
-      queuedRuns: this.rootRunScheduler.queuedRuns.map(({ runId, messageId, input, mode }) => ({ runId, messageId, input, mode }))
+      state: cloneRunState(this.state)
     };
   }
 
   subscribe(listener: (event: AgentHostEvent) => void): () => void {
     return this.events.subscribe(listener);
+  }
+
+  subscribeUpdates(listener: (update: AgentRuntimeUpdate) => void): () => void {
+    return this.updates.subscribe(listener);
   }
 
   close(): Promise<void> {
@@ -523,7 +548,7 @@ export class InteractiveAgentRuntime {
       } finally {
         this.sessionLease?.close();
         this.sessionLease = undefined;
-        this.runLedger?.close();
+        this.sessionLeases?.close();
       }
     });
     return this.commandRuntimeClosePromise;
@@ -536,11 +561,11 @@ export class InteractiveAgentRuntime {
     sessionId = this.getInfo().sessionId
   ): Promise<T> {
     if (this.closed) throw new Error("Agent runtime is closed.");
-    if (this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength || this.directRun || this.activeOperation || this.backgroundSubagentCount) {
+    if (this.state.kind !== "idle") {
       throw new Error(`Cannot start ${publicOperationName(operation)} while the runtime is busy.`);
     }
     const leaseState = this.acquireSessionLease(sessionId);
-    this.activeOperation = operation;
+    this.setState({ kind: "maintenance", operation });
     if (operationAbortController) this.abortController = operationAbortController;
     const execution = Promise.resolve().then(execute);
     const completion = execution.then(() => undefined, () => undefined);
@@ -553,7 +578,7 @@ export class InteractiveAgentRuntime {
       }
       if (this.activeOperationCompletion === completion) {
         this.activeOperationCompletion = undefined;
-        this.activeOperation = undefined;
+        this.setState({ kind: "idle" });
       }
       this.releaseSessionLease(leaseState);
     }
@@ -564,8 +589,8 @@ export class InteractiveAgentRuntime {
     if (current?.sessionId === sessionId) return { lease: current, acquired: false };
     current?.close();
     this.sessionLease = undefined;
-    if (!this.runLedger) return { lease: undefined, acquired: false };
-    const lease = this.runLedger.acquireSession(sessionId);
+    if (!this.sessionLeases) return { lease: undefined, acquired: false };
+    const lease = this.sessionLeases.acquire(sessionId);
     this.sessionLease = lease;
     return { lease, acquired: true };
   }
@@ -577,102 +602,14 @@ export class InteractiveAgentRuntime {
   }
 
   private releaseSessionLeaseIfIdle(): void {
-    if (this.rootRunScheduler.activeRun || this.rootRunScheduler.queueLength || this.directRun || this.activeOperation || this.backgroundSubagentCount) return;
+    if (this.state.kind !== "idle") return;
     const lease = this.sessionLease;
     if (!lease) return;
     lease.close();
     this.sessionLease = undefined;
   }
 
-  private async executeDirectSubagentTask(task: string, controller: AbortController): Promise<string> {
-    const input = task.trim();
-    if (!input) throw new Error("Subagent task cannot be empty.");
-    const info = this.getInfo();
-    const subagentInfo = this.commandRuntime.getSubagentInfo();
-    const run = this.standaloneRun(info.sessionId, randomUUID(), input);
-    const taskId = randomUUID();
-    const startedAtMs = Date.now();
-    const publicInput = redactSecrets(input);
-    this.admitRootRun(run);
-    this.startRootRun(run);
-    this.directRun = run;
-    this.abortController = controller;
-    this.events.emit({ ...this.eventBase(run), type: "message.user", messageId: run.messageId, content: publicInput });
-    this.events.emit({
-      ...this.eventBase(run),
-      type: "run.started",
-      messageId: run.messageId,
-      input: publicInput,
-      mode: run.mode,
-      model: {
-        alias: subagentInfo.modelAlias,
-        provider: subagentInfo.provider,
-        label: subagentInfo.modelLabel,
-        reasoning: subagentInfo.reasoningLabel
-      },
-      skills: info.skills ?? []
-    });
-    this.events.emit({
-      ...this.eventBase(run),
-      type: "tool.started",
-      toolCallId: taskId,
-      tool: "delegate_task",
-      args: { task: publicInput },
-      description: "Run a bounded read-only subagent",
-      display: { kind: "generic", summary: "Delegate read-only investigation", detail: publicInput }
-    });
-    this.events.emit({ ...this.eventBase(run), type: "reasoning.status", messageId: run.messageId, status: "正在运行只读子任务" });
-
-    try {
-      const output = await this.commandRuntime.runSubagentTask(input, {
-        taskId,
-        parentRunId: run.runId,
-        signal: controller.signal
-      });
-      const publicOutput = redactSecrets(output);
-      const durationMs = Date.now() - startedAtMs;
-      const ledgerFailure = this.persistTerminalRun(run, "completed", durationMs, undefined, undefined);
-      if (ledgerFailure) throw new Error(ledgerFailure);
-      run.status = "completed";
-      this.events.emit({ ...this.eventBase(run), type: "tool.completed", toolCallId: taskId, tool: "delegate_task", result: publicOutput, durationMs });
-      this.events.emit({ ...this.eventBase(run), type: "assistant.completed", messageId: run.messageId, content: publicOutput });
-      this.events.emit({ ...this.eventBase(run), type: "run.completed", durationMs });
-      return publicOutput;
-    } catch (error) {
-      const failure = error instanceof Error ? error : new Error(String(error));
-      const durationMs = Date.now() - startedAtMs;
-      const publicMessage = redactSecrets(failure.message);
-      const aborted = controller.signal.aborted || failure instanceof SubagentTaskAbortedError;
-      const ledgerFailure = this.persistTerminalRun(
-        run,
-        aborted ? "aborted" : "failed",
-        durationMs,
-        undefined,
-        publicMessage
-      );
-      const terminalMessage = ledgerFailure ?? publicMessage;
-      this.events.emit({ ...this.eventBase(run), type: "tool.failed", toolCallId: taskId, tool: "delegate_task", error: terminalMessage, durationMs });
-      if (aborted && !ledgerFailure) {
-        run.status = "aborted";
-        this.events.emit({ ...this.eventBase(run), type: "run.aborted", durationMs, reason: terminalMessage });
-      } else {
-        run.status = "failed";
-        this.commandRuntime.agent.recordError(failure);
-        this.events.emit({ ...this.eventBase(run), type: "run.failed", durationMs, error: terminalMessage });
-      }
-      if (!ledgerFailure && publicMessage === failure.message) throw failure;
-      const publicFailure = new Error(terminalMessage);
-      publicFailure.name = failure.name;
-      throw publicFailure;
-    } finally {
-      if (this.abortController === controller) this.abortController = undefined;
-      if (this.directRun?.runId === run.runId) this.directRun = undefined;
-    }
-  }
-
   private abortQueuedRun(run: QueuedAgentRun, reason: string): AgentRunOutcome {
-    const persistenceFailure = this.persistTerminalRun(run, "aborted", 0, undefined, reason);
-    if (persistenceFailure) return this.emitLedgerFailure(run, 0, persistenceFailure);
     run.status = "aborted";
     const publicReason = redactSecrets(reason);
     this.events.emit({ ...this.eventBase(run), type: "run.aborted", durationMs: 0, reason: publicReason });
@@ -690,8 +627,6 @@ export class InteractiveAgentRuntime {
   private failScheduledRun(run: QueuedAgentRun, error: unknown): AgentRunOutcome {
     const message = redactSecrets(error instanceof Error ? error.message : String(error));
     const durationMs = Math.max(0, Date.now() - run.queuedAtMs);
-    const persistenceFailure = this.persistTerminalRun(run, "failed", durationMs, undefined, message);
-    if (persistenceFailure) return this.emitLedgerFailure(run, durationMs, persistenceFailure);
     run.status = "failed";
     this.events.emit({ ...this.eventBase(run), type: "run.failed", durationMs, error: message });
     return {
@@ -712,7 +647,6 @@ export class InteractiveAgentRuntime {
     run.sessionId = info.sessionId;
     run.status = "thinking";
     run.startedAt = new Date(startedAtMs).toISOString();
-    this.startRootRun(run);
     if (run.wasQueued) {
       this.events.emit({
         ...this.eventBase(run),
@@ -723,12 +657,14 @@ export class InteractiveAgentRuntime {
     this.commandRuntime.setSubagentParentRunId(run.runId);
     this.tools.clear();
     this.permissionRequestIds.clear();
-    this.events.emit({
-      ...this.eventBase(run),
-      type: "message.user",
-      messageId: run.messageId,
-      content: run.input
-    });
+    if (!run.continuation) {
+      this.events.emit({
+        ...this.eventBase(run),
+        type: "message.user",
+        messageId: run.messageId,
+        content: run.input
+      });
+    }
     this.events.emit({
       ...this.eventBase(run),
       type: "run.started",
@@ -746,19 +682,56 @@ export class InteractiveAgentRuntime {
 
     try {
       let reasoningActive = false;
-      const { turn } = await this.taskRunCoordinator.execute({
-        runId: run.runId,
-        sessionId: run.sessionId,
-        input: run.input,
-        mode: run.mode,
-        attachments: run.attachments,
-        signal,
-        confirmPermission: async (request) => await this.waitForPermission(run, request),
-        onAgentEvent: (event) => {
+      let turn: AgentTurnOutcome | undefined;
+      if (run.mode === "autonomous") {
+        if (!this.autonomousExecutor) {
+          throw new Error("Autonomous execution is available only through `biny run`.");
+        }
+        ({ turn } = await this.autonomousExecutor.execute({
+          runId: run.runId,
+          sessionId: run.sessionId,
+          input: run.input,
+          mode: run.mode,
+          attachments: run.attachments,
+          signal,
+          confirmPermission: async (request) => await this.waitForPermission(run, request),
+          onAgentEvent: (event) => {
+            const mapped = this.handleAgentEvent(run, event, reasoningActive);
+            return reasoningActive = mapped.reasoningActive;
+          },
+          onReasoningCompleted: () => {
+            this.events.emit({
+              ...this.eventBase(run),
+              type: "reasoning.completed",
+              messageId: run.messageId,
+              status: "分析完成"
+            });
+          }
+        }));
+      } else {
+        // Chat/Plan 与 pi 一样只驱动一个 AgentSession 回合；不创建任务契约，也不在回答后
+        // 擅自跑验收命令。Plan 的只读工具限制仍由 AgentSession/Sdk coordinator 负责。
+        let terminalEvents = 0;
+        let streamFailure: string | undefined;
+        const runOptions = {
+          abortSignal: signal,
+          confirmPermission: async (request: AgentPermissionEventRequest) => await this.waitForPermission(run, request),
+          mode: run.mode,
+          attachments: run.attachments
+        };
+        const stream = run.continuation
+          ? agent.continueInterruptedTurn(runOptions)
+          : agent.run(run.input, runOptions);
+        for await (const event of stream) {
           const mapped = this.handleAgentEvent(run, event, reasoningActive);
-          return reasoningActive = mapped.reasoningActive;
-        },
-        onReasoningCompleted: () => {
+          reasoningActive = mapped.reasoningActive;
+          streamFailure ??= mapped.failure;
+          if (event.type === "done") {
+            terminalEvents += 1;
+            turn = event.outcome;
+          }
+        }
+        if (reasoningActive) {
           this.events.emit({
             ...this.eventBase(run),
             type: "reasoning.completed",
@@ -766,7 +739,15 @@ export class InteractiveAgentRuntime {
             status: "分析完成"
           });
         }
-      });
+        // 非协作嵌入方可能在 AbortSignal 后仍吐出一个“完成”事件；取消优先，不能把晚到的
+        // 结果写成成功回合。
+        if (signal.aborted) throw new Error("Current turn interrupted.");
+        if (terminalEvents !== 1 || !turn) {
+          throw new Error(terminalEvents > 1
+            ? "Agent stream emitted multiple terminal results."
+            : streamFailure ?? "Agent stream ended without a terminal result.");
+        }
+      }
       const durationMs = Date.now() - startedAtMs;
       if (turn.output && (turn.status === "completed" || turn.status === "incomplete")) {
         this.emitAssistantCompleted(run, turn.output);
@@ -775,7 +756,9 @@ export class InteractiveAgentRuntime {
       this.events.emit({ ...this.eventBase(run), type: "context.updated", context });
       if (turn.status === "completed") {
         const outcome = this.completeRun(run, durationMs, turn);
-        if (outcome.status === "completed") agent.rememberSuccessfulTask?.(run.input, turn.output);
+        // autonomous 的 attempt 会延迟记忆到独立验收通过；直接 chat/plan 已由 AgentSession 在
+        // 写入 assistant 消息后处理，不能重复入库。
+        if (run.mode === "autonomous" && outcome.status === "completed") agent.rememberSuccessfulTask?.(run.input, turn.output);
         return outcome;
       }
       if (turn.status === "incomplete") return this.incompleteRun(run, durationMs, turn);
@@ -808,8 +791,6 @@ export class InteractiveAgentRuntime {
   }
 
   private completeRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): AgentRunOutcome {
-    const persistenceFailure = this.persistTerminalRun(run, "completed", durationMs, turn.usage, undefined);
-    if (persistenceFailure) return this.emitLedgerFailure(run, durationMs, persistenceFailure);
     run.status = "completed";
     this.events.emit({
       ...this.eventBase(run),
@@ -825,8 +806,6 @@ export class InteractiveAgentRuntime {
 
   private incompleteRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): AgentRunOutcome {
     const reason = turn.error ?? incompleteReason(turn);
-    const persistenceFailure = this.persistTerminalRun(run, "incomplete", durationMs, turn.usage, reason);
-    if (persistenceFailure) return this.emitLedgerFailure(run, durationMs, persistenceFailure, turn.usage);
     run.status = "incomplete";
     this.events.emit({
       ...this.eventBase(run),
@@ -848,8 +827,6 @@ export class InteractiveAgentRuntime {
     turn?: AgentTurnOutcome
   ): AgentRunOutcome {
     const publicReason = redactSecrets(reason);
-    const persistenceFailure = this.persistTerminalRun(run, "aborted", durationMs, turn?.usage, publicReason);
-    if (persistenceFailure) return this.emitLedgerFailure(run, durationMs, persistenceFailure);
     run.status = "aborted";
     this.events.emit({
       ...this.eventBase(run),
@@ -880,8 +857,6 @@ export class InteractiveAgentRuntime {
     turn?: AgentTurnOutcome
   ): AgentRunOutcome {
     const publicError = redactSecrets(error);
-    const persistenceFailure = this.persistTerminalRun(run, "failed", durationMs, turn?.usage, publicError);
-    if (persistenceFailure) return this.emitLedgerFailure(run, durationMs, persistenceFailure, turn?.usage);
     run.status = "failed";
     this.events.emit({
       ...this.eventBase(run),
@@ -905,73 +880,11 @@ export class InteractiveAgentRuntime {
     };
   }
 
-  private admitRootRun(run: ActiveRunSnapshot): void {
-    this.runLedger?.admit({
-      runId: run.runId,
-      sessionId: run.sessionId,
-      messageId: run.messageId,
-      mode: run.mode,
-      input: run.input,
-      queuedAt: run.startedAt
-    });
-  }
-
-  private startRootRun(run: ActiveRunSnapshot): void {
-    this.runLedger?.start(run.runId, run.startedAt);
-  }
-
-  private persistTerminalRun(
-    run: ActiveRunSnapshot,
-    status: Extract<RootRunLedgerStatus, "completed" | "incomplete" | "failed" | "aborted">,
-    durationMs: number,
-    usage: SessionUsage | undefined,
-    reason: string | undefined
-  ): string | undefined {
-    if (!this.runLedger) return undefined;
-    const details = {
-      endedAt: new Date().toISOString(),
-      durationMs,
-      usage,
-      reason
-    };
-    try {
-      if (status === "completed") this.runLedger.complete(run.runId, details);
-      else if (status === "incomplete") this.runLedger.incomplete(run.runId, details);
-      else if (status === "aborted") this.runLedger.abort(run.runId, details);
-      else this.runLedger.fail(run.runId, details);
-      return undefined;
-    } catch (error) {
-      return `Root run ledger persistence failed: ${redactSecrets(errorMessage(error))}`;
-    }
-  }
-
-  private emitLedgerFailure(
-    run: ActiveRunSnapshot,
-    durationMs: number,
-    message: string,
-    usage?: SessionUsage
-  ): AgentRunOutcome {
-    const publicMessage = redactSecrets(message);
-    run.status = "failed";
-    this.commandRuntime.agent.recordError(new Error(publicMessage));
-    this.events.emit({ ...this.eventBase(run), type: "run.failed", durationMs, error: publicMessage });
-    return {
-      runId: run.runId,
-      status: "failed",
-      stopReason: "provider_error",
-      steps: 0,
-      output: "",
-      durationMs,
-      usage,
-      error: publicMessage
-    };
-  }
-
   private handleAgentEvent(
     run: ActiveRunSnapshot,
     event: AgentSessionEvent,
     reasoningActive: boolean
-  ): { reasoningActive: boolean; done?: AgentTurnOutcome; failure?: string } {
+  ): { reasoningActive: boolean; failure?: string } {
     if (event.type === "status") {
       run.status = event.status === "waiting_permission"
         ? "waiting_permission"
@@ -1085,7 +998,7 @@ export class InteractiveAgentRuntime {
       return { reasoningActive, failure: fatal === false ? undefined : event.message };
     }
     if (event.type === "done") {
-      return { reasoningActive, done: event.outcome };
+      return { reasoningActive };
     }
     return { reasoningActive };
   }
@@ -1207,24 +1120,42 @@ export class InteractiveAgentRuntime {
       startedAt: new Date().toISOString()
     };
   }
-}
 
-function publicRunSnapshot(run: ActiveRunSnapshot & { attachments?: AgentAttachment[] }): ActiveRunSnapshot {
-  const { attachments: _attachments, ...snapshot } = run;
-  return snapshot;
+  private setState(state: InteractiveRunState): void {
+    this.state = state;
+    this.revision += 1;
+    this.updates.emit({ snapshot: this.getSnapshot() });
+  }
 }
 
 export async function createInteractiveAgentRuntime(workspaceRoot: string, options?: CommandRuntimeOptions): Promise<InteractiveAgentRuntime> {
-  const runLedger = await RootRunLedger.open(options?.persistenceRoot ?? workspaceRoot);
+  const sessionLeases = await SessionLeaseStore.open(options?.persistenceRoot ?? workspaceRoot);
   let commandRuntime: CommandRuntime | undefined;
   try {
     commandRuntime = await createCommandRuntime(workspaceRoot, options);
-    return new InteractiveAgentRuntime(commandRuntime, { runLedger });
+    return new InteractiveAgentRuntime(commandRuntime, { sessionLeases });
   } catch (error) {
     await commandRuntime?.close();
-    runLedger.close();
+    sessionLeases.close();
     throw error;
   }
+}
+
+function cloneRunState(state: InteractiveRunState): InteractiveRunState {
+  if (state.kind === "runs") {
+    return {
+      kind: "runs",
+      activeRun: state.activeRun === undefined ? undefined : { ...state.activeRun },
+      queuedRuns: state.queuedRuns.map((run) => ({ ...run })),
+      pendingPermission: state.pendingPermission === undefined
+        ? undefined
+        : {
+          ...state.pendingPermission,
+          request: { ...state.pendingPermission.request }
+        }
+    };
+  }
+  return { ...state };
 }
 
 function redactPermissionRequest(request: AgentPermissionEventRequest): AgentPermissionEventRequest {
@@ -1283,7 +1214,6 @@ function publicOperationName(operation: ExclusiveRuntimeOperation): string {
   if (operation === "refresh_model") return "model refresh";
   if (operation === "resume") return "session resume";
   if (operation === "compact") return "conversation compaction";
-  if (operation === "plan") return "plan creation";
   if (operation === "mcp") return "MCP reconnection";
   if (operation === "memory") return "a memory command";
   return "a subagent task";
@@ -1334,10 +1264,6 @@ function toolFailureMessage(result: unknown): string {
     ?? readString(result, "message")
     ?? (readNumber(result, "exitCode") !== undefined ? `Command exited with code ${String(readNumber(result, "exitCode"))}.` : undefined)
     ?? `Tool did not complete (${readString(result, "status") ?? "failed"}).`;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function incompleteReason(outcome: AgentTurnOutcome): string {

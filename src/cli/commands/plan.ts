@@ -9,8 +9,22 @@ import { withCliAbortSignal } from "../sigint.js";
 export async function planCommand(workspaceRoot: string, task: string): Promise<void> {
   const runtime = await createInteractiveAgentRuntime(workspaceRoot);
   try {
-    const output = await withCliAbortSignal(async (signal) => await runtime.createPlan(task, undefined, signal));
-    console.log(output);
+    const outcome = await withCliAbortSignal(async (signal) => {
+      const submitted = runtime.submitPrompt(task, "plan");
+      const onAbort = (): void => {
+        runtime.cancelRun(submitted.runId);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        return await submitted.completion;
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+      }
+    });
+    if (outcome.output) console.log(outcome.output);
+    if (outcome.status !== "completed") {
+      throw new Error(outcome.error ?? `Plan stopped with ${outcome.stopReason} after ${String(outcome.steps)} steps.`);
+    }
     console.log(`\nSession: ${runtime.getInfo().sessionFile}`);
   } finally {
     await runtime.close();

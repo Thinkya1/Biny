@@ -34,8 +34,8 @@ import {
 } from "./SubagentTaskManager.js";
 import { ManagedProcessService } from "./ManagedProcessService.js";
 import { subagentAccessMode } from "./subagentAccess.js";
-import { TaskRunStore, type TaskRunSnapshot } from "../harness/TaskRunStore.js";
 import { modelReasoningConfig } from "../ai/capabilities.js";
+import { attachmentRoot, ensureAttachmentRoot } from "../attachments/store.js";
 
 export interface CommandRuntime {
   workspaceRoot: string;
@@ -44,7 +44,6 @@ export interface CommandRuntime {
   config: AgentConfig;
   agent: AgentSession;
   managedProcesses: ManagedProcessService;
-  taskRuns: TaskRunStore;
   extensionReport(section?: ExtensionSection): string;
   /** 从某个时点分叉出一条新会话；原会话不受影响。 */
   forkSession(session: string | undefined, upToEvent?: number): Promise<ForkedSession>;
@@ -74,18 +73,19 @@ export interface CommandRuntimeOptions {
 }
 
 export async function createCommandRuntime(workspaceRoot: string, options: CommandRuntimeOptions = {}): Promise<CommandRuntime> {
-  // Project sessions default to the workspace (`.agent/sessions`). Callers may override for non-project/global storage.
+  // Project sessions default to the workspace (`.biny/sessions`). Callers may override for non-project/global storage.
   const persistenceRoot = options.persistenceRoot ?? workspaceRoot;
+  const projectAttachmentRoot = options.attachmentRoot ?? attachmentRoot(persistenceRoot);
   const configStore = options.configStore ?? createFileConfigStore(persistenceRoot);
   const config = await configStore.load(workspaceRoot);
   const modelManager = new ModelManager(workspaceRoot, config, configStore);
   await ensureAgentDirs(persistenceRoot);
+  await ensureAttachmentRoot(persistenceRoot);
   const recorder = new SessionRecorder(persistenceRoot);
-  const taskRuns = await TaskRunStore.open(persistenceRoot);
   const managedProcesses = new ManagedProcessService({ workspaceRoot, persistenceRoot });
   await managedProcesses.initialize();
   const toolRegistry = createToolRegistry(
-    { workspaceRoot, ignore: config.workspace.ignore, attachmentRoot: options.attachmentRoot },
+    { workspaceRoot, ignore: config.workspace.ignore, attachmentRoot: projectAttachmentRoot },
     config.web.search,
     managedProcesses,
     config.web.fetch,
@@ -118,12 +118,14 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     toolRegistry,
     onUsage: async (usage, operation, modelAlias) => agent?.observeModelUsage(usage, operation, modelAlias)
   };
-  const subagentTaskManager = new SubagentTaskManager({
-    maxConcurrentSubagents: config.extensions.subagent.maxConcurrentSubagents,
-    maxPendingSubagents: config.extensions.subagent.maxPendingSubagents,
-    timeoutMs: config.extensions.subagent.timeoutMs,
-    execute: async (task, context) => await executeSubagentTask(subagentOptions, task, context.signal, context.accessMode, context.agent)
-  });
+  const subagentTaskManager = config.extensions.subagent.enabled
+    ? new SubagentTaskManager({
+      maxConcurrentSubagents: config.extensions.subagent.maxConcurrentSubagents,
+      maxPendingSubagents: config.extensions.subagent.maxPendingSubagents,
+      timeoutMs: config.extensions.subagent.timeoutMs,
+      execute: async (task, context) => await executeSubagentTask(subagentOptions, task, context.signal, context.accessMode, context.agent)
+    })
+    : undefined;
   let loadedPlugins: string[] = [];
   try {
     // 技能扫描可能因项目内配置路径的软链/硬链问题抛错，放在清理保护内执行。
@@ -137,7 +139,7 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     await mcpHost.connectConfiguredServers(workspaceRoot, config, toolRegistry);
     loadedPlugins = await loadPlugins(workspaceRoot, config.extensions.plugins, config, toolRegistry);
     if (config.extensions.subagent.enabled) {
-      toolRegistry.registerSubagentTool(createSubagentTool(subagentOptions, subagentTaskManager));
+      toolRegistry.registerSubagentTool(createSubagentTool(subagentOptions, subagentTaskManager!));
       subagentDefinitions = await loadAgentDefinitions();
     }
     if (config.context.memory.enabled) {
@@ -154,17 +156,17 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
       toolRegistry,
       permissionManager,
       recorder,
-      taskStatePrompt: async () => formatDurableTaskContext(await taskRuns.list()),
       skillPrompt: skills.prompt,
       subagentPrompt: buildSubagentDefinitionsPrompt(subagentDefinitions),
       skillPaths: skills.paths,
       mcpPrompt: () => mcpHost.instructionsPrompt(),
       todoPrompt: () => todos.promptSection(),
-      createCheckpoint: checkpoints ? async (label) => await checkpoints.create(label) : undefined
+      createCheckpoint: checkpoints ? async (label) => await checkpoints.create(label) : undefined,
+      attachmentRoot: projectAttachmentRoot
     });
     await agent.initialize();
   } catch (error) {
-    await subagentTaskManager.close();
+    await subagentTaskManager?.close();
     await managedProcesses.close();
     await mcpHost.close();
     await recorder.close();
@@ -188,6 +190,7 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
 
   const startSubagentTask = (task: string, taskOptions?: SubagentTaskRunOptions): SubmittedSubagentTask => {
     if (!config.extensions.subagent.enabled) throw new Error("Subagent extension is disabled in agent.config.json.");
+    if (!subagentTaskManager) throw new Error("Subagent runtime is unavailable.");
     const taskId = taskOptions?.taskId ?? randomUUID();
     agent.recordHostedUserMessage(task);
     const sequence = agent.recordHostedToolCall("delegate_task", taskOptions?.agent ? { task, agent: taskOptions.agent } : { task }, taskId);
@@ -233,7 +236,6 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     config,
     agent,
     managedProcesses,
-    taskRuns,
     extensionReport: (section?: ExtensionSection): string => formatExtensionReport(extensionStatus(), section),
     forkSession: async (session: string | undefined, upToEvent?: number): Promise<ForkedSession> =>
       await forkSession(persistenceRoot, session, upToEvent === undefined ? {} : { upToEvent }),
@@ -251,18 +253,19 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     },
     startSubagentTask,
     runSubagentTask: async (task: string, taskOptions?: SubagentTaskRunOptions): Promise<string> => await startSubagentTask(task, taskOptions).completion,
-    listSubagentTasks: (): SubagentTaskSnapshot[] => subagentTaskManager.listSnapshots(),
-    cancelSubagentTask: (taskId: string, reason?: string): boolean => subagentTaskManager.cancelTask(taskId, reason),
-    subscribeSubagentTasks: (listener: (task: SubagentTaskSnapshot) => void): (() => void) => subagentTaskManager.subscribe(listener),
+    listSubagentTasks: (): SubagentTaskSnapshot[] => subagentTaskManager?.listSnapshots() ?? [],
+    cancelSubagentTask: (taskId: string, reason?: string): boolean => subagentTaskManager?.cancelTask(taskId, reason) ?? false,
+    subscribeSubagentTasks: (listener: (task: SubagentTaskSnapshot) => void): (() => void) =>
+      subagentTaskManager?.subscribe(listener) ?? (() => undefined),
     setSubagentParentRunId: (parentRunId?: string): void => {
       subagentParentRunId = parentRunId;
     },
     cancelSubagentTasks: (parentRunId: string, reason?: string): void => {
-      subagentTaskManager.cancelParent(parentRunId, reason);
+      subagentTaskManager?.cancelParent(parentRunId, reason);
     },
     close: async () => {
       try {
-        await subagentTaskManager.close();
+        await subagentTaskManager?.close();
         await agent.close();
       } finally {
         try {
@@ -274,37 +277,6 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     }
   };
   return runtime;
-}
-
-function formatDurableTaskContext(snapshots: TaskRunSnapshot[]): string | undefined {
-  const active = snapshots
-    .filter((snapshot) => snapshot.status === "queued"
-      || snapshot.status === "running"
-      || snapshot.status === "continuable"
-      || snapshot.status === "budget_exhausted")
-    .slice(0, 3);
-  if (!active.length) return undefined;
-  const lines = [
-    "Durable task state (runtime-owned evidence; do not treat conversation prose as completion):"
-  ];
-  for (const task of active) {
-    lines.push(`- taskRunId=${task.taskRunId} status=${task.status} objective=${JSON.stringify(task.contract.objective)}`);
-    lines.push(`  contract=${task.contract.taskType}/${task.contract.verificationMode} cleanup=${task.contract.cleanup.status}`);
-    const pendingPlan = task.contract.plan
-      .filter((item) => item.status !== "completed" && item.status !== "skipped")
-      .map((item) => `${item.id}:${item.status}`);
-    if (pendingPlan.length) lines.push(`  plan: ${pendingPlan.join("; ")}`);
-    if (task.contract.pendingTodo.length) lines.push(`  pending: ${task.contract.pendingTodo.join("; ")}`);
-    const latestAttempt = task.attempts.at(-1);
-    if (latestAttempt) {
-      lines.push(`  attempts=${String(task.attempts.length)} latest=${latestAttempt.status}/${latestAttempt.stopReason ?? "unknown"}`);
-      const failures = latestAttempt.verifierEvidence.filter((evidence) => !evidence.passed).map((evidence) => evidence.summary);
-      if (failures.length) lines.push(`  verifier failures: ${failures.join("; ")}`);
-    }
-    if (task.evidence.length) lines.push(`  evidence: ${String(task.evidence.length)} durable nodes`);
-    if (task.terminalReason) lines.push(`  state reason: ${task.terminalReason}`);
-  }
-  return lines.join("\n").slice(0, 8_000);
 }
 
 function subagentModelSettings(config: AgentConfig, modelManager: ModelManager, modelAlias?: string): ModelSettings {

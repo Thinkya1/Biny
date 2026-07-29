@@ -105,11 +105,6 @@ export function parseKimiDiffCodeLine(line: string): KimiDiffCodeLine | undefine
   return parseKimiDiffCodeLineExact(line) ?? (line.startsWith("  ") ? parseKimiDiffCodeLineExact(line.slice(2)) : undefined);
 }
 
-export function padDiffLine(line: string, _width: number): string {
-  // Kept as a compatibility helper; foreground-only diff rows need no padding.
-  return line;
-}
-
 function parseDiffCodeLineExact(line: string): DiffCodeLine | undefined {
   const match = line.match(/^(.{4}) (.{4}) ([+\- ]) (.*)$/);
   if (!match?.[1] || !match[2] || !match[3] || match[4] === undefined) return undefined;

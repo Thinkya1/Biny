@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { CombinedAutocompleteProvider, visibleWidth } from "@earendil-works/pi-tui";
-import { createInitialTuiState, tuiReducer } from "../src/tui/state.js";
-import { agentEventToRuntimeEvents } from "../src/tui/runtime/agentEventAdapter.js";
+import { createInitialTuiState, tuiReducer, type TuiAction } from "../src/tui/reducer.js";
 import { sessionEventsToTranscript } from "../src/tui/sessionTranscript.js";
 import { diffLineStyle } from "../src/tui/diffLines.js";
 import { foldableTranscriptItems, formatToolDuration, latestExpandableTranscript } from "../src/tui/transcriptText.js";
 import { TranscriptView } from "../src/tui/components/transcriptView.js";
 import { ThinkingComponent, ToolExecutionComponent, splitToolTitle } from "../src/tui/components/messages.js";
+import { PendingAttachmentsComponent, pendingAttachmentLabel } from "../src/tui/components/pendingAttachments.js";
 import { PermissionDialog, SelectDialog, TextViewerDialog } from "../src/tui/components/dialogs.js";
 import {
   FooterComponent,
@@ -19,7 +19,7 @@ import {
   statusMessage,
   visibleShortcutHints
 } from "../src/tui/components/chrome.js";
-import type { PermissionChoice, ToolTranscriptItem, TranscriptState, TuiPermissionRequest } from "../src/tui/types.js";
+import type { PermissionChoice, ToolTranscriptItem, TranscriptState, TuiPermissionRequest, TuiState } from "../src/tui/types.js";
 import {
   ansi256ToHex,
   availableThemes,
@@ -30,8 +30,7 @@ import {
   themeBgTokens,
   themeColorTokens
 } from "../src/tui/theme/index.js";
-import { CHAT_SLASH_COMMANDS } from "../src/cli/commands/chatSlash.js";
-import { isConcurrentTuiSlashCommand, TUI_SLASH_COMMANDS } from "../src/tui/slashCommands.js";
+import { slashCommandsForSurface } from "../src/runtime/commandRegistry.js";
 import { modelThinkingOptions } from "../src/tui/modelOptions.js";
 import {
   confirmedPermissionChoice,
@@ -39,7 +38,7 @@ import {
   permissionPromptStateForRequest
 } from "../src/tui/permissionOptions.js";
 import { isFullYesConfirmation, permissionResultFromAnswer } from "../src/permission/confirmation.js";
-import { permissionChoiceToResult } from "../src/tui/runtime/createTuiRuntime.js";
+import { permissionChoiceToResult } from "../src/tui/runtime/permissionChoice.js";
 import type { SessionEvent } from "../src/session/recorder.js";
 
 /** 去掉 ANSI，方便对渲染出来的行做文本断言。 */
@@ -49,6 +48,17 @@ function plain(line: string): string {
 
 function plainLines(lines: string[]): string[] {
   return lines.map(plain);
+}
+
+const EVENT_BASE = {
+  sessionId: "session",
+  runId: "run",
+  timestamp: "2026-07-24T00:00:00.000Z"
+};
+
+/** 测试事件统一补齐 AgentHostEvent 的公共字段，不再经过 TUI 私有适配层。 */
+function reduce(state: TuiState, action: { type: string } & Record<string, unknown>): TuiState {
+  return tuiReducer(state, { ...EVENT_BASE, ...action } as TuiAction);
 }
 
 
@@ -65,7 +75,6 @@ function renderView(view: TranscriptView, width: number): string {
 
 async function main(): Promise<void> {
   testTranscriptUsesIndependentItemKinds();
-  testRuntimeStatusEventsReachFooterState();
   testReasoningStreamingRendersContent();
   testIncompleteSessionStaysDistinctFromCompletion();
   testAbortedSessionStaysDistinctFromCompletion();
@@ -93,6 +102,7 @@ async function main(): Promise<void> {
   testToolBlockRendersTitleAndClampedOutput();
   testThinkingBlockCollapses();
   testFooterAndChromeLayout();
+  testPendingAttachmentDisplay();
   testStatusAndShortcutHints();
   testWelcomeRendersOnboarding();
   testModelThinkingOptionsUseModelCapabilities();
@@ -159,65 +169,41 @@ function testPermissionConfirmationContract(): void {
 }
 
 function testSlashCommandParity(): void {
-  assert.deepEqual(
-    CHAT_SLASH_COMMANDS.map((command) => command.name),
-    TUI_SLASH_COMMANDS.map((command) => command.name)
-  );
-  assert.equal(TUI_SLASH_COMMANDS.length, 23);
-  assert.equal(TUI_SLASH_COMMANDS.find((command) => command.name === "/plan")?.requiresArgs, undefined);
-  assert.ok(TUI_SLASH_COMMANDS.some((command) => command.name === "/memory"));
-  assert.ok(TUI_SLASH_COMMANDS.some((command) => command.name === "/undo"));
-  assert.ok(TUI_SLASH_COMMANDS.some((command) => command.name === "/continue"));
-  assert.ok(TUI_SLASH_COMMANDS.some((command) => command.name === "/fork"));
-  assert.equal(isConcurrentTuiSlashCommand("/subagent status"), true);
-  assert.equal(isConcurrentTuiSlashCommand("/subagent CANCEL task-id"), true);
-  assert.equal(isConcurrentTuiSlashCommand("/subagent agents"), true);
-  assert.equal(isConcurrentTuiSlashCommand("/subagent review this"), false);
+  const tuiCommands = slashCommandsForSurface("tui");
+  const desktopCommands = slashCommandsForSurface("desktop");
+  const desktopNames = new Set(desktopCommands.map((command) => command.name));
+  assert.equal(tuiCommands.length, 24);
+  assert.equal(tuiCommands.find((command) => command.name === "/plan")?.requiresArgs, undefined);
+  assert.ok(tuiCommands.some((command) => command.name === "/mode"));
+  assert.ok(tuiCommands.some((command) => command.name === "/memory"));
+  assert.ok(tuiCommands.some((command) => command.name === "/undo"));
+  assert.ok(tuiCommands.some((command) => command.name === "/continue"));
+  assert.ok(tuiCommands.some((command) => command.name === "/fork"));
+  assert.ok(["/status", "/context", "/usage", "/memory", "/subagent"].every((name) => desktopNames.has(name)));
 }
 
 function testTranscriptUsesIndependentItemKinds(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "user.message", content: "question" });
-  state = tuiReducer(state, { type: "assistant.completed", content: "answer" });
-  state = tuiReducer(state, { type: "system.message", content: "notification" });
-  state = tuiReducer(state, { type: "session.error", message: "fatal" });
+  state = reduce(state, { type: "message.user", content: "question" });
+  state = reduce(state, { type: "assistant.completed", content: "answer" });
+  state = reduce(state, { type: "system.message", content: "notification" });
+  state = reduce(state, { type: "run.failed", durationMs: 10, error: "fatal" });
   assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["user", "assistant", "notification", "error"]);
 
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "read-1", tool: "read_file", args: { path: "README.md" } });
-  state = tuiReducer(state, { type: "tool.call.completed", toolCallId: "read-1", tool: "read_file", result: { path: "README.md", content: "hello" } });
+  state = reduce(state, { type: "tool.started", toolCallId: "read-1", tool: "read_file", args: { path: "README.md" } });
+  state = reduce(state, { type: "tool.completed", toolCallId: "read-1", tool: "read_file", result: { path: "README.md", content: "hello" } });
   assert.equal(state.transcript.committed.at(-1)?.kind, "tool");
-}
-
-function testRuntimeStatusEventsReachFooterState(): void {
-  let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "runtime.status", status: "thinking" });
-  assert.equal(state.status, "thinking");
-  state = tuiReducer(state, { type: "runtime.status", status: "running" });
-  assert.equal(state.status, "running");
-  state = tuiReducer(state, { type: "runtime.queue.updated", queuedCount: 2 });
-  assert.equal(state.queuedCount, 2);
-  assert.deepEqual(agentEventToRuntimeEvents({
-    type: "run.queued",
-    sessionId: "session",
-    runId: "run-2",
-    timestamp: "2026-07-24T00:00:00.000Z",
-    messageId: "message-2",
-    input: "follow up",
-    mode: "chat",
-    position: 2,
-    queueLength: 2
-  }), [{ type: "runtime.queue.updated", queuedCount: 2 }]);
 }
 
 function testReasoningStreamingRendersContent(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "user.message", content: "inspect" });
-  state = tuiReducer(state, { type: "reasoning.delta", content: "先检查" });
-  state = tuiReducer(state, { type: "reasoning.delta", content: "入口文件。" });
+  state = reduce(state, { type: "message.user", content: "inspect" });
+  state = reduce(state, { type: "reasoning.delta", content: "先检查" });
+  state = reduce(state, { type: "reasoning.delta", content: "入口文件。" });
   assert.deepEqual(state.transcript.active.map((item) => item.kind), ["reasoning"]);
   assert.equal(state.transcript.active[0]?.content, "先检查入口文件。");
 
-  state = tuiReducer(state, { type: "reasoning.completed", status: "分析完成" });
+  state = reduce(state, { type: "reasoning.completed", status: "分析完成" });
   assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["user", "reasoning"]);
   assert.equal(state.transcript.committed[1]?.content, "先检查入口文件。");
   // Pi keeps completed thinking visible by default; Ctrl+E can still collapse it.
@@ -235,68 +221,65 @@ function testReasoningStreamingRendersContent(): void {
   assert.match(collapsedThinking, /Thought/u);
   assert.doesNotMatch(collapsedThinking, /先检查入口文件。/u);
 
-  const runtimeEvents = agentEventToRuntimeEvents({
-    sessionId: "session",
-    runId: "run",
-    timestamp: "2026-07-24T00:00:00.000Z",
-    type: "reasoning.delta",
-    messageId: "message",
-    content: "继续验证。"
-  });
-  assert.deepEqual(runtimeEvents, [{ type: "reasoning.delta", content: "继续验证。" }]);
+  state = reduce(state, { type: "reasoning.delta", messageId: "message", content: "继续验证。" });
+  assert.equal(state.transcript.active.at(-1)?.content, "继续验证。");
 }
 
 function testIncompleteSessionStaysDistinctFromCompletion(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "user.message", content: "finish the project" });
-  state = tuiReducer(state, { type: "session.incomplete", sessionId: "session", message: "Step limit reached." });
-  assert.equal(state.status, "incomplete");
+  state = reduce(state, { type: "message.user", content: "finish the project" });
+  state = reduce(state, {
+    type: "run.incomplete",
+    durationMs: 10,
+    reason: "Step limit reached.",
+    stopReason: "step_limit",
+    steps: 1
+  });
   assert.equal(state.transcript.committed.at(-1)?.kind, "notification");
   assert.match(state.transcript.committed.at(-1)?.content ?? "", /Step limit/);
 }
 
 function testAbortedSessionStaysDistinctFromCompletion(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "user.message", content: "run the project" });
-  state = tuiReducer(state, { type: "session.aborted", sessionId: "session", message: "Current turn interrupted." });
-  assert.equal(state.status, "aborted");
+  state = reduce(state, { type: "message.user", content: "run the project" });
+  state = reduce(state, { type: "run.aborted", durationMs: 10, reason: "Current turn interrupted." });
   assert.equal(state.transcript.committed.at(-1)?.kind, "notification");
   assert.match(state.transcript.committed.at(-1)?.content ?? "", /interrupted/i);
 }
 
 function testAssistantStreamingUpdatesOneActiveCell(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "user.message", content: "stream" });
+  state = reduce(state, { type: "message.user", content: "stream" });
   const committedBefore = state.transcript.committed.length;
-  state = tuiReducer(state, { type: "assistant.delta", content: "你" });
+  state = reduce(state, { type: "assistant.delta", content: "你" });
   const activeId = state.transcript.active[0]?.id;
-  state = tuiReducer(state, { type: "assistant.delta", content: "好" });
-  state = tuiReducer(state, { type: "assistant.delta", content: "！" });
+  state = reduce(state, { type: "assistant.delta", content: "好" });
+  state = reduce(state, { type: "assistant.delta", content: "！" });
 
   assert.equal(state.transcript.committed.length, committedBefore);
   assert.equal(state.transcript.active.length, 1);
   assert.equal(state.transcript.active[0]?.id, activeId);
   assert.deepEqual(state.transcript.active[0], { id: activeId, kind: "assistant", content: "你好！" });
 
-  state = tuiReducer(state, { type: "assistant.completed", content: "你好！" });
+  state = reduce(state, { type: "assistant.completed", content: "你好！" });
   assert.equal(state.transcript.active.length, 0);
   assert.equal(state.transcript.committed.filter((item) => item.kind === "assistant").length, 1);
 }
 
 function testToolProgressUpdatesOneActiveCell(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "run-1", tool: "run_command", args: { command: "printf hello" } });
-  state = tuiReducer(state, { type: "tool.call.progress", toolCallId: "run-1", tool: "run_command", update: { kind: "status", text: "Started: printf hello" } });
+  state = reduce(state, { type: "tool.started", toolCallId: "run-1", tool: "run_command", args: { command: "printf hello" } });
+  state = reduce(state, { type: "tool.progress", toolCallId: "run-1", tool: "run_command", update: { kind: "status", text: "Started: printf hello" } });
   assert.equal((state.transcript.active[0] as ToolTranscriptItem).progress, "Running…");
-  state = tuiReducer(state, { type: "tool.call.progress", toolCallId: "run-1", tool: "run_command", update: { kind: "stdout", text: "hel" } });
-  state = tuiReducer(state, { type: "tool.call.progress", toolCallId: "run-1", tool: "run_command", update: { kind: "stdout", text: "lo" } });
+  state = reduce(state, { type: "tool.progress", toolCallId: "run-1", tool: "run_command", update: { kind: "stdout", text: "hel" } });
+  state = reduce(state, { type: "tool.progress", toolCallId: "run-1", tool: "run_command", update: { kind: "stdout", text: "lo" } });
 
   assert.equal(state.transcript.committed.length, 0);
   assert.equal(state.transcript.active.length, 1);
   assert.equal((state.transcript.active[0] as ToolTranscriptItem).output, "hello");
 
-  state = tuiReducer(state, {
-    type: "tool.call.completed",
+  state = reduce(state, {
+    type: "tool.completed",
     toolCallId: "run-1",
     tool: "run_command",
     result: { stdout: "hello", stderr: "", exitCode: 0, durationMs: 12 }
@@ -312,9 +295,9 @@ function testToolDurationMeasuredInUi(): void {
   Date.now = () => now;
   try {
     let state = createInitialTuiState("/workspace");
-    state = tuiReducer(state, { type: "tool.call.started", toolCallId: "timed", tool: "read_file", args: { path: "README.md" } });
+    state = reduce(state, { type: "tool.started", toolCallId: "timed", tool: "read_file", args: { path: "README.md" } });
     now = 2_450;
-    state = tuiReducer(state, { type: "tool.call.completed", toolCallId: "timed", tool: "read_file", result: { content: "done" } });
+    state = reduce(state, { type: "tool.completed", toolCallId: "timed", tool: "read_file", result: { content: "done" } });
     assert.equal((state.transcript.committed[0] as ToolTranscriptItem).durationMs, 1_450);
   } finally {
     Date.now = originalNow;
@@ -323,9 +306,9 @@ function testToolDurationMeasuredInUi(): void {
 
 function testActiveToolShowsLatestOutput(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "streaming", tool: "run_command", args: { command: "long-running-command" } });
-  state = tuiReducer(state, {
-    type: "tool.call.progress",
+  state = reduce(state, { type: "tool.started", toolCallId: "streaming", tool: "run_command", args: { command: "long-running-command" } });
+  state = reduce(state, {
+    type: "tool.progress",
     toolCallId: "streaming",
     tool: "run_command",
     update: { kind: "stdout", text: Array.from({ length: 8 }, (_, index) => `line ${String(index + 1)}`).join("\n") }
@@ -339,14 +322,14 @@ function testActiveToolShowsLatestOutput(): void {
 
 function testParallelToolsUpdateById(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "one", tool: "read_file", args: { path: "one.ts" } });
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "two", tool: "read_file", args: { path: "two.ts" } });
-  state = tuiReducer(state, { type: "tool.call.progress", toolCallId: "two", tool: "read_file", update: { kind: "progress", text: "second" } });
+  state = reduce(state, { type: "tool.started", toolCallId: "one", tool: "read_file", args: { path: "one.ts" } });
+  state = reduce(state, { type: "tool.started", toolCallId: "two", tool: "read_file", args: { path: "two.ts" } });
+  state = reduce(state, { type: "tool.progress", toolCallId: "two", tool: "read_file", update: { kind: "progress", text: "second" } });
   assert.equal((state.transcript.active[1] as ToolTranscriptItem).progress, "second");
   assert.equal((state.transcript.active[0] as ToolTranscriptItem).progress, undefined);
 
-  state = tuiReducer(state, { type: "tool.call.completed", toolCallId: "one", tool: "read_file", result: { path: "one.ts", content: "one" } });
-  state = tuiReducer(state, { type: "tool.call.completed", toolCallId: "two", tool: "read_file", result: { path: "two.ts", content: "two" } });
+  state = reduce(state, { type: "tool.completed", toolCallId: "one", tool: "read_file", result: { path: "one.ts", content: "one" } });
+  state = reduce(state, { type: "tool.completed", toolCallId: "two", tool: "read_file", result: { path: "two.ts", content: "two" } });
   assert.deepEqual(state.transcript.committed.map((item) => item.kind === "tool" ? item.toolCallId : undefined), ["one", "two"]);
   assert.equal(new Set(state.transcript.committed.map((item) => item.id)).size, 2);
   assert.equal(state.transcript.active.length, 0);
@@ -354,10 +337,10 @@ function testParallelToolsUpdateById(): void {
 
 function testDuplicateCompletionDoesNotFinishSiblingTool(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "one", tool: "read_file", args: { path: "one.ts" } });
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "two", tool: "read_file", args: { path: "two.ts" } });
-  state = tuiReducer(state, { type: "tool.call.completed", toolCallId: "one", tool: "read_file", result: { content: "one" } });
-  state = tuiReducer(state, { type: "tool.call.completed", toolCallId: "one", tool: "read_file", result: { content: "duplicate" } });
+  state = reduce(state, { type: "tool.started", toolCallId: "one", tool: "read_file", args: { path: "one.ts" } });
+  state = reduce(state, { type: "tool.started", toolCallId: "two", tool: "read_file", args: { path: "two.ts" } });
+  state = reduce(state, { type: "tool.completed", toolCallId: "one", tool: "read_file", result: { content: "one" } });
+  state = reduce(state, { type: "tool.completed", toolCallId: "one", tool: "read_file", result: { content: "duplicate" } });
 
   assert.deepEqual(state.transcript.committed.map((item) => item.kind === "tool" ? item.toolCallId : undefined), ["one"]);
   assert.deepEqual(state.transcript.active.map((item) => item.kind === "tool" ? item.toolCallId : undefined), ["two"]);
@@ -365,11 +348,11 @@ function testDuplicateCompletionDoesNotFinishSiblingTool(): void {
 
 function testReusedToolCallIdKeepsUniqueTranscriptCells(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "tool-1-1", tool: "read_file", args: { path: "one.ts" } });
-  state = tuiReducer(state, { type: "tool.call.completed", toolCallId: "tool-1-1", tool: "read_file", result: { content: "one" } });
+  state = reduce(state, { type: "tool.started", toolCallId: "tool-1-1", tool: "read_file", args: { path: "one.ts" } });
+  state = reduce(state, { type: "tool.completed", toolCallId: "tool-1-1", tool: "read_file", result: { content: "one" } });
   const firstId = state.transcript.committed[0]?.id;
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "tool-1-1", tool: "read_file", args: { path: "two.ts" } });
-  state = tuiReducer(state, { type: "tool.call.completed", toolCallId: "tool-1-1", tool: "read_file", result: { content: "two" } });
+  state = reduce(state, { type: "tool.started", toolCallId: "tool-1-1", tool: "read_file", args: { path: "two.ts" } });
+  state = reduce(state, { type: "tool.completed", toolCallId: "tool-1-1", tool: "read_file", result: { content: "two" } });
 
   assert.equal(state.transcript.active.length, 0);
   assert.equal(state.transcript.committed.filter((item) => item.kind === "tool").length, 2);
@@ -378,13 +361,13 @@ function testReusedToolCallIdKeepsUniqueTranscriptCells(): void {
 
 function testRecoverableErrorDoesNotFinalizeSiblingTools(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "failed", tool: "run_command", args: { command: "false" } });
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "success", tool: "run_command", args: { command: "true" } });
-  state = tuiReducer(state, { type: "tool.call.completed", toolCallId: "failed", tool: "run_command", result: { stderr: "failed", exitCode: 1 } });
-  state = tuiReducer(state, { type: "error.message", message: "first command failed" });
+  state = reduce(state, { type: "tool.started", toolCallId: "failed", tool: "run_command", args: { command: "false" } });
+  state = reduce(state, { type: "tool.started", toolCallId: "success", tool: "run_command", args: { command: "true" } });
+  state = reduce(state, { type: "tool.completed", toolCallId: "failed", tool: "run_command", result: { stderr: "failed", exitCode: 1 } });
+  state = reduce(state, { type: "error.message", message: "first command failed" });
 
   assert.deepEqual(state.transcript.active.map((item) => item.kind === "tool" ? item.toolCallId : undefined), ["success"]);
-  state = tuiReducer(state, { type: "tool.call.completed", toolCallId: "success", tool: "run_command", result: { stdout: "ok", exitCode: 0 } });
+  state = reduce(state, { type: "tool.completed", toolCallId: "success", tool: "run_command", result: { stdout: "ok", exitCode: 0 } });
   const tools = state.transcript.committed.filter((item): item is ToolTranscriptItem => item.kind === "tool");
   assert.deepEqual(tools.map((item) => item.status), ["failed", "success"]);
   assert.equal(state.transcript.committed.some((item) => item.kind === "error"), true);
@@ -392,20 +375,31 @@ function testRecoverableErrorDoesNotFinalizeSiblingTools(): void {
 
 function testPermissionRejectionKeepsTurnRunning(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "user.message", content: "write it" });
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "write", tool: "write_file", args: { path: "x.ts" } });
-  state = tuiReducer(state, {
+  state = reduce(state, { type: "message.user", content: "write it" });
+  state = reduce(state, { type: "tool.started", toolCallId: "write", tool: "write_file", args: { path: "x.ts" } });
+  state = reduce(state, {
     type: "permission.requested",
-    tool: "write_file",
-    title: "Write x.ts",
-    details: "write",
-    requireFullYes: false,
-    actionType: "write",
-    riskLevel: "write"
+    requestId: "permission",
+    toolCallId: "write",
+    request: {
+      toolCallId: "write",
+      tool: "write_file",
+      title: "Write x.ts",
+      details: "write",
+      requireFullYes: false,
+      actionType: "write",
+      riskLevel: "write"
+    }
   });
   const turnStartedAt = state.turnStartedAt;
-  state = tuiReducer(state, { type: "permission.rejected", tool: "write_file", reason: "Denied" });
-  assert.equal(state.status, "running");
+  state = reduce(state, {
+    type: "permission.resolved",
+    requestId: "permission",
+    toolCallId: "write",
+    tool: "write_file",
+    approved: false,
+    message: "Denied"
+  });
   assert.equal(state.turnStartedAt, turnStartedAt);
   assert.equal(state.transcript.active.length, 1);
 }
@@ -413,8 +407,8 @@ function testPermissionRejectionKeepsTurnRunning(): void {
 function testLongCommandStaysInFoldedDetails(): void {
   const command = `node script.js ${"--very-long-option ".repeat(20)}`;
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, {
-    type: "tool.call.started",
+  state = reduce(state, {
+    type: "tool.started",
     toolCallId: "long-command",
     tool: "run_command",
     args: { command },
@@ -427,8 +421,8 @@ function testLongCommandStaysInFoldedDetails(): void {
   assert.match(active.details ?? "", /Exit code: running/);
   assert.deepEqual(latestExpandableTranscript(state.transcript), { title: "Running command", content: active.details });
 
-  state = tuiReducer(state, {
-    type: "tool.call.completed",
+  state = reduce(state, {
+    type: "tool.completed",
     toolCallId: "long-command",
     tool: "run_command",
     result: { stdout: "done", stderr: "", exitCode: 0, durationMs: 25 }
@@ -454,8 +448,8 @@ function testLongCommandStaysInFoldedDetails(): void {
 function testCommandDisplayNeverLeaksRawCommand(): void {
   const command = "pnpm test --filter private-package-name";
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, {
-    type: "tool.call.started",
+  state = reduce(state, {
+    type: "tool.started",
     toolCallId: "plugin-command",
     tool: "plugin_shell",
     args: { script: command },
@@ -466,15 +460,15 @@ function testCommandDisplayNeverLeaksRawCommand(): void {
   assert.equal(active.title, "Running tests");
   assert.equal(active.title.includes(command), false);
   assert.match(active.details ?? "", /Command: pnpm test/);
-  state = tuiReducer(state, {
-    type: "tool.call.progress",
+  state = reduce(state, {
+    type: "tool.progress",
     toolCallId: "plugin-command",
     tool: "plugin_shell",
     update: { kind: "progress", text: `Executing ${command}` }
   });
   assert.equal((state.transcript.active[0] as ToolTranscriptItem).progress, "Running…");
-  state = tuiReducer(state, {
-    type: "tool.call.completed",
+  state = reduce(state, {
+    type: "tool.completed",
     toolCallId: "plugin-command",
     tool: "plugin_shell",
     result: { stdout: "passed", exitCode: 0 }
@@ -487,9 +481,9 @@ function testCommandDisplayNeverLeaksRawCommand(): void {
 function testFailedCommandCommitsOneToolItem(): void {
   const command = "pnpm test --filter impossible";
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "failed", tool: "run_command", args: { command } });
-  state = tuiReducer(state, {
-    type: "tool.call.completed",
+  state = reduce(state, { type: "tool.started", toolCallId: "failed", tool: "run_command", args: { command } });
+  state = reduce(state, {
+    type: "tool.completed",
     toolCallId: "failed",
     tool: "run_command",
     result: { stdout: "partial output", stderr: "test suite failed", exitCode: 2, durationMs: 7 }
@@ -508,9 +502,9 @@ function testFailedCommandCommitsOneToolItem(): void {
 
 function testErrorFinalizesActiveCells(): void {
   let state = createInitialTuiState("/workspace");
-  state = tuiReducer(state, { type: "assistant.delta", content: "partial" });
-  state = tuiReducer(state, { type: "tool.call.started", toolCallId: "broken", tool: "run_command", args: { command: "bad-command" } });
-  state = tuiReducer(state, { type: "session.error", message: "spawn failed" });
+  state = reduce(state, { type: "assistant.delta", content: "partial" });
+  state = reduce(state, { type: "tool.started", toolCallId: "broken", tool: "run_command", args: { command: "bad-command" } });
+  state = reduce(state, { type: "run.failed", durationMs: 10, error: "spawn failed" });
   assert.equal(state.transcript.active.length, 0);
   assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["assistant", "tool", "error"]);
   const tool = state.transcript.committed[1] as ToolTranscriptItem;
@@ -675,6 +669,23 @@ function testThinkingBlockCollapses(): void {
   assert.equal(collapsed.includes("先看 transcript 的结构。"), false);
 }
 
+function testPendingAttachmentDisplay(): void {
+  setTheme("dark");
+  const component = new PendingAttachmentsComponent();
+  component.setAttachments([
+    { name: "screenshot.png", mimeType: "image/png", size: 1536, data: "image" },
+    { name: "recording.mp3", mimeType: "audio/mpeg", size: 3, data: "audio" }
+  ]);
+  const lines = plainLines(component.render(40));
+  assert.match(lines[0] ?? "", /\[Image #1\] · 1\.5 KB/u);
+  assert.match(lines[1] ?? "", /\[Attachment #2\] · 3 B/u);
+  assert.equal(pendingAttachmentLabel({ mimeType: "image/webp" }, 2), "[Image #3]");
+
+  for (const line of plainLines(component.render(12))) {
+    assert.equal(visibleWidth(line) <= 12, true, line);
+  }
+}
+
 function testFooterAndChromeLayout(): void {
   setTheme("dark");
   const data = {
@@ -724,6 +735,8 @@ function testStatusAndShortcutHints(): void {
   assert.equal(busy.includes("esc"), true);
   const planHint = shortcutHints("idle", "plan").find((hint) => hint.key === "shift+tab");
   assert.equal(planHint?.description, "chat mode");
+  const chatHint = shortcutHints("idle", "chat").find((hint) => hint.key === "shift+tab");
+  assert.equal(chatHint?.description, "plan mode");
 
   // 窄终端整条丢弃，不把单条提示截半句。
   const visible = visibleShortcutHints(shortcutHints("idle", "chat"), 14);
@@ -841,7 +854,7 @@ function testTranscriptTextHelpers(): void {
 async function testSlashAutocompleteInsertsSingleSlash(): Promise<void> {
   // 补全器要的是不带斜杠的命令名，传成 `/resume` 会补出 `//resume`。
   const provider = new CombinedAutocompleteProvider(
-    TUI_SLASH_COMMANDS.map((command) => ({
+    slashCommandsForSurface("tui").map((command) => ({
       name: command.name.replace(/^\//, ""),
       description: command.description
     })),

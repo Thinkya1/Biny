@@ -18,47 +18,66 @@ import {
 import { formatPermissionModeChanged } from "../permission/commands.js";
 import type { PermissionMode } from "../permission/PermissionManager.js";
 import { parseThinkingSelection, type ThinkingSelection } from "../llm/ModelManager.js";
-import { formatSubagentTaskReport } from "../runtime/subagentTaskReport.js";
-import { formatSubagentAgentList } from "../extensions/report.js";
+import { slashCommandsForSurface } from "../runtime/commandRegistry.js";
+import { withAttachmentReferences } from "../attachments/references.js";
+import { executeRuntimeCommand } from "../runtime/commands.js";
+import {
+  createInteractiveAgentRuntime,
+  type InteractiveAgentRuntime
+} from "../runtime/InteractiveAgentRuntime.js";
+import {
+  pendingPermission,
+  runtimeIsBusy,
+  type InteractiveRuntimeSnapshot
+} from "../runtime/agentEvents.js";
 import type { SessionSummary } from "../session/events.js";
 import { FooterComponent, ShortcutsBarComponent, StatusIndicatorComponent, WelcomeComponent } from "./components/chrome.js";
 import { PermissionDialog, SelectDialog, TextViewerDialog } from "./components/dialogs.js";
 import { ThinkingComponent, ToolExecutionComponent } from "./components/messages.js";
+import { PendingAttachmentsComponent } from "./components/pendingAttachments.js";
 import { TranscriptView } from "./components/transcriptView.js";
 import { appendInputHistory, loadInputHistory } from "./inputHistory.js";
 import { permissionModeOptions } from "./permissionModeOptions.js";
-import { createTuiRuntime, type TuiRuntime } from "./runtime/createTuiRuntime.js";
+import { pasteTuiClipboard } from "./runtime/clipboard.js";
+import { permissionChoiceToResult } from "./runtime/permissionChoice.js";
 import { readGitBranch } from "./runtime/gitBranch.js";
 import { sessionEventsToTranscript } from "./sessionTranscript.js";
-import { TUI_SLASH_COMMANDS } from "./slashCommands.js";
 import { modelThinkingOptions } from "./modelOptions.js";
-import { createInitialTuiState, tuiReducer } from "./state.js";
+import { createInitialTuiState, tuiReducer } from "./reducer.js";
 import { editorTheme, theme } from "./theme/index.js";
 import { foldableTranscriptItems, latestExpandableTranscript } from "./transcriptText.js";
-import type { TuiState } from "./types.js";
+import type { PermissionChoice, TuiPermissionRequest, TuiState, TuiStatus } from "./types.js";
+import type { AgentAttachment, AgentRunMode } from "../agent/AgentSession.js";
 
 export interface TuiExitSummary {
   sessionId: string;
   sessionFile: string;
 }
 
+const TUI_SLASH_COMMANDS = slashCommandsForSurface("tui");
+
 export class BinyTui {
   private readonly ui: TUI;
   private readonly workspaceRoot: string;
   private readonly version: string | undefined;
+  private readonly initialSession: string | undefined;
 
   private state: TuiState;
-  private runtime: TuiRuntime | undefined;
+  private runtime: InteractiveAgentRuntime | undefined;
+  private runtimeSnapshot: InteractiveRuntimeSnapshot | undefined;
 
   private readonly headerContainer = new Container();
   private readonly chatContainer = new TranscriptView();
   private readonly editorContainer = new Container();
+  private readonly pendingAttachmentsView = new PendingAttachmentsComponent();
   private readonly status: StatusIndicatorComponent;
   private readonly footer: FooterComponent;
   private readonly shortcuts = new ShortcutsBarComponent();
   private readonly editor: Editor;
 
-  private mode: "chat" | "plan" = "chat";
+  private mode: Extract<AgentRunMode, "chat" | "plan"> = "chat";
+  /** 当前输入尚未发送的图片；实际读写剪贴板和存储都在 TUI runtime。 */
+  private pendingAttachments: AgentAttachment[] = [];
   private permissionMode: PermissionMode = "ask";
   private thinking: ThinkingSelection = "off";
   private gitBranch: string | undefined;
@@ -70,14 +89,16 @@ export class BinyTui {
   private unsubscribe: (() => void) | undefined;
   private resolveExit: (() => void) | undefined;
 
-  constructor(ui: TUI, workspaceRoot: string, version?: string) {
+  constructor(ui: TUI, workspaceRoot: string, version?: string, initialSession?: string) {
     this.ui = ui;
     this.workspaceRoot = workspaceRoot;
     this.version = version;
+    this.initialSession = initialSession;
     this.state = createInitialTuiState(workspaceRoot);
     this.status = new StatusIndicatorComponent(ui);
     this.footer = new FooterComponent(this.footerData());
     this.editor = new Editor(ui, editorTheme(), { paddingX: 1 });
+    this.editorContainer.addChild(this.pendingAttachmentsView);
     this.editorContainer.addChild(this.editor);
   }
 
@@ -111,8 +132,9 @@ export class BinyTui {
 
   private async startRuntime(): Promise<void> {
     try {
-      const runtime = await createTuiRuntime(this.workspaceRoot);
+      const runtime = await createInteractiveAgentRuntime(this.workspaceRoot);
       this.runtime = runtime;
+      this.runtimeSnapshot = runtime.getSnapshot();
       const info = runtime.getInfo();
       this.permissionMode = runtime.getPermissionMode();
       this.thinking = info.thinking;
@@ -136,9 +158,11 @@ export class BinyTui {
         })
         .catch((error) => this.notify(`读取输入历史失败：${describeError(error)}`));
 
-      this.unsubscribe = runtime.subscribe((event) => {
-        this.dispatch(event);
-        if (event.type === "session.completed" || event.type === "session.incomplete" || event.type === "session.error") {
+      this.unsubscribe = runtime.subscribeUpdates((update) => {
+        this.runtimeSnapshot = update.snapshot;
+        if (update.event) this.dispatch(update.event);
+        else this.refreshChrome();
+        if (update.event?.type === "run.completed" || update.event?.type === "run.incomplete" || update.event?.type === "run.failed") {
           void this.refreshContextUsage();
         }
       });
@@ -151,6 +175,7 @@ export class BinyTui {
         modelLabel: info.modelLabel,
         reasoningLabel: info.reasoningLabel
       });
+      if (this.initialSession) await this.resumeSession(this.initialSession);
       void this.refreshContextUsage();
     } catch (error) {
       this.notify(`TUI startup failed: ${describeError(error)}`);
@@ -169,8 +194,9 @@ export class BinyTui {
   }
 
   private refreshChrome(): void {
-    this.status.setState(this.state.status, this.state.queuedCount);
-    this.shortcuts.setState(this.state.status, this.mode);
+    const status = runtimeStatus(this.runtimeSnapshot);
+    this.status.setState(status, queuedRunCount(this.runtimeSnapshot));
+    this.shortcuts.setState(status, this.mode);
     this.footer.setData(this.footerData());
     this.ui.requestRender();
   }
@@ -211,13 +237,22 @@ export class BinyTui {
 
   private async submit(text: string): Promise<void> {
     const value = text.trim();
-    if (!value) return;
+    if (!value && !this.pendingAttachments.length) return;
+    if (!value.startsWith("/") && runtimeIsBusy(this.runtimeSnapshot)) {
+      this.notify("当前任务仍在运行。按 Esc 停止后再发送下一条消息。");
+      return;
+    }
+    const prompt = value || "请分析这个附件。";
+    const attachments = this.pendingAttachments;
+    this.setPendingAttachments([]);
     this.editor.setText("");
-    this.editor.addToHistory(value);
-    void appendInputHistory(this.workspaceRoot, value)
+    this.editor.addToHistory(prompt);
+    void appendInputHistory(this.workspaceRoot, prompt)
       .catch((error) => this.notify(`写入输入历史失败：${describeError(error)}`));
 
     if (value.startsWith("/")) {
+      // slash 命令不消费附件；保留它们给用户执行命令后继续编辑并发送。
+      this.setPendingAttachments(attachments);
       try {
         await this.handleSlashCommand(value);
       } catch (error) {
@@ -229,8 +264,10 @@ export class BinyTui {
     const runtime = this.runtime;
     if (!runtime) return;
     try {
-      await runtime.sendPrompt(value, this.mode);
+      await runtime.submitPrompt(withAttachmentReferences(prompt, attachments), this.mode, attachments).completion;
     } catch (error) {
+      this.setPendingAttachments([...attachments, ...this.pendingAttachments]);
+      this.editor.setText(prompt);
       this.dispatch({ type: "error.message", message: describeError(error) });
     } finally {
       await this.refreshContextUsage();
@@ -239,13 +276,11 @@ export class BinyTui {
 
   /** 全局键位。返回 `{consume:true}` 表示不再投递给焦点组件。 */
   private handleGlobalKey(data: string): { consume?: boolean } | undefined {
-    const busy = this.state.status === "thinking"
-      || this.state.status === "running"
-      || this.state.status === "waiting_permission";
+    const busy = runtimeIsBusy(this.runtimeSnapshot);
 
     if (matchesKey(data, "ctrl+c")) {
       if (busy) {
-        this.runtime?.cancelCurrentTurn();
+        this.runtime?.cancelCurrentRun();
         return { consume: true };
       }
       void this.exit();
@@ -254,12 +289,18 @@ export class BinyTui {
     if (matchesKey(data, "escape")) {
       if (this.overlay) return undefined;
       if (busy) {
-        this.runtime?.cancelCurrentTurn();
+        this.runtime?.cancelCurrentRun();
         return { consume: true };
       }
       return undefined;
     }
     if (this.overlay) return undefined;
+    // Windows 终端通常把 Ctrl+V 留给文本粘贴，和 Pi 一样只用 Alt+V 读取图片剪贴板。
+    const isClipboardPaste = process.platform === "win32" ? matchesKey(data, "alt+v") : matchesKey(data, "ctrl+v");
+    if (isClipboardPaste) {
+      void this.pasteClipboard();
+      return { consume: true };
+    }
     if (matchesKey(data, "shift+tab")) {
       this.mode = this.mode === "plan" ? "chat" : "plan";
       this.refreshChrome();
@@ -286,9 +327,36 @@ export class BinyTui {
     this.ui.requestRender();
   }
 
+  private async pasteClipboard(): Promise<void> {
+    const runtime = this.runtime;
+    if (!runtime) return;
+    try {
+      const pasted = await pasteTuiClipboard(this.workspaceRoot);
+      if (pasted.kind === "image") {
+        this.setPendingAttachments([...this.pendingAttachments, pasted.attachment]);
+        this.notify(`已附加 [Image #${String(this.pendingAttachments.length)}]。按 Enter 发送；当前模型需声明 vision 能力。`);
+        return;
+      }
+      if (pasted.kind === "text") {
+        this.editor.insertTextAtCursor(pasted.text);
+        this.ui.requestRender();
+        return;
+      }
+      this.notify("剪贴板中没有可读取的图片或文本。");
+    } catch (error) {
+      this.notify(`读取剪贴板失败：${describeError(error)}`);
+    }
+  }
+
   private showLatestDetails(): void {
     const expandable = latestExpandableTranscript(this.state.transcript);
     if (expandable) this.showTextViewer(expandable.title, expandable.content);
+  }
+
+  private setPendingAttachments(attachments: AgentAttachment[]): void {
+    this.pendingAttachments = attachments;
+    this.pendingAttachmentsView.setAttachments(attachments);
+    this.ui.requestRender();
   }
 
   // ---------------------------------------------------------------- 弹层
@@ -341,7 +409,7 @@ export class BinyTui {
 
   /** 权限请求进出时同步弹层，避免请求切换后还留着上一份确认状态。 */
   private syncPermissionDialog(): void {
-    const request = this.state.permission;
+    const request = tuiPermissionRequest(this.runtimeSnapshot);
     if (!request) {
       if (this.permissionDialog) this.closeOverlay();
       return;
@@ -355,7 +423,7 @@ export class BinyTui {
       request,
       (choice) => {
         this.closeOverlay();
-        this.runtime?.answerPermission(choice);
+        this.answerPermission(choice);
       },
       () => {
         this.dispatch({ type: "permission.details.toggled" });
@@ -364,6 +432,16 @@ export class BinyTui {
     dialog.setDetailsExpanded(this.state.permissionDetailsExpanded);
     this.permissionDialog = dialog;
     this.showOverlay(dialog);
+  }
+
+  private answerPermission(choice: PermissionChoice): void {
+    const runtime = this.runtime;
+    const request = pendingPermission(this.runtimeSnapshot);
+    if (!runtime || !request) return;
+    runtime.answerPermission(
+      request.requestId,
+      permissionChoiceToResult(choice, request.request.requireFullYes)
+    );
   }
 
   // ---------------------------------------------------------------- slash
@@ -403,52 +481,6 @@ export class BinyTui {
       return;
     }
 
-    if (command === "/context") {
-      this.showTextViewer("Context", await runtime.contextReport());
-      return;
-    }
-
-    if (command === "/usage") {
-      this.showTextViewer("Usage", runtime.usageReport());
-      return;
-    }
-
-    if (command === "/status") {
-      this.showTextViewer("Status", runtime.extensionReport());
-      return;
-    }
-
-    if (command === "/mcp" || command === "/skills" || command === "/plugins") {
-      const section = command.slice(1) as "mcp" | "skills" | "plugins";
-      const title = section === "mcp" ? "MCP" : section.charAt(0).toUpperCase() + section.slice(1);
-      this.showTextViewer(title, runtime.extensionReport(section).replace(new RegExp(`^${title}\\n`), ""));
-      return;
-    }
-
-    if (command === "/subagent") {
-      await this.handleSubagentCommand(args);
-      return;
-    }
-
-    if (command === "/memory") {
-      this.showTextViewer("Memory", await runtime.runMemoryCommand(args));
-      return;
-    }
-
-    if (command === "/review") {
-      const instructions = args.join(" ").trim();
-      const task = instructions
-        || "Review the current git changes for correctness, regressions, missing tests, and concrete risks. Return concise findings with exact file paths and line numbers.";
-      this.showTextViewer("Code Review", await runtime.runSubagentTask(task) || "No review findings.");
-      return;
-    }
-
-    if (command === "/compact") {
-      this.showTextViewer("Compact", await runtime.compactConversation(args.join(" ").trim() || undefined));
-      await this.refreshContextUsage();
-      return;
-    }
-
     if (command === "/model") {
       await this.handleModelCommand(args);
       return;
@@ -475,34 +507,6 @@ export class BinyTui {
       return;
     }
 
-    if (command === "/continue") {
-      const interrupted = await runtime.interruptedTurn();
-      // TUI 的运行走 durable-task 调度器，续跑目前只在 CLI 上接通；这里如实告知而不是
-      // 悄悄开一个新回合 —— 那会让用户以为续上了，其实是重来。
-      this.showTextViewer("Continue", interrupted
-        ? `Interrupted after ${String(interrupted.completedSteps)} step(s): ${interrupted.prompt}\n\nRun \`biny chat\` and use /continue there to resume it; TUI resume is not wired yet.`
-        : "No interrupted turn to continue.");
-      return;
-    }
-
-    if (command === "/undo") {
-      const checkpoints = await runtime.listCheckpoints();
-      if (!checkpoints.length) {
-        this.showTextViewer("Undo", "No checkpoints yet. Biny snapshots the workspace before its first edit of a turn (git repositories only).");
-        return;
-      }
-      if (args[0] === "list") {
-        this.showTextViewer("Checkpoints", checkpoints.map((entry) => `${entry.id}  ${entry.createdAt}  ${entry.label}`).join("\n"));
-        return;
-      }
-      const summary = await runtime.restoreCheckpoint(args[0] ?? "latest");
-      const moved = summary.movedAside.length
-        ? `\nMoved ${String(summary.movedAside.length)} file(s) created since then to ${summary.trashDirectory ?? "the undo trash"}:\n${summary.movedAside.join("\n")}`
-        : "";
-      this.showTextViewer("Undo", `Restored ${String(summary.restoredFiles)} file(s) from checkpoint ${summary.checkpoint.id} (${summary.checkpoint.label}).${moved}`);
-      return;
-    }
-
     if (command === "/permissions" || command === "/approvals") {
       if (args.length === 0) {
         this.showPermissionModePicker();
@@ -521,47 +525,49 @@ export class BinyTui {
         this.refreshChrome();
         return;
       }
+      if (runtimeIsBusy(this.runtimeSnapshot)) {
+        this.notify("当前任务仍在运行。按 Esc 停止后再提交 Plan。");
+        return;
+      }
       this.mode = "plan";
-      await runtime.sendPrompt(task, "plan");
+      await runtime.submitPrompt(task, "plan").completion;
       await this.refreshContextUsage();
+      return;
+    }
+
+    if (command === "/mode") {
+      const requested = args[0]?.toLowerCase();
+      if (!requested) {
+        this.showSelect({
+          title: "Select run mode",
+          hint: "↑↓ navigate · enter select · esc cancel",
+          selectedIndex: runModes.findIndex((entry) => entry.mode === this.mode),
+          items: runModes.map((entry) => ({ value: entry.mode, label: entry.label, description: entry.description })),
+          onSelect: (item) => {
+            this.mode = item.value as Extract<AgentRunMode, "chat" | "plan">;
+            this.refreshChrome();
+          }
+        });
+        return;
+      }
+      if (requested !== "chat" && requested !== "plan") {
+        this.showTextViewer("Mode", "Usage: /mode [chat|plan]");
+        return;
+      }
+      this.mode = requested;
+      this.refreshChrome();
+      return;
+    }
+
+    const sharedResult = await executeRuntimeCommand(runtime, value, "tui");
+    if (sharedResult) {
+      this.showTextViewer(sharedResult.title, sharedResult.content);
+      if (command === "/compact" || command === "/continue") await this.refreshContextUsage();
       return;
     }
 
     // 未知命令是小错误，用一条通知就够，不必占一整个弹层。
     this.notify(`Unknown command: ${command}. Type / to see the list.`);
-  }
-
-  private async handleSubagentCommand(args: string[]): Promise<void> {
-    const runtime = this.runtime;
-    if (!runtime) return;
-    const action = args[0]?.toLowerCase();
-    if (action === "status") {
-      this.showTextViewer("Subagent tasks", formatSubagentTaskReport(runtime.listSubagentTasks()));
-      return;
-    }
-    if (action === "agents") {
-      this.showTextViewer("Named subagents", formatSubagentAgentList(await runtime.listSubagentAgents()));
-      return;
-    }
-    if (action === "cancel") {
-      const taskId = args[1]?.trim();
-      if (!taskId) {
-        this.showTextViewer("Subagent", "Usage: /subagent cancel <task-id>");
-        return;
-      }
-      const cancelled = runtime.cancelSubagentTask(taskId, "Cancelled from the TUI.");
-      this.showTextViewer(
-        "Subagent",
-        cancelled ? `Cancelled subagent task ${taskId}.` : `No active subagent task found for ${taskId}.`
-      );
-      return;
-    }
-    const task = args.join(" ").trim();
-    if (!task) {
-      this.showTextViewer("Subagent", "Usage: /subagent <read-only task> | status | cancel <task-id> | agents");
-      return;
-    }
-    this.showTextViewer("Subagent", await runtime.runSubagentTask(task) || "Subagent returned no text.");
   }
 
   private async handleModelCommand(args: string[]): Promise<void> {
@@ -629,6 +635,12 @@ export class BinyTui {
     if (!runtime) return;
     try {
       const info = await runtime.switchModel(alias, thinking);
+      this.dispatch({
+        type: "model.changed",
+        provider: info.provider,
+        modelLabel: info.modelLabel,
+        reasoningLabel: info.reasoningLabel
+      });
       this.thinking = info.thinking;
       this.editor.borderColor = theme.thinkingBorder(this.thinking);
       this.notify(`Model changed to ${info.modelLabel} ${info.reasoningLabel.toLowerCase()}`);
@@ -690,6 +702,16 @@ export class BinyTui {
     const runtime = this.runtime;
     if (!runtime || !session) return;
     const resumed = await runtime.resumeSession(session);
+    const info = runtime.getInfo();
+    this.dispatch({
+      type: "session.started",
+      sessionId: info.sessionId,
+      sessionFile: info.sessionFile,
+      cwd: info.workspaceRoot,
+      provider: info.provider,
+      modelLabel: info.modelLabel,
+      reasoningLabel: info.reasoningLabel
+    });
     this.chatContainer.reset();
     this.dispatch({
       type: "transcript.replaced",
@@ -724,4 +746,27 @@ function sessionLabel(summary: SessionSummary): string {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+const runModes: Array<{ mode: Extract<AgentRunMode, "chat" | "plan">; label: string; description: string }> = [
+  { mode: "chat", label: "Chat", description: "直接执行一个 Agent 回合" },
+  { mode: "plan", label: "Plan", description: "只读分析与方案，不执行副作用工具" }
+];
+
+function runtimeStatus(snapshot: InteractiveRuntimeSnapshot | undefined): TuiStatus {
+  if (!snapshot || snapshot.state.kind === "idle") return "idle";
+  if (snapshot.state.kind !== "runs") return "running";
+  if (snapshot.state.pendingPermission) return "waiting_permission";
+  const status = snapshot.state.activeRun?.status;
+  return status === "thinking" || status === "queued" ? "thinking" : "running";
+}
+
+function queuedRunCount(snapshot: InteractiveRuntimeSnapshot | undefined): number {
+  return snapshot?.state.kind === "runs" ? snapshot.state.queuedRuns.length : 0;
+}
+
+function tuiPermissionRequest(snapshot: InteractiveRuntimeSnapshot | undefined): TuiPermissionRequest | undefined {
+  const pending = pendingPermission(snapshot);
+  if (!pending) return undefined;
+  return { ...pending.request };
 }

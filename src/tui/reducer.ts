@@ -5,7 +5,7 @@
  * and running tools live in active cells and are updated in place until one
  * completion event commits each cell exactly once.
  */
-import type { RuntimeEvent } from "../runtime/events.js";
+import type { AgentHostEvent } from "../runtime/agentEvents.js";
 import {
   completeToolItem,
   createRunningToolItem,
@@ -22,7 +22,11 @@ import type {
   TuiState
 } from "./types.js";
 
-export type TuiAction = RuntimeEvent
+export type TuiAction = AgentHostEvent
+  | { type: "session.started"; sessionId: string; sessionFile: string; cwd: string; provider: string; modelLabel: string; reasoningLabel: string }
+  | { type: "model.changed"; provider: string; modelLabel: string; reasoningLabel: string }
+  | { type: "error.message"; message: string }
+  | { type: "system.message"; content: string }
   | { type: "transcript.cleared" }
   | { type: "transcript.replaced"; items: TranscriptItem[]; viewingSessionId?: string }
   | { type: "permission.details.toggled" };
@@ -36,8 +40,6 @@ export function createInitialTuiState(workspaceRoot: string): TuiState {
     sessionId: "",
     sessionFile: "",
     viewingSessionId: undefined,
-    status: "idle",
-    queuedCount: 0,
     turnStartedAt: undefined,
     lastWorkedMs: undefined,
     transcript: { committed: [], active: [] },
@@ -57,69 +59,58 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
         sessionId: event.sessionId,
         sessionFile: event.sessionFile,
         viewingSessionId: event.sessionId,
-        status: "idle",
-        queuedCount: 0,
         turnStartedAt: undefined,
         lastWorkedMs: undefined
       };
     case "model.changed":
       return { ...state, provider: event.provider, modelLabel: event.modelLabel, reasoningLabel: event.reasoningLabel };
-    case "runtime.status":
-      return { ...state, status: event.status };
-    case "runtime.queue.updated":
-      return { ...state, queuedCount: event.queuedCount };
-    case "session.completed": {
+    case "run.started":
+    case "run.queued":
+    case "run.queue.updated":
+      return state;
+    case "run.completed": {
       const transcript = finalizeActiveCells(state.transcript, "skipped", "Interrupted before completion.");
       return {
         ...state,
-        status: state.status === "error" ? "error" : "completed",
-        permission: undefined,
         lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
         turnStartedAt: undefined,
         transcript
       };
     }
-    case "session.incomplete": {
-      const finalized = finalizeActiveCells(state.transcript, "skipped", event.message);
+    case "run.incomplete": {
+      const finalized = finalizeActiveCells(state.transcript, "skipped", event.reason);
       return {
         ...state,
-        status: "incomplete",
-        permission: undefined,
         lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
         turnStartedAt: undefined,
-        transcript: commitItem(finalized, notificationItem(finalized, event.message))
+        transcript: commitItem(finalized, notificationItem(finalized, event.reason))
       };
     }
-    case "session.aborted": {
-      const finalized = finalizeActiveCells(state.transcript, "skipped", event.message);
+    case "run.aborted": {
+      const finalized = finalizeActiveCells(state.transcript, "skipped", event.reason);
       return {
         ...state,
-        status: "aborted",
-        permission: undefined,
         lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
         turnStartedAt: undefined,
-        transcript: commitItem(finalized, notificationItem(finalized, event.message))
+        transcript: commitItem(finalized, notificationItem(finalized, event.reason))
       };
     }
-    case "session.error": {
-      const finalized = finalizeActiveCells(state.transcript, "failed", event.message);
+    case "run.failed": {
+      const finalized = finalizeActiveCells(state.transcript, "failed", event.error);
       return {
         ...state,
-        status: "error",
-        permission: undefined,
         lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
         turnStartedAt: undefined,
         transcript: commitItem(finalized, {
           id: nextTranscriptId(finalized, "error"),
           kind: "error",
-          content: event.message
+          content: event.error
         })
       };
     }
     case "error.message":
       return {
         ...state,
-        status: "error",
         transcript: commitItem(state.transcript, {
           id: nextTranscriptId(state.transcript, "error"),
           kind: "error",
@@ -140,11 +131,10 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
       return replaceTranscript(state, event.items, event.viewingSessionId);
     case "permission.details.toggled":
       return { ...state, permissionDetailsExpanded: !state.permissionDetailsExpanded };
-    case "user.message":
+    case "message.user":
       return {
         ...state,
         viewingSessionId: state.sessionId,
-        status: "thinking",
         turnStartedAt: Date.now(),
         lastWorkedMs: undefined,
         transcript: commitItem(state.transcript, {
@@ -156,7 +146,6 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
     case "reasoning.delta":
       return {
         ...state,
-        status: "thinking",
         transcript: updateReasoningDelta(state.transcript, event.content)
       };
     case "reasoning.completed":
@@ -167,70 +156,50 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
     case "assistant.delta":
       return {
         ...state,
-        status: "thinking",
         transcript: updateAssistantDelta(commitReasoning(state.transcript), event.content)
       };
     case "assistant.completed":
       return {
         ...state,
-        status: "completed",
         transcript: commitAssistant(commitReasoning(state.transcript), event.content)
       };
-    case "tool.call.started":
+    case "tool.started":
       return {
         ...state,
-        status: "running",
         transcript: startTool(commitReasoning(state.transcript), event)
       };
-    case "tool.call.progress":
+    case "tool.progress":
       return {
         ...state,
-        status: "running",
         transcript: updateTool(state.transcript, event.toolCallId, event.tool, (item) => updateRunningToolItem(item, event.update))
       };
-    case "tool.call.completed":
+    case "tool.completed":
       return {
         ...state,
-        status: "running",
         transcript: finishTool(state.transcript, event.toolCallId, event.tool, event.result)
       };
-    case "tool.call.failed":
+    case "tool.failed":
       return {
         ...state,
-        status: "error",
         transcript: finishTool(state.transcript, event.toolCallId, event.tool, { error: event.error }, "failed")
       };
     case "permission.requested":
-      return {
-        ...state,
-        status: "waiting_permission",
-        permission: {
-          tool: event.tool,
-          title: event.title,
-          details: event.details,
-          requireFullYes: event.requireFullYes,
-          diff: event.diff,
-          preview: event.preview,
-          actionType: event.actionType,
-          riskLevel: event.riskLevel,
-          targetPath: event.targetPath,
-          command: event.command,
-          reason: event.reason,
-          changeSummary: event.changeSummary
-        }
-      };
-    case "permission.approved":
-      return { ...state, status: "running", permission: undefined };
-    case "permission.rejected":
-      return { ...state, status: "running", permission: undefined };
-    case "permission.status.changed":
-      return {
-        ...state,
-        transcript: commitItem(state.transcript, {
-          ...notificationItem(state.transcript, event.message),
-          tone: "success"
-        })
-      };
+    case "permission.resolved":
+      return state;
+    case "reasoning.started":
+      return state;
+    case "reasoning.status":
+    case "command.started":
+    case "command.output":
+    case "command.completed":
+    case "command.failed":
+    case "file.read":
+    case "file.changed":
+    case "diff.created":
+    case "context.updated":
+    case "compact.started":
+    case "compact.completed":
+      return state;
   }
 }
 
@@ -313,7 +282,7 @@ function commitAssistant(transcript: TranscriptState, content: string): Transcri
 
 function startTool(
   transcript: TranscriptState,
-  event: Extract<RuntimeEvent, { type: "tool.call.started" }>
+  event: Extract<AgentHostEvent, { type: "tool.started" }>
 ): TranscriptState {
   const existing = event.toolCallId === undefined
     ? -1

@@ -7,7 +7,6 @@ import { AgentSession, type AgentRunOptions, type AgentSessionInfo } from "../sr
 import type { ContextStatus } from "../src/agent/context/types.js";
 import type { AgentSessionEvent } from "../src/agent/types.js";
 import { assertCompletedCliRun } from "../src/cli/commands/run.js";
-import { executeChatSlashCommand } from "../src/cli/commands/chatSlash.js";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
 import {
   createSubagentTools,
@@ -22,8 +21,8 @@ import {
 import type { CommandRuntime } from "../src/runtime/CommandRuntime.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
 import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.js";
+import { executeRuntimeCommand } from "../src/runtime/commands.js";
 import { AsyncEventQueue } from "../src/runtime/AsyncEventQueue.js";
-import { RootRunLedger } from "../src/runtime/RootRunLedger.js";
 import {
   SubagentTaskAbortedError,
   SubagentTaskManager,
@@ -33,7 +32,11 @@ import {
   type SubagentTaskSnapshot
 } from "../src/runtime/SubagentTaskManager.js";
 import { formatSubagentTaskReport } from "../src/runtime/subagentTaskReport.js";
-import type { AgentHostEvent } from "../src/runtime/agentEvents.js";
+import {
+  activeRun,
+  queuedRuns,
+  type AgentHostEvent
+} from "../src/runtime/agentEvents.js";
 import { listSessionSummaries } from "../src/session/events.js";
 import { replaySession } from "../src/session/replay.js";
 import { SessionRecorder } from "../src/session/recorder.js";
@@ -62,18 +65,19 @@ await testEmptyPromptIsRejected();
 await testAsyncEventQueueAcknowledgesAndFailsClosed();
 await testQueuedRunCancellationAndOutcome();
 await testQueuedPromptEventOrdering();
+await testRuntimeUpdatesCarryCanonicalState();
+await testContinueRequiresIdleRuntime();
 await testQueueLimit();
 await testConfiguredRunQueueLimit();
-await testRuntimePersistsRootRunLifecycle();
 await testSchedulerSetupFailureSettlesRun();
 await testMissingTerminalResultFailsRun();
 await testDuplicateTerminalResultFailsRun();
 await testIncompleteTurnDoesNotEmitRunCompleted();
 await testCliRejectsIncompleteAndFailedOutcomes();
-await testDirectSubagentCancellationLifecycle();
-await testDirectSubagentTimeoutIsFailure();
-await testImmediateDirectSubagentCancellation();
-await testImmediateDirectSubagentClose();
+await testSubagentMaintenanceCancellation();
+await testSubagentMaintenanceTimeout();
+await testImmediateSubagentMaintenanceCancellation();
+await testImmediateSubagentMaintenanceClose();
 await testCompactionCloseCancellation();
 await testSubagentUsageModelAttributionAndAuditPersistence();
 await testRecoverableDiagnosticDoesNotFailRun();
@@ -356,19 +360,13 @@ async function testSubagentInspectionControls(): Promise<void> {
   assert.deepEqual(runtime.listSubagentTasks(), [snapshot]);
   assert.equal(runtime.cancelSubagentTask(snapshot.taskId, "interactive cancellation"), true);
 
-  const output: string[] = [];
-  const originalLog = console.log;
-  console.log = (...values: unknown[]): void => { output.push(values.map(String).join(" ")); };
-  try {
-    assert.equal(await executeChatSlashCommand(commandRuntime, "/subagent status"), true);
-    assert.equal(await executeChatSlashCommand(commandRuntime, `/subagent cancel ${snapshot.taskId}`), true);
-  } finally {
-    console.log = originalLog;
-  }
-  assert.match(output.join("\n"), /task-visible · queued/);
+  const status = await executeRuntimeCommand(runtime, "/subagent status", "tui");
+  const cancelled = await executeRuntimeCommand(runtime, `/subagent cancel ${snapshot.taskId}`, "tui");
+  assert.match(status?.content ?? "", /task-visible · queued/);
+  assert.match(cancelled?.content ?? "", /Cancelled subagent task task-visible/);
   assert.deepEqual(cancellations, [
     { taskId: "task-visible", reason: "interactive cancellation" },
-    { taskId: "task-visible", reason: "Cancelled from the CLI." }
+    { taskId: "task-visible", reason: "Cancelled from the tui." }
   ]);
   await runtime.close();
 }
@@ -395,27 +393,24 @@ async function testCliBackgroundSubagentIsReachable(): Promise<void> {
   commandRuntime.listSubagentTasks = () => manager.listSnapshots();
   commandRuntime.cancelSubagentTask = (taskId, reason) => manager.cancelTask(taskId, reason);
 
-  const output: string[] = [];
-  const originalLog = console.log;
-  console.log = (...values: unknown[]): void => { output.push(values.map(String).join(" ")); };
+  const runtime = new InteractiveAgentRuntime(commandRuntime);
   try {
-    assert.equal(await executeChatSlashCommand(commandRuntime, "/subagent start inspect in background"), true);
+    const start = await executeRuntimeCommand(runtime, "/subagent start inspect in background", "tui");
     if (!started) throw new Error("CLI did not start a background subagent task.");
     assert.equal(foregroundCalls, 0);
     assert.equal(manager.getSnapshot(started.taskId)?.status, "running");
 
-    assert.equal(await executeChatSlashCommand(commandRuntime, "/subagent status"), true);
+    const status = await executeRuntimeCommand(runtime, "/subagent status", "tui");
     const rejected = assert.rejects(started.completion, SubagentTaskAbortedError);
-    assert.equal(await executeChatSlashCommand(commandRuntime, `/subagent cancel ${started.taskId}`), true);
+    const cancel = await executeRuntimeCommand(runtime, `/subagent cancel ${started.taskId}`, "tui");
     await rejected;
+    assert.match(start?.content ?? "", /^Started subagent task .+\. Use \/subagent status/);
+    assert.match(status?.content ?? "", /inspect in background/);
+    assert.match(cancel?.content ?? "", /^Cancelled subagent task /);
   } finally {
-    console.log = originalLog;
+    await runtime.close();
     await manager.close();
   }
-
-  assert.match(output[0] ?? "", /^Started subagent task .+\. Use \/subagent status/);
-  assert.match(output.join("\n"), /inspect in background/);
-  assert.match(output.at(-1) ?? "", /^Cancelled subagent task /);
 }
 
 async function testSubagentParentCancellationAndTimeout(): Promise<void> {
@@ -586,12 +581,12 @@ async function testRuntimeCloseDefersCleanupForNonCooperativeRun(): Promise<void
   let closeCalls = 0;
   let closedWhileWriting = false;
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({
-    runSdk: async function* (): AsyncGenerator<AgentSessionEvent> {
+    run: async function* (): AsyncGenerator<AgentSessionEvent> {
       writerActive = true;
       started.resolve();
       try {
         await release.promise;
-        yield { type: "done", content: "late completion" };
+        yield completed("late completion");
       } finally {
         writerActive = false;
       }
@@ -659,7 +654,7 @@ async function testMaintenanceGateIsAtomic(): Promise<void> {
   });
   const runtime = new InteractiveAgentRuntime(commandRuntime);
   const switching = runtime.switchModel("test");
-  assert.equal(runtime.getSnapshot().activeOperation, "switch_model");
+  assert.deepEqual(runtime.getSnapshot().state, { kind: "maintenance", operation: "switch_model" });
   assert.throws(() => runtime.submitPrompt("must not enter"), /model switching is running/);
   await assert.rejects(runtime.compactConversation(), /runtime is busy/);
   await assert.rejects(runtime.setPermissionMode("read-only"), /runtime is busy/);
@@ -727,7 +722,7 @@ async function testQueuedRunCancellationAndOutcome(): Promise<void> {
   const firstGate = deferred<void>();
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({ firstGate }));
   const first = runtime.submitPrompt("hold");
-  await waitUntil(() => runtime.getSnapshot().activeRun?.runId === first.runId);
+  await waitUntil(() => activeRun(runtime.getSnapshot())?.runId === first.runId);
   const cancelled = runtime.submitPrompt("cancel queued");
   const last = runtime.submitPrompt("last");
   assert.equal(runtime.cancelRun(cancelled.runId), true);
@@ -740,7 +735,7 @@ async function testQueuedRunCancellationAndOutcome(): Promise<void> {
     durationMs: 0,
     error: "Cancelled before execution."
   });
-  assert.deepEqual(runtime.getSnapshot().queuedRuns.map((run) => run.runId), [last.runId]);
+  assert.deepEqual(queuedRuns(runtime.getSnapshot()).map((run) => run.runId), [last.runId]);
   firstGate.resolve();
   assert.equal((await first.completion).status, "completed");
   assert.equal((await last.completion).status, "completed");
@@ -753,7 +748,7 @@ async function testQueuedPromptEventOrdering(): Promise<void> {
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({ firstGate }));
   runtime.subscribe((event) => events.push(event));
   const first = runtime.submitPrompt("hold");
-  await waitUntil(() => runtime.getSnapshot().activeRun?.runId === first.runId);
+  await waitUntil(() => activeRun(runtime.getSnapshot())?.runId === first.runId);
   const second = runtime.submitPrompt("queued prompt");
   assert.equal(events.some((event) => event.type === "message.user" && event.runId === second.runId), false);
   const queued = events.find((event) => event.type === "run.queued" && event.runId === second.runId);
@@ -772,7 +767,7 @@ async function testQueueLimit(): Promise<void> {
   const firstGate = deferred<void>();
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({ firstGate }));
   const first = runtime.submitPrompt("hold");
-  await waitUntil(() => runtime.getSnapshot().activeRun?.runId === first.runId);
+  await waitUntil(() => activeRun(runtime.getSnapshot())?.runId === first.runId);
   const queued = Array.from({ length: 32 }, (_value, index) => runtime.submitPrompt(`queued-${String(index)}`));
   assert.throws(() => runtime.submitPrompt("overflow"), /queue is full/);
   runtime.cancelCurrentRun();
@@ -782,31 +777,29 @@ async function testQueueLimit(): Promise<void> {
   await runtime.close();
 }
 
-async function testRuntimePersistsRootRunLifecycle(): Promise<void> {
-  const persistenceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-runtime-ledger-"));
-  let ledger: RootRunLedger | undefined;
-  let reopened: RootRunLedger | undefined;
-  let runtime: InteractiveAgentRuntime | undefined;
-  try {
-    ledger = await RootRunLedger.open(persistenceRoot);
-    runtime = new InteractiveAgentRuntime(fakeCommandRuntime(), { runLedger: ledger });
-    const submitted = runtime.submitPrompt("persist this root run");
-    assert.equal((await submitted.completion).status, "completed");
-    const snapshot = ledger.getSnapshot(submitted.runId);
-    assert.equal(snapshot.status, "completed");
-    assert.equal(snapshot.sessionId, "session-1");
-    assert.deepEqual(snapshot.transitions.map((transition) => transition.status), ["queued", "running", "completed"]);
+async function testRuntimeUpdatesCarryCanonicalState(): Promise<void> {
+  const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
+  const updates: Array<ReturnType<InteractiveAgentRuntime["getSnapshot"]>> = [];
+  runtime.subscribeUpdates((update) => updates.push(update.snapshot));
+  await runtime.submitPrompt("inspect state").completion;
 
-    await runtime.close();
-    runtime = undefined;
-    reopened = await RootRunLedger.open(persistenceRoot);
-    assert.equal(reopened.getSnapshot(submitted.runId).status, "completed");
-  } finally {
-    await runtime?.close();
-    reopened?.close();
-    ledger?.close();
-    await rm(persistenceRoot, { recursive: true, force: true });
-  }
+  assert.ok(updates.length > 1);
+  assert.deepEqual(updates.map((snapshot) => snapshot.revision), [...updates.map((snapshot) => snapshot.revision)].sort((left, right) => left - right));
+  assert.ok(updates.some((snapshot) => activeRun(snapshot)?.status === "thinking"));
+  assert.deepEqual(updates.at(-1)?.state, { kind: "idle" });
+  await runtime.close();
+}
+
+async function testContinueRequiresIdleRuntime(): Promise<void> {
+  const firstGate = deferred<void>();
+  const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({ firstGate }));
+  const run = runtime.submitPrompt("hold");
+  await waitUntil(() => activeRun(runtime.getSnapshot()) !== undefined);
+  await assert.rejects(runtime.continueInterruptedTurn(), /while the runtime is busy/u);
+  runtime.cancelCurrentRun();
+  firstGate.resolve();
+  await run.completion;
+  await runtime.close();
 }
 
 async function testConfiguredRunQueueLimit(): Promise<void> {
@@ -814,7 +807,7 @@ async function testConfiguredRunQueueLimit(): Promise<void> {
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({ firstGate }), { maxQueuedRuns: 1 });
   assert.throws(() => new InteractiveAgentRuntime(fakeCommandRuntime(), { maxQueuedRuns: 0 }), /positive safe integer/);
   const first = runtime.submitPrompt("hold");
-  await waitUntil(() => runtime.getSnapshot().activeRun?.runId === first.runId);
+  await waitUntil(() => activeRun(runtime.getSnapshot())?.runId === first.runId);
   const queued = runtime.submitPrompt("one queued turn");
   assert.throws(() => runtime.submitPrompt("overflow"), /queue is full/);
   runtime.cancelCurrentRun();
@@ -833,7 +826,7 @@ async function testSchedulerSetupFailureSettlesRun(): Promise<void> {
       return {
         workspaceRoot: "/tmp/project",
         sessionId: "session-1",
-        sessionFile: "/tmp/project/.agent/sessions/session-1.jsonl",
+        sessionFile: "/tmp/project/.biny/sessions/session-1.jsonl",
         provider: "test",
         modelLabel: "test/model",
         reasoningLabel: "Off",
@@ -856,7 +849,7 @@ async function testSchedulerSetupFailureSettlesRun(): Promise<void> {
 async function testMissingTerminalResultFailsRun(): Promise<void> {
   const events: AgentHostEvent[] = [];
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({
-    runSdk: async function* (): AsyncGenerator<AgentSessionEvent> {
+    run: async function* (): AsyncGenerator<AgentSessionEvent> {
       yield { type: "status", status: "thinking" };
     }
   }));
@@ -874,9 +867,9 @@ async function testMissingTerminalResultFailsRun(): Promise<void> {
 async function testDuplicateTerminalResultFailsRun(): Promise<void> {
   const events: AgentHostEvent[] = [];
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({
-    runSdk: async function* (): AsyncGenerator<AgentSessionEvent> {
-      yield { type: "done", content: "first" };
-      yield { type: "done", content: "second" };
+    run: async function* (): AsyncGenerator<AgentSessionEvent> {
+      yield completed("first");
+      yield completed("second");
     }
   }));
   runtime.subscribe((event) => events.push(event));
@@ -893,7 +886,7 @@ async function testDuplicateTerminalResultFailsRun(): Promise<void> {
 async function testIncompleteTurnDoesNotEmitRunCompleted(): Promise<void> {
   const events: AgentHostEvent[] = [];
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({
-    runSdk: async function* (): AsyncGenerator<AgentSessionEvent> {
+    run: async function* (): AsyncGenerator<AgentSessionEvent> {
       yield {
         type: "done",
         content: "",
@@ -942,7 +935,7 @@ async function testCliRejectsIncompleteAndFailedOutcomes(): Promise<void> {
   }), /failed.*provider failed/i);
 }
 
-async function testDirectSubagentCancellationLifecycle(): Promise<void> {
+async function testSubagentMaintenanceCancellation(): Promise<void> {
   const events: AgentHostEvent[] = [];
   const audit: string[] = [];
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({
@@ -953,27 +946,17 @@ async function testDirectSubagentCancellationLifecycle(): Promise<void> {
   runtime.subscribe((event) => events.push(event));
   const task = runtime.runSubagentTask("inspect safely");
   const rejected = assert.rejects(task, /abort|cancel/i);
-  await waitUntil(() => runtime.getSnapshot().activeRun !== undefined);
-  assert.equal(runtime.getSnapshot().activeOperation, "subagent");
+  await waitUntil(() => runtime.getSnapshot().state.kind === "maintenance");
   runtime.cancelCurrentRun();
   await rejected;
-  assert.deepEqual(events.map((event) => event.type), [
-    "message.user",
-    "run.started",
-    "tool.started",
-    "reasoning.status",
-    "tool.failed",
-    "run.aborted"
-  ]);
-  const started = events.find((event) => event.type === "run.started");
-  assert.equal(started?.type === "run.started" ? started.model.alias : undefined, "reviewer");
+  assert.deepEqual(events, []);
   assert.deepEqual(audit, ["user:inspect safely", "call:delegate_task", "result:delegate_task"]);
-  assert.equal(runtime.getSnapshot().activeRun, undefined);
-  assert.equal(runtime.getSnapshot().activeOperation, undefined);
+  assert.equal(activeRun(runtime.getSnapshot()), undefined);
+  assert.deepEqual(runtime.getSnapshot().state, { kind: "idle" });
   await runtime.close();
 }
 
-async function testDirectSubagentTimeoutIsFailure(): Promise<void> {
+async function testSubagentMaintenanceTimeout(): Promise<void> {
   const events: AgentHostEvent[] = [];
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({
     runSubagentTask: async (_task, options) => {
@@ -983,12 +966,11 @@ async function testDirectSubagentTimeoutIsFailure(): Promise<void> {
   runtime.subscribe((event) => events.push(event));
 
   await assert.rejects(runtime.runSubagentTask("inspect slowly"), SubagentTaskTimeoutError);
-  assert.ok(events.some((event) => event.type === "run.failed"));
-  assert.equal(events.some((event) => event.type === "run.aborted"), false);
+  assert.deepEqual(events, []);
   await runtime.close();
 }
 
-async function testImmediateDirectSubagentCancellation(): Promise<void> {
+async function testImmediateSubagentMaintenanceCancellation(): Promise<void> {
   let childStarted = false;
   const audit: string[] = [];
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({
@@ -1009,12 +991,12 @@ async function testImmediateDirectSubagentCancellation(): Promise<void> {
     "call:delegate_task",
     "result:delegate_task"
   ]);
-  assert.equal(runtime.getSnapshot().activeOperation, undefined);
-  assert.equal(runtime.getSnapshot().activeRun, undefined);
+  assert.equal(activeRun(runtime.getSnapshot()), undefined);
+  assert.deepEqual(runtime.getSnapshot().state, { kind: "idle" });
   await runtime.close();
 }
 
-async function testImmediateDirectSubagentClose(): Promise<void> {
+async function testImmediateSubagentMaintenanceClose(): Promise<void> {
   let childStarted = false;
   const audit: string[] = [];
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({
@@ -1035,8 +1017,8 @@ async function testImmediateDirectSubagentClose(): Promise<void> {
     "call:delegate_task",
     "result:delegate_task"
   ]);
-  assert.equal(runtime.getSnapshot().activeOperation, undefined);
-  assert.equal(runtime.getSnapshot().activeRun, undefined);
+  assert.equal(activeRun(runtime.getSnapshot()), undefined);
+  assert.deepEqual(runtime.getSnapshot().state, { kind: "idle" });
 }
 
 async function testCompactionCloseCancellation(): Promise<void> {
@@ -1052,7 +1034,7 @@ async function testCompactionCloseCancellation(): Promise<void> {
   await waitUntil(() => compactionStarted);
 
   await Promise.all([rejected, runtime.close()]);
-  assert.equal(runtime.getSnapshot().activeOperation, undefined);
+  assert.deepEqual(runtime.getSnapshot().state, { kind: "idle" });
 }
 
 async function testSubagentUsageModelAttributionAndAuditPersistence(): Promise<void> {
@@ -1107,9 +1089,9 @@ async function testSubagentUsageModelAttributionAndAuditPersistence(): Promise<v
 
 async function testRecoverableDiagnosticDoesNotFailRun(): Promise<void> {
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({
-    runSdk: async function* (): AsyncGenerator<AgentSessionEvent> {
+    run: async function* (): AsyncGenerator<AgentSessionEvent> {
       yield { type: "error", message: "recoverable tool diagnostic", fatal: false } as AgentSessionEvent;
-      yield { type: "done", content: "recovered" };
+      yield completed("recovered");
     }
   }));
   const outcome = await runtime.submitPrompt("recover").completion;
@@ -1120,12 +1102,12 @@ async function testRecoverableDiagnosticDoesNotFailRun(): Promise<void> {
 async function testToolErrorDoesNotStickAsRunFailure(): Promise<void> {
   const events: AgentHostEvent[] = [];
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({
-    runSdk: async function* (): AsyncGenerator<AgentSessionEvent> {
+    run: async function* (): AsyncGenerator<AgentSessionEvent> {
       yield {
         type: "sdk",
         part: { type: "tool-error", toolCallId: "recoverable-tool", toolName: "read_file", input: {}, error: "missing file" }
       } as AgentSessionEvent;
-      yield { type: "done", content: "used another path" };
+      yield completed("used another path");
     }
   }));
   runtime.subscribe((event) => events.push(event));
@@ -1140,7 +1122,7 @@ async function testCommandLifecycleStartsOnExecution(): Promise<void> {
   const executionGate = deferred<void>();
   const events: AgentHostEvent[] = [];
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({
-    runSdk: async function* (): AsyncGenerator<AgentSessionEvent> {
+    run: async function* (): AsyncGenerator<AgentSessionEvent> {
       yield {
         type: "tool-started",
         toolCallId: "command-1",
@@ -1154,7 +1136,7 @@ async function testCommandLifecycleStartsOnExecution(): Promise<void> {
         type: "sdk",
         part: { type: "tool-result", toolCallId: "command-1", toolName: "run_command", input: {}, output: { exitCode: 0, durationMs: 7 } }
       } as AgentSessionEvent;
-      yield { type: "done", content: "done" };
+      yield completed("done");
     }
   }));
   runtime.subscribe((event) => events.push(event));
@@ -1178,7 +1160,7 @@ async function testCommandFailureLifecycleUsesCommandFailed(): Promise<void> {
   ]) {
     const events: AgentHostEvent[] = [];
     const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({
-      runSdk: async function* (): AsyncGenerator<AgentSessionEvent> {
+      run: async function* (): AsyncGenerator<AgentSessionEvent> {
         yield {
           type: "tool-started",
           toolCallId: `command-${String(result.exitCode)}`,
@@ -1196,7 +1178,7 @@ async function testCommandFailureLifecycleUsesCommandFailed(): Promise<void> {
             output: result
           }
         } as AgentSessionEvent;
-        yield { type: "done", content: "recovered after command failure" };
+        yield completed("recovered after command failure");
       }
     }));
     runtime.subscribe((event) => events.push(event));
@@ -1218,7 +1200,7 @@ interface FakeRuntimeOptions {
   setPermissionMode?: () => Promise<void>;
   compactConversation?: (hint?: string, signal?: AbortSignal) => Promise<string>;
   runSubagentTask?: (task: string, options?: SubagentTaskRunOptions) => Promise<string>;
-  runSdk?: (input: string, options: AgentRunOptions) => AsyncGenerator<AgentSessionEvent>;
+  run?: (input: string, options: AgentRunOptions) => AsyncGenerator<AgentSessionEvent>;
   subagentInfo?: ReturnType<typeof modelInfo>;
   audit?: string[];
   subagentTasks?: SubagentTaskSnapshot[];
@@ -1229,7 +1211,7 @@ function fakeCommandRuntime(options: FakeRuntimeOptions = {}): CommandRuntime {
   const info: AgentSessionInfo = {
     workspaceRoot: "/tmp/project",
     sessionId: "session-1",
-    sessionFile: "/tmp/project/.agent/sessions/session-1.jsonl",
+    sessionFile: "/tmp/project/.biny/sessions/session-1.jsonl",
     provider: "test",
     modelLabel: "test/model",
     reasoningLabel: "Off",
@@ -1259,7 +1241,7 @@ function fakeCommandRuntime(options: FakeRuntimeOptions = {}): CommandRuntime {
         runOptions.abortSignal ? rejectOnAbort(runOptions.abortSignal) : new Promise<never>(() => undefined)
       ]);
     }
-    yield { type: "done", content: `done:${input}` };
+    yield completed(`done:${input}`);
   };
   const agent = {
     getInfo: options.getInfo ?? (() => info),
@@ -1275,7 +1257,7 @@ function fakeCommandRuntime(options: FakeRuntimeOptions = {}): CommandRuntime {
     usageReport: () => "",
     contextStatus: async () => context,
     compactConversation: options.compactConversation ?? (async () => "summary"),
-    runSdk: options.runSdk ?? defaultRunSdk,
+    run: options.run ?? defaultRunSdk,
     recordHostedUserMessage: (content: string) => {
       options.audit?.push(`user:${content}`);
     },
@@ -1324,6 +1306,20 @@ function fakeCommandRuntime(options: FakeRuntimeOptions = {}): CommandRuntime {
 
 function modelInfo() {
   return { modelAlias: "test", provider: "test", modelLabel: "test/model", reasoningLabel: "Off", thinking: "off" as const };
+}
+
+function completed(content: string): Extract<AgentSessionEvent, { type: "done" }> {
+  return {
+    type: "done",
+    content,
+    outcome: {
+      status: "completed",
+      stopReason: "model_stop",
+      finishReason: "stop",
+      steps: 1,
+      output: content
+    }
+  };
 }
 
 function executableTool(tools: ToolSet, name: string): {

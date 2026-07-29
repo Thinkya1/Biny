@@ -4,8 +4,9 @@
  * 这里描述界面层使用的消息、工具调用摘要、权限请求、整体状态和权限选择枚举。
  * 这些类型服务于 reducer 与组件渲染，不暴露底层 recorder 或 provider 对象。
  */
-import type { RuntimeStatus } from "../runtime/events.js";
 import type { ToolInputDisplay } from "../tools/types.js";
+
+export type TuiStatus = "idle" | "thinking" | "running" | "waiting_permission";
 
 interface TranscriptItemBase {
   id: string;
@@ -103,13 +104,10 @@ export interface TuiState {
   sessionId: string;
   sessionFile: string;
   viewingSessionId?: string;
-  status: RuntimeStatus;
-  queuedCount: number;
   turnStartedAt?: number;
   lastWorkedMs?: number;
   transcript: TranscriptState;
   permissionDetailsExpanded: boolean;
-  permission?: TuiPermissionRequest;
 }
 
 export type PermissionChoice =

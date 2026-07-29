@@ -9,6 +9,7 @@ import path from "node:path";
 import { compareReports, formatComparison, runEvalSuite } from "../../evals/runner.js";
 import { builtinEvalTasks, runTaskWithAgent } from "../../evals/suite.js";
 import type { EvalReport } from "../../evals/types.js";
+import { agentDir } from "../../session/store.js";
 
 export interface EvalRunOptions {
   label?: string;
@@ -44,7 +45,7 @@ export async function evalRunCommand(workspaceRoot: string, options: EvalRunOpti
   if (report.summary.totalCostUsd !== undefined) console.log(`$${report.summary.totalCostUsd.toFixed(4)}`);
   else console.log("cost unavailable: configure model pricing to compare spend across runs");
 
-  const target = options.out ?? path.join(workspaceRoot, ".agent", "evals", `${sanitizeLabel(report.label)}.json`);
+  const target = options.out ?? path.join(agentDir(workspaceRoot), "evals", `${sanitizeLabel(report.label)}.json`);
   await fs.mkdir(path.dirname(target), { recursive: true });
   await fs.writeFile(target, `${JSON.stringify(report, null, 2)}\n`, "utf8");
   console.log(`report: ${target}`);

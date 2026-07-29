@@ -8,10 +8,10 @@ import path from "node:path";
 import { ProcessTerminal, TUI } from "@earendil-works/pi-tui";
 import { BinyTui } from "./app.js";
 
-export async function startTui(workspaceRoot: string, version?: string): Promise<void> {
+export async function startTui(workspaceRoot: string, version?: string, initialSession?: string): Promise<void> {
   const terminal = new ProcessTerminal();
   const ui = new TUI(terminal);
-  const app = new BinyTui(ui, workspaceRoot, version);
+  const app = new BinyTui(ui, workspaceRoot, version, initialSession);
 
   const onSignal = (): void => {
     void app.exit();

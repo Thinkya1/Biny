@@ -1,12 +1,10 @@
 /**
  * Agent 事件总线模块。
  *
- * AgentEventBus 是 runtime 到 UI 的同步事件广播层。它不保存历史，只负责把统一 RuntimeEvent
+ * AgentEventBus 是 runtime 到 UI 的同步事件广播层。它不保存历史，只负责把指定事件类型
  * 分发给订阅者，避免 UI 直接依赖模型 SDK 或 agent loop 内部事件。
  */
-import type { RuntimeEvent, RuntimeEventSink } from "./events.js";
-
-export class AgentEventBus<TEvent = RuntimeEvent> {
+export class AgentEventBus<TEvent> {
   private readonly listeners = new Set<(event: TEvent) => void>();
 
   emit(event: TEvent): void {
@@ -20,11 +18,10 @@ export class AgentEventBus<TEvent = RuntimeEvent> {
     }
   }
 
-  subscribe(listener: TEvent extends RuntimeEvent ? RuntimeEventSink : (event: TEvent) => void): () => void {
-    const eventListener = listener as (event: TEvent) => void;
-    this.listeners.add(eventListener);
+  subscribe(listener: (event: TEvent) => void): () => void {
+    this.listeners.add(listener);
     return () => {
-      this.listeners.delete(eventListener);
+      this.listeners.delete(listener);
     };
   }
 }

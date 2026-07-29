@@ -26,7 +26,7 @@ const { version: cliVersion } = createRequire(import.meta.url)("../../package.js
 
 program.name("biny").description("Biny local desktop assistant").version(cliVersion);
 
-program.command("init").description("Initialize config and .agent directories").action(wrap(() => initCommand(workspaceRoot)));
+program.command("init").description("Initialize config and .biny directories").action(wrap(() => initCommand(workspaceRoot)));
 program.command("doctor").description("Check local environment").action(wrap(() => doctorCommand(workspaceRoot)));
 program
   .command("chat")

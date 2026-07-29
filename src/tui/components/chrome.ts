@@ -8,7 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import { type Component, Loader, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { PermissionMode } from "../../permission/PermissionManager.js";
-import type { RuntimeStatus } from "../../runtime/events.js";
+import type { AgentRunMode } from "../../agent/AgentSession.js";
+import type { TuiStatus } from "../types.js";
 import { theme } from "../theme/index.js";
 
 export interface FooterData {
@@ -19,7 +20,7 @@ export interface FooterData {
   modelLabel: string;
   thinkingLabel?: string;
   permissionMode: PermissionMode;
-  mode: "chat" | "plan";
+  mode: AgentRunMode;
   contextUsedTokens?: number;
   contextMaxTokens?: number;
   contextSource?: "estimated" | "provider";
@@ -161,7 +162,7 @@ function contextColorize(percent: number | undefined, text: string): string {
 /** 运行状态行：忙碌时 spinner，空闲时留一行空白保持布局稳定。 */
 export class StatusIndicatorComponent implements Component {
   private readonly loader: Loader;
-  private status: RuntimeStatus = "idle";
+  private status: TuiStatus = "idle";
   private queuedCount = 0;
   private running = false;
 
@@ -174,7 +175,7 @@ export class StatusIndicatorComponent implements Component {
     );
   }
 
-  setState(status: RuntimeStatus, queuedCount: number): void {
+  setState(status: TuiStatus, queuedCount: number): void {
     this.status = status;
     this.queuedCount = queuedCount;
     const busy = status === "thinking" || status === "running";
@@ -204,20 +205,16 @@ export class StatusIndicatorComponent implements Component {
   }
 }
 
-export function statusMessage(status: RuntimeStatus, queuedCount: number): string {
+export function statusMessage(status: TuiStatus, queuedCount: number): string {
   const queued = queuedCount > 0 ? ` · ${String(queuedCount)} queued` : "";
   if (status === "thinking") return `Thinking…${queued} (esc to interrupt)`;
   if (status === "running") return `Working…${queued} (esc to interrupt)`;
   if (status === "waiting_permission") return `Waiting for approval${queued}`;
-  if (status === "error") return "Last turn failed";
-  if (status === "aborted") return "Interrupted";
-  if (status === "incomplete") return "Turn ended early";
   return queued ? queued.replace(/^ · /, "") : "";
 }
 
-function statusColorize(status: RuntimeStatus, text: string): string {
-  if (status === "error") return theme.fg("error", text);
-  if (status === "aborted" || status === "incomplete" || status === "waiting_permission") {
+function statusColorize(status: TuiStatus, text: string): string {
+  if (status === "waiting_permission") {
     return theme.fg("warning", text);
   }
   return theme.fg("muted", text);
@@ -230,10 +227,10 @@ export interface ShortcutHint {
 
 /** 快捷键提示行：键位 dim，说明 muted，放不下的整条丢弃。 */
 export class ShortcutsBarComponent implements Component {
-  private status: RuntimeStatus = "idle";
-  private mode: "chat" | "plan" = "chat";
+  private status: TuiStatus = "idle";
+  private mode: AgentRunMode = "chat";
 
-  setState(status: RuntimeStatus, mode: "chat" | "plan"): void {
+  setState(status: TuiStatus, mode: AgentRunMode): void {
     this.status = status;
     this.mode = mode;
   }
@@ -250,7 +247,7 @@ export class ShortcutsBarComponent implements Component {
   }
 }
 
-export function shortcutHints(status: RuntimeStatus, mode: "chat" | "plan"): ShortcutHint[] {
+export function shortcutHints(status: TuiStatus, mode: AgentRunMode): ShortcutHint[] {
   const busy = status === "thinking" || status === "running";
   const hints: ShortcutHint[] = [];
   if (status === "waiting_permission") {
@@ -265,7 +262,10 @@ export function shortcutHints(status: RuntimeStatus, mode: "chat" | "plan"): Sho
     hints.push({ key: "enter", description: "send" }, { key: "/", description: "commands" });
   }
   // 越靠前越重要：窄终端从末尾开始丢弃提示。
-  hints.push({ key: "shift+tab", description: mode === "plan" ? "chat mode" : "plan mode" });
+  hints.push({
+    key: "shift+tab",
+    description: mode === "plan" ? "chat mode" : "plan mode"
+  });
   hints.push(
     { key: "↑/↓", description: "history" },
     { key: "ctrl+e", description: "expand" },
