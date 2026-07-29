@@ -25,8 +25,9 @@ import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { redactSecrets, redactSensitiveValue } from "../utils/secrets.js";
 import { assertSessionFileSize } from "./limits.js";
-import { sessionFilePath } from "./store.js";
+import { agentDir, sessionFilePath } from "./store.js";
 import type { SessionContextState, SessionContextUsage, SessionUsage } from "./metadata.js";
+import type { AttachmentReference } from "../attachments/store.js";
 
 export type { SessionContextState, SessionContextUsage, SessionUsage, UsageOperation } from "./metadata.js";
 
@@ -42,7 +43,7 @@ export interface ReasoningBlock {
 
 export type SessionEvent =
   // session 事件类型要保持稳定；resume、未来上下文压缩和记忆功能都会依赖这几个基础类型。
-  | { type: "user_message"; content: string; skills?: string[]; contextUsage?: SessionContextUsage; contextState?: SessionContextState; preparationUsage?: SessionUsage[]; auditOnly?: boolean; time?: string }
+  | { type: "user_message"; content: string; attachments?: AttachmentReference[]; skills?: string[]; contextUsage?: SessionContextUsage; contextState?: SessionContextState; preparationUsage?: SessionUsage[]; auditOnly?: boolean; time?: string }
   | { type: "assistant_message"; content: string; reasoningContent?: string; reasoningProviderOptions?: Record<string, unknown>; reasoningBlocks?: ReasoningBlock[]; usage?: SessionUsage; relatedUsage?: SessionUsage[]; contextState?: SessionContextState; auditOnly?: boolean; time?: string }
   | { type: "tool_call"; tool: string; args: unknown; toolCallId?: string; sequence?: number; assistantContent?: string; reasoningContent?: string; reasoningProviderOptions?: Record<string, unknown>; reasoningBlocks?: ReasoningBlock[]; auditOnly?: boolean; time?: string }
   | { type: "tool_result"; tool: string; result: unknown; toolCallId?: string; sequence?: number; relatedUsage?: SessionUsage[]; auditOnly?: boolean; time?: string }
@@ -239,23 +240,23 @@ function canonicalSessionFilePath(workspaceRoot: string, sessionId: string, requ
   const expectedName = path.basename(sessionFilePath(workspaceRoot, sessionId));
   const workspacePath = path.resolve(workspaceRoot);
   const canonicalWorkspace = realpathSync(workspacePath);
-  const agentPath = path.join(canonicalWorkspace, ".agent");
+  const agentPath = agentDir(canonicalWorkspace);
   const sessionsPath = path.join(agentPath, "sessions");
   const agentStat = lstatSync(agentPath);
   const sessionsStat = lstatSync(sessionsPath);
   if (agentStat.isSymbolicLink() || !agentStat.isDirectory()) {
-    throw new Error("Session storage .agent must be a real directory, not a symbolic link.");
+    throw new Error("Session storage .biny must be a real directory, not a symbolic link.");
   }
   if (sessionsStat.isSymbolicLink() || !sessionsStat.isDirectory()) {
-    throw new Error("Session storage .agent/sessions must be a real directory, not a symbolic link.");
+    throw new Error("Session storage .biny/sessions must be a real directory, not a symbolic link.");
   }
 
   const canonicalSessions = realpathSync(sessionsPath);
-  if (canonicalSessions !== path.join(canonicalWorkspace, ".agent", "sessions")) {
-    throw new Error("Session storage resolves outside the canonical .agent/sessions directory.");
+  if (canonicalSessions !== path.join(canonicalWorkspace, ".biny", "sessions")) {
+    throw new Error("Session storage resolves outside the canonical .biny/sessions directory.");
   }
   if (realpathSync(path.dirname(requestedFilePath)) !== canonicalSessions || path.basename(requestedFilePath) !== expectedName) {
-    throw new Error(`Session file resolves outside the canonical .agent/sessions directory: ${expectedName}`);
+    throw new Error(`Session file resolves outside the canonical .biny/sessions directory: ${expectedName}`);
   }
 
   const canonicalFile = path.join(canonicalSessions, expectedName);

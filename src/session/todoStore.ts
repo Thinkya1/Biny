@@ -5,12 +5,12 @@
  * 压缩会让这种遗忘更早发生 —— 被摘要掉的正是那些"待会儿要做"的细节。
  *
  * 这份清单是模型自己维护的锚：每回合注入 system prompt，所以它永远看得见；落盘到
- * `.agent/todos`，所以恢复会话后还在。它和 `TaskRunCoordinator` 的 `pendingTodo` 不是一
+ * `.biny/todos`，所以恢复会话后还在。它和 `TaskRunCoordinator` 的 `pendingTodo` 不是一
  * 回事 —— 那个是任务级的验收遗留项，由 harness 写；这个是模型在一次会话里自己的工作记忆。
  */
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { ensureAgentDirs } from "./store.js";
+import { agentDir, ensureAgentDirs } from "./store.js";
 
 export type TodoStatus = "pending" | "in_progress" | "completed";
 
@@ -82,7 +82,7 @@ export class TodoStore {
   }
 
   private filePath(): string {
-    return path.join(path.resolve(this.workspaceRoot), ".agent", "todos", `${this.sessionId}.json`);
+    return path.join(agentDir(this.workspaceRoot), "todos", `${this.sessionId}.json`);
   }
 
   private async persist(): Promise<void> {

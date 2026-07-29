@@ -51,7 +51,7 @@ async function testFullForkIsIndependent(root: string, source: string): Promise<
   appended.record({ type: "user_message", content: "only in the fork" });
   await appended.close();
 
-  const original = await readFile(path.join(root, ".agent", "sessions", `${source}.jsonl`), "utf8");
+  const original = await readFile(path.join(root, ".biny", "sessions", `${source}.jsonl`), "utf8");
   assert.equal(original.includes("only in the fork"), false, "writing the fork must not touch the source session");
 }
 

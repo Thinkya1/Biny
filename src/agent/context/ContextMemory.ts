@@ -110,7 +110,7 @@ export class ContextMemory {
    *
    * 这里只做一件安全的事 —— 把较早的 tool result 正文替换成一个占位说明，从最旧的
    * 开始，直到估算落回预算内。消息条数、角色、toolCallId 全部不变，配对关系天然保住；
-   * 原文早就在 session JSONL 和 `.agent/tool-results` 里，占位符只影响下一次推理看到
+   * 原文早就在 session JSONL 和 `.biny/tool-results` 里，占位符只影响下一次推理看到
    * 什么，不影响已记录的事实。
    *
    * 保留 `keepRecentToolResults` 条最近的结果不动：模型当下正要用的就是它们。
@@ -545,7 +545,7 @@ function assembleContext(
   // 记忆条目要带上来源说明，模型才知道这是跨会话的项目记忆而不是当前对话内容。
   addSystem(
     "stable memory",
-    memoryMatches.length ? `Stable project memory (recalled from .agent/memory):\n${formatMemoryMatches(memoryMatches)}` : "",
+    memoryMatches.length ? `Stable project memory (recalled from .biny/memory):\n${formatMemoryMatches(memoryMatches)}` : "",
     false
   );
 

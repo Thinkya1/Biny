@@ -60,7 +60,7 @@ async function main(): Promise<void> {
     assert.equal(reread.hasMore, false);
 
     // 归档引用之外的路径一律拒绝，工具参数不能借它读到任意文件。
-    for (const escape of ["../../etc/passwd", ".agent/sessions/archive-test.jsonl", ".agent/tool-results/../sessions/x.jsonl"]) {
+    for (const escape of ["../../etc/passwd", ".biny/sessions/archive-test.jsonl", ".biny/tool-results/../sessions/x.jsonl"]) {
       const denied = await reader.execute({ archivePath: escape }, toolOptions(`escape-${escape}`)) as Record<string, unknown>;
       assert.equal(typeof denied.error, "string", `${escape} should be refused`);
       assert.equal(denied.content, undefined);

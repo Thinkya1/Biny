@@ -19,6 +19,8 @@ const protectedCredentialFiles = new Set([
 ]);
 
 const protectedCredentialDirectories = new Set([
+  ".biny",
+  ".agent",
   ".ssh",
   ".aws",
   ".azure",
@@ -26,7 +28,7 @@ const protectedCredentialDirectories = new Set([
   ".gnupg"
 ]);
 
-const protectedGitDirectories = [...protectedCredentialDirectories, ".agent"];
+const protectedGitDirectories = [...protectedCredentialDirectories];
 
 /**
  * 判断是否为受保护的凭据路径。除固定文件名外，还覆盖 `.env` 系列、`agent.config.json.*`
@@ -178,5 +180,5 @@ function decodeGitPathToken(token: string | undefined): string | undefined {
 function isProtectedGitPath(value: string): boolean {
   const normalized = value.replaceAll("\\", "/").replace(/^\.\//, "");
   return isProtectedCredentialPath(normalized)
-    || normalized.split("/").some((segment) => segment === ".agent");
+    || normalized.split("/").some((segment) => segment === ".biny" || segment === ".agent");
 }

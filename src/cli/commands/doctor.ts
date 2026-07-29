@@ -1,7 +1,7 @@
 /**
  * 环境诊断命令模块。
  *
- * `doctor` 做轻量本地检查，报告 Node、pnpm、git、配置文件和 `.agent` 目录状态。
+ * `doctor` 做轻量本地检查，报告 Node、pnpm、git、配置文件和 `.biny` 目录状态。
  * 它只读取环境，不创建或修改项目文件。
  */
 import { execFile } from "node:child_process";
@@ -24,7 +24,7 @@ export async function doctorCommand(workspaceRoot: string): Promise<void> {
     [projectSettingsPath(workspaceRoot), (await pathExists(projectSettingsPath(workspaceRoot))) ? "found" : "missing"],
     ["legacy project config", await legacyConfigStatus(workspaceRoot)],
     ["credentials", await credentialStatus()],
-    [".agent", (await pathExists(path.join(workspaceRoot, ".agent"))) ? "found" : "missing"]
+    [".biny", (await pathExists(path.join(workspaceRoot, ".biny"))) ? "found" : "missing"]
   ];
 
   for (const [name, result] of checks) {

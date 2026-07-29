@@ -283,7 +283,7 @@ export function isSensitiveSubagentPath(value: string): boolean {
   if (isProtectedCredentialPath(normalized)) return true;
   return normalized.split("/").some((segment) => {
     const lower = segment.toLowerCase().replace(/^"|"$/g, "");
-    return lower === ".agent" || lower === ".ssh" || lower === ".npmrc" || lower === ".netrc" || lower.startsWith(".env");
+    return lower === ".biny" || lower === ".agent" || lower === ".ssh" || lower === ".npmrc" || lower === ".netrc" || lower.startsWith(".env");
   });
 }
 

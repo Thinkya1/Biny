@@ -1,7 +1,7 @@
 /**
  * 归档工具结果读取模块。
  *
- * 超出回合预算的工具输出会被移出对话，只在上下文里留下 `.agent/tool-results` 引用。该目录被
+ * 超出回合预算的工具输出会被移出对话，只在上下文里留下 `.biny/tool-results` 引用。该目录被
  * workspace ignore 规则挡在 `read_file` 之外，因此按需取回必须走这个受限入口：它只接受归档
  * 引用形态的路径，不接受任意工作区路径。
  */
@@ -44,7 +44,7 @@ export function createReadToolResultTool(context: ToolContext): Tool<ReadToolRes
     parameters: {
       type: "object",
       properties: {
-        archivePath: { type: "string", minLength: 1, description: "The .agent/tool-results reference reported by an archived tool result." },
+        archivePath: { type: "string", minLength: 1, description: "The .biny/tool-results reference reported by an archived tool result." },
         offset: { type: "integer", minimum: 0, description: "Character offset to start from. Defaults to 0." },
         length: { type: "integer", minimum: 1, maximum: maxLength, description: `Characters to return. Defaults to ${String(defaultLength)}.` }
       },

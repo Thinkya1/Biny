@@ -12,7 +12,7 @@ import { closeSync, openSync } from "node:fs";
 import { appendFile, open, realpath, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
-import { ensureAgentDirs } from "../session/store.js";
+import { agentDir, ensureAgentDirs } from "../session/store.js";
 
 const defaultReadinessTimeoutMs = 30_000;
 const defaultReadinessIntervalMs = 250;
@@ -157,7 +157,7 @@ export class ManagedProcessService {
     this.workspaceRoot = path.resolve(options.workspaceRoot);
     const persistenceRoot = path.resolve(options.persistenceRoot ?? options.workspaceRoot);
     this.persistenceRoot = persistenceRoot;
-    this.processRoot = path.join(persistenceRoot, ".agent", "processes");
+    this.processRoot = path.join(agentDir(persistenceRoot), "processes");
     this.lifecycleLogPath = path.join(this.processRoot, "lifecycle.jsonl");
     this.terminationGraceMs = options.terminationGraceMs ?? defaultTerminationGraceMs;
     this.killSettleMs = options.killSettleMs ?? defaultKillSettleMs;

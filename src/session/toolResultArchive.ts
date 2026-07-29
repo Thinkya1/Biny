@@ -1,7 +1,7 @@
 /**
  * 超出回合预算的工具结果归档模块。
  *
- * 归档文件只落在 `.agent/tool-results` 下，文件名完全由运行期标识派生。模型拿到的是
+ * 归档文件只落在 `.biny/tool-results` 下，文件名完全由运行期标识派生。模型拿到的是
  * 归档引用而不是原文，需要完整内容时通过 `read_tool_result` 工具按需取回。
  */
 import { constants as fsConstants } from "node:fs";
@@ -15,7 +15,7 @@ const archiveVersion = 1;
 const previewCharacters = 8_192;
 const maxArchiveFileBytes = 64 * 1024 * 1024;
 const maxRetainedArchives = 512;
-const archiveDirectory = path.posix.join(".agent", "tool-results");
+const archiveDirectory = path.posix.join(".biny", "tool-results");
 const archiveNamePattern = /^tool-result-[0-9a-f]{64}\.json$/;
 
 export interface ArchivedToolResult {

@@ -2,7 +2,7 @@
 import { constants, promises as fs } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
-import { ensureAgentDirs } from "../session/store.js";
+import { agentDir, ensureAgentDirs } from "../session/store.js";
 
 const maxHistoryItems = 100;
 const historyFileName = "input-history.jsonl";
@@ -64,7 +64,7 @@ async function secureHistoryLocation(workspaceRoot: string, requireAgentDirector
   if (workspaceStat.isSymbolicLink() || !workspaceStat.isDirectory()) {
     throw new Error("TUI input history workspace must be a real canonical directory.");
   }
-  const agentPath = path.join(canonicalWorkspace, ".agent");
+  const agentPath = agentDir(canonicalWorkspace);
   let stat;
   try {
     stat = await fs.lstat(agentPath);
@@ -73,7 +73,7 @@ async function secureHistoryLocation(workspaceRoot: string, requireAgentDirector
     throw error;
   }
   if (stat.isSymbolicLink() || !stat.isDirectory() || await fs.realpath(agentPath) !== agentPath) {
-    throw new Error("TUI input history .agent storage must be a real canonical directory.");
+    throw new Error("TUI input history .biny storage must be a real canonical directory.");
   }
   return {
     workspace: { path: canonicalWorkspace, device: workspaceStat.dev, inode: workspaceStat.ino },
@@ -132,7 +132,7 @@ async function assertHistoryStorage(location: HistoryLocation): Promise<void> {
   await assertDirectoryIdentity(location.workspace);
   await assertDirectoryIdentity(location.agent);
   if (await fs.realpath(location.agent.path) !== location.agent.path) {
-    throw new Error("TUI input history .agent storage changed during access.");
+    throw new Error("TUI input history .biny storage changed during access.");
   }
 }
 

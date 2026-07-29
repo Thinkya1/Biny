@@ -52,7 +52,7 @@ async function testClearedTurnIsNotResumable(root: string): Promise<void> {
 
 async function testCorruptStateIsIgnored(root: string): Promise<void> {
   const store = new TurnStore(root, "session-c");
-  const target = path.join(root, ".agent", "turns", "session-c.json");
+  const target = path.join(root, ".biny", "turns", "session-c.json");
   await (await import("node:fs/promises")).writeFile(target, "{ not json");
   assert.equal(await store.load(), undefined);
   // 空 messages 不构成可续跑的状态。

@@ -31,7 +31,7 @@ export function createMemoryTools(getMemory: () => LocalMemory | undefined): Too
 function createSaveMemoryTool(getMemory: () => LocalMemory | undefined): Tool {
   return {
     name: "save_memory",
-    description: "Save one durable, auditable project memory entry (decision, convention, gotcha, workflow) to the local memory store under .agent/memory. Use it when the user asks you to remember something or when you learn a non-obvious project fact worth keeping across sessions. Never store secrets or large source excerpts.",
+    description: "Save one durable, auditable project memory entry (decision, convention, gotcha, workflow) to the local memory store under .biny/memory. Use it when the user asks you to remember something or when you learn a non-obvious project fact worth keeping across sessions. Never store secrets or large source excerpts.",
     parameters: {
       type: "object",
       properties: {
@@ -60,7 +60,7 @@ function createSaveMemoryTool(getMemory: () => LocalMemory | undefined): Tool {
         // 写入涉及话题文件与索引两个文件，保守地与其他写操作串行。
         accesses: ToolAccesses.all(),
         display: { kind: "generic" as const, summary: `Remember: ${entry.title}`, detail: { topic: entry.topic } },
-        description: `Save a durable memory entry to .agent/memory/${entry.topic}.md`,
+        description: `Save a durable memory entry to .biny/memory/${entry.topic}.md`,
         approvalRule: "save_memory",
         async execute(): Promise<unknown> {
           const memory = getMemory();
@@ -78,7 +78,7 @@ function createSaveMemoryTool(getMemory: () => LocalMemory | undefined): Tool {
 function createRecallMemoryTool(getMemory: () => LocalMemory | undefined): Tool {
   return {
     name: "recall_memory",
-    description: "Search the durable local project memory store (.agent/memory) for notes relevant to a query, or read one full topic. Use it when past decisions, debugging notes, or workflows may already cover the current task.",
+    description: "Search the durable local project memory store (.biny/memory) for notes relevant to a query, or read one full topic. Use it when past decisions, debugging notes, or workflows may already cover the current task.",
     parameters: {
       type: "object",
       properties: {

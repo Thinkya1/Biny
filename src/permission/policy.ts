@@ -177,7 +177,7 @@ export function analyzePermissionRequest(input: AnalyzePermissionInput): Permiss
   }
 
   if (input.toolName === "recall_memory") {
-    // 记忆检索只读取 .agent/memory 内经过校验的本地文件。
+    // 记忆检索只读取 .biny/memory 内经过校验的本地文件。
     return {
       ...base(input),
       actionType: "read",
@@ -187,7 +187,7 @@ export function analyzePermissionRequest(input: AnalyzePermissionInput): Permiss
   }
 
   if (input.toolName === "save_memory") {
-    // 只写入 .agent/memory 存储（自动记忆抽取本就在无确认路径上写同一存储）。
+    // 只写入 .biny/memory 存储（自动记忆抽取本就在无确认路径上写同一存储）。
     return {
       ...base(input),
       actionType: "write",

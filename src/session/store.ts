@@ -1,7 +1,7 @@
 /**
  * Session 存储定位模块。
  *
- * `.agent/sessions`、`.agent/logs`、`.agent/runs`、`.agent/tasks`、`.agent/processes` 和 `.agent/tool-results`、`.agent/todos` 的目录创建、session 文件名生成、latest 解析以及 session id
+ * `.biny/sessions`、`.biny/logs`、`.biny/runs`、`.biny/tasks`、`.biny/processes` 和 `.biny/tool-results`、`.biny/todos` 的目录创建、session 文件名生成、latest 解析以及 session id
  * 前缀匹配都在这里处理。命令层只需要给出 workspace 和可选 session 参数，不必关心文件布局。
  */
 import { randomBytes } from "node:crypto";
@@ -11,6 +11,9 @@ import path from "node:path";
 import { readSessionTail } from "./limits.js";
 
 const sessionMetadataConcurrency = 8;
+const managedStateDirectories = ["sessions", "attachments", "logs", "runs", "tasks", "processes", "tool-results", "todos", "turns", "evals"] as const;
+const legacyStateDirectories = new Set([...managedStateDirectories, "memory"]);
+const legacyStateFiles = new Set(["input-history.jsonl", "telemetry.jsonl", "checkpoints.json"]);
 
 interface PathIdentity {
   path: string;
@@ -39,8 +42,8 @@ export interface SessionDeleteHooks {
 }
 
 export function agentDir(workspaceRoot: string): string {
-  // 所有 agent 运行产物集中放在工作区 .agent 下，方便清理和忽略。
-  return path.join(workspaceRoot, ".agent");
+  // `.biny` 同时承载项目配置和运行状态；所有新运行记录都只写这里。
+  return path.join(workspaceRoot, ".biny");
 }
 
 export async function ensureAgentDirs(workspaceRoot: string): Promise<void> {
@@ -48,20 +51,74 @@ export async function ensureAgentDirs(workspaceRoot: string): Promise<void> {
   // the persistence root even when the final file itself uses O_NOFOLLOW.
   const workspacePath = path.resolve(workspaceRoot);
   const canonicalWorkspace = await fs.realpath(workspacePath);
-  const agentPath = path.join(canonicalWorkspace, ".agent");
-  await ensureRealDirectory(agentPath, ".agent");
+  const agentPath = path.join(canonicalWorkspace, ".biny");
+  await ensureRealDirectory(agentPath, ".biny");
   const canonicalAgent = await fs.realpath(agentPath);
-  if (canonicalAgent !== path.join(canonicalWorkspace, ".agent")) {
-    throw new Error("Session storage .agent resolves outside the canonical persistence root.");
+  if (canonicalAgent !== path.join(canonicalWorkspace, ".biny")) {
+    throw new Error("Session storage .biny resolves outside the canonical persistence root.");
   }
-
-  for (const name of ["sessions", "logs", "runs", "tasks", "processes", "tool-results", "todos", "turns", "evals"] as const) {
+  for (const name of managedStateDirectories) {
     const directory = path.join(agentPath, name);
-    await ensureRealDirectory(directory, `.agent/${name}`);
+    await ensureRealDirectory(directory, `.biny/${name}`);
     if (await fs.realpath(directory) !== path.join(canonicalAgent, name)) {
-      throw new Error(`Session storage .agent/${name} resolves outside the canonical .agent directory.`);
+      throw new Error(`Session storage .biny/${name} resolves outside the canonical .biny directory.`);
     }
   }
+  await migrateLegacyAgentState(canonicalWorkspace, canonicalAgent);
+}
+
+/**
+ * 旧版把运行状态放在 `.agent`。首次打开时只复制普通文件和真实目录，绝不覆盖 `.biny`
+ * 中已有的新数据，也不跟随旧目录里的软链接，避免迁移把写入边界带到工作区之外。
+ */
+async function migrateLegacyAgentState(workspaceRoot: string, targetRoot: string): Promise<void> {
+  const legacyRoot = path.join(workspaceRoot, ".agent");
+  let legacy: import("node:fs").Stats;
+  try {
+    legacy = await fs.lstat(legacyRoot);
+  } catch (error) {
+    if (isNotFound(error)) return;
+    throw error;
+  }
+  if (!legacy.isDirectory() || legacy.isSymbolicLink()) return;
+  await copyMissingLegacyEntries(legacyRoot, targetRoot);
+}
+
+async function copyMissingLegacyEntries(source: string, target: string, root = true): Promise<void> {
+  const entries = await fs.readdir(source, { withFileTypes: true });
+  for (const entry of entries) {
+    // 只迁移 Biny 自己生成的状态。技能、具名 agent 等旧扩展目录仍由兼容路径只读加载，
+    // 不能因为一次运行状态迁移顺手复制用户任意目录。
+    if (root && !legacyStateDirectories.has(entry.name) && !legacyStateFiles.has(entry.name)) continue;
+    const sourcePath = path.join(source, entry.name);
+    const targetPath = path.join(target, entry.name);
+    const sourceStat = await fs.lstat(sourcePath);
+    if (sourceStat.isSymbolicLink()) continue;
+    if (sourceStat.isDirectory()) {
+      if (!await ensureMissingMigrationDirectory(targetPath)) continue;
+      await copyMissingLegacyEntries(sourcePath, targetPath, false);
+      continue;
+    }
+    if (!sourceStat.isFile()) continue;
+    try {
+      await fs.copyFile(sourcePath, targetPath, constants.COPYFILE_EXCL);
+    } catch (error) {
+      if (!isAlreadyExists(error)) throw error;
+    }
+  }
+}
+
+/** 迁移只会进入自己创建的目录或已有真实目录；未知软链接一律跳过，不把旧状态写到工作区外。 */
+async function ensureMissingMigrationDirectory(directory: string): Promise<boolean> {
+  try {
+    const existing = await fs.lstat(directory);
+    return existing.isDirectory() && !existing.isSymbolicLink();
+  } catch (error) {
+    if (!isNotFound(error)) throw error;
+  }
+  await fs.mkdir(directory, { mode: 0o700 });
+  const created = await fs.lstat(directory);
+  return created.isDirectory() && !created.isSymbolicLink();
 }
 
 export function sessionFilePath(workspaceRoot: string, sessionId: string): string {
@@ -199,7 +256,7 @@ async function resolveSessionFileAt(location: SessionStorageLocation, session: s
   if (explicitFileName) {
     const filePath = await existingSessionFile(location, explicitFileName);
     if (filePath) return filePath;
-    throw new Error(`Session file not found: .agent/sessions/${explicitFileName}`);
+    throw new Error(`Session file not found: .biny/sessions/${explicitFileName}`);
   }
 
   if (session.includes("\0") || session.includes("/") || session.includes("\\") || session === "." || session === "..") {
@@ -230,7 +287,7 @@ async function resolveSessionFileAt(location: SessionStorageLocation, session: s
 async function latestSessionFile(location: SessionStorageLocation): Promise<string> {
   // latest 基于修改时间而不是文件名，能覆盖恢复后继续追加的旧 session。
   const sessions = await listSessionFilesInDirectory(location);
-  if (!sessions.length) throw new Error("No sessions found in .agent/sessions.");
+  if (!sessions.length) throw new Error("No sessions found in .biny/sessions.");
   const stats: Array<{ fileName: string; filePath: string; mtimeMs: number } | undefined> = new Array(sessions.length);
   let nextIndex = 0;
   const workers = Array.from({ length: Math.min(sessionMetadataConcurrency, sessions.length) }, async () => {
@@ -256,7 +313,7 @@ async function latestSessionFile(location: SessionStorageLocation): Promise<stri
   const nonEmpty = stats.filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
   nonEmpty.sort((a, b) => a.mtimeMs - b.mtimeMs || a.fileName.localeCompare(b.fileName));
   const latest = nonEmpty.at(-1);
-  if (!latest) throw new Error("No sessions found in .agent/sessions.");
+  if (!latest) throw new Error("No sessions found in .biny/sessions.");
   return latest.filePath;
 }
 
@@ -268,7 +325,7 @@ function isLatestAlias(session: string): boolean {
 async function resolveSessionStorage(workspaceRoot: string): Promise<SessionStorageLocation> {
   const workspacePath = path.resolve(workspaceRoot);
   const canonicalWorkspace = await fs.realpath(workspacePath);
-  const agentPath = path.join(canonicalWorkspace, ".agent");
+  const agentPath = path.join(canonicalWorkspace, ".biny");
   const sessionsPath = path.join(agentPath, "sessions");
   const [workspaceStat, agentStat, sessionsStat] = await Promise.all([
     fs.lstat(canonicalWorkspace),
@@ -279,16 +336,16 @@ async function resolveSessionStorage(workspaceRoot: string): Promise<SessionStor
     throw new Error("Session persistence root must be a real directory.");
   }
   if (agentStat.isSymbolicLink() || !agentStat.isDirectory()) {
-    throw new Error("Session storage .agent must be a real directory, not a symbolic link.");
+    throw new Error("Session storage .biny must be a real directory, not a symbolic link.");
   }
   if (sessionsStat.isSymbolicLink() || !sessionsStat.isDirectory()) {
-    throw new Error("Session storage .agent/sessions must be a real directory, not a symbolic link.");
+    throw new Error("Session storage .biny/sessions must be a real directory, not a symbolic link.");
   }
 
   const canonicalSessions = await fs.realpath(sessionsPath);
-  const expectedSessions = path.join(canonicalWorkspace, ".agent", "sessions");
+  const expectedSessions = path.join(canonicalWorkspace, ".biny", "sessions");
   if (canonicalSessions !== expectedSessions) {
-    throw new Error("Session storage resolves outside the canonical .agent/sessions directory.");
+    throw new Error("Session storage resolves outside the canonical .biny/sessions directory.");
   }
   return {
     workspace: { path: canonicalWorkspace, device: workspaceStat.dev, inode: workspaceStat.ino },
@@ -345,7 +402,7 @@ async function existingSessionFile(location: SessionStorageLocation, fileName: s
 
   const canonicalFile = await fs.realpath(filePath);
   if (path.dirname(canonicalFile) !== location.sessions.path || path.basename(canonicalFile) !== fileName) {
-    throw new Error(`Session resolves outside the canonical .agent/sessions directory: ${fileName}`);
+    throw new Error(`Session resolves outside the canonical .biny/sessions directory: ${fileName}`);
   }
   await assertSessionStorage(location);
   return canonicalFile;
@@ -404,8 +461,8 @@ async function assertSessionBinding(location: SessionStorageLocation, fileName: 
 
 async function assertSessionStorage(location: SessionStorageLocation): Promise<void> {
   await assertPathIdentity(location.workspace, "Session persistence root changed during access.");
-  await assertPathIdentity(location.agent, "Session storage .agent changed during access.");
-  await assertPathIdentity(location.sessions, "Session storage .agent/sessions changed during access.");
+  await assertPathIdentity(location.agent, "Session storage .biny changed during access.");
+  await assertPathIdentity(location.sessions, "Session storage .biny/sessions changed during access.");
   if (await fs.realpath(location.agent.path) !== location.agent.path || await fs.realpath(location.sessions.path) !== location.sessions.path) {
     throw new Error("Session storage changed during access.");
   }
@@ -511,6 +568,14 @@ function isSymbolicLinkError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error.code === "ELOOP" || error.code === "EMLINK");
 }
 
+function isNotFound(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+}
+
 function explicitSessionFileName(session: string): string | undefined {
   if (path.isAbsolute(session) || session.includes("\0")) {
     throw new Error(`Invalid session reference: ${session}`);
@@ -525,7 +590,7 @@ function explicitSessionFileName(session: string): string | undefined {
   }
 
   const normalized = path.normalize(session);
-  const expectedDirectory = path.join(".agent", "sessions");
+  const expectedDirectory = path.join(".biny", "sessions");
   if (path.dirname(normalized) !== expectedDirectory || !isSessionFileName(path.basename(normalized))) {
     throw new Error(`Invalid session reference: ${session}`);
   }

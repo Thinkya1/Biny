@@ -1,5 +1,5 @@
 /**
- * 任务运行记录的持久化存储（`.agent/tasks/task-run-*.json`）。
+ * 任务运行记录的持久化存储（`.biny/tasks/task-run-*.json`）。
  *
  * 存在的意义是「任务状态不能只活在内存和对话里」：对话被压缩、进程被重启之后，任务进度、
  * 每次尝试和证据都要还能读回来，因此每次状态变更都立即整份落盘。
@@ -14,7 +14,7 @@ import { constants, promises as fs, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { SessionUsage } from "../session/metadata.js";
-import { ensureAgentDirs } from "../session/store.js";
+import { agentDir, ensureAgentDirs } from "../session/store.js";
 import { redactSecrets, redactSensitiveValue } from "../utils/secrets.js";
 import type { TaskAttemptBudget } from "./TaskAttemptLoop.js";
 import {
@@ -120,17 +120,17 @@ export class TaskRunStore {
 
   /**
    * 打开存储目录，并记下它的 device/inode 作为身份标识：后续每次写入都要核对，
-   * 防止运行期间 `.agent/tasks` 被替换成软链接或另一个目录而把记录写到工作区之外。
+   * 防止运行期间 `.biny/tasks` 被替换成软链接或另一个目录而把记录写到工作区之外。
    */
   static async open(persistenceRoot: string): Promise<TaskRunStore> {
     await ensureAgentDirs(persistenceRoot);
     const canonicalRoot = await fs.realpath(path.resolve(persistenceRoot));
-    const directoryPath = path.join(canonicalRoot, ".agent", "tasks");
+    const directoryPath = path.join(agentDir(canonicalRoot), "tasks");
     const canonicalTasks = await fs.realpath(directoryPath);
     if (canonicalTasks !== directoryPath) throw new Error("Task storage resolves outside the canonical persistence root.");
     const stat = await fs.lstat(canonicalTasks);
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
-      throw new Error("Task storage .agent/tasks must be a real directory, not a symbolic link.");
+      throw new Error("Task storage .biny/tasks must be a real directory, not a symbolic link.");
     }
     const store = new TaskRunStore(canonicalRoot, canonicalTasks, { device: stat.dev, inode: stat.ino });
     return store;

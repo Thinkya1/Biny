@@ -13,7 +13,7 @@ import { compileTaskContract } from "./TaskContractCompiler.js";
 import type { AcceptanceCriterion, TaskContract } from "./types.js";
 import { workspaceStateDigest } from "./WorkspaceState.js";
 
-const ignoredDirectoryNames = new Set([".agent", ".git", "node_modules", "dist", "build", "out", "target", "coverage"]);
+const ignoredDirectoryNames = new Set([".biny", ".agent", ".git", "node_modules", "dist", "build", "out", "target", "coverage"]);
 const launchIntentPattern = /(?:启动|运行起来|跑起来|启动服务|start\s+(?:the\s+)?(?:project|app|server|service)|run\s+(?:the\s+)?(?:project|app|server|service)|serve\s+(?:the\s+)?(?:project|app))/iu;
 const codeChangeIntentPattern = /(?:修改|改动|更改|实现|修复|增加|添加|删除|重构|编写|更新|替换|迁移|优化|开发|补全|完善|复制|移动|重命名|排序|去重|转换|解析|生成|清理|规范化|合并|导出|导入|提取|保留|实现一下|implement|fix|add|remove|refactor|update|change|create|write|modify|improve|complete|copy|move|rename|sort|deduplicate|convert|parse|generate|clean|normalize|merge|export|import|extract)/iu;
 const negatedCodeChangeIntentPattern = /(?:(?:不(?:要|必)?|无需|不需要|禁止|切勿)\s*(?:去\s*)?|(?:do\s+not|don't|without|no)\s+)(?:修改|改动|更改|实现|修复|增加|添加|删除|重构|编写|更新|替换|迁移|优化|开发|补全|完善|复制|移动|重命名|排序|去重|转换|解析|生成|清理|规范化|合并|导出|导入|提取|保留|implement|fix|add|remove|refactor|update|change|create|write|modify|improve|complete|copy|move|rename|sort|deduplicate|convert|parse|generate|clean|normalize|merge|export|import|extract)/igu;

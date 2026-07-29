@@ -43,8 +43,8 @@ async function main(): Promise<void> {
 async function testProcessStorageRejectsSymlink(): Promise<void> {
   const root = await mkdtemp(path.join(os.tmpdir(), "biny-managed-process-storage-"));
   const outside = await mkdtemp(path.join(os.tmpdir(), "biny-managed-process-storage-outside-"));
-  await mkdir(path.join(root, ".agent"));
-  await symlink(outside, path.join(root, ".agent", "processes"), "dir");
+  await mkdir(path.join(root, ".biny"));
+  await symlink(outside, path.join(root, ".biny", "processes"), "dir");
   const service = new ManagedProcessService({ workspaceRoot: root, persistenceRoot: root });
   try {
     await assert.rejects(service.initialize(), /real directory, not a symbolic link/i);
@@ -160,7 +160,7 @@ async function testManagedHttpProcessOutlivesFiniteCommandTimeout(workspaceRoot:
     assert.equal(stopped.cleanup.status, "stopped");
     assert.equal(await waitFor(() => !isManagedProcessAlive(started.pid), 1_000), true);
 
-    const lifecycle = await readFile(path.join(workspaceRoot, ".agent", "processes", "lifecycle.jsonl"), "utf8");
+    const lifecycle = await readFile(path.join(workspaceRoot, ".biny", "processes", "lifecycle.jsonl"), "utf8");
     assert.match(lifecycle, /"event":"started"/);
     assert.match(lifecycle, /"event":"stopped"/);
   } finally {

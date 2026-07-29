@@ -24,10 +24,17 @@ const reasoningBlockSchema = z.object({
   providerOptions: z.record(z.unknown()).optional()
 });
 const sessionContextSchema = z.record(z.unknown());
+const attachmentReferenceSchema = z.object({
+  name: z.string(),
+  mimeType: z.string(),
+  path: z.string(),
+  size: z.number().int().nonnegative().optional()
+});
 const sessionEventSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("user_message"),
     content: z.string(),
+    attachments: z.array(attachmentReferenceSchema).optional(),
     skills: z.array(z.string()).optional(),
     contextUsage: sessionContextSchema.optional(),
     contextState: sessionContextSchema.optional(),

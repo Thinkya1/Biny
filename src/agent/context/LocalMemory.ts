@@ -597,19 +597,19 @@ async function resolveMemoryDirectory(workspaceRoot: string, create: boolean): P
   const workspacePath = path.resolve(workspaceRoot);
   const canonicalWorkspace = await fs.realpath(workspacePath);
   const agentPath = path.join(canonicalWorkspace, path.basename(agentDir(workspaceRoot)));
-  const agent = await ensureRealDirectory(agentPath, create, ".agent");
+  const agent = await ensureRealDirectory(agentPath, create, ".biny");
   if (!agent) return undefined;
   const canonicalAgent = await fs.realpath(agentPath);
-  if (canonicalAgent !== path.join(canonicalWorkspace, ".agent")) {
-    throw new Error("Local memory storage .agent resolves outside the canonical workspace.");
+  if (canonicalAgent !== path.join(canonicalWorkspace, ".biny")) {
+    throw new Error("Local memory storage .biny resolves outside the canonical workspace.");
   }
 
   const memoryPath = path.join(agentPath, "memory");
-  const memory = await ensureRealDirectory(memoryPath, create, ".agent/memory");
+  const memory = await ensureRealDirectory(memoryPath, create, ".biny/memory");
   if (!memory) return undefined;
   const canonicalMemory = await fs.realpath(memoryPath);
   if (canonicalMemory !== path.join(canonicalAgent, "memory")) {
-    throw new Error("Local memory storage .agent/memory resolves outside the canonical .agent directory.");
+    throw new Error("Local memory storage .biny/memory resolves outside the canonical .biny directory.");
   }
   return { workspaceRoot: canonicalWorkspace, path: canonicalMemory, device: memory.dev, inode: memory.ino };
 }

@@ -6,7 +6,7 @@
  * - **建快照不碰用户的 git 状态**。用独立的临时索引文件加 `commit-tree`，快照挂在
  *   `refs/biny/checkpoints/*` 上。用户的暂存区、HEAD、分支历史、reflog 全都不受影响，
  *   `git log` 里也看不见这些提交。
- * - **恢复不删文件**。快照之后新建的文件会被移到 `.agent/undo-trash/<时间戳>/` 而不是
+ * - **恢复不删文件**。快照之后新建的文件会被移到 `.biny/undo-trash/<时间戳>/` 而不是
  *   删除。恢复本身也是可逆的 —— 一个"撤销"功能如果会让人丢东西，就没人敢用。
  *
  * 快照只覆盖 git 认得的范围（遵守 .gitignore）。`node_modules`、构建产物和被忽略的本地
@@ -17,7 +17,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { ensureAgentDirs } from "./store.js";
+import { agentDir, ensureAgentDirs } from "./store.js";
 
 const run = promisify(execFile);
 const checkpointRefPrefix = "refs/biny/checkpoints";
@@ -25,7 +25,7 @@ const checkpointRefPrefix = "refs/biny/checkpoints";
  * agent 自己的状态目录必须整个排除在快照之外。它进了快照，恢复就会覆盖会话日志、计划清单，
  * 乃至记录着"要恢复到哪个快照"的索引文件本身 —— 撤销会把自己的依据一起抹掉。
  */
-const excludeAgentState = ":(exclude).agent";
+const excludeAgentState = [":(exclude).biny", ":(exclude).agent"];
 const maxCheckpoints = 50;
 
 export interface Checkpoint {
@@ -63,7 +63,7 @@ export class CheckpointStore {
       // 独立索引文件：用户暂存了什么、没暂存什么，全程不受影响。
       const env = { ...process.env, GIT_INDEX_FILE: temporaryIndex };
       await this.git(["read-tree", "--empty"], env);
-      await this.git(["add", "-A", "--", ".", excludeAgentState], env);
+      await this.git(["add", "-A", "--", ".", ...excludeAgentState], env);
       const tree = (await this.git(["write-tree"], env)).trim();
       const commit = (await this.git([
         "commit-tree", tree,
@@ -106,7 +106,7 @@ export class CheckpointStore {
     // 先把新增文件挪走，再落回快照内容。顺序反过来的话，新增文件会被后面的写入覆盖判断漏掉。
     let trashDirectory: string | undefined;
     if (addedSinceCheckpoint.length) {
-      trashDirectory = path.join(".agent", "undo-trash", new Date().toISOString().replace(/[:.]/g, "-"));
+      trashDirectory = path.join(".biny", "undo-trash", new Date().toISOString().replace(/[:.]/g, "-"));
       await ensureAgentDirs(this.workspaceRoot);
       for (const file of addedSinceCheckpoint) {
         const destination = path.join(this.workspaceRoot, trashDirectory, file);
@@ -141,12 +141,12 @@ export class CheckpointStore {
 
   private async trackedFilesNow(): Promise<Set<string>> {
     // -c 已跟踪 + -o 未跟踪，--exclude-standard 让 .gitignore 生效，和建快照时的范围一致。
-    const { stdout } = await run("git", ["ls-files", "-co", "--exclude-standard", "--", ".", excludeAgentState], { cwd: this.workspaceRoot, maxBuffer: 64 * 1024 * 1024 });
+    const { stdout } = await run("git", ["ls-files", "-co", "--exclude-standard", "--", ".", ...excludeAgentState], { cwd: this.workspaceRoot, maxBuffer: 64 * 1024 * 1024 });
     return new Set(stdout.split("\n").map((line) => line.trim()).filter(Boolean));
   }
 
   private indexPath(): string {
-    return path.join(this.workspaceRoot, ".agent", "checkpoints.json");
+    return path.join(agentDir(this.workspaceRoot), "checkpoints.json");
   }
 
   private async appendIndexEntry(checkpoint: Checkpoint): Promise<void> {

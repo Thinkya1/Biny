@@ -1,5 +1,5 @@
 /**
- * 本地 telemetry 落盘（`.agent/telemetry.jsonl`）。
+ * 本地 telemetry 落盘（`.biny/telemetry.jsonl`）。
  *
  * 只写本地文件，不上报任何外部服务。输入/输出是否记录由配置决定，且写入前一律脱敏。
  *

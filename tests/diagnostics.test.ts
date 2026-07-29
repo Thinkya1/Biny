@@ -20,7 +20,7 @@ async function main(): Promise<void> {
 }
 
 function config(overrides: Partial<DiagnosticsConfig> = {}): DiagnosticsConfig {
-  return { ...structuredClone(defaultConfig.diagnostics), autoDetect: false, ...overrides };
+  return { ...structuredClone(defaultConfig.diagnostics), enabled: true, autoDetect: false, ...overrides };
 }
 
 async function testMatchesByExtension(workspaceRoot: string): Promise<void> {

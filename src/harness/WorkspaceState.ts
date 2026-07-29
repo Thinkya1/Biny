@@ -10,7 +10,7 @@ import path from "node:path";
 import { isIgnoredPath } from "../workspace/ignore.js";
 
 // 运行时目录和构建产物会频繁变化，纳入指纹会让「有没有改动」永远为真。
-const ignoredDirectoryNames = new Set([".agent", ".git", "node_modules", "dist", "build", "out", "target", "coverage"]);
+const ignoredDirectoryNames = new Set([".biny", ".agent", ".git", "node_modules", "dist", "build", "out", "target", "coverage"]);
 const maxEntries = 20_000;
 const maxContentBytes = 64 * 1024 * 1024;
 

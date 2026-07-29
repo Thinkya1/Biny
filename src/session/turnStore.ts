@@ -14,7 +14,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { ModelMessage } from "ai";
-import { ensureAgentDirs } from "./store.js";
+import { agentDir, ensureAgentDirs } from "./store.js";
 
 const turnStateVersion = 1;
 
@@ -60,7 +60,7 @@ export class TurnStore {
   }
 
   private filePath(): string {
-    return path.join(path.resolve(this.persistenceRoot), ".agent", "turns", `${this.sessionId}.json`);
+    return path.join(agentDir(this.persistenceRoot), "turns", `${this.sessionId}.json`);
   }
 }
 

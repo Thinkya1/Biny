@@ -2,7 +2,7 @@
  * Biny 配置与全局 agent 数据的路径解析。
  *
  * 模型配置必须脱离工作区共享，BINY_AGENT_DIR 只改变这一个全局根目录；项目会话等运行产物
- * 仍由 session/store.ts 按工作区定位到 `.agent`。
+ * 仍由 session/store.ts 按工作区定位到 `.biny`。
  */
 import os from "node:os";
 import path from "node:path";
