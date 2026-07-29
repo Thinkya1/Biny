@@ -6,6 +6,7 @@ dist/
 /release/
 docs/
 .agent/
+.biny/
 .agents/
 .env
 PROJECT_DESCRIPTION.local.md
