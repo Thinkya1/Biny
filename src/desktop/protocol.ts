@@ -7,12 +7,13 @@
  *
  * 通道名统一用 `desktop:<领域>:<动作>` 的形式，便于排查。
  */
-import type { AgentRunMode } from "../agent/AgentSession.js";
+import type { InteractiveAgentRunMode } from "../agent/AgentSession.js";
 import type { ModelCatalogEntry } from "../ai/types.js";
 import type { ModelApiBackend, ModelCompatibility, ModelProvider, ThinkingLevelMap, WebSearchConfig } from "../config/schema.js";
 import type { ModelChoice, ModelRuntimeInfo, ThinkingSelection } from "../llm/ModelManager.js";
 import type { PermissionMode, PermissionResult } from "../permission/PermissionManager.js";
-import type { AgentHostEvent, InteractiveRuntimeSnapshot } from "../runtime/agentEvents.js";
+import type { AgentHostEvent, AgentRuntimeUpdate, InteractiveRuntimeSnapshot } from "../runtime/agentEvents.js";
+import { slashCommandsForSurface, type SlashCommandDefinition } from "../runtime/commandRegistry.js";
 import type { SessionEvent } from "../session/recorder.js";
 
 export const desktopIpc = {
@@ -155,21 +156,16 @@ export interface DesktopBootstrap {
   fontPreference: DesktopFontPreference;
 }
 
-/**
- * 发送提示后的回执。`queued` 为真表示这一轮被排进了运行队列（当前还有任务在跑），
- * 界面据此显示排队状态而不是立即进入运行中。
- */
+/** 发送提示后的回执；Desktop 忙碌时会拒绝提交，不维护隐式 follow-up 队列。 */
 export interface DesktopRunReceipt {
   sessionId: string;
   runId: string;
   messageId: string;
-  queued: boolean;
 }
 
 /** 事件推送信封。带上 projectId 是因为所有项目共用同一条事件通道，渲染层要自己过滤。 */
-export interface DesktopAgentEventEnvelope {
+export interface DesktopAgentEventEnvelope extends AgentRuntimeUpdate {
   projectId: string;
-  event: AgentHostEvent;
 }
 
 export interface DesktopAttachment {
@@ -348,25 +344,10 @@ export interface DesktopMemoryCompactionResult {
   error?: string;
 }
 
-export interface DesktopSlashCommand {
-  name: string;
-  description: string;
-  /** 需要参数的命令：从菜单选中时补进输入框让用户接着写，而不是直接执行。 */
-  requiresArgs?: boolean;
-}
+export type DesktopSlashCommand = SlashCommandDefinition;
 
 /** 桌面端输入框支持的斜杠命令；执行走 runSlashCommand IPC。 */
-export const DESKTOP_SLASH_COMMANDS: DesktopSlashCommand[] = [
-  { name: "/status", description: "查看模型、权限与扩展状态" },
-  { name: "/context", description: "查看已加载上下文与预算" },
-  { name: "/usage", description: "查看 token 用量与成本" },
-  { name: "/mcp", description: "查看 MCP；可输入 reconnect <server> 重连" },
-  { name: "/skills", description: "查看可用技能" },
-  { name: "/plugins", description: "查看已加载插件" },
-  { name: "/memory", description: "查看持久记忆；可加 show/add/forget/search/compact 参数" },
-  { name: "/subagent", description: "派发子代理任务；可加 start / status / cancel <task-id> / agents", requiresArgs: true },
-  { name: "/review", description: "用只读子代理评审当前改动" }
-];
+export const DESKTOP_SLASH_COMMANDS: DesktopSlashCommand[] = slashCommandsForSurface("desktop");
 
 export interface DesktopSlashResult {
   command: string;
@@ -412,8 +393,8 @@ export interface DesktopApi {
   duplicateSession(projectId: string, sessionId: string): Promise<DesktopWorkspaceSnapshot>;
   deleteSession(projectId: string, sessionId: string): Promise<DesktopWorkspaceSnapshot>;
   showSessionMenu(projectId: string, sessionId: string, pinned: boolean): Promise<DesktopSessionMenuAction | undefined>;
-  sendPrompt(projectId: string, sessionId: string | undefined, input: string, mode: AgentRunMode, attachments: DesktopAttachment[]): Promise<DesktopRunReceipt>;
-  editPrompt(projectId: string, sessionId: string, userMessageIndex: number, input: string, mode: AgentRunMode, attachments: DesktopAttachment[]): Promise<DesktopRunReceipt>;
+  sendPrompt(projectId: string, sessionId: string | undefined, input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[]): Promise<DesktopRunReceipt>;
+  editPrompt(projectId: string, sessionId: string, userMessageIndex: number, input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[]): Promise<DesktopRunReceipt>;
   cancelRun(projectId: string): Promise<void>;
   runSlashCommand(projectId: string, sessionId: string | undefined, command: string): Promise<DesktopSlashResult>;
   resolvePermission(projectId: string, requestId: string, result: PermissionResult): Promise<void>;

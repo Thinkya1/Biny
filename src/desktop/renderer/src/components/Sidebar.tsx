@@ -34,7 +34,6 @@ interface SidebarProps {
   onRemoveProject(projectId: string): void;
   onSearch(): void;
   onSettings(): void;
-  onUnavailable(feature: string): void;
 }
 
 type ProjectDragPlacement = "before" | "after";
@@ -74,8 +73,7 @@ export const Sidebar = memo(function Sidebar({
   onNewTask,
   onRemoveProject,
   onSearch,
-  onSettings,
-  onUnavailable
+  onSettings
 }: SidebarProps): React.JSX.Element {
   const [expandedSections, setExpandedSections] = useState<Record<SidebarSectionName, boolean>>({ pinned: true, projects: true });
   const [projectMenuOpen, setProjectMenuOpen] = useState<string>();
@@ -263,7 +261,6 @@ export const Sidebar = memo(function Sidebar({
                     onOpenTerminal={() => { setProjectMenuOpen(undefined); onOpenTerminalProject(project.id); }}
                     onRename={() => { setProjectMenuOpen(undefined); onRenameProject(project.id); }}
                     onNewTask={() => { setProjectMenuOpen(undefined); onNewTask(project.id); }}
-                    onArchive={() => { setProjectMenuOpen(undefined); onUnavailable("归档任务"); }}
                     onRemove={() => { setProjectMenuOpen(undefined); onRemoveProject(project.id); }}
                     onSelect={selectOrToggleProject}
                     project={project}
@@ -325,7 +322,6 @@ export const Sidebar = memo(function Sidebar({
                     onOpenTerminal={() => { setProjectMenuOpen(undefined); onOpenTerminalProject(project.id); }}
                     onRename={() => { setProjectMenuOpen(undefined); onRenameProject(project.id); }}
                     onNewTask={() => { setProjectMenuOpen(undefined); onNewTask(project.id); }}
-                    onArchive={() => { setProjectMenuOpen(undefined); onUnavailable("归档任务"); }}
                     onRemove={() => { setProjectMenuOpen(undefined); onRemoveProject(project.id); }}
                     onSelect={selectOrToggleProject}
                     project={project}
@@ -396,7 +392,6 @@ const ProjectRow = memo(function ProjectRow({
   onPin,
   onReveal,
   onOpenTerminal,
-  onArchive,
   onRemove,
   onDragStart,
   onDragEnd,
@@ -415,7 +410,6 @@ const ProjectRow = memo(function ProjectRow({
   onPin(): void;
   onReveal(): void;
   onOpenTerminal(): void;
-  onArchive(): void;
   onRemove(): void;
   onDragStart(): void;
   onDragEnd(): void;
@@ -475,20 +469,19 @@ const ProjectRow = memo(function ProjectRow({
       <div className={`project-row-actions${menuOpen ? " is-open" : ""}`}>
         <button ref={menuButtonRef} aria-label={`${project.name} 项目操作`} className="project-row-action" onClick={onMenu} type="button"><Icon name="more" size={14} /></button>
         <button aria-label={`新建任务 ${project.name}`} className="project-row-action" onClick={onNewTask} title="新建任务" type="button"><Icon name="edit" size={14} /></button>
-        {menuOpen ? <ProjectMenu anchorRef={menuButtonRef} onArchive={onArchive} onOpenTerminal={onOpenTerminal} onPin={onPin} onRemove={onRemove} onRename={onRename} onReveal={onReveal} project={project} /> : null}
+        {menuOpen ? <ProjectMenu anchorRef={menuButtonRef} onOpenTerminal={onOpenTerminal} onPin={onPin} onRemove={onRemove} onRename={onRename} onReveal={onReveal} project={project} /> : null}
       </div>
     </div>
   );
 });
 
-function ProjectMenu({ anchorRef, project, onPin, onReveal, onOpenTerminal, onRename, onArchive, onRemove }: { anchorRef: FloatingMenuAnchor; project: DesktopProject; onPin(): void; onReveal(): void; onOpenTerminal(): void; onRename(): void; onArchive(): void; onRemove(): void }): React.JSX.Element {
+function ProjectMenu({ anchorRef, project, onPin, onReveal, onOpenTerminal, onRename, onRemove }: { anchorRef: FloatingMenuAnchor; project: DesktopProject; onPin(): void; onReveal(): void; onOpenTerminal(): void; onRename(): void; onRemove(): void }): React.JSX.Element {
   return (
     <FloatingProjectMenu anchorRef={anchorRef} ariaLabel="项目操作菜单">
       <button onClick={onPin} role="menuitem" type="button"><Icon name="pin" size={15} /><span>{project.pinned ? "取消置顶项目" : "置顶项目"}</span></button>
       <button onClick={onReveal} role="menuitem" type="button"><Icon name="external" size={15} /><span>在 Finder 中显示</span></button>
       <button onClick={onOpenTerminal} role="menuitem" type="button"><Icon name="terminal" size={15} /><span>在终端中打开</span></button>
       <button onClick={onRename} role="menuitem" type="button"><Icon name="edit" size={15} /><span>重命名项目</span></button>
-      <button onClick={onArchive} role="menuitem" type="button"><Icon name="archive" size={15} /><span>归档任务</span></button>
       <div className="project-menu-separator" />
       <button className="is-danger" onClick={onRemove} role="menuitem" type="button"><Icon name="trash" size={15} /><span>移除</span></button>
     </FloatingProjectMenu>

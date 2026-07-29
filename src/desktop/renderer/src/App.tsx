@@ -9,11 +9,15 @@
  * 串到当前界面上。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AgentRunMode } from "../../../agent/AgentSession.js";
+import type { InteractiveAgentRunMode } from "../../../agent/AgentSession.js";
 import type { ContextBudgetStatus, ContextStatus } from "../../../agent/context/types.js";
 import type { ModelRuntimeInfo, ThinkingSelection } from "../../../llm/ModelManager.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
-import type { AgentHostEvent } from "../../../runtime/agentEvents.js";
+import {
+  activeRun,
+  pendingPermission,
+  type AgentHostEvent
+} from "../../../runtime/agentEvents.js";
 import type { SessionEvent } from "../../../session/recorder.js";
 import { publicUserMessage } from "../../../session/publicMessage.js";
 import type {
@@ -48,7 +52,7 @@ import {
 import { buildSessionTimeline, listChangedFiles, type TimelineTurn } from "./sessionTimeline.js";
 import { Composer, type ContextUsage } from "./components/Composer.js";
 import { NavigationControls } from "./components/NavigationControls.js";
-import { FeatureUnavailableOverlay, RenameOverlay, SearchOverlay, SettingsOverlay, SlashResultOverlay, Toast } from "./components/Overlays.js";
+import { RenameOverlay, SearchOverlay, SettingsOverlay, SlashResultOverlay, Toast } from "./components/Overlays.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { Workspace } from "./components/Workspace.js";
 
@@ -79,7 +83,6 @@ export function App(): React.JSX.Element {
   const [deletedUserMessages, setDeletedUserMessages] = useState<Set<string>>(() => new Set());
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [unavailableFeature, setUnavailableFeature] = useState<string>();
   const [contextBudget, setContextBudget] = useState<ContextBudgetStatus>();
   const [renameTarget, setRenameTarget] = useState<RenameTarget>();
   const [slashResult, setSlashResult] = useState<DesktopSlashResult>();
@@ -211,10 +214,12 @@ export function App(): React.JSX.Element {
       const activeProjectId = projectRef.current;
       const projectBatch = activeProjectId ? batch.filter((envelope) => envelope.projectId === activeProjectId) : [];
       if (projectBatch.length) {
-        setWorkspace((current) => current && current.project.id === activeProjectId ? applyEventsToWorkspace(current, projectBatch.map((envelope) => envelope.event)) : current);
+        setWorkspace((current) => current && current.project.id === activeProjectId ? applyUpdatesToWorkspace(current, projectBatch) : current);
         const currentSessionId = selectedRef.current;
         if (currentSessionId) {
-          const currentEvents = projectBatch.map((envelope) => envelope.event).filter((event) => event.sessionId === currentSessionId);
+          const currentEvents = projectBatch
+            .map((envelope) => envelope.event)
+            .filter((event): event is AgentHostEvent => event !== undefined && event.sessionId === currentSessionId);
           if (currentEvents.length) {
             setDocument((current) => current?.session.id === currentSessionId
               ? { ...current, liveEvents: [...current.liveEvents, ...currentEvents] }
@@ -230,8 +235,9 @@ export function App(): React.JSX.Element {
       // 包括非当前项目的：后台项目跑完了，侧栏也该更新。
       const completedProjects = new Map<string, string>();
       for (const envelope of batch) {
-        if (envelope.event.type === "run.completed" || envelope.event.type === "run.incomplete" || envelope.event.type === "run.aborted" || envelope.event.type === "run.failed") {
-          completedProjects.set(envelope.projectId, envelope.event.sessionId);
+        const event = envelope.event;
+        if (event && (event.type === "run.completed" || event.type === "run.incomplete" || event.type === "run.aborted" || event.type === "run.failed")) {
+          completedProjects.set(envelope.projectId, event.sessionId);
         }
       }
       for (const [projectId, sessionId] of completedProjects) scheduleRefresh(projectId, sessionId);
@@ -359,7 +365,7 @@ export function App(): React.JSX.Element {
     };
   }, [newTask, openProject]);
 
-  const sendPrompt = useCallback(async (input: string, mode: AgentRunMode, attachments: DesktopAttachment[]): Promise<void> => {
+  const sendPrompt = useCallback(async (input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[]): Promise<void> => {
     const projectId = projectRef.current;
     if (!projectId) throw new Error("请先打开一个项目。");
     const previousSessionId = selectedRef.current;
@@ -377,7 +383,6 @@ export function App(): React.JSX.Element {
       const summary = workspace?.sessions.find((session) => session.id === receipt.sessionId) ?? syntheticSession(projectId, receipt.sessionId, input);
       setDocument({ session: summary, events: [], liveEvents: [] });
     }
-    if (receipt.queued) setToast("补充要求已排入当前会话");
   }, [commitNavigation, document, workspace?.sessions]);
 
   const runSlashCommand = useCallback(async (command: string): Promise<void> => {
@@ -388,7 +393,7 @@ export function App(): React.JSX.Element {
 
   const editPrompt = useCallback(async (
     input: string,
-    mode: AgentRunMode,
+    mode: InteractiveAgentRunMode,
     attachments: DesktopAttachment[],
     sessionId: string,
     userMessageIndex: number
@@ -712,7 +717,7 @@ export function App(): React.JSX.Element {
   }, [contextBudget, document, workspace?.models, workspace?.runtime?.info]);
   const clearToast = useCallback(() => setToast(undefined), []);
   const sessionSummary = workspace?.sessions.find((session) => session.id === selectedSessionId) ?? document?.session;
-  const activeSessionId = workspace?.runtime?.activeRun?.sessionId ?? workspace?.runtime?.pendingPermission?.sessionId;
+  const activeSessionId = activeRun(workspace?.runtime)?.sessionId ?? pendingPermission(workspace?.runtime)?.sessionId;
   const selectedRunning = Boolean(activeSessionId && activeSessionId === selectedSessionId);
   const activeElsewhere = Boolean(activeSessionId && selectedSessionId && activeSessionId !== selectedSessionId);
   const composer = (
@@ -729,7 +734,6 @@ export function App(): React.JSX.Element {
       onSlashCommand={runSlashCommand}
       onStop={async () => { const projectId = projectRef.current; if (projectId) await window.biny.cancelRun(projectId); }}
       onSwitchModel={switchModel}
-      onUnavailable={setUnavailableFeature}
       permissionMode={workspace?.runtime?.permissionMode ?? "ask"}
       project={workspace?.project}
       running={selectedRunning}
@@ -755,7 +759,6 @@ export function App(): React.JSX.Element {
         onSelectProject={(projectId) => void selectProject(projectId)}
         onSelectSession={(sessionId) => { const projectId = projectRef.current; if (projectId) void navigateToSession(projectId, sessionId); }}
         onSettings={() => setSettingsOpen(true)}
-        onUnavailable={(feature) => setUnavailableFeature(feature)}
         onResizeEnd={() => setSidebarResizing(false)}
         onResizeStart={() => setSidebarResizing(true)}
         onWidthChange={(width) => { setSidebarWidth(width); void window.biny.setSidebarWidth(width); }}
@@ -874,17 +877,22 @@ export function App(): React.JSX.Element {
         }}
         open={Boolean(renameTarget)}
       />
-      <FeatureUnavailableOverlay feature={unavailableFeature} onClose={() => setUnavailableFeature(undefined)} />
       <SlashResultOverlay onClose={() => setSlashResult(undefined)} result={slashResult} />
       <Toast message={toast} onClose={clearToast} />
     </div>
   );
 }
 
-function applyEventsToWorkspace(workspace: DesktopWorkspaceSnapshot, events: AgentHostEvent[]): DesktopWorkspaceSnapshot {
+function applyUpdatesToWorkspace(
+  workspace: DesktopWorkspaceSnapshot,
+  updates: DesktopAgentEventEnvelope[]
+): DesktopWorkspaceSnapshot {
   const sessions = [...workspace.sessions];
-  let runtime = workspace.runtime ? { ...workspace.runtime, queuedRuns: [...workspace.runtime.queuedRuns] } : undefined;
-  for (const event of events) {
+  let runtime = workspace.runtime;
+  for (const update of updates) {
+    runtime = update.snapshot;
+    const event = update.event;
+    if (!event) continue;
     const visibleInput = event.type === "message.user" ? publicUserMessage(event.content) : "";
     let session = sessions.find((candidate) => candidate.id === event.sessionId);
     if (!session && event.type === "message.user") {
@@ -897,29 +905,12 @@ function applyEventsToWorkspace(workspace: DesktopWorkspaceSnapshot, events: Age
     }
     if (session && event.type === "run.started") {
       replaceSession(sessions, { ...session, status: "running", updatedAt: event.timestamp });
-      if (runtime) {
-        runtime = {
-          ...runtime,
-          activeRun: {
-            sessionId: event.sessionId,
-            runId: event.runId,
-            messageId: event.messageId,
-            input: event.input,
-            mode: event.mode,
-            status: "running",
-            startedAt: event.timestamp
-          },
-          queuedRuns: runtime.queuedRuns.filter((run) => run.runId !== event.runId)
-        };
-      }
     }
     if (session && event.type === "permission.requested") {
       replaceSession(sessions, { ...session, status: "waiting_permission", updatedAt: event.timestamp });
-      if (runtime) runtime = { ...runtime, pendingPermission: { sessionId: event.sessionId, runId: event.runId, requestId: event.requestId, toolCallId: event.toolCallId, request: event.request } };
     }
     if (session && event.type === "permission.resolved") {
       replaceSession(sessions, { ...session, status: "running", updatedAt: event.timestamp });
-      if (runtime?.pendingPermission?.requestId === event.requestId) runtime = { ...runtime, pendingPermission: undefined };
     }
     if (session && (event.type === "run.completed" || event.type === "run.incomplete" || event.type === "run.aborted" || event.type === "run.failed")) {
       replaceSession(sessions, {
@@ -931,7 +922,6 @@ function applyEventsToWorkspace(workspace: DesktopWorkspaceSnapshot, events: Age
             : event.type === "run.aborted" ? "aborted" : "completed",
         updatedAt: event.timestamp
       });
-      if (runtime?.activeRun?.runId === event.runId) runtime = { ...runtime, activeRun: undefined, pendingPermission: undefined };
     }
   }
   return { ...workspace, sessions: sessions.sort(sessionSort), runtime };

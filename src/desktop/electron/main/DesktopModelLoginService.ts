@@ -10,6 +10,11 @@
  */
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type Server } from "node:http";
+import {
+  CLAUDE_SUBSCRIPTION_BETA,
+  extractOpenAiAccountId,
+  openAiCodexHeaders
+} from "../../../llm/subscriptionAuth.js";
 import type { DesktopModelLoginMethod, DesktopModelLoginProvider, DesktopModelLoginStartResult } from "../../protocol.js";
 
 const AUTHORIZATION_TTL_MS = 10 * 60 * 1000;
@@ -24,7 +29,6 @@ const CODEX_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token";
 const CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const CODEX_CALLBACK_HOST = "127.0.0.1";
 const CODEX_CALLBACK_PORT = 1455;
-const CLAUDE_SUBSCRIPTION_BETA = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219";
 
 export interface AuthenticatedModelLogin {
   provider: DesktopModelLoginProvider;
@@ -351,40 +355,6 @@ function mergeRefreshedTokens(previous: OAuthTokens, payload: unknown, provider:
     refreshToken: typeof record.refresh_token === "string" && record.refresh_token ? record.refresh_token : previous.refreshToken,
     accountId: previous.accountId
   };
-}
-
-function openAiCodexHeaders(accessToken: string): Record<string, string> {
-  const headers: Record<string, string> = {
-    "OpenAI-Beta": "responses=experimental",
-    originator: "codex_cli_rs",
-    "User-Agent": "codex_cli_rs/0.0.0 (Biny)"
-  };
-  const accountId = extractOpenAiAccountId(accessToken);
-  if (accountId) headers["ChatGPT-Account-Id"] = accountId;
-  return headers;
-}
-
-/**
- * 从 access token（JWT）里读出 ChatGPT 账号 id，请求 Codex 接口时要带上。
- * 只解 payload、不验签：这里不是在做鉴权，签名由服务端校验；解析失败就当没有账号 id。
- */
-function extractOpenAiAccountId(token: string): string | undefined {
-  const payload = token.split(".")[1];
-  if (!payload) return undefined;
-  try {
-    // JWT 用的是 base64url 且省略了 padding，先补齐 `=` 再换回标准 base64 字符集。
-    const padded = payload + "=".repeat((4 - (payload.length % 4)) % 4);
-    const parsed = JSON.parse(Buffer.from(padded.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) as Record<string, unknown>;
-    const nested = parsed["https://api.openai.com/auth"];
-    if (nested && typeof nested === "object") {
-      const accountId = (nested as Record<string, unknown>).chatgpt_account_id;
-      if (typeof accountId === "string" && accountId) return accountId;
-    }
-    const accountId = parsed.chatgpt_account_id;
-    return typeof accountId === "string" && accountId ? accountId : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function formatModelName(modelId: string): string {

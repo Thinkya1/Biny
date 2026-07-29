@@ -56,12 +56,13 @@ async function startDesktopApplication(): Promise<void> {
   const projects = new DesktopProjectService(state, storage, configStore);
   let mainWindow: BrowserWindow | undefined;
   let preparingQuit = false;
-  const agents = new DesktopAgentManager(state, projects, configStore, (projectId, event) => {
+  const agents = new DesktopAgentManager(state, projects, configStore, (projectId, update) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send(desktopIpc.event, { projectId, event });
+      mainWindow.webContents.send(desktopIpc.event, { projectId, ...update });
     }
+    const event = update.event;
     // 只有窗口不在前台时才发系统通知：界面上已经能看到权限询问就不用再打扰一次。
-    if (event.type === "permission.requested" && (!mainWindow || !mainWindow.isFocused() || !mainWindow.isVisible()) && Notification.isSupported()) {
+    if (event?.type === "permission.requested" && (!mainWindow || !mainWindow.isFocused() || !mainWindow.isVisible()) && Notification.isSupported()) {
       new Notification({
         title: "Biny 等待权限",
         body: event.request.changeSummary ?? event.request.title,

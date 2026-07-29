@@ -9,9 +9,10 @@ import type { AgentSessionEvent } from "../src/agent/types.js";
 import type { ContextStatus } from "../src/agent/context/types.js";
 import type { CommandRuntime } from "../src/runtime/CommandRuntime.js";
 import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.js";
-import { RootRunLedger } from "../src/runtime/RootRunLedger.js";
-import type { AgentHostEvent } from "../src/runtime/agentEvents.js";
+import { SessionLeaseStore } from "../src/runtime/SessionLease.js";
+import { pendingPermission, type AgentHostEvent } from "../src/runtime/agentEvents.js";
 import { loadConfigFile, saveConfigFile } from "../src/config/loader.js";
+import type { CredentialStore } from "../src/config/credentials.js";
 import { createFileConfigStore } from "../src/config/store.js";
 import { defaultConfig } from "../src/config/schema.js";
 import { DesktopAgentManager } from "../src/desktop/electron/main/DesktopAgentManager.js";
@@ -192,7 +193,7 @@ async function testInteractiveRuntimeStrongConfirmation(): Promise<void> {
     () => runtime.answerPermission(permission.requestId, { approved: true, scope: "once" }),
     /requires the full word yes/u
   );
-  assert.equal(runtime.getSnapshot().pendingPermission?.requestId, permission.requestId);
+  assert.equal(pendingPermission(runtime.getSnapshot())?.requestId, permission.requestId);
   assert.throws(
     () => runtime.answerPermission(permission.requestId, { approved: true, scope: "once", confirmation: "y" }),
     /requires the full word yes/u
@@ -356,7 +357,7 @@ async function testWorkspaceDirectoryListing(): Promise<void> {
     const root = await projects.listWorkspaceDirectory(project, ".");
     assert.equal(root.path, ".");
     assert.deepEqual(root.entries.map((entry) => ({ name: entry.name, path: entry.path, kind: entry.kind })), [
-      { name: ".agent", path: ".agent", kind: "directory" },
+      { name: ".biny", path: ".biny", kind: "directory" },
       { name: "src", path: "src", kind: "directory" },
       { name: "README.md", path: "README.md", kind: "file" }
     ]);
@@ -590,9 +591,10 @@ async function testDesktopModelConfiguration(): Promise<void> {
     await projects.listSessions(project, undefined, new Map());
     const attachment = await projects.saveAttachment(project, "notes.txt", "text/plain", new TextEncoder().encode("desktop only"));
     assert.match(attachment.path, /^@attachments\//);
-    // Project sessions live in the workspace; attachments stay under desktop userData.
-    await access(path.join(workspaceRoot, ".agent", "sessions"));
-    await access(path.join(desktopRoot, "projects", project.id, ".agent", "attachments"));
+    // Project sessions and attachments live together, so TUI/CLI can reopen Desktop uploads.
+    await access(path.join(workspaceRoot, ".biny", "sessions"));
+    await access(path.join(workspaceRoot, ".biny", "attachments"));
+    await assert.rejects(access(path.join(desktopRoot, "projects", project.id, ".biny", "attachments")));
     await assert.rejects(access(path.join(workspaceRoot, "agent.config.json")));
     await agents.closeAll();
   } finally {
@@ -622,7 +624,7 @@ async function testDesktopSubagentSlashCommands(): Promise<void> {
     assert.match(status.content, /No subagent tasks/);
 
     const cancelMissing = await agents.runSlashCommand(project.id, undefined, "/subagent cancel task-404");
-    assert.match(cancelMissing.content, /没有找到可取消的子代理任务：task-404/);
+    assert.match(cancelMissing.content, /No active subagent task found for task-404/);
 
     await assert.rejects(agents.runSlashCommand(project.id, undefined, "/subagent cancel"), /task-id/);
     await assert.rejects(agents.runSlashCommand(project.id, undefined, "/subagent start"), /start/);
@@ -640,16 +642,16 @@ async function testDesktopSubagentSlashCommands(): Promise<void> {
 async function testDesktopReportsRuntimeLeaseConflict(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-runtime-lease-"));
   const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-runtime-lease-data-"));
-  let owner: RootRunLedger | undefined;
+  let owner: SessionLeaseStore | undefined;
   try {
     const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
     const project = await projects.createProject(workspaceRoot);
-    owner = await RootRunLedger.open(workspaceRoot);
+    owner = await SessionLeaseStore.open(workspaceRoot);
     const recorder = new SessionRecorder(workspaceRoot, "session-owner");
     recorder.record({ type: "user_message", content: "owner session" });
     await recorder.close();
     await state.setSelectedSession(project.id, "session-owner");
-    owner.acquireSession("session-owner");
+    owner.acquire("session-owner");
     const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
     await assert.rejects(
       () => agents.setPermissionMode(project.id, "read-only"),
@@ -668,24 +670,16 @@ async function testDesktopReportsRuntimeLeaseConflict(): Promise<void> {
 async function testDesktopCredentialsAreSeparated(): Promise<void> {
   const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-credentials-"));
   try {
-    const store = new DesktopConfigStore(desktopRoot, {
-      isAvailable: () => true,
-      encrypt: (value) => `encrypted:${Buffer.from(value).toString("base64")}`,
-      decrypt: (value) => Buffer.from(value.slice("encrypted:".length), "base64").toString("utf8")
-    });
+    const store = new DesktopConfigStore(desktopRoot, memoryCredentialStore());
     const config = structuredClone(defaultConfig);
     config.providers.deepseek!.apiKey = "desktop-secret";
     config.web.search.apiKey = "tvly-web-secret";
     await store.save(config);
-    const [settings, credentials] = await Promise.all([
-      readFile(path.join(desktopRoot, "agent.config.json"), "utf8"),
-      readFile(path.join(desktopRoot, "credentials.json"), "utf8")
-    ]);
+    const settings = await readFile(path.join(desktopRoot, "agent.config.json"), "utf8");
     assert.doesNotMatch(settings, /desktop-secret/);
-    assert.doesNotMatch(credentials, /desktop-secret/);
-    // 联网搜索密钥同样只进加密凭据文件，不落明文设置文件。
+    // 联网搜索密钥同样只进凭据后端，不落明文设置文件。
     assert.doesNotMatch(settings, /tvly-web-secret/);
-    assert.doesNotMatch(credentials, /tvly-web-secret/);
+    await assert.rejects(readFile(path.join(desktopRoot, "credentials.json"), "utf8"), /ENOENT/u);
     const loaded = await store.load();
     assert.equal(loaded.providers.deepseek?.apiKey, "desktop-secret");
     assert.equal(loaded.web.search.apiKey, "tvly-web-secret");
@@ -703,7 +697,7 @@ async function testDesktopWebSearchSettings(): Promise<void> {
     const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
 
     const initial = await agents.webSearchSettings(project.id);
-    assert.equal(initial.enabled, true);
+    assert.equal(initial.enabled, false);
     assert.equal(initial.provider, "anysearch");
     assert.equal(initial.hasApiKey, false);
 
@@ -942,11 +936,7 @@ async function testLegacyDesktopDataMigration(): Promise<void> {
 
     const storage = new DesktopUserDataStore(desktopRoot);
     await storage.initialize();
-    const configStore = new DesktopConfigStore(desktopRoot, {
-      isAvailable: () => true,
-      encrypt: (value) => value,
-      decrypt: (value) => value
-    });
+    const configStore = new DesktopConfigStore(desktopRoot, memoryCredentialStore());
     const stateProject: DesktopProject = { ...project, id: "state-project", name: "State Project" };
     const legacyStatePath = path.join(desktopRoot, "legacy-desktop-state.json");
     const destinationStatePath = path.join(desktopRoot, "desktop-state.json");
@@ -987,17 +977,17 @@ async function testLegacyDesktopDataMigration(): Promise<void> {
     const legacySessionBody = `${JSON.stringify({ type: "user_message", content: "keep me" })}\n`;
     await writeFile(sessionFilePath(desktopProjectRoot, "legacy-session"), legacySessionBody);
     await mkdir(path.join(desktopProjectRoot, ".agent", "attachments"), { recursive: true });
-    await writeFile(path.join(desktopProjectRoot, ".agent", "attachments", "note.txt"), "attachment stays desktop-only\n");
+    await writeFile(path.join(desktopProjectRoot, ".agent", "attachments", "note.txt"), "attachment migrates with the session\n");
 
     const dataRoot = await storage.ensureProjectData(project);
     assert.equal(dataRoot, path.resolve(projectRoot));
     assert.equal(await readFile(sessionFilePath(projectRoot, "legacy-session"), "utf8"), legacySessionBody);
-    await assert.rejects(access(path.join(projectRoot, ".agent", "attachments", "note.txt")));
+    await access(path.join(projectRoot, ".biny", "attachments", "note.txt"));
     await access(path.join(desktopProjectRoot, ".agent", "attachments", "note.txt"));
 
     const globalRoot = await storage.ensureGlobalData();
     assert.equal(globalRoot, path.join(desktopRoot, "global"));
-    await access(path.join(globalRoot, ".agent", "sessions"));
+    await access(path.join(globalRoot, ".biny", "sessions"));
 
     // 旧项目配置只用于 doctor 提示，启动不会自动迁移或覆盖全局模型配置。
     assert.equal((await configStore.load()).defaultModel, defaultConfig.defaultModel);
@@ -1383,7 +1373,7 @@ function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
   const info: AgentSessionInfo = {
     workspaceRoot: "/tmp/project",
     sessionId: "session-1",
-    sessionFile: "/tmp/project/.agent/sessions/session-1.jsonl",
+    sessionFile: "/tmp/project/.biny/sessions/session-1.jsonl",
     provider: "test",
     modelLabel: "test/model",
     reasoningLabel: "Off",
@@ -1421,7 +1411,7 @@ function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
     setPermissionMode: async () => undefined,
     listModels: () => [],
     switchModel: async () => ({ modelAlias: "test", provider: "test", modelLabel: "test/model", reasoningLabel: "Off", thinking: "off" as const }),
-    async *runSdk(input: string, options: AgentRunOptions): AsyncGenerator<AgentSessionEvent> {
+    async *run(input: string, options: AgentRunOptions): AsyncGenerator<AgentSessionEvent> {
       yield { type: "status", status: "thinking" };
       if (input === "cancel") {
         if (!options.abortSignal?.aborted) {
@@ -1473,7 +1463,18 @@ function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
           text: secretProbe ? "password=opaque-live-tool-secret" : "done"
         } as AgentSessionEvent & never
       };
-      yield { type: "done", content: secretProbe ? "Authorization: Bearer opaque-live-tool-secret" : "done" };
+      const content = secretProbe ? "Authorization: Bearer opaque-live-tool-secret" : "done";
+      yield {
+        type: "done",
+        content,
+        outcome: {
+          status: "completed",
+          stopReason: "model_stop",
+          finishReason: "stop",
+          steps: 1,
+          output: content
+        }
+      };
     },
     contextStatus: async () => context,
     recordError: () => undefined,
@@ -1490,4 +1491,18 @@ function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
     cancelSubagentTasks: () => undefined,
     close: async () => undefined
   } as unknown as CommandRuntime;
+}
+
+function memoryCredentialStore(): CredentialStore {
+  const values = new Map<string, string>();
+  return {
+    persistent: true,
+    get: async (account) => values.get(account),
+    set: async (account, value) => {
+      values.set(account, value);
+    },
+    delete: async (account) => {
+      values.delete(account);
+    }
+  };
 }

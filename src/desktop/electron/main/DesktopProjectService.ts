@@ -14,11 +14,17 @@ import path from "node:path";
 import { promisify } from "node:util";
 import type { AgentConfigStore } from "../../../config/store.js";
 import { listModelChoices, type ModelChoice } from "../../../llm/ModelManager.js";
-import type { AgentHostEvent, InteractiveRuntimeSnapshot } from "../../../runtime/agentEvents.js";
+import {
+  activeRun,
+  pendingPermission,
+  type AgentHostEvent,
+  type InteractiveRuntimeSnapshot
+} from "../../../runtime/agentEvents.js";
 import { listSessionSummaries, readStoredSessionEvents } from "../../../session/events.js";
 import { createSessionFile, deleteSessionFile, duplicateSessionFile, ensureAgentDirs } from "../../../session/store.js";
 import { gitInspectionEnvironment } from "../../../tools/git/environment.js";
 import { resolveWorkspaceDirectory, resolveWorkspacePath, toWorkspaceRelative } from "../../../workspace/resolvePath.js";
+import { attachmentFilePath, attachmentPathPrefix, saveAttachment as saveProjectAttachment } from "../../../attachments/store.js";
 import type {
   DesktopAttachment,
   DesktopProject,
@@ -36,7 +42,6 @@ const execFileAsync = promisify(execFile);
 const filePreviewLimit = 512 * 1024;
 /** 内联图片要整张塞进 data URL，超过这个大小就不给了，免得 IPC 和 DOM 里挂着几十兆的 base64。 */
 const inlineImageLimit = 8 * 1024 * 1024;
-const attachmentPathPrefix = "@attachments/";
 const imageMediaTypes: Record<string, string> = {
   avif: "image/avif",
   bmp: "image/bmp",
@@ -237,17 +242,10 @@ export class DesktopProjectService {
    * 既避免同名覆盖，也避免用户提供的名字里带路径分隔符写到目录之外。
    */
   async saveAttachment(project: DesktopProject, name: string, mimeType: string, bytes: Uint8Array): Promise<DesktopAttachment> {
-    const safeName = sanitizeFileName(name);
-    const directory = await this.storage.ensureAttachmentsRoot(project);
-    const fileName = `${String(Date.now())}-${randomBytes(3).toString("hex")}-${safeName}`;
-    const filePath = path.join(directory, fileName);
-    await fs.writeFile(filePath, bytes);
-    return {
-      name: safeName,
-      path: `@attachments/${fileName}`,
-      mimeType,
-      size: bytes.byteLength
-    };
+    // 先迁移旧版 userData 附件，再使用和 TUI/CLI 相同的项目级存储器写入。
+    await this.storage.ensureProjectData(project);
+    const attachment = await saveProjectAttachment(project.path, name, mimeType, bytes);
+    return { ...attachment, size: attachment.size ?? bytes.byteLength };
   }
 
   async listWorkspaceDirectory(project: DesktopProject, relativePath: string): Promise<DesktopWorkspaceDirectory> {
@@ -311,7 +309,7 @@ export class DesktopProjectService {
    * 读取消息里引用的图片，转成 data URL 交给界面内联显示。
    *
    * 渲染进程的 CSP 只放行 self / data: / https:，本地图片没法直接用 file:// 加载，只能由主进程
-   * 读出来转码。附件存在 userData 而不是工作区里，所以要按 `@attachments/` 前缀分流。
+   * 读出来转码。附件在项目 `.biny/attachments` 而非工作区可见文件，所以要按 `@attachments/` 前缀分流。
    * 这是展示用的旁路加载，任何失败都返回 undefined 让界面退回文件名，不往上抛错。
    */
   async readInlineImage(project: DesktopProject, relativePath: string): Promise<string | undefined> {
@@ -345,7 +343,7 @@ export class DesktopProjectService {
     return project;
   }
 
-  /** 项目内的持久化根目录（`<项目>/.agent`），与 TUI / CLI 共用同一份数据。 */
+  /** 项目内的持久化根目录（`<项目>/.biny`），与 TUI / CLI 共用同一份数据。 */
   async dataRoot(project: DesktopProject): Promise<string> {
     return await this.storage.ensureProjectData(project);
   }
@@ -358,13 +356,6 @@ export class DesktopProjectService {
   attachmentsRoot(project: DesktopProject): string {
     return this.storage.attachmentsRoot(project);
   }
-}
-
-/** 附件目录是平铺的，文件名里不允许出现分隔符，否则就是想读目录之外的东西。 */
-function attachmentFilePath(attachmentsRoot: string, relativePath: string): string | undefined {
-  const fileName = relativePath.slice(attachmentPathPrefix.length);
-  if (!fileName || fileName.includes("/") || fileName.includes("\\") || fileName.includes("..")) return undefined;
-  return path.join(attachmentsRoot, fileName);
 }
 
 function isAlreadyExists(error: unknown): boolean {
@@ -409,8 +400,8 @@ function sessionStatus(
   runtime: InteractiveRuntimeSnapshot | undefined,
   events: AgentHostEvent[] | undefined
 ): DesktopSessionStatus {
-  if (runtime?.pendingPermission?.sessionId === sessionId) return "waiting_permission";
-  if (runtime?.activeRun?.sessionId === sessionId) return "running";
+  if (pendingPermission(runtime)?.sessionId === sessionId) return "waiting_permission";
+  if (activeRun(runtime)?.sessionId === sessionId) return "running";
   const finalEvent = events
     ? [...events].reverse().find((event) => event.type === "run.completed" || event.type === "run.incomplete" || event.type === "run.failed" || event.type === "run.aborted")
     : undefined;
@@ -433,11 +424,6 @@ function createSessionId(): string {
     String(now.getSeconds()).padStart(2, "0")
   ].join("");
   return `${stamp}-${randomBytes(4).toString("hex")}`;
-}
-
-function sanitizeFileName(value: string): string {
-  const sanitized = path.basename(value).replace(/[^A-Za-z0-9._\-\u4e00-\u9fff]/g, "-").slice(0, 120);
-  return sanitized || "attachment";
 }
 
 function isNotFound(error: unknown): boolean {

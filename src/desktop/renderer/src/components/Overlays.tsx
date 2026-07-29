@@ -107,33 +107,21 @@ interface SettingsOverlayProps {
   onCancelModelLogin(provider: DesktopModelLoginProvider, authRequestId: string): Promise<void>;
 }
 
-type SettingsTab = "外观" | "模型" | "使用统计" | "记忆" | "每日回顾" | "语音" | "开放网关" | "远程接入" | "联网搜索" | "健康" | "关于";
+type SettingsTab = "外观" | "模型" | "记忆" | "联网搜索" | "关于";
 
 const settingsNav: Array<{ badge?: string; group?: string; tab: SettingsTab; icon: React.ComponentProps<typeof Icon>["name"]; label: string }> = [
   { group: "通用", tab: "外观", icon: "spark", label: "外观" },
   { group: "AI 与集成", tab: "模型", icon: "cpu", label: "模型" },
-  { tab: "使用统计", icon: "chart", label: "使用统计" },
   { tab: "记忆", icon: "brain", label: "记忆" },
-  { tab: "每日回顾", icon: "calendar", label: "每日回顾" },
-  { tab: "语音", icon: "mic", label: "语音" },
-  { tab: "开放网关", icon: "network", label: "开放网关" },
-  { tab: "远程接入", icon: "remote", label: "远程接入" },
   { badge: "Beta", tab: "联网搜索", icon: "search", label: "联网搜索" },
-  { group: "系统", tab: "健康", icon: "activity", label: "健康" },
-  { tab: "关于", icon: "help", label: "关于" }
+  { group: "系统", tab: "关于", icon: "help", label: "关于" }
 ];
 
 const settingsSubtitles: Record<SettingsTab, string> = {
   模型: "模型连接、API key 与默认模型管理。",
   外观: "主题偏好。",
-  使用统计: "查看模型与工具的资源消耗。",
   记忆: "记忆检索、自动总结、整理与条目管理。",
-  每日回顾: "管理每日自动回顾的内容与节奏。",
-  语音: "语音输入与输出能力设置。",
-  开放网关: "管理可供外部工具接入的服务。",
-  远程接入: "配置远程设备与工作区访问。",
   联网搜索: "配置联网搜索与数据来源。",
-  健康: "查看桌面端运行状态与诊断信息。",
   关于: "版本与产品信息。"
 };
 
@@ -295,7 +283,6 @@ export function SettingsOverlay({
             onImportCookies={onImportCookies}
             onClearCookies={onClearCookies}
           /> : null}
-          {tab === "使用统计" || tab === "每日回顾" || tab === "语音" || tab === "开放网关" || tab === "远程接入" || tab === "健康" ? <SettingsComingSoon tab={tab} /> : null}
           {message ? <div className="settings-message">{message}</div> : null}
         </main>
       </section>
@@ -347,31 +334,6 @@ export function SlashResultOverlay({ result, onClose }: { result?: DesktopSlashR
   );
 }
 
-/**
- * 未完成功能提示弹窗。
- *
- * 界面上先摆出入口、但功能还没做完时统一走这里：明确说「还没做」，而不是给一个点了没反应的
- * 按钮，也不用假数据把它装成能用。
- */
-export function FeatureUnavailableOverlay({ feature, onClose }: { feature?: string; onClose(): void }): React.JSX.Element | null {
-  const presence = useClosingPresence(Boolean(feature));
-  const [lastFeature, setLastFeature] = useState<string>();
-  useEffect(() => {
-    if (feature) setLastFeature(feature);
-  }, [feature]);
-  const shown = feature ?? lastFeature;
-  if (!presence.present || !shown) return null;
-  return (
-    <ModalBackdrop onClose={onClose}>
-      <section aria-label={`${shown}功能开发中`} className={`t-modal feature-unavailable-modal ${presenceClass(presence.phase)}`}>
-        <Icon name="wand" size={22} />
-        <h2>{shown}还在开发中</h2>
-        <p>这个入口暂时不可用。Biny 不会用模拟数据把没完成的功能装成能用的样子，做好后会直接在这里生效。</p>
-        <div><button className="is-primary" onClick={onClose} type="button">知道了</button></div>
-      </section>
-    </ModalBackdrop>
-  );
-}
 
 export function Toast({ message, onClose }: { message?: string; onClose(): void }): React.JSX.Element | null {
   useEffect(() => {
@@ -1861,17 +1823,6 @@ function SettingsWebSearch({ onLoad, onSave, onNotify, onOpenExternal, onLoadCoo
   );
 }
 
-function SettingsComingSoon({ tab }: { tab: "使用统计" | "每日回顾" | "语音" | "开放网关" | "远程接入" | "健康" }): React.JSX.Element {
-  return (
-    <div className="settings-sections settings-coming-soon">
-      <section>
-        <h3>{tab}</h3>
-        <p>该设置入口已纳入桌面端导航，详细配置将在后续版本接入。</p>
-      </section>
-    </div>
-  );
-}
-
 const memoryTopicOptions = [
   { value: "project", label: "project · 项目事实" },
   { value: "decisions", label: "decisions · 决策" },
@@ -2015,7 +1966,7 @@ function SettingsMemory({ models, onLoad, onSaveSettings, onSearch, onAdd, onDel
       <section>
         <h3>记忆功能</h3>
         <div className="setting-row">
-          <span><strong>启用记忆</strong><small>启用后自动沉淀与检索 .agent/memory 中的可审计项目记忆</small></span>
+          <span><strong>启用记忆</strong><small>启用后自动沉淀与检索 .biny/memory 中的可审计项目记忆</small></span>
           <button aria-checked={enabled} className={`setting-switch${enabled ? " is-on" : ""}`} onClick={() => setEnabled(!enabled)} role="switch" type="button"><span className="setting-switch-knob" /></button>
         </div>
         <div className="setting-row">

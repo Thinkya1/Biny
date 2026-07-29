@@ -1,8 +1,7 @@
 /**
- * 桌面端专属数据目录（Electron userData 下）：配置、凭据、界面状态、附件，以及不属于任何
- * 项目的会话。
+ * 桌面端专属数据目录（Electron userData 下）：配置、凭据、界面状态，以及不属于任何项目的会话。
  *
- * 属于项目的 session / run / 记忆仍然放在 `<项目>/.agent` 里，这样同一个工作区在桌面端和
+ * 属于项目的 session / run / 记忆仍然放在 `<项目>/.biny` 里，这样同一个工作区在桌面端和
  * TUI 里看到的是同一份历史。
  *
  * 另外承担历史状态和会话迁移；旧模型配置不在启动时自动搬运，避免静默复制凭据。
@@ -20,7 +19,7 @@ export class DesktopUserDataStore {
     await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
   }
 
-  /** 项目的桌面端专属目录：附件，以及统一到项目目录之前遗留的会话。 */
+  /** 项目的桌面端专属目录：统一到项目目录之前遗留的会话和附件。 */
   projectDesktopRoot(project: DesktopProject): string {
     return path.join(this.root, "projects", projectStorageId(project.id));
   }
@@ -31,7 +30,7 @@ export class DesktopUserDataStore {
   }
 
   attachmentsRoot(project: DesktopProject): string {
-    return path.join(agentDir(this.projectDesktopRoot(project)), "attachments");
+    return path.join(agentDir(project.path), "attachments");
   }
 
   /**
@@ -78,17 +77,22 @@ export class DesktopUserDataStore {
 
   /**
    * Ensures project session storage lives under the project path and returns that root.
-   * One-time migration copies leftover userData project agent files (except attachments)
-   * into `<project>/.agent` when the destination file is missing.
+   * One-time migration copies leftover userData project agent files into `<project>/.biny`
+   * when the destination file is missing, including attachment files referenced by old sessions.
    */
   async ensureProjectData(project: DesktopProject): Promise<string> {
     const targetRoot = path.resolve(project.path);
     await ensureAgentDirs(targetRoot);
 
-    const legacyAgentDirectory = agentDir(this.projectDesktopRoot(project));
     const targetAgentDirectory = agentDir(targetRoot);
-    if (await exists(legacyAgentDirectory) && path.resolve(legacyAgentDirectory) !== path.resolve(targetAgentDirectory)) {
-      await mergeDirectory(legacyAgentDirectory, targetAgentDirectory, new Set(["attachments"]));
+    const legacyDirectories = [
+      agentDir(this.projectDesktopRoot(project)),
+      path.join(this.projectDesktopRoot(project), ".agent")
+    ];
+    for (const legacyDirectory of legacyDirectories) {
+      if (await exists(legacyDirectory) && path.resolve(legacyDirectory) !== path.resolve(targetAgentDirectory)) {
+        await mergeDirectory(legacyDirectory, targetAgentDirectory);
+      }
     }
     return targetRoot;
   }
@@ -102,6 +106,7 @@ export class DesktopUserDataStore {
   }
 
   async ensureAttachmentsRoot(project: DesktopProject): Promise<string> {
+    await this.ensureProjectData(project);
     const directory = this.attachmentsRoot(project);
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     return directory;

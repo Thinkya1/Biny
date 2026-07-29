@@ -11,7 +11,7 @@
  *
  * 模型配置的保存与连通性测试也在这里：写入前先用候选配置实际发一次请求，避免存下一份用不了的配置。
  */
-import type { AgentAttachment, AgentRunMode } from "../../../agent/AgentSession.js";
+import type { AgentAttachment, InteractiveAgentRunMode } from "../../../agent/AgentSession.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { generateText } from "ai";
@@ -26,15 +26,14 @@ import { hasUsableModelConfiguration, listConfiguredModelChoices, type ModelRunt
 import { providerProfile } from "../../../llm/profiles.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
 import { webSearchKeyEnvNames } from "../../../tools/web/search.js";
-import { formatSubagentAgentList } from "../../../extensions/report.js";
-import { formatSubagentTaskReport } from "../../../runtime/subagentTaskReport.js";
+import { executeRuntimeCommand } from "../../../runtime/commands.js";
 import {
   createInteractiveAgentRuntime,
   type AgentRunOutcome,
   type InteractiveAgentRuntime
 } from "../../../runtime/InteractiveAgentRuntime.js";
-import { RootRunLedgerLeaseError } from "../../../runtime/RootRunLedger.js";
-import type { AgentHostEvent } from "../../../runtime/agentEvents.js";
+import { SessionLeaseError } from "../../../runtime/SessionLease.js";
+import { runtimeIsBusy, type AgentHostEvent, type AgentRuntimeUpdate } from "../../../runtime/agentEvents.js";
 import { withAttachmentReferences } from "../../attachmentReferences.js";
 import type {
   DesktopAttachment,
@@ -76,7 +75,7 @@ export class DesktopAgentManager {
     private readonly state: DesktopStateStore,
     private readonly projects: DesktopProjectService,
     private readonly configStore: AgentConfigStore,
-    private readonly emit: (projectId: string, event: AgentHostEvent) => void,
+    private readonly emit: (projectId: string, update: AgentRuntimeUpdate) => void,
     openExternal?: (url: string) => Promise<void>
   ) {
     this.modelLogin = new DesktopModelLoginService(openExternal ?? (async () => {
@@ -109,7 +108,7 @@ export class DesktopAgentManager {
 
   async startDraft(projectId: string): Promise<DesktopWorkspaceSnapshot> {
     const managed = this.runtimes.get(projectId);
-    if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
+    if (managed && runtimeIsBusy(managed.runtime.getSnapshot())) {
       throw new Error("当前项目仍有任务运行。请先停止它，或稍后再开始新任务。");
     }
     if (managed) {
@@ -143,19 +142,21 @@ export class DesktopAgentManager {
     projectId: string,
     sessionId: string | undefined,
     input: string,
-    mode: AgentRunMode,
+    mode: InteractiveAgentRunMode,
     attachments: DesktopAttachment[]
   ): Promise<DesktopRunReceipt> {
     await this.requireConfiguredModel(projectId);
     await this.refreshOAuthCredentials(projectId);
     const runtime = await this.ensureRuntime(projectId);
     const snapshot = runtime.getSnapshot();
-    // 空闲时才从磁盘重载模型配置：跑到一半换模型会让同一轮对话前后用的模型不一致。
-    if (!snapshot.activeRun && !snapshot.queuedRuns.length) await runtime.refreshModelFromDisk();
+    if (runtimeIsBusy(snapshot)) {
+      throw new Error("当前任务仍在运行。请先停止它，再发送下一条消息。");
+    }
+    await runtime.refreshModelFromDisk();
     // 目标会话不是运行时当前会话时需要切过去，但只能在完全空闲时切。
     if (sessionId && runtime.getInfo().sessionId !== sessionId) {
       const snapshot = runtime.getSnapshot();
-      if (snapshot.activeRun || snapshot.queuedRuns.length) {
+      if (runtimeIsBusy(snapshot)) {
         throw new Error("The selected session is still running. Return to it or stop the task before resuming another session.");
       }
       await runtime.resumeSession(sessionId);
@@ -170,8 +171,7 @@ export class DesktopAgentManager {
     return {
       sessionId: info.sessionId,
       runId: submitted.runId,
-      messageId: submitted.messageId,
-      queued: submitted.queued
+      messageId: submitted.messageId
     };
   }
 
@@ -186,7 +186,7 @@ export class DesktopAgentManager {
     sessionId: string,
     userMessageIndex: number,
     input: string,
-    mode: AgentRunMode,
+    mode: InteractiveAgentRunMode,
     attachments: DesktopAttachment[]
   ): Promise<DesktopRunReceipt> {
     await this.requireConfiguredModel(projectId);
@@ -194,13 +194,13 @@ export class DesktopAgentManager {
     const runtime = await this.ensureRuntime(projectId);
     if (runtime.getInfo().sessionId !== sessionId) {
       const snapshot = runtime.getSnapshot();
-      if (snapshot.activeRun || snapshot.queuedRuns.length) {
+      if (runtimeIsBusy(snapshot)) {
         throw new Error("当前项目仍有其他会话正在运行，请先停止后再编辑消息。");
       }
       await runtime.resumeSession(sessionId);
     }
     const snapshot = runtime.getSnapshot();
-    if (snapshot.activeRun || snapshot.queuedRuns.length) {
+    if (runtimeIsBusy(snapshot)) {
       runtime.cancelCurrentRun();
       await runtime.waitForIdle();
     }
@@ -219,8 +219,7 @@ export class DesktopAgentManager {
     return {
       sessionId: info.sessionId,
       runId: submitted.runId,
-      messageId: submitted.messageId,
-      queued: submitted.queued
+      messageId: submitted.messageId
     };
   }
 
@@ -257,7 +256,7 @@ export class DesktopAgentManager {
     pastedAuthorization?: string
   ): Promise<DesktopWorkspaceSnapshot> {
     const managed = this.runtimes.get(projectId);
-    if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
+    if (managed && runtimeIsBusy(managed.runtime.getSnapshot())) {
       throw new Error("任务运行期间不能修改模型配置。");
     }
     this.projects.requireProject(projectId);
@@ -283,7 +282,7 @@ export class DesktopAgentManager {
 
   async saveModelConfiguration(projectId: string, input: DesktopModelConfigurationInput): Promise<DesktopWorkspaceSnapshot> {
     const managed = this.runtimes.get(projectId);
-    if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
+    if (managed && runtimeIsBusy(managed.runtime.getSnapshot())) {
       throw new Error("任务运行期间不能修改模型配置。");
     }
     this.projects.requireProject(projectId);
@@ -304,7 +303,7 @@ export class DesktopAgentManager {
 
   async removeModelConfiguration(projectId: string, alias: string): Promise<DesktopWorkspaceSnapshot> {
     const managed = this.runtimes.get(projectId);
-    if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
+    if (managed && runtimeIsBusy(managed.runtime.getSnapshot())) {
       throw new Error("任务运行期间不能修改模型配置。");
     }
     this.projects.requireProject(projectId);
@@ -340,7 +339,7 @@ export class DesktopAgentManager {
 
   async saveWebSearchSettings(projectId: string, input: DesktopWebSearchSettingsInput): Promise<DesktopWebSearchSettings> {
     const managed = this.runtimes.get(projectId);
-    if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
+    if (managed && runtimeIsBusy(managed.runtime.getSnapshot())) {
       throw new Error("任务运行期间不能修改联网搜索配置。");
     }
     this.projects.requireProject(projectId);
@@ -393,7 +392,7 @@ export class DesktopAgentManager {
 
   async saveMemorySettings(projectId: string, input: DesktopMemorySettings): Promise<DesktopMemoryOverview> {
     const managed = this.runtimes.get(projectId);
-    if (managed?.runtime.getSnapshot().activeRun || managed?.runtime.getSnapshot().queuedRuns.length) {
+    if (managed && runtimeIsBusy(managed.runtime.getSnapshot())) {
       throw new Error("任务运行期间不能修改记忆设置。");
     }
     this.projects.requireProject(projectId);
@@ -587,92 +586,11 @@ export class DesktopAgentManager {
     // /context、/usage 依赖当前会话：用户查看的会话与 runtime 不一致且空闲时先切换。
     if (sessionId && runtime.getInfo().sessionId !== sessionId) {
       const snapshot = runtime.getSnapshot();
-      if (!snapshot.activeRun && !snapshot.queuedRuns.length) await runtime.resumeSession(sessionId);
+      if (!runtimeIsBusy(snapshot)) await runtime.resumeSession(sessionId);
     }
-    const [command, ...args] = input.trim().split(/\s+/);
-    switch (command) {
-      case "/status": {
-        const info = runtime.getInfo();
-        return {
-          command,
-          title: "状态",
-          content: [
-            `模型：${info.modelLabel}（${info.reasoningLabel}）`,
-            `权限：${runtime.getPermissionMode()}`,
-            "",
-            runtime.extensionReport()
-          ].join("\n")
-        };
-      }
-      case "/context":
-        return { command, title: "上下文", content: await runtime.contextReport() };
-      case "/usage":
-        return { command, title: "用量", content: runtime.usageReport() };
-      case "/mcp": {
-        if (args[0]?.toLowerCase() === "reconnect") {
-          const serverName = args[1]?.trim();
-          if (!serverName || args.length !== 2) throw new Error("用法：/mcp reconnect <server>");
-          const status = await runtime.reconnectMcpServer(serverName);
-          return {
-            command,
-            title: "MCP",
-            content: status.connected
-              ? `已重连 ${serverName}（${String(status.toolNames.length)} 个工具）。`
-              : `重连 ${serverName} 失败：${status.lastError ?? "未知错误"}`
-          };
-        }
-        return { command, title: "MCP", content: runtime.extensionReport("mcp") };
-      }
-      case "/skills":
-        return { command, title: "技能", content: runtime.extensionReport("skills") };
-      case "/plugins":
-        return { command, title: "插件", content: runtime.extensionReport("plugins") };
-      case "/memory":
-        return { command, title: "记忆", content: await runtime.runMemoryCommand(args) };
-      case "/subagent": {
-        const action = args[0]?.toLowerCase();
-        if (action === "agents") {
-          return { command, title: "子代理", content: formatSubagentAgentList(await runtime.listSubagentAgents()) };
-        }
-        if (action === "status") {
-          return { command, title: "子代理", content: formatSubagentTaskReport(runtime.listSubagentTasks()) };
-        }
-        if (action === "cancel") {
-          const taskId = args[1]?.trim();
-          if (!taskId) throw new Error("用法：/subagent cancel <task-id>");
-          const cancelled = runtime.cancelSubagentTask(taskId, "Cancelled from the desktop app.");
-          return {
-            command,
-            title: "子代理",
-            content: cancelled ? `已取消子代理任务 ${taskId}。` : `没有找到可取消的子代理任务：${taskId}。`
-          };
-        }
-        if (action === "start") {
-          const backgroundTask = args.slice(1).join(" ").trim();
-          if (!backgroundTask) throw new Error("用法：/subagent start <任务>");
-          const submitted = runtime.startSubagentTask(backgroundTask);
-          // 后台任务的结果通过 /subagent status 查看；这里只挂一个空 catch 防止未处理拒绝。
-          submitted.completion.catch(() => undefined);
-          return {
-            command,
-            title: "子代理",
-            content: `已启动后台子代理任务 ${submitted.taskId}。用 /subagent status 查看进度，/subagent cancel ${submitted.taskId} 取消。`
-          };
-        }
-        const task = args.join(" ").trim();
-        if (!task) {
-          return { command, title: "子代理", content: "用法：/subagent <任务> | start <任务> | status | cancel <task-id> | agents" };
-        }
-        return { command, title: "子代理", content: await runtime.runSubagentTask(task) || "子代理没有返回内容。" };
-      }
-      case "/review": {
-        const task = args.join(" ").trim()
-          || "Review the current git changes for correctness, regressions, missing tests, and concrete risks. Return concise findings with exact file paths and line numbers.";
-        return { command, title: "代码评审", content: await runtime.runSubagentTask(task) || "No review findings." };
-      }
-      default:
-        throw new Error(`未知命令：${command ?? input}`);
-    }
+    const result = await executeRuntimeCommand(runtime, input, "desktop");
+    if (!result) throw new Error(`未知命令：${input.trim().split(/\s+/, 1)[0] ?? input}`);
+    return result;
   }
 
   async duplicateSession(projectId: string, sessionId: string): Promise<DesktopWorkspaceSnapshot> {
@@ -686,7 +604,7 @@ export class DesktopAgentManager {
     const managed = this.runtimes.get(projectId);
     if (managed?.runtime.getInfo().sessionId === sessionId) {
       const snapshot = managed.runtime.getSnapshot();
-      if (snapshot.activeRun || snapshot.queuedRuns.length) throw new Error("Stop the running task before deleting this session.");
+      if (runtimeIsBusy(snapshot)) throw new Error("Stop the running task before deleting this session.");
       managed.unsubscribe();
       await managed.runtime.close();
       this.runtimes.delete(projectId);
@@ -707,16 +625,14 @@ export class DesktopAgentManager {
   /** 关窗前用它决定要不要提示用户：等待权限也算「在跑」，直接关掉会丢掉这次询问。 */
   hasRunningTasks(): boolean {
     return [...this.runtimes.values()].some(({ runtime }) => {
-      const snapshot = runtime.getSnapshot();
-      return Boolean(snapshot.activeRun || snapshot.pendingPermission || snapshot.queuedRuns.length);
+      return runtimeIsBusy(runtime.getSnapshot());
     });
   }
 
   isProjectRunning(projectId: string): boolean {
     const runtime = this.runtimes.get(projectId)?.runtime;
     if (!runtime) return false;
-    const snapshot = runtime.getSnapshot();
-    return Boolean(snapshot.activeRun || snapshot.pendingPermission || snapshot.queuedRuns.length);
+    return runtimeIsBusy(runtime.getSnapshot());
   }
 
   cancelAll(): void {
@@ -761,7 +677,7 @@ export class DesktopAgentManager {
     } catch (error) {
       const message = formatRuntimeInitializationError(error);
       this.runtimeErrors.set(projectId, message);
-      if (error instanceof RootRunLedgerLeaseError) throw new Error(message);
+      if (error instanceof SessionLeaseError) throw new Error(message);
       throw error;
     } finally {
       if (this.runtimeInitializations.get(projectId) === initialization) this.runtimeInitializations.delete(projectId);
@@ -785,7 +701,7 @@ export class DesktopAgentManager {
     const project = this.projects.requireProject(projectId);
     if (project.missing) throw new Error(`Project path is unavailable: ${project.path}`);
     await this.refreshOAuthCredentials(projectId);
-    // 项目会话与 TUI/CLI 共用 `<项目>/.agent`；附件仍留在桌面端的 userData 里。
+    // 项目会话与附件都使用 `<项目>/.biny`，因此 Desktop/TUI/CLI 能恢复同一份多模态历史。
     const persistenceRoot = await this.projects.dataRoot(project);
     const runtime = await createInteractiveAgentRuntime(project.path, {
       persistenceRoot,
@@ -809,14 +725,17 @@ export class DesktopAgentManager {
         }
       }
     }
-    const unsubscribe = runtime.subscribe((event) => {
-      const projectEvents = this.projectEvents(projectId);
-      const sessionEvents = projectEvents.get(event.sessionId) ?? [];
-      sessionEvents.push(event);
-      // 实时事件只为「重新打开会话时补上本轮内容」，按会话保留最近 4000 条，防止长跑占满内存。
-      if (sessionEvents.length > 4_000) sessionEvents.splice(0, sessionEvents.length - 4_000);
-      projectEvents.set(event.sessionId, sessionEvents);
-      this.emit(projectId, event);
+    const unsubscribe = runtime.subscribeUpdates((update) => {
+      const event = update.event;
+      if (event) {
+        const projectEvents = this.projectEvents(projectId);
+        const sessionEvents = projectEvents.get(event.sessionId) ?? [];
+        sessionEvents.push(event);
+        // 实时事件只为「重新打开会话时补上本轮内容」，按会话保留最近 4000 条，防止长跑占满内存。
+        if (sessionEvents.length > 4_000) sessionEvents.splice(0, sessionEvents.length - 4_000);
+        projectEvents.set(event.sessionId, sessionEvents);
+      }
+      this.emit(projectId, update);
     });
     this.runtimes.set(projectId, { runtime, unsubscribe });
     this.runtimeErrors.delete(projectId);
@@ -1008,7 +927,7 @@ function formatModelConnectionError(error: unknown): string {
 }
 
 function formatRuntimeInitializationError(error: unknown): string {
-  if (error instanceof RootRunLedgerLeaseError) {
+  if (error instanceof SessionLeaseError) {
     return `当前项目正在被另一个 Biny/CLI 会话占用（进程 ${String(error.pid)}）。请先退出该会话，或切换到其他项目后重试。`;
   }
   return error instanceof Error ? error.message : String(error);
@@ -1044,9 +963,15 @@ async function loadNativeAttachments(root: string, attachments: DesktopAttachmen
     if (filePath !== normalizedRoot && !filePath.startsWith(`${normalizedRoot}${path.sep}`)) continue;
     try {
       const bytes = await fs.readFile(filePath);
-      native.push({ name: attachment.name, mimeType: attachment.mimeType, data: bytes.toString("base64") });
+      native.push({
+        name: attachment.name,
+        mimeType: attachment.mimeType,
+        path: attachment.path,
+        size: attachment.size,
+        data: bytes.toString("base64")
+      });
     } catch {
-      // The textual attachment reference remains available to the agent.
+      throw new Error(`附件文件不可读取：${attachment.name}`);
     }
   }
   return native;

@@ -6,7 +6,7 @@
  * `modelSetupRequired` 等状态由上层传入。
  */
 import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { AgentRunMode, AgentSessionInfo } from "../../../../agent/AgentSession.js";
+import type { AgentSessionInfo, InteractiveAgentRunMode } from "../../../../agent/AgentSession.js";
 import type { ModelChoice, ThinkingSelection } from "../../../../llm/ModelManager.js";
 import type { PermissionMode } from "../../../../permission/PermissionManager.js";
 import type { DesktopAttachment, DesktopProject, DesktopSlashCommand } from "../../../protocol.js";
@@ -29,13 +29,12 @@ interface ComposerProps {
   modelSetupRequired: boolean;
   focusToken: number;
   onOpenProject(): void;
-  onSend(input: string, mode: AgentRunMode, attachments: DesktopAttachment[]): Promise<void>;
+  onSend(input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[]): Promise<void>;
   onSlashCommand(command: string): Promise<void>;
   onStop(): Promise<void>;
   onPermissionMode(mode: PermissionMode): Promise<void>;
   onSwitchModel(alias: string, thinking: ThinkingSelection): Promise<void>;
   onSaveAttachment(file: File): Promise<DesktopAttachment>;
-  onUnavailable(feature: string): void;
 }
 
 export interface ContextUsage {
@@ -69,11 +68,10 @@ export const Composer = memo(function Composer({
   onStop,
   onPermissionMode,
   onSwitchModel,
-  onSaveAttachment,
-  onUnavailable
+  onSaveAttachment
 }: ComposerProps): React.JSX.Element {
   const [input, setInput] = useState("");
-  const [mode, setMode] = useState<AgentRunMode>("chat");
+  const [mode, setMode] = useState<InteractiveAgentRunMode>("chat");
   const [attachments, setAttachments] = useState<DesktopAttachment[]>([]);
   const [menu, setMenu] = useState<ComposerMenu>(null);
   const [busy, setBusy] = useState(false);
@@ -160,17 +158,13 @@ export const Composer = memo(function Composer({
   };
 
   const submit = async (): Promise<void> => {
-    const value = input.trim();
+    const value = input.trim() || (attachments.length ? "请分析这些附件。" : "");
     if (!project || !value || busy) return;
-    // 报告命令只在整条输入匹配时执行；/mcp reconnect、/memory、/subagent 与 /review
-    // 是允许带参数的桌面端命令。其他以 / 开头的自然语言或多行内容仍按消息发送。
-    const slashCommand = DESKTOP_SLASH_COMMANDS.find((command) => command.name === value);
-    const mcpReconnect = /^\/mcp\s+reconnect\s+\S+$/i.test(value);
-    const memoryWithArgs = /^\/memory\s+(list|show|add|forget)(\s|$)/i.test(value);
-    const subagentWithArgs = /^\/subagent\s+\S/i.test(value);
-    const reviewWithArgs = /^\/review\s+\S/i.test(value);
-    if (slashCommand || mcpReconnect || memoryWithArgs || subagentWithArgs || reviewWithArgs) {
-      await runSlash(slashCommand?.name ?? value);
+    // 命令是否接收参数由共享注册表声明；其他以 / 开头的自然语言仍作为普通消息发送。
+    const [slashName] = value.split(/\s+/, 1);
+    const slashCommand = DESKTOP_SLASH_COMMANDS.find((command) => command.name === slashName);
+    if (slashCommand && (value === slashCommand.name || slashCommand.acceptsArgs)) {
+      await runSlash(value);
       return;
     }
     if (activeElsewhere) return;
@@ -348,7 +342,13 @@ export const Composer = memo(function Composer({
                 }}
               />
             </div>
-            <button className={`mode-toggle${mode === "plan" ? " is-active" : ""}`} disabled={modelSetupRequired} onClick={() => setMode(mode === "chat" ? "plan" : "chat")} title="规划模式只影响下一次运行" type="button">{mode === "plan" ? "规划" : "聊天"}</button>
+            <button
+              className={`mode-toggle${mode === "plan" ? " is-active" : ""}`}
+              disabled={modelSetupRequired}
+              onClick={() => setMode(mode === "plan" ? "chat" : "plan")}
+              title="聊天直接执行；规划只读"
+              type="button"
+            >{runModeLabel(mode)}</button>
             {thinkingEfforts.length ? (
               <div className="composer-menu-anchor">
                 <button className="composer-select thinking-trigger" data-composer-menu="thinking" disabled={!project || modelSetupRequired} onClick={() => setMenu(menu === "thinking" ? null : "thinking")} title="思考级别" type="button">
@@ -365,7 +365,6 @@ export const Composer = memo(function Composer({
                 />
               </div>
             ) : null}
-            <button aria-label="工具与技能" className="composer-icon-button" disabled={!project || modelSetupRequired} onClick={() => onUnavailable("工具与技能")} title="工具与技能" type="button"><Icon name="wrench" /></button>
           </div>
           <div className="composer-actions-right">
             <div className="composer-menu-anchor">
@@ -392,7 +391,7 @@ export const Composer = memo(function Composer({
             <button
               aria-label={running ? "暂停生成" : "发送任务"}
               className="send-button"
-              disabled={running ? false : !input.trim() || !project || busy || activeElsewhere}
+              disabled={running ? false : (!input.trim() && !attachments.length) || !project || busy || activeElsewhere}
               onClick={() => { if (running) void onStop(); else void submit(); }}
               title={running ? "暂停当前生成" : sessionId ? "发送" : "创建任务并发送"}
               type="button"
@@ -516,6 +515,10 @@ function ThinkingMenu({
 
 function permissionLabel(mode: PermissionMode): string {
   return permissionOptions.find((option) => option.mode === mode)?.label ?? mode;
+}
+
+function runModeLabel(mode: InteractiveAgentRunMode): string {
+  return mode === "plan" ? "规划" : "聊天";
 }
 
 const thinkingLabels: Record<ThinkingSelection, string> = {
