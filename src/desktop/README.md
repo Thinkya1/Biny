@@ -56,15 +56,14 @@ Electron Main
 - UI：`setSidebarWidth`、`setFilePanelWidth`、`onMenuAction`
 - 事件：`onAgentEvent`
 
-`resolveDroppedFile` 只调用 Electron `webUtils.getPathForFile`，不授予 Renderer 通用文件系统权限。桌面端的**项目会话**写入打开项目的 `.agent/sessions`（与 TUI/CLI 共用）；**配置、凭据、UI 状态、附件和非项目会话**仍在应用用户数据目录。附件通过受限的 `@attachments/` 虚拟路径提供给 `read_file`，不会写进用户打开的项目目录。
+`resolveDroppedFile` 只调用 Electron `webUtils.getPathForFile`，不授予 Renderer 通用文件系统权限。桌面端的**项目会话和附件**写入打开项目的 `.biny/`（与 TUI/CLI 共用）；**配置、凭据、UI 状态和非项目会话**仍在应用用户数据目录。附件通过受限的 `@attachments/` 虚拟路径提供给 `read_file`，不会混进用户的业务文件目录。
 
 ## 用户数据目录
 
 桌面端 UI 数据目录：`app.getPath("userData")/workspaces/default`。在 macOS 上通常是 `~/Library/Application Support/Biny/workspaces/default`。模型配置单独使用全局 `~/.biny/agent/`，并可由 `BINY_AGENT_DIR` 覆盖。
 
 - `desktop-state.json`：项目列表、窗口尺寸、面板宽度和会话 UI 元数据。
-- `global/.agent/sessions/`：非项目会话（不绑定某个打开的项目路径）。
-- `projects/<project-id>/.agent/attachments/`：该项目的桌面端附件（仍隔离在用户数据目录）。
+- `global/.biny/sessions/`：非项目会话（不绑定某个打开的项目路径）。
 
 全局 `agent.config.json` 只保存 provider/model 元数据和运行设置。macOS 的 API key、OAuth access/refresh token 通过 `com.biny.agent` Keychain service 保存，CLI/TUI 与 Electron 使用相同的 account 命名；非 macOS 使用 `apiKeyEnv` 环境变量，不写本地凭据文件。
 
@@ -74,19 +73,20 @@ Electron Main
 
 打开某个项目后，Desktop 与 TUI/CLI 使用同一套项目级持久化根：
 
-- `<project>/.agent/sessions/`：项目问答历史（两端共用）
-- `<project>/.agent/` 下的 runs、tasks、logs、memory、processes、telemetry：与会话配套的运行时数据
+- `<project>/.biny/sessions/`：项目问答历史（两端共用）
+- `<project>/.biny/attachments/`：Desktop/TUI/CLI 共用的图片、音频等附件
+- `<project>/.biny/` 下的 runs、tasks、logs、memory、processes、telemetry：与会话配套的运行时数据
 
-首次打开项目时，若用户数据目录里仍有旧版 `projects/<project-id>/.agent/` 会话（不含 attachments），会**单向合并**到 `<project>/.agent/`：目标中已有的文件优先保留，缺失的旧文件被复制过来。之后新会话只写入项目目录。
+首次打开项目时，旧工作区 `.agent/` 以及用户数据目录的 `projects/<project-id>/.agent/`（或 `.biny/`）会**单向合并**到 `<project>/.biny/`：目标中已有的文件优先保留，缺失的普通文件被复制过来；软链接不会被跟随。之后新会话和附件都只写入项目目录。
 
 首次打开没有可用默认模型的项目时，桌面端会先进入模型配置页；只有默认模型具备有效凭据和服务地址后，才能开始任务。项目 `.biny/settings.json` 可以覆盖默认模型和运行参数，但不能配置 provider 或凭据。
 旧的 `desktop-state.json` 会按既有逻辑迁移；项目内旧 `agent.config.json` 和旧桌面模型配置保持原样，`biny doctor` 只提示位置和迁移建议，不会自动复制或覆盖全局配置。
 
 ## Agent 事件协议
 
-协议定义位于 `src/runtime/agentEvents.ts`。每个运行事件都有 `sessionId`、`runId` 和 `timestamp`；消息、工具或权限事件还携带相应的 `messageId`、`toolCallId`、`requestId`。
+协议定义位于 `src/runtime/agentEvents.ts`。Runtime 通过 `AgentRuntimeUpdate` 同时发布可选事件与完整 snapshot，Renderer 不再从事件自行拼装运行状态。每个运行事件都有 `sessionId`、`runId` 和 `timestamp`；消息、工具或权限事件还携带相应的 `messageId`、`toolCallId`、`requestId`。
 
-- 运行：`run.started`、`run.completed`、`run.aborted`、`run.failed`
+- 运行：`run.queued`、`run.queue.updated`、`run.started`、`run.completed`、`run.incomplete`、`run.aborted`、`run.failed`
 - 文本：`message.user`、`assistant.delta`、`assistant.completed`
 - 公开状态：`reasoning.started`、`reasoning.status`、`reasoning.completed`
 - 工具：`tool.started`、`tool.progress`、`tool.completed`、`tool.failed`
@@ -101,21 +101,23 @@ Renderer 对 `assistant.delta` 和命令输出按 animation frame 合并更新�
 
 ## 会话和运行状态
 
-- Desktop 与 TUI/CLI 的项目会话都写入 `<project>/.agent/sessions/*.jsonl`，稳定事件类型没有变化；同一项目两端可见同一份历史。
-- 非项目会话保留在用户数据目录的 `global/.agent/sessions/`。
+- Desktop 与 TUI/CLI 的项目会话都写入 `<project>/.biny/sessions/*.jsonl`，稳定事件类型没有变化；同一项目两端可见同一份历史。
+- 非项目会话保留在用户数据目录的 `global/.biny/sessions/`。
 - 两端继续使用同一套 replay 逻辑恢复工具 ID、sequence、上下文摘要和 usage。
-- Main 是运行状态的唯一事实来源。Renderer 重建后通过 `bootstrap`、workspace snapshot 和缓存的实时事件重新获取状态。
-- Desktop 与 TUI/CLI 可以同时打开同一个项目；执行锁落在 `<project>/.agent/runs/session-<sessionId>.lock`，同一 Session 同一时刻只能有一个执行者，不同 Session 可以并行执行。
+- `InteractiveAgentRuntime` 是运行状态的唯一事实来源。Renderer 重建后通过 `bootstrap`、workspace snapshot 和后续 `AgentRuntimeUpdate` 获取状态。
+- 实时状态是一个带单调 `revision` 的闭合 `RunState`：`idle`、`runs`、`maintenance`、`background_subagent` 互斥，Renderer 不再分别维护 `activeRun`、队列和权限请求。
+- Desktop 与 TUI 的共享 slash command 来自 `src/runtime/commandRegistry.ts`，状态读取和运行时操作由 `src/runtime/commands.ts` 执行；界面层只保留帮助、选择器、清屏等本地行为。
+- Desktop 与 TUI/CLI 可以同时打开同一个项目；执行锁落在 `<project>/.biny/runs/session-<sessionId>.lock`，同一 Session 同一时刻只能有一个执行者，不同 Session 可以并行执行。
 - 当前阶段按 Pi 的单进程、单 AgentSession 模型运行：同一 Session 被另一端执行时，第二个运行时会收到 Session 占用提示，暂不支持跨进程 attach 到实时执行。TODO：引入 SessionHost 后再支持多客户端共同挂载同一 Session。
-- 切换页面不会中止任务；同一端对同一 Session 的补充要求仍进入本地 runtime 队列。
+- 切换页面不会中止任务；Desktop 与 TUI 在 Session 忙碌时都拒绝创建隐式排队任务，编辑中的输入保持不变。
 - 停止按钮调用 runtime 的 `AbortController`，并拒绝正在等待的权限请求，不只是停止 UI 渲染。
 - 权限请求保存在 Main runtime snapshot 中，切换会话或 Renderer 刷新不会丢失。
 
 ## 当前边界
 
-- “已安排、插件、站点、拉取请求”导航和输入区的“工具与技能”仅提供入口；点击弹出“开发中”提示，不用假数据伪装可用。
+- 设置页和输入区只暴露已经接通的能力，不保留“开发中”占位入口。
 - 输入区的上下文用量来自运行时上报的 `context.updated`，因此只在当前会话跑过至少一轮后显示。
 - 语音输入、麦克风录音和实时语音对话没有实现；已有音频附件在模型声明支持 `audio` 时会作为原生 `file` message part 发送。
-- 图片附件在模型声明支持 `vision` 时会转换为原生 `file` message part，否则仍以安全保存后的 `@attachments/` 路径交给 Agent 工具读取。
+- 图片附件会转换为原生 `file` message part；当前模型未明确声明 `vision` 时，发送会直接失败并提示切换或配置模型，而不会静默降级。
 - 命令区域是实时日志视图，不是完整 PTY 终端模拟器。
 - 本地包未签名、未公证；公开 Release 使用 CI secrets 完成签名和公证。

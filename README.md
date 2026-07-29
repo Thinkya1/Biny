@@ -19,6 +19,9 @@
 - **可恢复** —— 消息、工具调用、验收证据和续跑状态都写在本机；被打断后 `/continue` 从最后一个完成的步继续，不用重跑。
 - **可扩展** —— Skill、Plugin、MCP server（stdio / http）、具名子代理，以及跨会话的持久记忆。
 - **Plan 模式** —— 先出计划，不执行会产生副作用的操作。
+- **统一交互、按策略限权** —— Desktop/TUI 的每条输入都直接进入同一个 AgentSession：Chat 使用当前权限策略，Plan 只开放只读工具；只有显式的 `biny run` 使用 durable 任务契约、独立验证和续跑，不猜测一条普通输入是否“足够复杂”。
+- **统一命令语义** —— `/status`、`/context`、`/usage`、`/memory`、`/subagent`、`/continue` 等命令由 Desktop 与 TUI 共用同一份声明和执行逻辑；`biny chat` 是默认 TUI 的兼容别名，不再启动第二套交互循环。
+- **图片附件** —— Desktop 可直接粘贴/拖入图片，TUI 用 `Ctrl+V`（Windows 为 `Alt+V`）粘贴系统剪贴板图片；附件保存在项目 `.biny/attachments`，会话只记录引用。输入会先写入会话；模型未声明 `vision` 时会记录明确错误，不会静默丢弃图片。
 
 ## 快速开始
 
@@ -42,7 +45,7 @@ export DEEPSEEK_API_KEY="你的 key"
 pnpm dev                              # 打开 TUI
 ```
 
-单次任务：`biny run "总结当前项目并指出最重要的风险"`。完整命令见 `biny --help`。
+单次自主任务：`biny run "总结当前项目并指出最重要的风险"`。`biny chat` 与直接运行 `biny` 都打开同一个 TUI。完整命令见 `biny --help`。
 
 ## 配置模型和密钥
 
@@ -106,7 +109,9 @@ macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON �
 
 TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 reasoning effort，才会继续打开对应的档位选择器。列表不会把所有模型强行显示成同一套档位：例如 DeepSeek V4 Pro 使用自身声明的三档 `low`、`medium`、`high`，DeepSeek V4 Flash 不显示思考档位。这里的名称是模型/Provider 支持的配置选项，不代表跨模型可比较的真实推理程度。模型目录刷新后，实时模型会进入同一注册表，也可以用 `provider/model-id` 引用；选中的实时模型元数据会写入全局模型配置。
 
-联网搜索默认走 AnySearch（`ANYSEARCH_API_KEY`，也可用匿名额度），另支持 Google、DuckDuckGo、Brave 和 Tavily，在 `web.search` 里切换。桌面端的 **设置 → 联网搜索** 提供独立浏览器和 Cookie-Editor JSON 导入/导出；在其中登录后，Google 搜索与 `web_fetch` 会按域名、路径和 HTTPS 规则使用对应 Cookie。
+联网搜索启用后默认走 AnySearch（`ANYSEARCH_API_KEY`，也可用匿名额度），另支持 Google、DuckDuckGo、Brave 和 Tavily，在 `web.search` 里切换。桌面端的 **设置 → 联网搜索** 提供独立浏览器和 Cookie-Editor JSON 导入/导出；在其中登录后，Google 搜索与 `web_fetch` 会按域名、路径和 HTTPS 规则使用对应 Cookie。
+
+为避免普通聊天在没有明确意图时自动扩大能力面，联网搜索/抓取与共享 Cookie、子代理、持久记忆、自动诊断和本地 telemetry 默认关闭；需要时在全局配置或 Desktop 设置中显式开启。Skill 仍会扫描已配置目录，MCP 只连接明确启用的 server，回合前 Git checkpoint 保持开启。
 
 全局配置中的 provider/model、上下文预算、步数与成本上限、子代理、Skill / MCP / Plugin、诊断钩子等设置，schema 见 [`src/config/schema.ts`](./src/config/schema.ts)；项目覆盖只允许运行参数。
 
@@ -115,11 +120,12 @@ TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 re
 会话和运行时数据写在项目里，桌面端和 CLI 共用：
 
 ```text
-<project>/.agent/sessions/   问答历史
-<project>/.agent/            runs、tasks、logs、memory 等
+<project>/.biny/sessions/    问答历史
+<project>/.biny/attachments/ 图片、音频等会话附件
+<project>/.biny/             runs、tasks、logs、memory 等
 ```
 
-全局模型配置在 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）；全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表、UI 状态、附件和非项目会话仍在 `~/Library/Application Support/Biny/workspaces/default/`；项目 session、run、memory 等运行数据仍在项目 `.agent/`。
+全局模型配置在 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）；全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表、UI 状态和非项目会话仍在 `~/Library/Application Support/Biny/workspaces/default/`；项目 session、附件、run、memory 等运行数据都在项目 `.biny/`。首次打开项目时会将旧 `.agent/` 中的 Biny 运行状态单向补入 `.biny/`，不会覆盖新文件，也不会跟随旧目录内的软链接。
 
 同一个 Session 同一时刻只能由一个运行时执行，另一个会返回占用提示；不同 Session 可以并行。
 
