@@ -17,6 +17,7 @@ import type { AgentConfigStore } from "../../../config/store.js";
 
 export class DesktopConfigStore implements AgentConfigStore {
   private writeTail = Promise.resolve();
+  private currentRevision = 0;
 
   constructor(
     private readonly root: string,
@@ -32,6 +33,7 @@ export class DesktopConfigStore implements AgentConfigStore {
       const previous = await this.load(workspaceRoot);
       await saveStoredCredentials(config, this.credentials, previous);
       await saveConfig(workspaceRoot, config, { globalDir: this.root });
+      this.currentRevision += 1;
     });
     this.writeTail = run.catch(() => undefined);
     await run;
@@ -39,5 +41,9 @@ export class DesktopConfigStore implements AgentConfigStore {
 
   configPath(): string {
     return path.join(this.root, "agent.config.json");
+  }
+
+  revision(): number {
+    return this.currentRevision;
   }
 }

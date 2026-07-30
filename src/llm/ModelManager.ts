@@ -4,7 +4,12 @@ import {
   type AgentConfig,
   type ReasoningEffort
 } from "../config/schema.js";
-import { createModelSettings, resolveModelConfig, type ModelSettings } from "./factory.js";
+import {
+  createModelSettings,
+  resolveModelConfig,
+  validateModelConfiguration,
+  type ModelSettings
+} from "./factory.js";
 import type { LanguageModel } from "ai";
 import { fetchModelCatalog } from "../ai/modelCatalog.js";
 import { modelContextBudget, modelReasoningConfig, modelThinkingLevelMap } from "../ai/capabilities.js";
@@ -16,9 +21,12 @@ import {
   type ModelChoice
 } from "./ModelRegistry.js";
 import { ModelResolver } from "./ModelResolver.js";
+import { refreshSubscriptionOAuthTokens } from "./subscriptionAuth.js";
 
 export type ThinkingSelection = "off" | ReasoningEffort;
 export type { ModelChoice } from "./ModelRegistry.js";
+
+const OAUTH_REFRESH_WINDOW_MS = 5 * 60 * 1_000;
 
 export interface ModelRuntimeInfo {
   modelAlias: string;
@@ -34,6 +42,7 @@ export interface ModelRuntimeInfo {
 export class ModelManager {
   private activeSettings: ModelSettings;
   private readonly registry: ModelRegistry;
+  private observedConfigRevision: number | undefined;
 
   constructor(
     private readonly workspaceRoot: string,
@@ -42,6 +51,7 @@ export class ModelManager {
   ) {
     this.registry = new ModelRegistry(config);
     this.activeSettings = createModelSettings(config);
+    this.observedConfigRevision = configStore.revision?.();
   }
 
   listModels(): ModelChoice[] {
@@ -63,6 +73,54 @@ export class ModelManager {
   getContextBudget(): ReturnType<typeof modelContextBudget> {
     const resolved = resolveModelConfig(this.config);
     return modelContextBudget(resolved.model, this.config.context.maxInputTokens, resolved.alias);
+  }
+
+  /**
+   * 所有 AgentSession 回合共用的轻量准备：进程内配置变更才重读磁盘，
+   * 当前 OAuth provider 临近过期才联网续期，其余 prompt 只做同步配置校验。
+   */
+  async preparePrompt(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    const revision = this.configStore.revision?.();
+    if (revision !== undefined && revision !== this.observedConfigRevision) {
+      await this.refreshFromDisk();
+    }
+
+    const resolved = resolveModelConfig(this.config);
+    const oauth = resolved.provider.oauth;
+    if (
+      resolved.provider.authMode === "oauth-bearer"
+      && oauth?.refreshToken
+      && oauth.expiresAt - Date.now() <= OAUTH_REFRESH_WINDOW_MS
+    ) {
+      const refreshed = await refreshSubscriptionOAuthTokens(oauth.provider, {
+        accessToken: resolved.provider.apiKey ?? "",
+        refreshToken: oauth.refreshToken,
+        expiresAt: oauth.expiresAt,
+        accountId: oauth.accountId
+      }, signal);
+      const nextConfig = configSchema.parse({
+        ...this.config,
+        providers: {
+          ...this.config.providers,
+          [resolved.providerAlias]: {
+            ...resolved.provider,
+            apiKey: refreshed.accessToken,
+            oauth: {
+              provider: oauth.provider,
+              refreshToken: refreshed.refreshToken,
+              expiresAt: refreshed.expiresAt,
+              accountId: refreshed.accountId
+            }
+          }
+        }
+      });
+      await this.configStore.save(nextConfig, this.workspaceRoot);
+      const effective = await this.configStore.load(this.workspaceRoot).catch(() => nextConfig);
+      this.applyConfig(effective);
+    }
+
+    validateModelConfiguration(this.config);
   }
 
   async refreshModelCatalog(providerAlias = resolveModelConfig(this.config).providerAlias): Promise<ModelCatalogEntry[]> {
@@ -106,17 +164,27 @@ export class ModelManager {
     // 项目覆盖的 defaultModel/thinking 仍然优先；保存后重新读取有效配置，避免内存状态
     // 短暂显示一个实际上被项目覆盖遮住的模型。
     const effective = await this.configStore.load(this.workspaceRoot).catch(() => candidate);
-    Object.assign(this.config, effective);
-    this.activeSettings = effective === candidate ? nextSettings : createModelSettings(effective);
+    if (effective === candidate) {
+      Object.assign(this.config, effective);
+      this.activeSettings = nextSettings;
+      this.observedConfigRevision = this.configStore.revision?.();
+    } else {
+      this.applyConfig(effective);
+    }
     return this.getInfo();
   }
 
   async refreshFromDisk(): Promise<ModelRuntimeInfo> {
     const nextConfig = await this.configStore.load(this.workspaceRoot);
+    this.applyConfig(nextConfig);
+    return this.getInfo();
+  }
+
+  private applyConfig(nextConfig: AgentConfig): void {
     const nextSettings = createModelSettings(nextConfig);
     Object.assign(this.config, nextConfig);
     this.activeSettings = nextSettings;
-    return this.getInfo();
+    this.observedConfigRevision = this.configStore.revision?.();
   }
 }
 

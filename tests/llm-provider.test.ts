@@ -5,6 +5,7 @@ import path from "node:path";
 import { generateText, jsonSchema } from "ai";
 import { CONFIG_FILE, ensureConfig, loadConfig, maxConfigFileBytes, saveConfig } from "../src/config/loader.js";
 import { configSchema, defaultConfig, type AgentConfig, type ModelProvider } from "../src/config/schema.js";
+import type { AgentConfigStore } from "../src/config/store.js";
 import { createModelSettings, createLanguageModelForConfig } from "../src/llm/factory.js";
 import { ModelManager } from "../src/llm/ModelManager.js";
 
@@ -17,7 +18,84 @@ async function main(): Promise<void> {
   await testAnthropicMessagesAndToolSchema();
   await testMissingKeyAndCompatibilityEndpointAreHardErrors();
   await testModelSwitchValidatesBeforePersisting();
+  await testPromptPreflightReloadsOnlyAfterConfigChange();
+  await testPromptPreflightRefreshesExpiringOAuth();
   await testConfigFileStorageBoundaries();
+}
+
+async function testPromptPreflightReloadsOnlyAfterConfigChange(): Promise<void> {
+  const initial = configFor({ type: "openai", apiKey: "key" });
+  const { store, replace, loadCount } = revisionedConfigStore(initial);
+  const manager = new ModelManager("/tmp/biny-preflight-reload", initial, store);
+
+  await manager.preparePrompt();
+  assert.equal(loadCount(), 0);
+
+  const changed = configSchema.parse({
+    ...initial,
+    defaultModel: "next-model",
+    models: {
+      ...initial.models,
+      "next-model": { provider: "active", model: "next-model" }
+    }
+  });
+  await replace(changed);
+  await manager.preparePrompt();
+  assert.equal(loadCount(), 1);
+  assert.equal(manager.getInfo().modelAlias, "next-model");
+
+  await manager.preparePrompt();
+  assert.equal(loadCount(), 1);
+}
+
+async function testPromptPreflightRefreshesExpiringOAuth(): Promise<void> {
+  const config = configSchema.parse({
+    ...defaultConfig,
+    defaultModel: "claude-test",
+    providers: {
+      active: {
+        type: "claude-subscription",
+        apiKey: "expired-access",
+        authMode: "oauth-bearer",
+        oauth: {
+          provider: "claude-code",
+          refreshToken: "refresh-token",
+          expiresAt: Date.now() + 60_000
+        }
+      }
+    },
+    models: {
+      "claude-test": { provider: "active", model: "claude-test" }
+    },
+    context: { ...defaultConfig.context, memory: { enabled: false } }
+  });
+  const { store, persisted, loadCount } = revisionedConfigStore(config);
+  const manager = new ModelManager("/tmp/biny-preflight-oauth", config, store);
+  const originalFetch = globalThis.fetch;
+  let refreshCount = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL): Promise<Response> => {
+    assert.equal(String(input), "https://platform.claude.com/v1/oauth/token");
+    refreshCount += 1;
+    // refresh_token 可以省略；服务商不轮换时继续使用原 token。
+    return new Response(JSON.stringify({ access_token: "fresh-access", expires_in: 3_600 }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  }) as typeof fetch;
+
+  try {
+    await manager.preparePrompt();
+    assert.equal(refreshCount, 1);
+    assert.equal(loadCount(), 1);
+    assert.equal(persisted().providers.active?.apiKey, "fresh-access");
+    assert.equal(persisted().providers.active?.oauth?.refreshToken, "refresh-token");
+
+    await manager.preparePrompt();
+    assert.equal(refreshCount, 1);
+    assert.equal(loadCount(), 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 }
 
 async function testConfigFileStorageBoundaries(): Promise<void> {
@@ -358,6 +436,34 @@ function configFor(options: {
     workspace: defaultConfig.workspace,
     context: { ...defaultConfig.context, memory: { enabled: false } }
   });
+}
+
+function revisionedConfigStore(initial: AgentConfig): {
+  store: AgentConfigStore;
+  replace(config: AgentConfig): Promise<void>;
+  persisted(): AgentConfig;
+  loadCount(): number;
+} {
+  let config = structuredClone(initial);
+  let revision = 0;
+  let loads = 0;
+  const store: AgentConfigStore = {
+    load: async () => {
+      loads += 1;
+      return structuredClone(config);
+    },
+    save: async (next) => {
+      config = structuredClone(next);
+      revision += 1;
+    },
+    revision: () => revision
+  };
+  return {
+    store,
+    replace: async (next) => await store.save(next),
+    persisted: () => structuredClone(config),
+    loadCount: () => loads
+  };
 }
 
 function openAiResponse(content: string): Response {

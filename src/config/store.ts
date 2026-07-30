@@ -17,6 +17,8 @@ import type { AgentConfig } from "./schema.js";
 export interface AgentConfigStore {
   load(workspaceRoot?: string): Promise<AgentConfig>;
   save(config: AgentConfig, workspaceRoot?: string): Promise<void>;
+  /** 当前进程内成功写入配置的版本号；runtime 用它避免每次 prompt 都重新读盘。 */
+  revision?(): number;
 }
 
 export interface FileConfigStoreOptions {
@@ -27,6 +29,7 @@ export interface FileConfigStoreOptions {
 export function createFileConfigStore(workspaceRoot: string, options: FileConfigStoreOptions = {}): AgentConfigStore {
   const credentials = options.credentialStore ?? createCredentialStore();
   const pathOptions: ConfigPathOptions = { globalDir: options.globalDir };
+  let revision = 0;
   return {
     load: async (requestedWorkspaceRoot) => await applyStoredCredentials(
       await loadConfig(requestedWorkspaceRoot ?? workspaceRoot, pathOptions),
@@ -37,6 +40,8 @@ export function createFileConfigStore(workspaceRoot: string, options: FileConfig
       const previous = await applyStoredCredentials(await loadConfig(targetRoot, pathOptions), credentials);
       await saveStoredCredentials(config, credentials, previous);
       await saveConfig(targetRoot, config, pathOptions);
-    }
+      revision += 1;
+    },
+    revision: () => revision
   };
 }
