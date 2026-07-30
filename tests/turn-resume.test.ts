@@ -1,10 +1,32 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { spawn, type ChildProcess } from "node:child_process";
+import { appendFileSync } from "node:fs";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ModelMessage } from "ai";
+import { z } from "zod";
+import { AgentSession } from "../src/agent/AgentSession.js";
+import type { AgentTurnOutcome } from "../src/agent/types.js";
+import { configSchema, defaultConfig } from "../src/config/schema.js";
+import { createLanguageModelForConfig } from "../src/llm/factory.js";
+import { PermissionManager } from "../src/permission/PermissionManager.js";
+import { SessionRecorder } from "../src/session/recorder.js";
 import { ensureAgentDirs } from "../src/session/store.js";
 import { TurnStore } from "../src/session/turnStore.js";
+import { ToolRegistry } from "../src/tools/registry.js";
+import type { Tool } from "../src/tools/types.js";
+
+interface WorkerOptions {
+  workspaceRoot: string;
+  sessionId: string;
+  endpoint: string;
+  executionLog: string;
+  phase: "initial" | "resumed";
+  crash: "during-tool-b" | "after-tool-b";
+}
 
 async function main(): Promise<void> {
   const root = await mkdtemp(path.join(os.tmpdir(), "biny-turn-"));
@@ -14,6 +36,8 @@ async function main(): Promise<void> {
     await testClearedTurnIsNotResumable(root);
     await testCorruptStateIsIgnored(root);
     await testIsolatedPerSession(root);
+    await testAgentSessionResumesAfterCrashDuringToolB();
+    await testAgentSessionResumesAfterCrashAfterToolB();
     console.log("turn resume tests passed");
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -65,4 +89,320 @@ async function testIsolatedPerSession(root: string): Promise<void> {
   assert.equal(await new TurnStore(root, "session-e").load(), undefined);
 }
 
-await main();
+async function testAgentSessionResumesAfterCrashDuringToolB(): Promise<void> {
+  await testAgentSessionCrashRecovery("during-tool-b", 1);
+}
+
+async function testAgentSessionResumesAfterCrashAfterToolB(): Promise<void> {
+  await testAgentSessionCrashRecovery("after-tool-b", 2);
+}
+
+/**
+ * 真正启动两个 AgentSession 进程：第一个在工具 B 中或 B 后被硬终止，第二个恢复同一
+ * session 并调用 continueInterruptedTurn。执行日志证明工具 A 没有被重新执行。
+ */
+async function testAgentSessionCrashRecovery(
+  crash: WorkerOptions["crash"],
+  expectedPersistedSteps: number
+): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), `biny-turn-${crash}-`));
+  const executionLog = path.join(workspaceRoot, "tool-executions.log");
+  const sessionId = `resume-${crash}`;
+  const provider = await startRecoveryProvider(crash);
+  try {
+    const initial = spawnWorker({
+      workspaceRoot,
+      sessionId,
+      endpoint: provider.endpoint,
+      executionLog,
+      phase: "initial",
+      crash
+    });
+    const initialResult = crash === "after-tool-b"
+      ? await killAfterToolB(initial, provider.afterToolBRequest)
+      : await childResult(initial);
+    if (crash === "during-tool-b") {
+      assert.equal(initialResult.code, 73, initialResult.stderr);
+    } else {
+      assert.equal(initialResult.signal, "SIGKILL", initialResult.stderr);
+    }
+
+    const persisted = await new TurnStore(workspaceRoot, sessionId).load();
+    assert.equal(persisted?.completedSteps, expectedPersistedSteps);
+
+    const resumed = spawnWorker({
+      workspaceRoot,
+      sessionId,
+      endpoint: provider.endpoint,
+      executionLog,
+      phase: "resumed",
+      crash
+    });
+    const resumedResult = await childResult(resumed);
+    assert.equal(resumedResult.code, 0, resumedResult.stderr);
+    const outcome = JSON.parse(resumedResult.stdout.trim()) as AgentTurnOutcome;
+    assert.equal(outcome.status, "completed");
+    assert.equal(outcome.steps, 3);
+    assert.equal(await new TurnStore(workspaceRoot, sessionId).load(), undefined);
+
+    const executions = (await readFile(executionLog, "utf8")).trim().split("\n");
+    assert.equal(executions.filter((entry) => entry === "tool-a:done").length, 1);
+    assert.equal(executions.filter((entry) => entry === "tool-b:done").length, 1);
+    assert.equal(
+      executions.filter((entry) => entry === "tool-b:start").length,
+      crash === "during-tool-b" ? 2 : 1
+    );
+
+    const resumedRequest = provider.resumedRequests[0];
+    assert.ok(resumedRequest?.includes("call-a"), "resumed context must include tool A");
+    assert.equal(
+      resumedRequest?.includes("call-b"),
+      crash === "after-tool-b",
+      "the resume point must match whether tool B completed before the crash"
+    );
+  } finally {
+    await provider.close();
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+function spawnWorker(options: WorkerOptions): ChildProcess {
+  return spawn(
+    process.execPath,
+    [...process.execArgv, fileURLToPath(import.meta.url), "--agent-worker", JSON.stringify(options)],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        BINY_AGENT_DIR: path.join(options.workspaceRoot, "global-agent")
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    }
+  );
+}
+
+async function killAfterToolB(
+  child: ChildProcess,
+  afterToolBRequest: Promise<void>
+): Promise<ChildResult> {
+  await withTimeout(afterToolBRequest, 10_000);
+  child.kill("SIGKILL");
+  return await childResult(child);
+}
+
+interface ChildResult {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+}
+
+async function childResult(child: ChildProcess): Promise<ChildResult> {
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => { stdout += chunk; });
+  child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
+  return await withTimeout(new Promise<ChildResult>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve({ code, signal, stdout, stderr }));
+  }), 15_000);
+}
+
+async function startRecoveryProvider(crash: WorkerOptions["crash"]): Promise<{
+  endpoint: string;
+  afterToolBRequest: Promise<void>;
+  resumedRequests: string[];
+  close(): Promise<void>;
+}> {
+  let resolveAfterToolB!: () => void;
+  const afterToolBRequest = new Promise<void>((resolve) => { resolveAfterToolB = resolve; });
+  const resumedRequests: string[] = [];
+  const server = createServer(async (request, response) => {
+    const body = await requestBody(request);
+    const phase = request.headers["x-test-phase"];
+    if (phase === "resumed") resumedRequests.push(body);
+    const hasToolA = body.includes("call-a");
+    const hasToolB = body.includes("call-b");
+    if (crash === "after-tool-b" && phase === "initial" && hasToolB) {
+      resolveAfterToolB();
+      return;
+    }
+    if (!hasToolA) {
+      sendProviderParts(response, toolCallParts("call-a", "tool_a"));
+      return;
+    }
+    if (!hasToolB) {
+      sendProviderParts(response, toolCallParts("call-b", "tool_b"));
+      return;
+    }
+    sendProviderParts(response, [
+      { choices: [{ index: 0, delta: { content: "recovered" }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      "[DONE]"
+    ]);
+  });
+  await listen(server);
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Recovery provider did not bind a TCP port.");
+  return {
+    endpoint: `http://127.0.0.1:${String(address.port)}/v1`,
+    afterToolBRequest,
+    resumedRequests,
+    close: async () => await closeServer(server)
+  };
+}
+
+function toolCallParts(toolCallId: string, toolName: string): Array<Record<string, unknown> | "[DONE]"> {
+  return [
+    {
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: toolCallId,
+            type: "function",
+            function: { name: toolName, arguments: "{}" }
+          }]
+        },
+        finish_reason: null
+      }]
+    },
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    "[DONE]"
+  ];
+}
+
+function sendProviderParts(
+  response: import("node:http").ServerResponse,
+  parts: Array<Record<string, unknown> | "[DONE]">
+): void {
+  const body = parts
+    .map((part) => `data: ${typeof part === "string" ? part : JSON.stringify(part)}\n\n`)
+    .join("");
+  response.writeHead(200, { "content-type": "text/event-stream" });
+  response.end(body);
+}
+
+async function requestBody(request: import("node:http").IncomingMessage): Promise<string> {
+  let body = "";
+  request.setEncoding("utf8");
+  for await (const chunk of request) body += String(chunk);
+  return body;
+}
+
+async function listen(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+}
+
+async function closeServer(server: Server): Promise<void> {
+  server.closeAllConnections?.();
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(`Timed out after ${String(timeoutMs)}ms`)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+async function runAgentWorker(options: WorkerOptions): Promise<void> {
+  await ensureAgentDirs(options.workspaceRoot);
+  const config = configSchema.parse({
+    ...defaultConfig,
+    defaultModel: "test-model",
+    providers: {
+      active: {
+        type: "openai",
+        apiKey: "test-key",
+        baseUrl: options.endpoint
+      }
+    },
+    models: {
+      "test-model": {
+        provider: "active",
+        model: "test-model",
+        headers: { "x-test-phase": options.phase }
+      }
+    },
+    agent: { ...defaultConfig.agent, maxSteps: 6 },
+    permission: { ...defaultConfig.permission, mode: "full-access" },
+    context: { ...defaultConfig.context, memory: { enabled: false } }
+  });
+  const registry = new ToolRegistry();
+  registry.register(crashTestTool("tool_a", options));
+  registry.register(crashTestTool("tool_b", options));
+  const recorder = options.phase === "initial"
+    ? new SessionRecorder(options.workspaceRoot, options.sessionId)
+    : new SessionRecorder(options.workspaceRoot);
+  const agent = new AgentSession({
+    workspaceRoot: options.workspaceRoot,
+    config,
+    model: createLanguageModelForConfig(config),
+    toolRegistry: registry,
+    permissionManager: new PermissionManager(config.permission),
+    recorder
+  });
+  await agent.initialize();
+  if (options.phase === "resumed") await agent.resume(options.sessionId);
+  let outcome: AgentTurnOutcome | undefined;
+  const stream = options.phase === "initial"
+    ? agent.prompt("run tool A and tool B")
+    : agent.continueInterruptedTurn();
+  for await (const event of stream) {
+    if (event.type === "done") outcome = event.outcome;
+  }
+  await agent.close();
+  if (!outcome) throw new Error("Agent worker ended without an outcome.");
+  process.stdout.write(`${JSON.stringify(outcome)}\n`);
+}
+
+function crashTestTool(name: "tool_a" | "tool_b", options: WorkerOptions): Tool<Record<string, never>> {
+  return {
+    name,
+    description: `Execute ${name}.`,
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    schema: z.object({}),
+    risk: "read",
+    resolveExecution() {
+      return {
+        approvalRule: name,
+        async execute() {
+          if (name === "tool_a") {
+            appendFileSync(options.executionLog, "tool-a:done\n");
+            return { completed: true };
+          }
+          appendFileSync(options.executionLog, "tool-b:start\n");
+          if (options.phase === "initial" && options.crash === "during-tool-b") process.exit(73);
+          appendFileSync(options.executionLog, "tool-b:done\n");
+          return { completed: true };
+        }
+      };
+    }
+  };
+}
+
+const workerIndex = process.argv.indexOf("--agent-worker");
+if (workerIndex === -1) {
+  await main();
+} else {
+  const serialized = process.argv[workerIndex + 1];
+  if (!serialized) throw new Error("Missing AgentSession worker options.");
+  await runAgentWorker(JSON.parse(serialized) as WorkerOptions);
+}
