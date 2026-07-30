@@ -7,7 +7,7 @@
  * `accumulatedEvidence` 跨自动续跑保留：验收看的是整段任务的证据，而 `attemptToolEvidence`
  * 只含本次尝试的，用于按尝试审计。
  */
-import type { AgentRunOptions, AgentSession } from "../agent/AgentSession.js";
+import type { AgentAttemptOptions, AgentSession } from "../agent/AgentSession.js";
 import type { AgentSessionEvent, AgentTurnOutcome } from "../agent/types.js";
 import { redactSecrets, redactSensitiveValue } from "../utils/secrets.js";
 import type { TaskAttemptContext } from "./TaskAttemptLoop.js";
@@ -15,7 +15,7 @@ import type { AgentAttemptExecution, TaskContract, TaskToolEvidence } from "./ty
 
 export interface AgentAttemptExecutorOptions {
   agent: AgentSession;
-  runOptions(context: TaskAttemptContext<TaskContract>): AgentRunOptions;
+  runOptions(context: TaskAttemptContext<TaskContract>): AgentAttemptOptions;
   prompt?(context: TaskAttemptContext<TaskContract>): string;
   initialEvidence?: TaskToolEvidence[];
   onEvent?(event: AgentSessionEvent, context: TaskAttemptContext<TaskContract>): void;
@@ -40,31 +40,32 @@ export class AgentAttemptExecutor {
     const publicInput = runOptions.sessionUserMessage ?? prompt;
     // 验收用的提示词属于模型上下文，不是用户看到的消息，因此宿主事件和 session 记录里
     // 用 publicInput，真正发给模型的完整 prompt 走 modelInput（对应 publicUserMessage 的切分）。
-    for await (const event of this.options.agent.run(publicInput, { ...runOptions, modelInput: prompt })) {
+    for await (const event of this.options.agent.runAttempt(publicInput, { ...runOptions, modelInput: prompt })) {
       this.options.onEvent?.(event, context);
-      if (event.type === "tool-started") {
+      if (event.type === "tool.started") {
         evidence.set(event.toolCallId, {
           toolCallId: event.toolCallId,
           tool: event.tool,
           args: compactEvidenceValue(event.args),
           observedAt: new Date().toISOString()
         });
-      } else if (event.type === "sdk" && event.part.type === "tool-result") {
-        const current = evidence.get(event.part.toolCallId);
-        evidence.set(event.part.toolCallId, {
-          toolCallId: event.part.toolCallId,
-          tool: event.part.toolName,
+      } else if (event.type === "tool.completed") {
+        const current = evidence.get(event.toolCallId);
+        evidence.set(event.toolCallId, {
+          toolCallId: event.toolCallId,
+          tool: event.tool,
           args: current?.args,
-          result: compactEvidenceValue(event.part.output),
+          result: compactEvidenceValue(event.result),
           observedAt: new Date().toISOString()
         });
-      } else if (event.type === "sdk" && event.part.type === "tool-error") {
-        const current = evidence.get(event.part.toolCallId);
-        evidence.set(event.part.toolCallId, {
-          toolCallId: event.part.toolCallId,
-          tool: event.part.toolName,
+      } else if (event.type === "tool.failed") {
+        const current = evidence.get(event.toolCallId);
+        evidence.set(event.toolCallId, {
+          toolCallId: event.toolCallId,
+          tool: event.tool,
           args: current?.args,
-          error: String(event.part.error),
+          result: event.result === undefined ? undefined : compactEvidenceValue(event.result),
+          error: event.error,
           observedAt: new Date().toISOString()
         });
       } else if (event.type === "error" && event.fatal !== false) {

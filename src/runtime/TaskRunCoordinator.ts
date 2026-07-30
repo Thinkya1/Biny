@@ -1,5 +1,5 @@
-import type { AgentAttachment, AgentRunMode } from "../agent/AgentSession.js";
-import type { AgentPermissionRequest, AgentPermissionResult, AgentSessionEvent, AgentTurnOutcome } from "../agent/types.js";
+import type { AgentAttachment } from "../agent/AgentSession.js";
+import type { AgentPermissionRequest, AgentPermissionResult, AgentTurnOutcome } from "../agent/types.js";
 import { AcceptanceVerifier } from "../harness/AcceptanceVerifier.js";
 import { AgentAttemptExecutor } from "../harness/AgentAttemptExecutor.js";
 import { cleanupTask } from "../harness/TaskCleanup.js";
@@ -21,13 +21,9 @@ export interface TaskRunCoordinatorExecution {
   runId: string;
   sessionId: string;
   input: string;
-  mode: Extract<AgentRunMode, "autonomous">;
   attachments?: AgentAttachment[];
   signal: AbortSignal;
-  confirmPermission(request: AgentPermissionRequest): Promise<AgentPermissionResult>;
-  /** Maps a raw Agent event into the host and returns whether reasoning remains active. */
-  onAgentEvent(event: AgentSessionEvent): boolean;
-  onReasoningCompleted(): void;
+  confirmPermission?(request: AgentPermissionRequest): Promise<AgentPermissionResult>;
 }
 
 export interface TaskRunCoordinatorResult {
@@ -36,8 +32,7 @@ export interface TaskRunCoordinatorResult {
 
 /**
  * Owns one durable task's contract, bounded attempts, independent verification,
- * decision policy, cleanup, and persistence. The interactive runtime only maps
- * host events and presents its resulting turn to the user.
+ * decision policy, cleanup, and persistence.
  */
 export class TaskRunCoordinator {
   private readonly runtime: CommandRuntime;
@@ -61,7 +56,6 @@ export class TaskRunCoordinator {
     let durableTaskCreated = false;
     let latestExecution: AgentAttemptExecution | undefined;
     const executions = new Map<string, AgentAttemptExecution>();
-    let reasoningActive = false;
     let cleanupCompleted = false;
 
     try {
@@ -100,8 +94,7 @@ export class TaskRunCoordinator {
         initialEvidence: resolved.priorToolEvidence,
         runOptions: (context) => ({
           abortSignal: context.signal,
-          confirmPermission: async (request) => await options.confirmPermission(request),
-          mode: options.mode,
+          confirmPermission: options.confirmPermission,
           attachments: options.attachments,
           maxSteps: context.remainingRuntimeSteps === undefined
             ? undefined
@@ -109,10 +102,7 @@ export class TaskRunCoordinator {
           deferSuccessfulMemory: true,
           sessionUserMessage: options.input,
           recordSessionUserMessage: context.attemptNumber === 1
-        }),
-        onEvent: (event) => {
-          reasoningActive = options.onAgentEvent(event);
-        }
+        })
       });
       const loop = new TaskAttemptLoop<TaskContract>({
         budget,
@@ -151,10 +141,6 @@ export class TaskRunCoordinator {
             attemptId: context.attemptId,
             execution
           });
-          if (reasoningActive) {
-            options.onReasoningCompleted();
-            reasoningActive = false;
-          }
           return {
             output: execution.output,
             runtimeSteps: execution.runtimeSteps,

@@ -9,6 +9,7 @@ import type { AgentSessionEvent } from "../src/agent/types.js";
 import type { ContextStatus } from "../src/agent/context/types.js";
 import type { CommandRuntime } from "../src/runtime/CommandRuntime.js";
 import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.js";
+import { executeRuntimeCommand } from "../src/runtime/commands.js";
 import { SessionLeaseStore } from "../src/runtime/SessionLease.js";
 import { pendingPermission, type AgentHostEvent } from "../src/runtime/agentEvents.js";
 import { loadConfigFile, saveConfigFile } from "../src/config/loader.js";
@@ -103,7 +104,7 @@ async function testInteractiveRuntimeProtocol(): Promise<void> {
   const permissionRequested = new Promise<Extract<AgentHostEvent, { type: "permission.requested" }>>((resolve) => {
     resolvePermission = resolve;
   });
-  runtime.subscribe((event) => {
+  subscribeHostEvents(runtime, (event) => {
     events.push(event);
     if (event.type === "permission.requested") resolvePermission(event);
   });
@@ -120,11 +121,9 @@ async function testInteractiveRuntimeProtocol(): Promise<void> {
     "reasoning.started",
     "reasoning.completed",
     "tool.started",
-    "reasoning.status",
     "permission.requested",
     "permission.resolved",
     "tool.completed",
-    "file.changed",
     "assistant.delta",
     "assistant.completed",
     "context.updated",
@@ -137,7 +136,7 @@ async function testInteractiveRuntimeProtocol(): Promise<void> {
 async function testInteractiveRuntimeRedactsToolEvents(): Promise<void> {
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
   const events: AgentHostEvent[] = [];
-  runtime.subscribe((event) => {
+  subscribeHostEvents(runtime, (event) => {
     events.push(event);
     if (event.type === "permission.requested") {
       runtime.answerPermission(event.requestId, { approved: true, scope: "once" });
@@ -159,7 +158,7 @@ async function testInteractiveRuntimeRedactsRunText(): Promise<void> {
   for (const input of ["secret-event-error", "secret-thrown-error"]) {
     const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
     const events: AgentHostEvent[] = [];
-    runtime.subscribe((event) => events.push(event));
+    subscribeHostEvents(runtime, (event) => events.push(event));
     const outcome = await runtime.submitPrompt(input).completion;
     const serialized = JSON.stringify({ events, outcome });
     assert.equal(serialized.includes("opaque-live-run-secret"), false);
@@ -168,10 +167,14 @@ async function testInteractiveRuntimeRedactsRunText(): Promise<void> {
     await runtime.close();
   }
 
-  const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
+  const services = fakeCommandRuntime();
+  const runtime = new InteractiveAgentRuntime(services);
   const events: AgentHostEvent[] = [];
-  runtime.subscribe((event) => events.push(event));
-  await assert.rejects(runtime.runSubagentTask("secret-subagent-failure"), /\[redacted\]/);
+  subscribeHostEvents(runtime, (event) => events.push(event));
+  await assert.rejects(
+    executeRuntimeCommand(runtime, services, "/subagent secret-subagent-failure", "desktop"),
+    /\[redacted\]/
+  );
   assert.equal(JSON.stringify(events).includes("opaque-live-run-secret"), false);
   await runtime.close();
 }
@@ -182,7 +185,7 @@ async function testInteractiveRuntimeStrongConfirmation(): Promise<void> {
   const permissionRequested = new Promise<Extract<AgentHostEvent, { type: "permission.requested" }>>((resolve) => {
     resolvePermission = resolve;
   });
-  runtime.subscribe((event) => {
+  subscribeHostEvents(runtime, (event) => {
     if (event.type === "permission.requested") resolvePermission(event);
   });
 
@@ -206,7 +209,7 @@ async function testInteractiveRuntimeStrongConfirmation(): Promise<void> {
 async function testPermissionRequiredToolResultIsFailed(): Promise<void> {
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
   const events: AgentHostEvent[] = [];
-  runtime.subscribe((event) => {
+  subscribeHostEvents(runtime, (event) => {
     events.push(event);
     if (event.type === "permission.requested") {
       runtime.answerPermission(event.requestId, { approved: true, scope: "once" });
@@ -215,7 +218,7 @@ async function testPermissionRequiredToolResultIsFailed(): Promise<void> {
 
   await runtime.submitPrompt("stale").completion;
   assert.equal(events.some((event) => event.type === "tool.failed" && /target changed/i.test(event.error)), true);
-  assert.equal(events.some((event) => event.type === "tool.completed" || event.type === "file.changed"), false);
+  assert.equal(events.some((event) => event.type === "tool.completed"), false);
   await runtime.close();
 }
 
@@ -255,7 +258,7 @@ async function testInteractiveRuntimeAbort(): Promise<void> {
   const events: AgentHostEvent[] = [];
   let started!: () => void;
   const runStarted = new Promise<void>((resolve) => { started = resolve; });
-  runtime.subscribe((event) => {
+  subscribeHostEvents(runtime, (event) => {
     events.push(event);
     if (event.type === "run.started") started();
   });
@@ -1172,18 +1175,18 @@ function testLiveExecutionTimelineKeepsReasoningAndToolsInOrder(): void {
   const timeline = buildSessionTimeline([], [
     { ...base, type: "message.user", messageId: "message", content: "inspect and test" },
     { ...base, type: "run.started", messageId: "message", input: "inspect and test", mode: "chat", model: { alias: "test", provider: "test", label: "test/model", reasoning: "High" }, skills: [] },
-    { ...base, type: "reasoning.started", messageId: "message", status: "正在分析任务" },
-    { ...base, timestamp: "2026-01-01T00:00:01.000Z", type: "reasoning.delta", messageId: "message", content: "先检查入口。" },
-    { ...base, timestamp: "2026-01-01T00:00:02.000Z", type: "reasoning.completed", messageId: "message", status: "分析完成" },
+    { ...base, type: "reasoning.started", phase: "initial" },
+    { ...base, timestamp: "2026-01-01T00:00:01.000Z", type: "reasoning.delta", content: "先检查入口。" },
+    { ...base, timestamp: "2026-01-01T00:00:02.000Z", type: "reasoning.completed" },
     { ...base, timestamp: "2026-01-01T00:00:03.000Z", type: "tool.started", toolCallId: "read", tool: "read_file", args: { path: "src/index.ts" } },
     { ...base, timestamp: "2026-01-01T00:00:04.000Z", type: "tool.completed", toolCallId: "read", tool: "read_file", result: {}, durationMs: 1_000 },
-    { ...base, timestamp: "2026-01-01T00:00:05.000Z", type: "reasoning.started", messageId: "message", status: "正在验证" },
-    { ...base, timestamp: "2026-01-01T00:00:06.000Z", type: "reasoning.delta", messageId: "message", content: "再运行测试。" },
-    { ...base, timestamp: "2026-01-01T00:00:07.000Z", type: "reasoning.completed", messageId: "message", status: "分析完成" },
+    { ...base, timestamp: "2026-01-01T00:00:05.000Z", type: "reasoning.started", phase: "continuing" },
+    { ...base, timestamp: "2026-01-01T00:00:06.000Z", type: "reasoning.delta", content: "再运行测试。" },
+    { ...base, timestamp: "2026-01-01T00:00:07.000Z", type: "reasoning.completed" },
     { ...base, timestamp: "2026-01-01T00:00:08.000Z", type: "tool.started", toolCallId: "test", tool: "run_command", args: { command: "pnpm test" } },
     { ...base, timestamp: "2026-01-01T00:00:09.000Z", type: "tool.completed", toolCallId: "test", tool: "run_command", result: {}, durationMs: 1_000 },
-    { ...base, timestamp: "2026-01-01T00:00:10.000Z", type: "assistant.delta", messageId: "message", content: "完成。" },
-    { ...base, timestamp: "2026-01-01T00:00:11.000Z", type: "assistant.completed", messageId: "message", content: "完成。" },
+    { ...base, timestamp: "2026-01-01T00:00:10.000Z", type: "assistant.delta", content: "完成。" },
+    { ...base, timestamp: "2026-01-01T00:00:11.000Z", type: "assistant.completed", content: "完成。" },
     { ...base, timestamp: "2026-01-01T00:00:12.000Z", type: "run.completed", durationMs: 12_000 }
   ]);
   const turn = timeline[0];
@@ -1196,10 +1199,10 @@ function testLiveAssistantCompletionDoesNotDuplicateDelta(): void {
   const base = { sessionId: "session", runId: "duplicate-run", timestamp: "2026-01-01T00:00:00.000Z" };
   const timeline = buildSessionTimeline([], [
     { ...base, type: "message.user", messageId: "message", content: "停止进程" },
-    { ...base, type: "assistant.delta", messageId: "message", content: "正文" },
+    { ...base, type: "assistant.delta", content: "正文" },
     { ...base, type: "tool.started", toolCallId: "tool", tool: "list_processes", args: {} },
     { ...base, type: "tool.completed", toolCallId: "tool", tool: "list_processes", result: {}, durationMs: 10 },
-    { ...base, type: "assistant.completed", messageId: "message", content: "正文" },
+    { ...base, type: "assistant.completed", content: "正文" },
     { ...base, type: "run.completed", durationMs: 20 }
   ]);
   const turn = timeline[0];
@@ -1260,8 +1263,7 @@ function testChangedFileProjection(): void {
   const completed = buildSessionTimeline([], [
     { ...base, type: "message.user", messageId: "message", content: "write" },
     { ...base, type: "tool.started", toolCallId: "write-tool", tool: "write_file", args: { path: "hello.py" }, display: { kind: "file_io", operation: "write", path: "hello.py" } },
-    { ...base, type: "tool.completed", toolCallId: "write-tool", tool: "write_file", result: { path: "hello.py" }, durationMs: 10 },
-    { ...base, type: "file.changed", toolCallId: "write-tool", path: "hello.py", operation: "write" }
+    { ...base, type: "tool.completed", toolCallId: "write-tool", tool: "write_file", result: { path: "hello.py" }, durationMs: 10 }
   ]);
   assert.deepEqual(listChangedFiles(completed[0]!), [{ path: "hello.py", operation: "write", status: "completed" }]);
 
@@ -1278,9 +1280,8 @@ function testLiveTimelineProjection(): void {
   const live: AgentHostEvent[] = [
     { ...base, type: "message.user", messageId: "message", content: "show diff" },
     { ...base, type: "tool.started", toolCallId: "tool", tool: "git_diff", args: {} },
-    { ...base, type: "diff.created", toolCallId: "tool", diff: "diff --git a/a.ts b/a.ts\n+const a = 1;" },
-    { ...base, type: "tool.completed", toolCallId: "tool", tool: "git_diff", result: {}, durationMs: 20 },
-    { ...base, type: "assistant.completed", messageId: "message", content: "done" },
+    { ...base, type: "tool.completed", toolCallId: "tool", tool: "git_diff", result: { output: "diff --git a/a.ts b/a.ts\n+const a = 1;" }, durationMs: 20 },
+    { ...base, type: "assistant.completed", content: "done" },
     { ...base, type: "run.completed", durationMs: 30 }
   ];
   const timeline = buildSessionTimeline([], live);
@@ -1288,18 +1289,32 @@ function testLiveTimelineProjection(): void {
   assert.equal(timeline[0]?.tools[0]?.diff?.includes("a.ts"), true);
   assert.equal(timeline[0]?.status, "completed");
 
+  const successfulCommand = buildSessionTimeline([], [
+    { ...base, runId: "successful-command", type: "message.user", messageId: "command-message", content: "run" },
+    { ...base, runId: "successful-command", type: "tool.started", toolCallId: "command", tool: "run_command", args: { command: "pnpm test" }, display: { kind: "command", command: "pnpm test", cwd: "/workspace" } },
+    { ...base, runId: "successful-command", type: "tool.progress", toolCallId: "command", tool: "run_command", update: { kind: "stdout", text: "passed\n" } },
+    { ...base, runId: "successful-command", type: "tool.progress", toolCallId: "command", tool: "run_command", update: { kind: "stderr", text: "warning\n" } },
+    { ...base, runId: "successful-command", type: "tool.completed", toolCallId: "command", tool: "run_command", result: { exitCode: 0 }, durationMs: 8 }
+  ]);
+  assert.deepEqual(successfulCommand[0]?.tools[0]?.command, {
+    command: "pnpm test",
+    cwd: "/workspace",
+    stdout: "passed\n",
+    stderr: "warning\n",
+    exitCode: 0
+  });
+
   const failedCommand = buildSessionTimeline([], [
     { ...base, runId: "failed-command", type: "message.user", messageId: "command-message", content: "run" },
-    { ...base, runId: "failed-command", type: "tool.started", toolCallId: "command", tool: "run_command", args: { command: "false" } },
-    { ...base, runId: "failed-command", type: "tool.completed", toolCallId: "command", tool: "run_command", result: { exitCode: 1 }, durationMs: 8 },
-    { ...base, runId: "failed-command", type: "command.completed", toolCallId: "command", command: "false", exitCode: 1, durationMs: 8 }
+    { ...base, runId: "failed-command", type: "tool.started", toolCallId: "command", tool: "run_command", args: { command: "false" }, display: { kind: "command", command: "false" } },
+    { ...base, runId: "failed-command", type: "tool.failed", toolCallId: "command", tool: "run_command", result: { exitCode: 1 }, error: "Command exited with code 1.", durationMs: 8 }
   ]);
   assert.equal(failedCommand[0]?.tools[0]?.status, "failed");
 
   const typedFailure = buildSessionTimeline([], [
     { ...base, runId: "typed-failure", type: "message.user", messageId: "typed-message", content: "run" },
-    { ...base, runId: "typed-failure", type: "tool.started", toolCallId: "typed-command", tool: "run_command", args: { command: "false" } },
-    { ...base, runId: "typed-failure", type: "command.failed", toolCallId: "typed-command", command: "false", status: "failed", exitCode: 1, error: "Command exited with code 1.", durationMs: 8 },
+    { ...base, runId: "typed-failure", type: "tool.started", toolCallId: "typed-command", tool: "run_command", args: { command: "false" }, display: { kind: "command", command: "false" } },
+    { ...base, runId: "typed-failure", type: "tool.failed", toolCallId: "typed-command", tool: "run_command", result: { status: "failed", exitCode: 1 }, error: "Command exited with code 1.", durationMs: 8 },
     { ...base, runId: "typed-failure", type: "run.incomplete", durationMs: 30, reason: "Step limit reached.", stopReason: "step_limit", finishReason: "tool-calls", steps: 8 }
   ]);
   assert.equal(typedFailure[0]?.tools[0]?.status, "failed");
@@ -1321,9 +1336,9 @@ function testLiveReasoningAndSkillProjection(): void {
       model: { alias: "test", provider: "test", label: "test/model", reasoning: "High" },
       skills: [".agent/skills/programmatic-tools/SKILL.md"]
     },
-    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:01.000Z", type: "reasoning.started", messageId: "message", status: "正在分析任务" },
-    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:02.512Z", type: "reasoning.delta", messageId: "message", content: "先拆分问题。" },
-    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:02.512Z", type: "reasoning.completed", messageId: "message", status: "分析完成" },
+    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:01.000Z", type: "reasoning.started", phase: "initial" },
+    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:02.512Z", type: "reasoning.delta", content: "先拆分问题。" },
+    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:02.512Z", type: "reasoning.completed" },
     { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:03.000Z", type: "run.completed", durationMs: 3_000 }
   ];
   const timeline = buildSessionTimeline([], live);
@@ -1400,7 +1415,7 @@ function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
     setPermissionMode: async () => undefined,
     listModels: () => [],
     switchModel: async () => ({ modelAlias: "test", provider: "test", modelLabel: "test/model", reasoningLabel: "Off", thinking: "off" as const }),
-    async *run(input: string, options: AgentRunOptions): AsyncGenerator<AgentSessionEvent> {
+    async *prompt(input: string, options: AgentRunOptions): AsyncGenerator<AgentSessionEvent> {
       yield { type: "status", status: "thinking" };
       if (input === "cancel") {
         if (!options.abortSignal?.aborted) {
@@ -1414,14 +1429,13 @@ function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
       }
       if (input === "secret-thrown-error") throw new Error("provider password=opaque-live-run-secret");
       const secretProbe = input === "secret";
+      yield { type: "reasoning.started", phase: "initial" };
       if (secretProbe) {
-        yield {
-          type: "sdk",
-          part: { type: "reasoning-delta", id: "reasoning", text: "token=opaque-live-tool-secret" } as AgentSessionEvent & never
-        };
+        yield { type: "reasoning.delta", content: "token=opaque-live-tool-secret" };
       }
+      yield { type: "reasoning.completed" };
       yield {
-        type: "tool-started",
+        type: "tool.started",
         toolCallId: "tool-1",
         tool: "write_file",
         args: {
@@ -1436,23 +1450,26 @@ function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
           content: secretProbe ? "apiKey=opaque-live-tool-secret" : undefined
         }
       };
-      const result = await options.confirmPermission?.(request as Parameters<NonNullable<AgentRunOptions["confirmPermission"]>>[0]);
-      yield { type: "permission-result", toolCallId: "tool-1", request: request as Parameters<NonNullable<AgentRunOptions["confirmPermission"]>>[0], result: result ?? { approved: false } };
+      await options.confirmPermission?.(request as Parameters<NonNullable<AgentRunOptions["confirmPermission"]>>[0]);
       const output = input === "stale"
         ? { status: "permission_required", approved: false, reason: "The target changed after approval." }
         : secretProbe
           ? { path: "a.ts", token: "opaque-live-tool-secret", diffPreview: "+ apiKey=opaque-live-tool-secret", safe: "visible" }
           : { path: "a.ts" };
-      yield { type: "sdk", part: { type: "tool-result", toolCallId: "tool-1", toolName: "write_file", output } as AgentSessionEvent & never };
-      yield {
-        type: "sdk",
-        part: {
-          type: "text-delta",
-          id: "text",
-          text: secretProbe ? "password=opaque-live-tool-secret" : "done"
-        } as AgentSessionEvent & never
-      };
+      if (input === "stale") {
+        yield {
+          type: "tool.failed",
+          toolCallId: "tool-1",
+          tool: "write_file",
+          error: "The target changed after approval.",
+          result: output
+        };
+      } else {
+        yield { type: "tool.completed", toolCallId: "tool-1", tool: "write_file", result: output };
+      }
+      yield { type: "assistant.delta", content: secretProbe ? "password=opaque-live-tool-secret" : "done" };
       const content = secretProbe ? "Authorization: Bearer opaque-live-tool-secret" : "done";
+      yield { type: "assistant.completed", content };
       yield {
         type: "done",
         content,
@@ -1471,15 +1488,25 @@ function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
   };
   return {
     agent,
-    getSubagentInfo: () => ({ modelAlias: "test", provider: "test", modelLabel: "test/model", reasoningLabel: "Off", thinking: "off" as const }),
-    runSubagentTask: async (task: string) => {
-      if (task === "secret-subagent-failure") throw new Error("subagent apiKey=opaque-live-run-secret");
-      return `subagent:${task}`;
+    startSubagentTask: (task: string) => {
+      const completion = task === "secret-subagent-failure"
+        ? Promise.reject(new Error("subagent apiKey=opaque-live-run-secret"))
+        : Promise.resolve(`subagent:${task}`);
+      return { taskId: "desktop-test-subagent", completion };
     },
+    subagents: undefined,
     setSubagentParentRunId: () => undefined,
-    cancelSubagentTasks: () => undefined,
     close: async () => undefined
   } as unknown as CommandRuntime;
+}
+
+function subscribeHostEvents(
+  runtime: InteractiveAgentRuntime,
+  listener: (event: AgentHostEvent) => void
+): () => void {
+  return runtime.subscribe((update) => {
+    if (update.event) listener(update.event);
+  });
 }
 
 function memoryCredentialStore(): CredentialStore {

@@ -6,10 +6,13 @@ import { z } from "zod";
 import { AgentSession } from "../src/agent/AgentSession.js";
 import type { AgentPermissionRequest, AgentPermissionResult, AgentSessionEvent } from "../src/agent/types.js";
 import { configSchema, defaultConfig, type AgentConfig } from "../src/config/schema.js";
+import type { AgentConfigStore } from "../src/config/store.js";
 import { createLanguageModelForConfig } from "../src/llm/factory.js";
+import { ModelManager } from "../src/llm/ModelManager.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
 import { SessionRecorder } from "../src/session/recorder.js";
 import { ensureAgentDirs } from "../src/session/store.js";
+import { TurnStore } from "../src/session/turnStore.js";
 import { createReadFileTool } from "../src/tools/file/readFile.js";
 import { ToolRegistry } from "../src/tools/registry.js";
 import type { Tool } from "../src/tools/types.js";
@@ -17,6 +20,7 @@ import { saveAttachment } from "../src/attachments/store.js";
 
 async function main(): Promise<void> {
   await testAgentStreamsFinalAnswer();
+  await testAgentPromptRunsSharedModelPreflight();
   await testUnsupportedImageAttachmentFailsBeforeProviderCall();
   await testImageAttachmentStoresOnlyReferenceInSession();
   await testAttachmentStorageRejectsSymlink();
@@ -45,10 +49,68 @@ async function main(): Promise<void> {
   await testConsumerReturnAbortsAndDrainsStream();
 }
 
+async function testAgentPromptRunsSharedModelPreflight(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  let requestedModel: unknown;
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    requestedModel = (JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>).model;
+    return sseResponse([
+      { choices: [{ index: 0, delta: { content: "updated model" }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      "[DONE]"
+    ]);
+  }) as typeof fetch;
+
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-agent-preflight-"));
+  await ensureAgentDirs(workspaceRoot);
+  const config = configFor();
+  let persisted = structuredClone(config);
+  let revision = 0;
+  const configStore: AgentConfigStore = {
+    load: async () => structuredClone(persisted),
+    save: async (next) => {
+      persisted = structuredClone(next);
+      revision += 1;
+    },
+    revision: () => revision
+  };
+  const modelManager = new ModelManager(workspaceRoot, config, configStore);
+  const recorder = new SessionRecorder(workspaceRoot);
+  const agent = new AgentSession({
+    workspaceRoot,
+    config,
+    configStore,
+    model: undefined,
+    modelManager,
+    toolRegistry: new ToolRegistry(),
+    permissionManager: new PermissionManager(config.permission),
+    recorder
+  });
+  await agent.initialize();
+  try {
+    await configStore.save(configSchema.parse({
+      ...persisted,
+      defaultModel: "updated-model",
+      models: {
+        ...persisted.models,
+        "updated-model": { provider: "active", model: "updated-model" }
+      }
+    }));
+    const events = await collect(agent.prompt("use the latest configured model"));
+    assert.equal(events.find((event) => event.type === "done")?.outcome.status, "completed");
+    assert.equal(requestedModel, "updated-model");
+    assert.equal(agent.getInfo().modelAlias, "updated-model");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await agent.close();
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function testUnsupportedImageAttachmentFailsBeforeProviderCall(): Promise<void> {
   const { agent, sessionFile, cleanup } = await createAgent();
   try {
-    const events = await collect(agent.run("请分析图片", {
+    const events = await collect(agent.prompt("请分析图片", {
       attachments: [{ name: "shot.png", mimeType: "image/png", path: "@attachments/shot.png", size: 3, data: "abc" }]
     }));
     assert.equal(events.some((event) => event.type === "error" && /vision/u.test(event.message)), true);
@@ -89,7 +151,7 @@ async function testImageAttachmentStoresOnlyReferenceInSession(): Promise<void> 
     config.models["test-model"]!.capabilities = { vision: true };
   });
   try {
-    await collect(agent.run("请分析图片", {
+    await collect(agent.prompt("请分析图片", {
       attachments: [{ name: "shot.png", mimeType: "image/png", path: "@attachments/shot.png", size: 3, data: "base64-image-payload" }]
     }));
     await agent.close();
@@ -115,7 +177,7 @@ async function testImageAttachmentIsRehydratedOnResume(): Promise<void> {
   try {
     const bytes = Buffer.from("persisted-image-bytes");
     const reference = await saveAttachment(workspaceRoot, "shot.png", "image/png", bytes);
-    await collect(agent.run("请分析图片", {
+    await collect(agent.prompt("请分析图片", {
       attachments: [{ ...reference, data: bytes.toString("base64") }]
     }));
 
@@ -170,6 +232,11 @@ async function testStepLimitIsIncompleteAndDoesNotQueueSuccessfulMemory(): Promi
         assert.equal(outcome.steps, maxSteps);
         assert.equal(requestCount, maxSteps);
         assert.equal(successfulTaskCount, 0);
+        assert.equal(await agent.interruptedTurn(), undefined);
+        await assert.rejects(
+          collect(agent.continueInterruptedTurn()),
+          /There is no interrupted turn to continue/u
+        );
       } finally {
         await cleanup(agent);
       }
@@ -457,7 +524,7 @@ async function testAgentStreamsFinalAnswer(): Promise<void> {
   try {
     const events = await collect(runAgent(agent, "hi"));
     assert.equal(calls, 1);
-    assert.equal(events.some((event) => event.type === "sdk" && event.part.type === "text-delta"), true);
+    assert.equal(events.some((event) => event.type === "assistant.delta"), true);
     assert.equal(events.some((event) => event.type === "done" && event.content === "hello"), true);
     await agent.close();
     const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; usage?: { inputTokens?: number }; contextState?: { budget?: { source?: string } } });
@@ -497,8 +564,8 @@ async function testAgentRunsToolAndKeepsSessionEvents(): Promise<void> {
   try {
     const events = await collect(runAgent(agent, "Read README.md"));
     assert.equal(requests.length, 2);
-    assert.equal(events.some((event) => event.type === "tool-started" && event.toolCallId === "read-1"), true);
-    assert.equal(events.some((event) => event.type === "sdk" && event.part.type === "tool-result"), true);
+    assert.equal(events.some((event) => event.type === "tool.started" && event.toolCallId === "read-1"), true);
+    assert.equal(events.some((event) => event.type === "tool.completed" && event.toolCallId === "read-1"), true);
     assert.equal(events.some((event) => event.type === "done" && event.content === "README read"), true);
     await agent.close();
     const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; contextUsage?: { usedTokens?: number } });
@@ -524,7 +591,7 @@ async function testInternalAttemptPersistsOnlyPublicPrompt(): Promise<void> {
 
   const { agent, cleanup, sessionFile } = await createAgent();
   try {
-    await collect(agent.run("用户原始提示词", {
+    await collect(agent.runAttempt("用户原始提示词", {
       modelInput: "internal verifier prompt",
       sessionUserMessage: "用户原始提示词",
       confirmPermission: async () => ({ approved: true, scope: "once" })
@@ -600,7 +667,7 @@ async function testPlanModeExposesOnlyReadTools(): Promise<void> {
 
   const { agent, cleanup } = await createAgent(registry);
   try {
-    const events = await collect(agent.run("Research this task", { mode: "plan" }));
+    const events = await collect(agent.prompt("Research this task", { mode: "plan" }));
     assert.equal(requests.length, 1);
     assert.deepEqual(requestToolNames(requests[0]), ["read_file"]);
     assert.equal(events.some((event) => event.type === "done" && event.content === "plan answer"), true);
@@ -652,7 +719,7 @@ async function testParallelPermissionGate(): Promise<void> {
     }));
     assert.equal(requestCount, 2);
     assert.equal(confirmCount, 1);
-    assert.equal(events.filter((event) => event.type === "sdk" && event.part.type === "tool-result").length, 2);
+    assert.equal(events.filter((event) => event.type === "tool.completed").length, 2);
   } finally {
     globalThis.fetch = originalFetch;
     await cleanup(agent);
@@ -1058,14 +1125,18 @@ async function testPreAbortedRunStopsBeforeRequest(): Promise<void> {
     return sseResponse([{ choices: [{ index: 0, delta: { content: "unexpected" }, finish_reason: "stop" }] }, "[DONE]"]);
   }) as typeof fetch;
 
-  const { agent, cleanup, sessionFile } = await createAgent();
+  const { agent, cleanup, sessionFile, workspaceRoot } = await createAgent();
   const controller = new AbortController();
   controller.abort();
   try {
+    const staleTurn = new TurnStore(workspaceRoot, agent.getInfo().sessionId);
+    await staleTurn.save("older interrupted turn", [{ role: "user", content: "older" }], 1);
+    assert.notEqual(await agent.interruptedTurn(), undefined);
     const events = await collect(runAgent(agent, "hi", undefined, controller.signal));
     assert.equal(calls, 0);
     assert.equal(events.some((event) => event.type === "error"), true);
     assert.equal(events.some((event) => event.type === "done" && event.content === ""), true);
+    assert.equal(await agent.interruptedTurn(), undefined);
     await agent.close();
     const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; content?: string });
     assert.equal(sessionEvents[0]?.type, "user_message");
@@ -1088,7 +1159,7 @@ async function testPreAbortedPlanRecordsAttempt(): Promise<void> {
   const controller = new AbortController();
   controller.abort();
   try {
-    const events = await collect(agent.run("inspect cancellation", {
+    const events = await collect(agent.prompt("inspect cancellation", {
       mode: "plan",
       abortSignal: controller.signal
     }));
@@ -1143,7 +1214,7 @@ async function testConsumerReturnAbortsAndDrainsStream(): Promise<void> {
 
   const { agent, cleanup } = await createAgent();
   try {
-    const iterator = agent.run("start a long response")[Symbol.asyncIterator]();
+    const iterator = agent.prompt("start a long response")[Symbol.asyncIterator]();
     const first = await iterator.next();
     assert.equal(first.value?.type, "status");
     const second = iterator.next();
@@ -1268,7 +1339,7 @@ function runAgent(
   confirmPermission?: (request: AgentPermissionRequest) => Promise<AgentPermissionResult>,
   abortSignal?: AbortSignal
 ): AsyncIterable<AgentSessionEvent> {
-  return agent.run(input, {
+  return agent.prompt(input, {
     confirmPermission: confirmPermission ?? (async () => ({ approved: true, scope: "once" })),
     abortSignal
   });

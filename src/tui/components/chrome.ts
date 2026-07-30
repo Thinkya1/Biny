@@ -163,7 +163,6 @@ function contextColorize(percent: number | undefined, text: string): string {
 export class StatusIndicatorComponent implements Component {
   private readonly loader: Loader;
   private status: TuiStatus = "idle";
-  private queuedCount = 0;
   private running = false;
 
   constructor(ui: TUI) {
@@ -175,9 +174,8 @@ export class StatusIndicatorComponent implements Component {
     );
   }
 
-  setState(status: TuiStatus, queuedCount: number): void {
+  setState(status: TuiStatus): void {
     this.status = status;
-    this.queuedCount = queuedCount;
     const busy = status === "thinking" || status === "running";
     if (busy && !this.running) {
       this.running = true;
@@ -186,7 +184,7 @@ export class StatusIndicatorComponent implements Component {
       this.running = false;
       this.loader.stop();
     }
-    if (busy) this.loader.setMessage(statusMessage(status, queuedCount));
+    if (busy) this.loader.setMessage(statusMessage(status));
   }
 
   dispose(): void {
@@ -199,18 +197,17 @@ export class StatusIndicatorComponent implements Component {
 
   render(width: number): string[] {
     if (this.running) return this.loader.render(width).slice(0, 1);
-    const message = statusMessage(this.status, this.queuedCount);
+    const message = statusMessage(this.status);
     if (!message) return [""];
     return [truncateToWidth(statusColorize(this.status, message), width, "…")];
   }
 }
 
-export function statusMessage(status: TuiStatus, queuedCount: number): string {
-  const queued = queuedCount > 0 ? ` · ${String(queuedCount)} queued` : "";
-  if (status === "thinking") return `Thinking…${queued} (esc to interrupt)`;
-  if (status === "running") return `Working…${queued} (esc to interrupt)`;
-  if (status === "waiting_permission") return `Waiting for approval${queued}`;
-  return queued ? queued.replace(/^ · /, "") : "";
+export function statusMessage(status: TuiStatus): string {
+  if (status === "thinking") return "Thinking… (esc to interrupt)";
+  if (status === "running") return "Working… (esc to interrupt)";
+  if (status === "waiting_permission") return "Waiting for approval";
+  return "";
 }
 
 function statusColorize(status: TuiStatus, text: string): string {
@@ -254,7 +251,6 @@ export function shortcutHints(status: TuiStatus, mode: AgentRunMode): ShortcutHi
     hints.push({ key: "enter", description: "answer" }, { key: "ctrl+o", description: "details" });
   } else if (busy) {
     hints.push(
-      { key: "enter", description: "queue follow-up" },
       { key: "esc", description: "interrupt" },
       { key: "ctrl+o", description: "details" }
     );

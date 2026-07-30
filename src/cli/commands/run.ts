@@ -5,30 +5,38 @@
  * session 文件位置。它适合脚本化调用或不需要持续对话的任务。
  */
 import type { AgentTurnOutcome } from "../../agent/types.js";
+import type { CommandRuntime } from "../../runtime/CommandRuntime.js";
+import type { SessionLease, SessionLeaseStore } from "../../runtime/SessionLease.js";
 import { withCliAbortSignal } from "../sigint.js";
 
 export async function runCommand(workspaceRoot: string, input: string): Promise<void> {
-  // run 是一次性入口：执行完一个任务后输出结果和 session 文件位置。
-  const { createAutonomousAgentRuntime } = await import("../../runtime/ExecutionService.js");
-  const runtime = await createAutonomousAgentRuntime(workspaceRoot);
+  const [{ createCommandRuntime }, { ExecutionService }, { SessionLeaseStore }] = await Promise.all([
+    import("../../runtime/CommandRuntime.js"),
+    import("../../runtime/ExecutionService.js"),
+    import("../../runtime/SessionLease.js")
+  ]);
+  let runtime: CommandRuntime | undefined;
+  let leases: SessionLeaseStore | undefined;
+  let lease: SessionLease | undefined;
   try {
-    const outcome = await withCliAbortSignal(async (abortSignal) => {
-      const submitted = runtime.submitPrompt(input, "autonomous");
-      const onAbort = (): void => {
-        runtime.cancelRun(submitted.runId);
-      };
-      abortSignal.addEventListener("abort", onAbort, { once: true });
-      try {
-        return await submitted.completion;
-      } finally {
-        abortSignal.removeEventListener("abort", onAbort);
-      }
-    });
-    if (outcome.output) console.log(outcome.output);
-    console.log(`\nSession: ${runtime.getInfo().sessionFile}`);
-    assertCompletedCliRun(outcome);
+    runtime = await createCommandRuntime(workspaceRoot);
+    leases = await SessionLeaseStore.open(runtime.persistenceRoot);
+    lease = leases.acquire(runtime.agent.getInfo().sessionId);
+    const execution = await ExecutionService.create(runtime);
+    const result = await withCliAbortSignal(async (signal) => await execution.execute({ input, signal }));
+    if (result.turn.output) console.log(result.turn.output);
+    console.log(`\nSession: ${result.session.sessionFile}`);
+    assertCompletedCliRun(result.turn);
+  } catch (error) {
+    runtime?.agent.recordError(error);
+    throw error;
   } finally {
-    await runtime.close();
+    try {
+      await runtime?.close();
+    } finally {
+      lease?.close();
+      leases?.close();
+    }
   }
 }
 

@@ -90,6 +90,13 @@ export interface AgentRunOptions {
   attachments?: AgentAttachment[];
 }
 
+export type AgentPromptOptions = Pick<
+  AgentRunOptions,
+  "abortSignal" | "confirmPermission" | "mode" | "attachments"
+>;
+
+export type AgentAttemptOptions = Omit<AgentRunOptions, "mode">;
+
 export type { AgentAttachment } from "../attachments/store.js";
 
 export interface AgentSessionInfo {
@@ -107,10 +114,9 @@ export interface AgentSessionInfo {
   skills?: string[];
 }
 
-/** 普通交互统一走 chat；plan 仅改变工具策略；autonomous 只给 CLI 的强制 durable 策略使用。 */
-export type AgentRunMode = "chat" | "plan" | "autonomous";
-/** Desktop/TUI 的交互策略；durable 执行由 `biny run` 明确触发。 */
-export type InteractiveAgentRunMode = Exclude<AgentRunMode, "autonomous">;
+/** 普通交互统一走 chat；plan 只改变工具策略。durable execution 不属于交互 mode。 */
+export type AgentRunMode = "chat" | "plan";
+export type InteractiveAgentRunMode = AgentRunMode;
 
 export interface ResumedAgentSession extends SessionReplay {
   filePath: string;
@@ -214,10 +220,21 @@ export class AgentSession {
   async *continueInterruptedTurn(runOptions: AgentRunOptions = {}): AsyncGenerator<AgentSessionEvent> {
     const turn = await this.turnStore.load();
     if (!turn) throw new Error("There is no interrupted turn to continue.");
-    yield* this.run(turn.prompt, {
+    const turnLimit = runOptions.maxSteps ?? this.options.config.agent.maxSteps;
+    const remainingSteps = turnLimit - turn.completedSteps;
+    if (remainingSteps < 1) {
+      await this.turnStore.clear().catch(() => undefined);
+      throw new Error(
+        `The interrupted turn already reached its ${String(turnLimit)}-step limit. `
+        + "Send a new user message to start another turn."
+      );
+    }
+    yield* this.runTurn(turn.prompt, {
       ...runOptions,
+      maxSteps: remainingSteps,
       continueFrom: turn.messages,
-      recordSessionUserMessage: false
+      recordSessionUserMessage: false,
+      completedStepsBeforeRun: turn.completedSteps
     });
   }
 
@@ -230,7 +247,20 @@ export class AgentSession {
     return await runMemoryCommand(this.localMemory, args);
   }
 
-  async *run(input: string, runOptions: AgentRunOptions = {}): AsyncGenerator<AgentSessionEvent> {
+  /** Desktop/TUI 的公开交互入口，只接受 chat / plan 策略。 */
+  async *prompt(input: string, options: AgentPromptOptions = {}): AsyncGenerator<AgentSessionEvent> {
+    yield* this.runTurn(input, options);
+  }
+
+  /** Durable task harness 的单次有界尝试；不暴露为交互 mode。 */
+  async *runAttempt(input: string, options: AgentAttemptOptions = {}): AsyncGenerator<AgentSessionEvent> {
+    yield* this.runTurn(input, { ...options, mode: "chat" });
+  }
+
+  private async *runTurn(
+    input: string,
+    runOptions: AgentRunOptions & { completedStepsBeforeRun?: number } = {}
+  ): AsyncGenerator<AgentSessionEvent> {
     const release = this.beginOperation("agent turn");
     const turnController = new AbortController();
     const abortSignal = runOptions.abortSignal
@@ -238,6 +268,11 @@ export class AgentSession {
       : turnController.signal;
     const effectiveRunOptions: AgentRunOptions = { ...runOptions, abortSignal };
     const modelInput = runOptions.modelInput ?? input;
+    const continuing = Boolean(runOptions.continueFrom?.length);
+    const completedStepsBeforeRun = continuing ? runOptions.completedStepsBeforeRun ?? 0 : 0;
+    if (!Number.isSafeInteger(completedStepsBeforeRun) || completedStepsBeforeRun < 0) {
+      throw new RangeError("Completed turn steps must be a non-negative safe integer.");
+    }
     const usageBeforePreparation = this.usageRecords.length;
     let userMessageRecorded = false;
     const recordUserMessage = (): void => {
@@ -256,18 +291,33 @@ export class AgentSession {
     };
     let streamTask: Promise<void> | undefined;
     try {
+    // 新根输入明确放弃旧断点；否则它在首个新 step 落盘前崩溃时，/continue 会错误复活上一回合。
+    if (!continuing) await this.turnStore.clear().catch(() => undefined);
     if (abortSignal.aborted) {
       recordUserMessage();
-      const outcome = abortedTurn("Current turn interrupted before execution.", 0);
+      const outcome = abortedTurn("Current turn interrupted before execution.", completedStepsBeforeRun);
       yield { type: "error", message: outcome.error ?? "Current turn interrupted." };
       yield { type: "status", status: "aborted" };
+      yield doneEvent(outcome);
+      return;
+    }
+    try {
+      await this.options.modelManager?.preparePrompt(abortSignal);
+    } catch (error) {
+      recordUserMessage();
+      const outcome = abortSignal.aborted
+        ? abortedTurn("Current turn interrupted during model preparation.", completedStepsBeforeRun)
+        : failedTurn(errorMessage(error), completedStepsBeforeRun, "provider_error");
+      this.recordError(outcome.error);
+      yield { type: "error", message: outcome.error ?? "Agent run failed." };
+      yield { type: "status", status: outcome.status === "aborted" ? "aborted" : "error" };
       yield doneEvent(outcome);
       return;
     }
     const model = this.options.modelManager?.getModel() ?? this.options.model;
     if (!model) {
       recordUserMessage();
-      const outcome = failedTurn("Vercel AI SDK model is not configured.", 0);
+      const outcome = failedTurn("Vercel AI SDK model is not configured.", completedStepsBeforeRun);
       this.recordError(outcome.error);
       yield { type: "error", message: outcome.error ?? "Agent run failed." };
       yield { type: "status", status: "error" };
@@ -300,8 +350,8 @@ export class AgentSession {
     } catch (error) {
       recordUserMessage();
       const outcome = abortSignal.aborted
-        ? abortedTurn("Current turn interrupted during context preparation.", 0)
-        : failedTurn(errorMessage(error), 0, isTimeoutFailure(error) ? "timeout" : "provider_error");
+        ? abortedTurn("Current turn interrupted during context preparation.", completedStepsBeforeRun)
+        : failedTurn(errorMessage(error), completedStepsBeforeRun, isTimeoutFailure(error) ? "timeout" : "provider_error");
       this.recordError(outcome.error);
       yield { type: "error", message: outcome.error ?? "Agent run failed." };
       yield { type: "status", status: outcome.status === "aborted" ? "aborted" : "error" };
@@ -311,7 +361,7 @@ export class AgentSession {
     }
     if (abortSignal.aborted) {
       recordUserMessage();
-      const outcome = abortedTurn("Current turn interrupted during context preparation.", 0);
+      const outcome = abortedTurn("Current turn interrupted during context preparation.", completedStepsBeforeRun);
       this.recordError(outcome.error);
       yield { type: "error", message: outcome.error ?? "Current turn interrupted." };
       yield { type: "status", status: "aborted" };
@@ -329,10 +379,27 @@ export class AgentSession {
     const allowedToolNames = mode === "plan"
       ? new Set(this.options.toolRegistry.list().filter((tool) => tool.risk === "read").map((tool) => tool.name))
       : undefined;
+    let reasoningActive = false;
+    const emitUpdate = (event: AgentSessionEvent): void => {
+      if (
+        reasoningActive
+        && (event.type === "assistant.delta" || event.type === "assistant.completed" || event.type === "tool.started")
+      ) {
+        queue.push({ type: "reasoning.completed" });
+        reasoningActive = false;
+      }
+      if (event.type === "reasoning.started") {
+        if (reasoningActive) return;
+        reasoningActive = true;
+      } else if (event.type === "reasoning.completed") {
+        reasoningActive = false;
+      }
+      queue.push(event);
+    };
     const coordinator = new SdkToolExecutionCoordinator(
       runtime,
       permissionManager,
-      (event) => queue.push(event),
+      emitUpdate,
       () => ({ ...stepContext }),
       allowedToolNames
     );
@@ -356,14 +423,20 @@ export class AgentSession {
           return stepMessages;
         }
       },
-      onPart: (part) => queue.push({ type: "sdk", part }),
+      onPart: handlePart,
       onStepEnd: async (step) => {
         // 每步各自是一次 provider 请求，用量按步记录而不是等回合结束一次性归并。
         stepUsageRecords.push(this.recordModelUsage(step.usage, mode === "plan" ? "plan" : "agent"));
         if (step.usage.inputTokens !== undefined) this.contextMemory.recordProviderUsage(step.usage);
-        // 落盘这一步结束时的完整 context：进程在这之后挂掉，下次可以从这里继续。
-        await this.turnStore.save(runOptions.sessionUserMessage ?? input, step.messages, step.index + 1)
-          .catch(() => undefined);
+        const completedSteps = completedStepsBeforeRun + step.index + 1;
+        if (step.finishReason === "tool-calls" && step.index + 1 < maxSteps) {
+          // 只有 Agent Loop 本来还会进入下一步时才保留断点。正常完成、输出截断和 step-limit
+          // 都是已经返回给用户的终态，不能被 /continue 误认成异常中断。
+          await this.turnStore.save(runOptions.sessionUserMessage ?? input, step.messages, completedSteps)
+            .catch(() => undefined);
+        } else {
+          await this.turnStore.clear().catch(() => undefined);
+        }
       }
     };
     const stepUsageRecords: SessionUsage[] = [];
@@ -389,46 +462,55 @@ export class AgentSession {
       (stepContext.reasoningBlocks ??= []).push(created);
       return created;
     };
-    const handlePart = (part: TextStreamPart<ToolSet>): void => {
-          if (part.type === "start-step") {
-            observedSteps += 1;
-            stepContext.assistantContent = "";
-            stepContext.reasoningContent = "";
-            stepContext.reasoningProviderOptions = undefined;
-            stepContext.reasoningBlocks = [];
-            reasoningBlockIds.clear();
-          } else if (part.type === "text-delta") {
-            stepContext.assistantContent += part.text;
-          } else if (part.type === "reasoning-delta") {
-            stepContext.reasoningContent += part.text;
-            turnReasoningContent += part.text;
-            stepContext.reasoningProviderOptions = part.providerMetadata ?? stepContext.reasoningProviderOptions;
-            const block = reasoningBlock(part.id);
-            block.text += part.text;
-            if (part.providerMetadata) block.providerOptions = part.providerMetadata;
-          } else if (part.type === "reasoning-start" || part.type === "reasoning-end") {
-            stepContext.reasoningProviderOptions = part.providerMetadata ?? stepContext.reasoningProviderOptions;
-            const block = reasoningBlock(part.id);
-            if (part.providerMetadata) block.providerOptions = part.providerMetadata;
-          } else if (part.type === "error") {
-            streamError = part.error;
-          }
-          if (part.type === "tool-call") {
-            const duplicateMessage = coordinator.observeToolCall(part.toolCallId);
-            if (duplicateMessage && !duplicateToolCallError) {
-              duplicateToolCallError = new Error(duplicateMessage);
-              streamError = duplicateToolCallError;
-              streamFailureReported = true;
-              queue.push({ type: "error", message: duplicateMessage, fatal: true });
-              turnController.abort(duplicateToolCallError);
-            }
-            if (part.invalid) invalidToolCalls.push({ toolName: part.toolName, toolCallId: part.toolCallId, input: part.input });
-          }
-          queue.push({ type: "sdk", part });
-    };
+    function handlePart(part: TextStreamPart<ToolSet>): void {
+      if (part.type === "start-step") {
+        const phase = observedSteps === 0 ? "initial" : "continuing";
+        observedSteps += 1;
+        stepContext.assistantContent = "";
+        stepContext.reasoningContent = "";
+        stepContext.reasoningProviderOptions = undefined;
+        stepContext.reasoningBlocks = [];
+        reasoningBlockIds.clear();
+        emitUpdate({ type: "reasoning.started", phase });
+      } else if (part.type === "text-delta") {
+        stepContext.assistantContent += part.text;
+        emitUpdate({ type: "assistant.delta", content: part.text });
+      } else if (part.type === "reasoning-delta") {
+        stepContext.reasoningContent += part.text;
+        turnReasoningContent += part.text;
+        stepContext.reasoningProviderOptions = part.providerMetadata ?? stepContext.reasoningProviderOptions;
+        const block = reasoningBlock(part.id);
+        block.text += part.text;
+        if (part.providerMetadata) block.providerOptions = part.providerMetadata;
+        emitUpdate({ type: "reasoning.delta", content: part.text });
+      } else if (part.type === "reasoning-start" || part.type === "reasoning-end") {
+        stepContext.reasoningProviderOptions = part.providerMetadata ?? stepContext.reasoningProviderOptions;
+        const block = reasoningBlock(part.id);
+        if (part.providerMetadata) block.providerOptions = part.providerMetadata;
+      } else if (part.type === "error") {
+        streamError = part.error;
+      }
+      if (part.type === "tool-call") {
+        const duplicateMessage = coordinator.observeToolCall(part.toolCallId);
+        if (duplicateMessage && !duplicateToolCallError) {
+          duplicateToolCallError = new Error(duplicateMessage);
+          streamError = duplicateToolCallError;
+          streamFailureReported = true;
+          queue.push({ type: "error", message: duplicateMessage, fatal: true });
+          turnController.abort(duplicateToolCallError);
+        }
+        if (part.invalid) {
+          invalidToolCalls.push({
+            toolName: part.toolName,
+            toolCallId: part.toolCallId,
+            input: part.input
+          });
+        }
+      }
+    }
     streamTask = (async (): Promise<void> => {
       try {
-        loopResult = await runAgentLoop(messages, { ...loopConfig, onPart: handlePart }, abortSignal);
+        loopResult = await runAgentLoop(messages, loopConfig, abortSignal);
       } catch (error) {
         // 重复 tool call 这类情况已经推过 fatal error 并主动 abort 了；循环随后抛出的
         // 中断异常是同一件事的后果，不能再报一次。首个原因也要保留，不被中断异常覆盖。
@@ -444,6 +526,7 @@ export class AgentSession {
           }));
         }
         await coordinator.waitForIdle();
+        if (reasoningActive) emitUpdate({ type: "reasoning.completed" });
         queue.close();
       }
     })();
@@ -483,10 +566,13 @@ export class AgentSession {
       const outcome = finishedTurn(
         content,
         loopResult.finishReason,
-        steps.length,
-        maxSteps,
+        completedStepsBeforeRun + steps.length,
+        completedStepsBeforeRun + maxSteps,
         usageRecord
       );
+      if (content && (outcome.status === "completed" || outcome.status === "incomplete")) {
+        yield { type: "assistant.completed", content };
+      }
       if (outcome.status === "completed") {
         if (!runOptions.deferSuccessfulMemory) {
           this.rememberSuccessfulTask(runOptions.sessionUserMessage ?? input, content);
@@ -505,8 +591,8 @@ export class AgentSession {
       const failure = streamError ?? error;
       const message = errorMessage(failure);
       const outcome = runOptions.abortSignal?.aborted
-        ? abortedTurn(message || "Current turn interrupted.", observedSteps)
-        : failedTurn(message, observedSteps, isTimeoutFailure(failure) ? "timeout" : "provider_error");
+        ? abortedTurn(message || "Current turn interrupted.", completedStepsBeforeRun + observedSteps)
+        : failedTurn(message, completedStepsBeforeRun + observedSteps, isTimeoutFailure(failure) ? "timeout" : "provider_error");
       this.recordError(message);
       if (!streamFailureReported) yield { type: "error", message };
       yield { type: "status", status: outcome.status === "aborted" ? "aborted" : "error" };
@@ -525,7 +611,7 @@ export class AgentSession {
   async runTask(input: string, runOptions: AgentRunOptions = {}): Promise<AgentTurnOutcome> {
     let outcome: AgentTurnOutcome | undefined;
     try {
-      for await (const event of this.run(input, runOptions)) {
+      for await (const event of this.runTurn(input, runOptions)) {
         if (event.type === "done") outcome = event.outcome;
       }
     } catch (error) {
@@ -567,6 +653,7 @@ export class AgentSession {
       const messages = await this.rehydrateSessionAttachments(replay.messages, replay.events);
       this.contextMemory.restore(messages, replay.contextState ?? replay.contextUsage);
       this.recorder = replacementRecorder;
+      this.turnStore = new TurnStore(this.persistenceRoot(), replacementRecorder.sessionId);
       return { ...replay, messages, filePath, sessionId: replacementRecorder.sessionId };
     } catch (error) {
       await replacementRecorder?.close().catch(() => undefined);

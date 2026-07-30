@@ -65,8 +65,6 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
     case "model.changed":
       return { ...state, provider: event.provider, modelLabel: event.modelLabel, reasoningLabel: event.reasoningLabel };
     case "run.started":
-    case "run.queued":
-    case "run.queue.updated":
       return state;
     case "run.completed": {
       const transcript = finalizeActiveCells(state.transcript, "skipped", "Interrupted before completion.");
@@ -188,14 +186,6 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
       return state;
     case "reasoning.started":
       return state;
-    case "reasoning.status":
-    case "command.started":
-    case "command.output":
-    case "command.completed":
-    case "command.failed":
-    case "file.read":
-    case "file.changed":
-    case "diff.created":
     case "context.updated":
     case "compact.started":
     case "compact.completed":

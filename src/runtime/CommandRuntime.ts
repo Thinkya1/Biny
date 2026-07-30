@@ -8,19 +8,17 @@ import { randomUUID } from "node:crypto";
 import { createFileConfigStore, type AgentConfigStore } from "../config/store.js";
 import type { AgentConfig } from "../config/schema.js";
 import { AgentSession } from "../agent/AgentSession.js";
-import { ModelManager, modelRuntimeInfo, type ModelRuntimeInfo } from "../llm/ModelManager.js";
+import { ModelManager } from "../llm/ModelManager.js";
 import { SessionRecorder } from "../session/recorder.js";
 import { ensureAgentDirs } from "../session/store.js";
 import { createToolRegistry } from "../tools/registry.js";
 import { createTodoTool } from "../tools/todo.js";
 import { TodoStore } from "../session/todoStore.js";
-import type { InterruptedTurn } from "../session/turnStore.js";
-import { forkSession, type ForkedSession } from "../session/fork.js";
-import { CheckpointStore, type Checkpoint, type RestoreSummary } from "../session/checkpointStore.js";
+import { CheckpointStore } from "../session/checkpointStore.js";
 import { PermissionManager } from "../permission/PermissionManager.js";
 import { createSkillTool, loadSkills, type SkillBundle } from "../extensions/skills.js";
 import { loadPlugins } from "../extensions/plugins.js";
-import { createMcpResourceTools, McpToolHost, type McpServerStatus } from "../extensions/mcp.js";
+import { createMcpResourceTools, McpToolHost } from "../extensions/mcp.js";
 import { createSubagentTool, runSubagentTask as executeSubagentTask, type SubagentOptions } from "../extensions/subagent.js";
 import { buildSubagentDefinitionsPrompt, loadSubagentDefinitions, type SubagentDefinition } from "../extensions/agents.js";
 import { createMemoryTools } from "../extensions/memory.js";
@@ -29,7 +27,6 @@ import { createModelSettings, type ModelSettings } from "../llm/factory.js";
 import {
   SubagentTaskManager,
   type SubagentTaskRunOptions,
-  type SubagentTaskSnapshot,
   type SubmittedSubagentTask
 } from "./SubagentTaskManager.js";
 import { ManagedProcessService } from "./ManagedProcessService.js";
@@ -44,25 +41,14 @@ export interface CommandRuntime {
   config: AgentConfig;
   agent: AgentSession;
   managedProcesses: ManagedProcessService;
+  checkpoints: CheckpointStore | undefined;
+  mcp: McpToolHost;
+  subagents: SubagentTaskManager | undefined;
   extensionReport(section?: ExtensionSection): string;
-  /** 从某个时点分叉出一条新会话；原会话不受影响。 */
-  forkSession(session: string | undefined, upToEvent?: number): Promise<ForkedSession>;
-  /** 上次被打断、尚未收尾的回合。 */
-  interruptedTurn(): Promise<InterruptedTurn | undefined>;
-  /** 工作区快照；非 git 目录下为 undefined。 */
-  listCheckpoints(): Promise<Checkpoint[]>;
-  restoreCheckpoint(id: string): Promise<RestoreSummary>;
-  reconnectMcpServer(serverName: string): Promise<McpServerStatus>;
-  getSubagentInfo(): ModelRuntimeInfo;
   /** 实时重新扫描具名子代理定义（会话期间可编辑生效）。 */
   listSubagentAgents(): Promise<SubagentDefinition[]>;
   startSubagentTask(task: string, options?: SubagentTaskRunOptions): SubmittedSubagentTask;
-  runSubagentTask(task: string, options?: SubagentTaskRunOptions): Promise<string>;
-  listSubagentTasks(): SubagentTaskSnapshot[];
-  cancelSubagentTask(taskId: string, reason?: string): boolean;
-  subscribeSubagentTasks(listener: (task: SubagentTaskSnapshot) => void): () => void;
   setSubagentParentRunId(parentRunId?: string): void;
-  cancelSubagentTasks(parentRunId: string, reason?: string): void;
   close(): Promise<void>;
 }
 
@@ -151,7 +137,7 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
       persistenceRoot,
       configStore,
       config,
-      model: modelManager.getModel(),
+      model: undefined,
       modelManager,
       toolRegistry,
       permissionManager,
@@ -236,32 +222,17 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     config,
     agent,
     managedProcesses,
+    checkpoints,
+    mcp: mcpHost,
+    subagents: subagentTaskManager,
     extensionReport: (section?: ExtensionSection): string => formatExtensionReport(extensionStatus(), section),
-    forkSession: async (session: string | undefined, upToEvent?: number): Promise<ForkedSession> =>
-      await forkSession(persistenceRoot, session, upToEvent === undefined ? {} : { upToEvent }),
-    interruptedTurn: async (): Promise<InterruptedTurn | undefined> => await agent.interruptedTurn(),
-    listCheckpoints: async (): Promise<Checkpoint[]> => checkpoints ? await checkpoints.list() : [],
-    restoreCheckpoint: async (id: string): Promise<RestoreSummary> => {
-      if (!checkpoints) throw new Error("Checkpoints need a git repository; this workspace is not one.");
-      return await checkpoints.restore(id);
-    },
-    reconnectMcpServer: async (serverName: string): Promise<McpServerStatus> => await mcpHost.reconnectServer(serverName),
-    getSubagentInfo: (): ModelRuntimeInfo => subagentRuntimeInfo(config),
     listSubagentAgents: async (): Promise<SubagentDefinition[]> => {
       subagentDefinitions = await loadAgentDefinitions();
       return [...subagentDefinitions];
     },
     startSubagentTask,
-    runSubagentTask: async (task: string, taskOptions?: SubagentTaskRunOptions): Promise<string> => await startSubagentTask(task, taskOptions).completion,
-    listSubagentTasks: (): SubagentTaskSnapshot[] => subagentTaskManager?.listSnapshots() ?? [],
-    cancelSubagentTask: (taskId: string, reason?: string): boolean => subagentTaskManager?.cancelTask(taskId, reason) ?? false,
-    subscribeSubagentTasks: (listener: (task: SubagentTaskSnapshot) => void): (() => void) =>
-      subagentTaskManager?.subscribe(listener) ?? (() => undefined),
     setSubagentParentRunId: (parentRunId?: string): void => {
       subagentParentRunId = parentRunId;
-    },
-    cancelSubagentTasks: (parentRunId: string, reason?: string): void => {
-      subagentTaskManager?.cancelParent(parentRunId, reason);
     },
     close: async () => {
       try {
@@ -295,22 +266,6 @@ function subagentModelSettings(config: AgentConfig, modelManager: ModelManager, 
       : { enabled: false, effort: "high" as const }
   };
   return createModelSettings(modelConfig, alias);
-}
-
-function subagentRuntimeInfo(config: AgentConfig): ModelRuntimeInfo {
-  const alias = config.extensions.subagent.model;
-  if (!alias) return modelRuntimeInfo(config);
-  const model = config.models[alias];
-  if (!model) throw new Error(`Unknown subagent model alias: ${alias}`);
-  const thinking = modelReasoningConfig(model)?.defaultEffort ?? "off";
-  return modelRuntimeInfo({
-    ...config,
-    defaultModel: alias,
-    thinking: {
-      enabled: thinking !== "off",
-      effort: thinking === "off" ? config.thinking.effort : thinking
-    }
-  });
 }
 
 export async function withCommandRuntime(workspaceRoot: string, fn: (runtime: CommandRuntime) => Promise<void>): Promise<void> {

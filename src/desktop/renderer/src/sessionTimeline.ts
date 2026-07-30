@@ -15,7 +15,7 @@ import type { SessionEvent } from "../../../session/recorder.js";
 import type { SessionUsage } from "../../../session/metadata.js";
 import { publicUserMessage } from "../../../session/publicMessage.js";
 
-export type TimelineRunStatus = "idle" | "queued" | "running" | "waiting_permission" | "completed" | "incomplete" | "aborted" | "failed";
+export type TimelineRunStatus = "idle" | "running" | "waiting_permission" | "completed" | "incomplete" | "aborted" | "failed";
 export type TimelineToolStatus = "waiting" | "running" | "success" | "failed" | "denied" | "aborted";
 
 export interface TimelinePermission {
@@ -314,16 +314,17 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
   const startReasoning = (event: Extract<AgentHostEvent, { type: "reasoning.started" }>): TimelineReasoningStep => {
     finishReasoning(event.runId, event.timestamp);
     const turn = turnFor(event);
+    const status = event.phase === "initial" ? "正在分析任务" : "正在继续处理";
     const step: TimelineReasoningStep = {
       kind: "reasoning",
       id: `${event.runId}:reasoning:${String(turn.steps.filter((candidate) => candidate.kind === "reasoning").length)}`,
       content: "",
-      status: event.status,
+      status,
       startedAt: event.timestamp
     };
     turn.steps.push(step);
     activeReasoning.set(event.runId, step);
-    turn.reasoningStatus = event.status;
+    turn.reasoningStatus = status;
     turn.reasoningStartedAt = event.timestamp;
     return step;
   };
@@ -331,7 +332,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
   const reasoningStepFor = (event: Extract<AgentHostEvent, { type: "reasoning.delta" }>): TimelineReasoningStep => {
     const existing = activeReasoning.get(event.runId);
     if (existing) return existing;
-    return startReasoning({ ...event, type: "reasoning.started", status: "正在思考" });
+    return startReasoning({ ...event, type: "reasoning.started", phase: "continuing" });
   };
 
   const appendAssistant = (turn: TimelineTurn, content: string): void => {
@@ -356,7 +357,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       turn.user = publicUserMessage(event.content);
       turn.userMessageIndex = userMessageIndex;
       userMessageIndex += 1;
-      turn.status = "queued";
+      turn.status = "running";
     } else if (event.type === "run.started") {
       turn.status = "running";
       turn.model = event.model;
@@ -381,15 +382,11 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       const step = reasoningStepFor(event);
       step.content += event.content;
       turn.reasoning += event.content;
-    } else if (event.type === "reasoning.status") {
-      turn.reasoningStatus = event.status;
-      const step = activeReasoning.get(event.runId);
-      if (step) step.status = event.status;
     } else if (event.type === "reasoning.completed") {
-      turn.reasoningStatus = event.status;
+      turn.reasoningStatus = "分析完成";
       const step = activeReasoning.get(event.runId);
       if (step) {
-        step.status = event.status;
+        step.status = "分析完成";
         finishReasoning(event.runId, event.timestamp);
       }
     } else if (event.type === "tool.started") {
@@ -401,16 +398,25 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       tool.description = event.description;
       tool.display = event.display;
       if (event.display?.kind === "file_io") tool.path = event.display.path;
+      if (event.display?.kind === "command") {
+        tool.command = { command: event.display.command, cwd: event.display.cwd, stdout: "", stderr: "" };
+      }
+      turn.reasoningStatus = toolStatus(event.tool, event.display);
     } else if (event.type === "tool.progress") {
       const tool = toolFor(event, event.tool);
       tool.updates.push(event.update);
+      if (tool.command && event.update.text) {
+        if (event.update.kind === "stdout") tool.command.stdout += event.update.text;
+        if (event.update.kind === "stderr") tool.command.stderr += event.update.text;
+      }
     } else if (event.type === "tool.completed") {
       const tool = toolFor(event, event.tool);
-      tool.result = event.result;
+      applyToolResult(tool, event.result);
       tool.status = "success";
       tool.durationMs = event.durationMs;
     } else if (event.type === "tool.failed") {
       const tool = toolFor(event, event.tool);
+      if (event.result !== undefined) applyToolResult(tool, event.result);
       tool.status = "failed";
       tool.error = event.error;
       tool.durationMs = event.durationMs;
@@ -430,36 +436,6 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       };
       if (!event.approved) tool.status = "denied";
       turn.status = "running";
-    } else if (event.type === "command.started") {
-      const tool = toolFor(event, "run_command");
-      tool.command = { command: event.command, cwd: event.cwd, stdout: "", stderr: "" };
-    } else if (event.type === "command.output") {
-      const tool = toolFor(event, "run_command");
-      tool.command ??= { command: "", stdout: "", stderr: "" };
-      if (event.stream === "stderr") tool.command.stderr += event.content;
-      if (event.stream === "stdout") tool.command.stdout += event.content;
-    } else if (event.type === "command.completed") {
-      const tool = toolFor(event, "run_command");
-      tool.command ??= { command: event.command, cwd: event.cwd, stdout: "", stderr: "" };
-      tool.command.exitCode = event.exitCode;
-      tool.durationMs = event.durationMs;
-      // 非零退出只标状态；「退出码 N」由展开视图的徽标表达，不再造一条冗余错误文案。
-      if (event.exitCode !== undefined && event.exitCode !== 0) tool.status = "failed";
-    } else if (event.type === "command.failed") {
-      const tool = toolFor(event, "run_command");
-      tool.command ??= { command: event.command, cwd: event.cwd, stdout: "", stderr: "" };
-      tool.command.exitCode = event.exitCode;
-      tool.status = "failed";
-      tool.error = event.error;
-      tool.durationMs = event.durationMs;
-    } else if (event.type === "file.read" || event.type === "file.changed") {
-      const tool = toolFor(event, event.type === "file.read" ? "read_file" : event.operation === "write" ? "write_file" : "edit_file");
-      tool.path = event.path;
-      if (event.type === "file.changed") tool.display ??= { kind: "file_io", operation: event.operation, path: event.path };
-    } else if (event.type === "diff.created") {
-      const tool = toolFor(event, "git_diff");
-      tool.diff = event.diff;
-      tool.path = event.path;
     } else if (event.type === "run.completed") {
       turn.status = "completed";
       turn.timestamp = event.timestamp;
@@ -597,6 +573,31 @@ function resultString(result: unknown, key: string): string | undefined {
   if (typeof result !== "object" || result === null) return undefined;
   const value = (result as Record<string, unknown>)[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function resultNumber(result: unknown, key: string): number | undefined {
+  if (typeof result !== "object" || result === null) return undefined;
+  const value = (result as Record<string, unknown>)[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+function applyToolResult(tool: TimelineTool, result: unknown): void {
+  tool.result = result;
+  tool.diff = tool.tool === "git_diff"
+    ? resultString(result, "output")
+    : resultString(result, "diffPreview");
+  if (tool.command) tool.command.exitCode = resultNumber(result, "exitCode");
+}
+
+function toolStatus(tool: string, display: ToolInputDisplay | undefined): string {
+  if (display?.kind === "command") return "正在运行命令";
+  if (display?.kind === "file_io") {
+    if (display.operation === "read") return "正在读取文件";
+    if (display.operation === "write" || display.operation === "edit") return "正在修改文件";
+    if (display.operation === "search" || display.operation === "grep") return "正在搜索项目";
+    if (display.operation === "git") return "正在检查 Git 状态";
+  }
+  return `正在执行 ${tool}`;
 }
 
 function modelLabel(provider: string, model: string): string {

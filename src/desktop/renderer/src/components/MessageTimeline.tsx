@@ -105,7 +105,7 @@ const Turn = memo(function Turn({
   const [expandedReasoning, setExpandedReasoning] = useState<Set<string>>(() => new Set());
   const [errorOpen, setErrorOpen] = useState(false);
   const summary = useMemo(() => turnSummary(turn), [turn]);
-  const running = turn.status === "running" || turn.status === "waiting_permission" || turn.status === "queued";
+  const running = turn.status === "running" || turn.status === "waiting_permission";
   const executionSteps = turn.steps.length ? turn.steps : fallbackExecutionSteps(turn);
   const toggleReasoning = (stepId: string): void => {
     setExpandedReasoning((current) => {
@@ -149,7 +149,7 @@ const Turn = memo(function Turn({
             skills={turn.skills}
           />
         ) : running && !turn.assistant ? (
-          <div className="reasoning-row is-static"><span className="reasoning-pulse" /><span>{turn.status === "queued" ? "等待上一项任务完成" : "正在处理"}</span></div>
+          <div className="reasoning-row is-static"><span className="reasoning-pulse" /><span>正在处理</span></div>
         ) : null}
         {!executionSteps.some((step) => step.kind === "assistant") && turn.assistant ? <MarkdownContent content={turn.assistant} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} /> : null}
 
@@ -195,8 +195,8 @@ function fallbackExecutionSteps(turn: TimelineTurn): TimelineStep[] {
     id: `${turn.id}:reasoning:fallback`,
     content: turn.reasoning,
     status: turn.reasoningStatus,
-    durationMs: turn.reasoningDurationMs ?? (turn.status === "running" || turn.status === "waiting_permission" || turn.status === "queued" ? undefined : turn.durationMs),
-    completed: turn.status !== "running" && turn.status !== "waiting_permission" && turn.status !== "queued"
+    durationMs: turn.reasoningDurationMs ?? (turn.status === "running" || turn.status === "waiting_permission" ? undefined : turn.durationMs),
+    completed: turn.status !== "running" && turn.status !== "waiting_permission"
   }];
 }
 
@@ -571,4 +571,3 @@ function formatMessageTime(timestamp: string): string {
   if (Number.isNaN(date.getTime())) return "";
   return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
 }
-

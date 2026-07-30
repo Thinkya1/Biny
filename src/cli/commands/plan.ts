@@ -3,11 +3,11 @@
  *
  * CLI 只负责启动共享 runtime；计划消息的上下文组装和记录由 AgentSession 处理。
  */
-import { createInteractiveAgentRuntime } from "../../runtime/InteractiveAgentRuntime.js";
+import { createInteractiveAgentHost } from "../../runtime/InteractiveAgentRuntime.js";
 import { withCliAbortSignal } from "../sigint.js";
 
 export async function planCommand(workspaceRoot: string, task: string): Promise<void> {
-  const runtime = await createInteractiveAgentRuntime(workspaceRoot);
+  const { runtime } = await createInteractiveAgentHost(workspaceRoot);
   try {
     const outcome = await withCliAbortSignal(async (signal) => {
       const submitted = runtime.submitPrompt(task, "plan");
@@ -25,7 +25,7 @@ export async function planCommand(workspaceRoot: string, task: string): Promise<
     if (outcome.status !== "completed") {
       throw new Error(outcome.error ?? `Plan stopped with ${outcome.stopReason} after ${String(outcome.steps)} steps.`);
     }
-    console.log(`\nSession: ${runtime.getInfo().sessionFile}`);
+    console.log(`\nSession: ${runtime.getSnapshot().info.sessionFile}`);
   } finally {
     await runtime.close();
   }

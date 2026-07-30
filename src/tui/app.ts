@@ -20,11 +20,13 @@ import type { PermissionMode } from "../permission/PermissionManager.js";
 import { parseThinkingSelection, type ThinkingSelection } from "../llm/ModelManager.js";
 import { slashCommandsForSurface } from "../runtime/commandRegistry.js";
 import { withAttachmentReferences } from "../attachments/references.js";
+import { forkSession } from "../session/fork.js";
 import { executeRuntimeCommand } from "../runtime/commands.js";
 import {
-  createInteractiveAgentRuntime,
+  createInteractiveAgentHost,
   type InteractiveAgentRuntime
 } from "../runtime/InteractiveAgentRuntime.js";
+import type { CommandRuntime } from "../runtime/CommandRuntime.js";
 import {
   pendingPermission,
   runtimeIsBusy,
@@ -64,6 +66,7 @@ export class BinyTui {
 
   private state: TuiState;
   private runtime: InteractiveAgentRuntime | undefined;
+  private commands: CommandRuntime | undefined;
   private runtimeSnapshot: InteractiveRuntimeSnapshot | undefined;
 
   private readonly headerContainer = new Container();
@@ -132,11 +135,12 @@ export class BinyTui {
 
   private async startRuntime(): Promise<void> {
     try {
-      const runtime = await createInteractiveAgentRuntime(this.workspaceRoot);
+      const { runtime, commands } = await createInteractiveAgentHost(this.workspaceRoot);
       this.runtime = runtime;
+      this.commands = commands;
       this.runtimeSnapshot = runtime.getSnapshot();
-      const info = runtime.getInfo();
-      this.permissionMode = runtime.getPermissionMode();
+      const { info, permissionMode } = this.runtimeSnapshot;
+      this.permissionMode = permissionMode;
       this.thinking = info.thinking;
       // 补全器要的是不带斜杠的命令名，它自己会补上 `/`；带斜杠会补出 `//resume`。
       this.editor.setAutocompleteProvider(new CombinedAutocompleteProvider(
@@ -158,7 +162,7 @@ export class BinyTui {
         })
         .catch((error) => this.notify(`读取输入历史失败：${describeError(error)}`));
 
-      this.unsubscribe = runtime.subscribeUpdates((update) => {
+      this.unsubscribe = runtime.subscribe((update) => {
         this.runtimeSnapshot = update.snapshot;
         if (update.event) this.dispatch(update.event);
         else this.refreshChrome();
@@ -195,7 +199,7 @@ export class BinyTui {
 
   private refreshChrome(): void {
     const status = runtimeStatus(this.runtimeSnapshot);
-    this.status.setState(status, queuedRunCount(this.runtimeSnapshot));
+    this.status.setState(status);
     this.shortcuts.setState(status, this.mode);
     this.footer.setData(this.footerData());
     this.ui.requestRender();
@@ -218,9 +222,9 @@ export class BinyTui {
   }
 
   private async refreshContextUsage(): Promise<void> {
-    if (!this.runtime) return;
+    if (!this.commands) return;
     try {
-      const context = await this.runtime.contextStatus();
+      const context = await this.commands.agent.contextStatus();
       // 百分比按模型自身的上下文窗口算；没有窗口信息时才退回输入预算。
       this.contextUsage = {
         usedTokens: context.budget.usedTokens,
@@ -448,7 +452,8 @@ export class BinyTui {
 
   private async handleSlashCommand(value: string): Promise<void> {
     const runtime = this.runtime;
-    if (!runtime) return;
+    const commands = this.commands;
+    if (!runtime || !commands) return;
     // 容忍多打的斜杠：`//resume` 只可能是想写 `/resume`。
     const [command = "", ...args] = value.trim().replace(/^\/+/, "/").split(/\s+/);
 
@@ -502,7 +507,11 @@ export class BinyTui {
         this.showTextViewer("Fork", "Usage: /fork [session] [upToEvent]");
         return;
       }
-      const forked = await runtime.forkSession(args[0], upTo);
+      const forked = await forkSession(
+        commands.persistenceRoot,
+        args[0],
+        upTo === undefined ? {} : { upToEvent: upTo }
+      );
       this.showTextViewer("Fork", `Forked ${forked.sourceSessionId} at ${String(forked.events)} event(s) into ${forked.sessionId}\n${forked.filePath}`);
       return;
     }
@@ -512,8 +521,14 @@ export class BinyTui {
         this.showPermissionModePicker();
         return;
       }
-      this.showTextViewer("Permissions", await runtime.runPermissionCommand(args));
-      this.permissionMode = runtime.getPermissionMode();
+      this.showTextViewer(
+        "Permissions",
+        await runtime.runExclusiveOperation(
+          "permission",
+          async () => await commands.agent.runPermissionCommand(args)
+        )
+      );
+      this.permissionMode = runtime.getSnapshot().permissionMode;
       this.refreshChrome();
       return;
     }
@@ -559,7 +574,7 @@ export class BinyTui {
       return;
     }
 
-    const sharedResult = await executeRuntimeCommand(runtime, value, "tui");
+    const sharedResult = await executeRuntimeCommand(runtime, commands, value, "tui");
     if (sharedResult) {
       this.showTextViewer(sharedResult.title, sharedResult.content);
       if (command === "/compact" || command === "/continue") await this.refreshContextUsage();
@@ -572,16 +587,23 @@ export class BinyTui {
 
   private async handleModelCommand(args: string[]): Promise<void> {
     const runtime = this.runtime;
-    if (!runtime) return;
+    const commands = this.commands;
+    if (!runtime || !commands) return;
     if (args[0]) {
       await this.applyModel(args[0], parseThinkingSelection(args[1]));
       return;
     }
-    await runtime.refreshModelFromDisk();
+    await runtime.runExclusiveOperation(
+      "refresh_model",
+      async () => await commands.agent.refreshModelFromDisk()
+    );
     // 实时目录只是增强项；离线或未配置凭据时继续展示全局配置中的模型。
-    await runtime.refreshModelCatalog().catch(() => undefined);
-    const info = runtime.getInfo();
-    const models = runtime.listModels();
+    await runtime.runExclusiveOperation(
+      "model_catalog",
+      async () => await commands.agent.refreshModelCatalog()
+    ).catch(() => undefined);
+    const info = runtime.getSnapshot().info;
+    const models = commands.agent.listModels();
     this.showSelect({
       title: "Select model",
       hint: "↑↓ navigate · enter select · esc cancel",
@@ -599,8 +621,9 @@ export class BinyTui {
 
   private async selectModel(alias: string): Promise<void> {
     const runtime = this.runtime;
-    if (!runtime) return;
-    const model = runtime.listModels().find((candidate) => candidate.alias === alias);
+    const commands = this.commands;
+    if (!runtime || !commands) return;
+    const model = commands.agent.listModels().find((candidate) => candidate.alias === alias);
     if (!model) {
       this.showTextViewer("Model", `Unknown model alias: ${alias}`);
       return;
@@ -610,7 +633,7 @@ export class BinyTui {
       return;
     }
 
-    const current = runtime.getInfo();
+    const current = runtime.getSnapshot().info;
     const currentThinking = current.modelAlias === alias && current.thinking !== "off"
       ? current.thinking
       : model.defaultThinking;
@@ -632,9 +655,13 @@ export class BinyTui {
 
   private async applyModel(alias: string, thinking?: ThinkingSelection): Promise<void> {
     const runtime = this.runtime;
-    if (!runtime) return;
+    const commands = this.commands;
+    if (!runtime || !commands) return;
     try {
-      const info = await runtime.switchModel(alias, thinking);
+      const info = await runtime.runExclusiveOperation(
+        "switch_model",
+        async () => await commands.agent.switchModel(alias, thinking)
+      );
       this.dispatch({
         type: "model.changed",
         provider: info.provider,
@@ -667,16 +694,20 @@ export class BinyTui {
 
   private async applyPermissionMode(mode: PermissionMode): Promise<void> {
     const runtime = this.runtime;
-    if (!runtime) return;
-    await runtime.setPermissionMode(mode);
+    const commands = this.commands;
+    if (!runtime || !commands) return;
+    await runtime.runExclusiveOperation(
+      "permission",
+      async () => await commands.agent.setPermissionMode(mode)
+    );
     this.permissionMode = mode;
     this.notify(formatPermissionModeChanged(mode));
   }
 
   private async showSessionPicker(): Promise<void> {
-    const runtime = this.runtime;
-    if (!runtime) return;
-    const summaries = (await runtime.listSessions())
+    const commands = this.commands;
+    if (!commands) return;
+    const summaries = (await commands.agent.listSessions())
       .filter((summary) => summary.firstUserMessage.trim())
       .slice()
       .reverse();
@@ -702,7 +733,7 @@ export class BinyTui {
     const runtime = this.runtime;
     if (!runtime || !session) return;
     const resumed = await runtime.resumeSession(session);
-    const info = runtime.getInfo();
+    const info = runtime.getSnapshot().info;
     this.dispatch({
       type: "session.started",
       sessionId: info.sessionId,
@@ -731,7 +762,7 @@ export class BinyTui {
     this.unsubscribe?.();
     this.status.dispose();
     if (this.runtime) {
-      const info = this.runtime.getInfo();
+      const info = this.runtime.getSnapshot().info;
       this.exitSummary = { sessionId: info.sessionId, sessionFile: info.sessionFile };
       await this.runtime.close();
     }
@@ -757,12 +788,7 @@ function runtimeStatus(snapshot: InteractiveRuntimeSnapshot | undefined): TuiSta
   if (!snapshot || snapshot.state.kind === "idle") return "idle";
   if (snapshot.state.kind !== "runs") return "running";
   if (snapshot.state.pendingPermission) return "waiting_permission";
-  const status = snapshot.state.activeRun?.status;
-  return status === "thinking" || status === "queued" ? "thinking" : "running";
-}
-
-function queuedRunCount(snapshot: InteractiveRuntimeSnapshot | undefined): number {
-  return snapshot?.state.kind === "runs" ? snapshot.state.queuedRuns.length : 0;
+  return snapshot.state.activeRun.status === "thinking" ? "thinking" : "running";
 }
 
 function tuiPermissionRequest(snapshot: InteractiveRuntimeSnapshot | undefined): TuiPermissionRequest | undefined {

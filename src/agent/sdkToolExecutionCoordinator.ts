@@ -37,7 +37,13 @@ import type {
 import { resolveWorkspacePath, toWorkspaceRelative } from "../workspace/resolvePath.js";
 import type { ReasoningBlock } from "../session/recorder.js";
 import { archiveToolResult, serializeToolResult, toolResultPreview } from "../session/toolResultArchive.js";
-import type { AgentPermissionRequest, AgentPermissionResult, AgentRuntimeContext, AgentSessionEvent } from "./types.js";
+import type {
+  AgentPermissionRequest,
+  AgentPermissionResult,
+  AgentRuntimeContext,
+  AgentSessionEvent,
+  AgentToolEvent
+} from "./types.js";
 
 interface ToolExecutionOutcome {
   result: unknown;
@@ -100,7 +106,7 @@ export class SdkToolExecutionCoordinator {
   constructor(
     private readonly context: AgentRuntimeContext,
     private readonly permissionManager: PermissionManager,
-    private readonly emit: (event: Exclude<AgentSessionEvent, { type: "sdk" | "status" | "done" }>) => void,
+    private readonly emit: (event: AgentToolEvent | Extract<AgentSessionEvent, { type: "error" }>) => void,
     private readonly getStepContext: () => AgentStepContext = () => ({}),
     private readonly allowedToolNames?: ReadonlySet<string>
   ) {
@@ -165,7 +171,7 @@ export class SdkToolExecutionCoordinator {
         reasoningProviderOptions: stepContext.reasoningProviderOptions,
         reasoningBlocks: stepContext.reasoningBlocks
       });
-      this.emit({ type: "tool-started", toolCallId, tool: toolName, args: input });
+      this.emit({ type: "tool.started", toolCallId, tool: toolName, args: input });
       return await this.finishSyntheticCall(call, sequence, { error: errorMessage }, errorMessage);
     }
     let registered: Tool;
@@ -174,7 +180,7 @@ export class SdkToolExecutionCoordinator {
     } catch {
       const result = { error: `Unknown tool: ${toolName}` };
       const sequence = this.nextSequence();
-      this.emit({ type: "tool-started", toolCallId, tool: toolName, args: input });
+      this.emit({ type: "tool.started", toolCallId, tool: toolName, args: input });
       this.context.recorder.record({
         type: "tool_call",
         tool: toolName,
@@ -186,9 +192,12 @@ export class SdkToolExecutionCoordinator {
         reasoningProviderOptions: this.getStepContext().reasoningProviderOptions,
         reasoningBlocks: this.getStepContext().reasoningBlocks
       });
-      this.context.recorder.record({ type: "tool_result", tool: toolName, result, toolCallId, sequence });
-      this.emit({ type: "error", message: result.error, recorded: true, fatal: false });
-      return result;
+      return await this.finishSyntheticCall(
+        { id: toolCallId, name: toolName, args: input },
+        sequence,
+        result,
+        result.error
+      );
     }
     const source = this.context.toolRegistry.listEntries().find((entry) => entry.tool.name === toolName)?.source ?? registered.source ?? "builtin";
     return await this.execute(registered, input, { toolCallId, abortSignal: signal } as ToolExecutionOptions<unknown>, source);
@@ -227,14 +236,14 @@ export class SdkToolExecutionCoordinator {
 
     try {
       if (duplicate) {
-        this.emit({ type: "tool-started", toolCallId: call.id, tool: call.name, args: call.args });
+        this.emit({ type: "tool.started", toolCallId: call.id, tool: call.name, args: call.args });
         const message = `Duplicate tool call id was rejected before execution: ${options.toolCallId}.`;
         // The turn already emitted one fatal protocol error. Keep each rejected
         // call auditable through its tool_result without duplicating UI errors.
         return await finish({ error: message, duplicateToolCallId: true });
       }
       if (signal?.aborted) {
-        this.emit({ type: "tool-started", toolCallId: call.id, tool: call.name, args: call.args });
+        this.emit({ type: "tool.started", toolCallId: call.id, tool: call.name, args: call.args });
         const message = abortedToolMessage(call.name, signal.reason);
         return await finish({ status: "aborted", error: message }, message);
       }
@@ -246,12 +255,12 @@ export class SdkToolExecutionCoordinator {
           signal?.throwIfAborted();
           const prepared = await this.prepareToolCall(toolDefinition, call, source, signal);
           if (!prepared.ok) {
-            this.emit({ type: "tool-started", toolCallId: call.id, tool: call.name, args: call.args });
+            this.emit({ type: "tool.started", toolCallId: call.id, tool: call.name, args: call.args });
             return await finish(prepared.result, prepared.errorMessage);
           }
 
           this.emit({
-            type: "tool-started",
+            type: "tool.started",
             toolCallId: call.id,
             tool: call.name,
             args: call.args,
@@ -280,7 +289,6 @@ export class SdkToolExecutionCoordinator {
                 return result;
               }
               if (gatedEvaluation.decision === "allow") return { approved: true as const, scope: "once" as const };
-              this.emit({ type: "permission-requested", toolCallId: call.id, request: permissionRequest });
               const result = this.context.confirmPermission
                 ? await this.context.confirmPermission(permissionRequest)
                 : await confirmPermissionRequest(permissionRequest);
@@ -288,7 +296,6 @@ export class SdkToolExecutionCoordinator {
               const validatedResult = validateStrongConfirmation(permissionRequest, result);
               this.permissionManager.applyResult(permissionRequest, validatedResult);
               if (validatedResult.approved) grantedPermission = validatedResult;
-              this.emit({ type: "permission-result", toolCallId: call.id, request: permissionRequest, result: validatedResult });
               return validatedResult;
             }, signal);
             if (!permissionResult.approved) {
@@ -348,6 +355,7 @@ export class SdkToolExecutionCoordinator {
             this.context.recorder.record({ type: "error", message: outcome.errorMessage });
             this.emit({ type: "error", message: outcome.errorMessage, recorded: true, fatal: false });
           }
+          this.emitToolResult(call, modelResult, outcome.errorMessage);
           return modelResult;
         }
       });
@@ -367,7 +375,35 @@ export class SdkToolExecutionCoordinator {
       this.context.recorder.record({ type: "error", message: errorMessage });
       this.emit({ type: "error", message: errorMessage, recorded: true, fatal: false });
     }
+    this.emitToolResult(call, modelResult, errorMessage);
     return modelResult;
+  }
+
+  private emitToolResult(
+    call: { id: string; name: string },
+    result: unknown,
+    errorMessage?: string
+  ): void {
+    const durationMs = resultNumber(result, "durationMs");
+    const error = errorMessage ?? failedToolResultMessage(result);
+    if (error) {
+      this.emit({
+        type: "tool.failed",
+        toolCallId: call.id,
+        tool: call.name,
+        error,
+        result,
+        durationMs
+      });
+      return;
+    }
+    this.emit({
+      type: "tool.completed",
+      toolCallId: call.id,
+      tool: call.name,
+      result,
+      durationMs
+    });
   }
 
   /**
@@ -575,7 +611,7 @@ export class SdkToolExecutionCoordinator {
         toolCallId: call.id,
         signal,
         onUpdate: (update) => {
-          if (!signal?.aborted) this.emit({ type: "tool-progress", toolCallId: call.id, tool: call.name, update });
+          if (!signal?.aborted) this.emit({ type: "tool.progress", toolCallId: call.id, tool: call.name, update });
         },
         approvedFile
       });
@@ -792,6 +828,31 @@ function readStringField(value: unknown, key: string): string {
   if (typeof value !== "object" || value === null) return "";
   const field = (value as Record<string, unknown>)[key];
   return typeof field === "string" ? field : "";
+}
+
+function resultNumber(value: unknown, key: string): number | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === "number" ? field : undefined;
+}
+
+function failedToolResultMessage(result: unknown): string | undefined {
+  if (typeof result !== "object" || result === null) return undefined;
+  const record = result as Record<string, unknown>;
+  const failed = typeof record.error === "string"
+    || (typeof record.exitCode === "number" && record.exitCode !== 0)
+    || record.approved === false
+    || record.status === "denied"
+    || record.status === "failed"
+    || record.status === "timed_out"
+    || record.status === "aborted"
+    || record.status === "permission_required";
+  if (!failed) return undefined;
+  return readStringField(result, "error")
+    || readStringField(result, "reason")
+    || readStringField(result, "message")
+    || (typeof record.exitCode === "number" ? `Command exited with code ${String(record.exitCode)}.` : undefined)
+    || `Tool did not complete (${typeof record.status === "string" ? record.status : "failed"}).`;
 }
 
 function isErrorWithCode(error: unknown, code: string): boolean {

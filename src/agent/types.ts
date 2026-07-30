@@ -1,6 +1,6 @@
-/** Agent runtime types shared by the SDK-backed session and Ink host. */
+/** AgentSession 对外发布的规范化运行事件。 */
 import type { AgentConfig } from "../config/schema.js";
-import type { LanguageModel, TextStreamPart, ToolSet } from "ai";
+import type { LanguageModel } from "ai";
 import type { SessionRecorder } from "../session/recorder.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { ToolInputDisplay, ToolUpdate } from "../tools/types.js";
@@ -43,14 +43,24 @@ export interface AgentTurnOutcome {
   error?: string;
 }
 
-/** SDK-native stream plus the small set of Biny lifecycle events that the SDK does not own. */
+export type AgentSessionUpdate =
+  | { type: "assistant.delta"; content: string }
+  | { type: "assistant.completed"; content: string }
+  | { type: "reasoning.started"; phase: "initial" | "continuing" }
+  | { type: "reasoning.delta"; content: string }
+  | { type: "reasoning.completed" }
+  | AgentToolEvent;
+
+export type AgentToolEvent =
+  | { type: "tool.started"; toolCallId: string; tool: string; args: unknown; description?: string; display?: ToolInputDisplay }
+  | { type: "tool.progress"; toolCallId: string; tool: string; update: ToolUpdate }
+  | { type: "tool.completed"; toolCallId: string; tool: string; result: unknown; durationMs?: number }
+  | { type: "tool.failed"; toolCallId: string; tool: string; error: string; result?: unknown; durationMs?: number };
+
+/** Provider 原始分片在 Session 内归一化，宿主不需要理解 AI SDK 协议。 */
 export type AgentSessionEvent =
   | { type: "status"; status: AgentStatus }
-  | { type: "sdk"; part: TextStreamPart<ToolSet> }
-  | { type: "tool-started"; toolCallId: string; tool: string; args: unknown; description?: string; display?: ToolInputDisplay }
-  | { type: "tool-progress"; toolCallId: string; tool: string; update: ToolUpdate }
-  | { type: "permission-requested"; toolCallId: string; request: AgentPermissionRequest }
-  | { type: "permission-result"; toolCallId: string; request: AgentPermissionRequest; result: AgentPermissionResult }
+  | AgentSessionUpdate
   | { type: "error"; message: string; recorded?: boolean; fatal?: boolean }
   | { type: "done"; content: string; usage?: SessionUsage; outcome: AgentTurnOutcome };
 

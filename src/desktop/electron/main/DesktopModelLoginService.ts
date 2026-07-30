@@ -11,21 +11,23 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import {
+  CLAUDE_OAUTH_CLIENT_ID,
+  CLAUDE_OAUTH_TOKEN_ENDPOINT,
   CLAUDE_SUBSCRIPTION_BETA,
+  CODEX_OAUTH_CLIENT_ID,
+  CODEX_OAUTH_TOKEN_ENDPOINT,
   extractOpenAiAccountId,
-  openAiCodexHeaders
+  openAiCodexHeaders,
+  parseSubscriptionOAuthTokens,
+  type SubscriptionOAuthTokens
 } from "../../../llm/subscriptionAuth.js";
 import type { DesktopModelLoginMethod, DesktopModelLoginProvider, DesktopModelLoginStartResult } from "../../protocol.js";
 
 const AUTHORIZATION_TTL_MS = 10 * 60 * 1000;
-const CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_AUTHORIZE_ENDPOINT = "https://claude.com/cai/oauth/authorize";
-const CLAUDE_TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token";
 const CLAUDE_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback";
 const CLAUDE_SCOPE = "user:sessions:claude_code user:mcp_servers user:file_upload";
-const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_AUTHORIZE_ENDPOINT = "https://auth.openai.com/oauth/authorize";
-const CODEX_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token";
 const CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const CODEX_CALLBACK_HOST = "127.0.0.1";
 const CODEX_CALLBACK_PORT = 1455;
@@ -43,13 +45,6 @@ export interface AuthenticatedModel {
   id: string;
   displayName: string;
   supportsThinking: boolean;
-}
-
-interface OAuthTokens {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt: number;
-  accountId?: string;
 }
 
 interface BasePendingAuthorization {
@@ -100,11 +95,6 @@ export class DesktopModelLoginService {
     if (pending?.provider === provider) this.dispose(authRequestId);
   }
 
-  async refresh(provider: DesktopModelLoginProvider, tokens: OAuthTokens): Promise<OAuthTokens> {
-    if (provider === "claude-code") return await this.refreshClaudeTokens(tokens);
-    return await this.refreshCodexTokens(tokens);
-  }
-
   /** Claude 侧回调落在其官网页面上，拿不到重定向，只能让用户把授权码粘回来（paste-code）。 */
   private async startClaudeAuthorization(): Promise<DesktopModelLoginStartResult> {
     const verifier = base64url(randomBytes(32));
@@ -112,7 +102,7 @@ export class DesktopModelLoginService {
     const state = verifier;
     const url = new URL(CLAUDE_AUTHORIZE_ENDPOINT);
     url.searchParams.set("code", "true");
-    url.searchParams.set("client_id", CLAUDE_CLIENT_ID);
+    url.searchParams.set("client_id", CLAUDE_OAUTH_CLIENT_ID);
     url.searchParams.set("response_type", "code");
     url.searchParams.set("redirect_uri", CLAUDE_REDIRECT_URI);
     url.searchParams.set("scope", CLAUDE_SCOPE);
@@ -141,7 +131,7 @@ export class DesktopModelLoginService {
     const server = await startCodexCallbackServer(state, callback.resolve);
     const url = new URL(CODEX_AUTHORIZE_ENDPOINT);
     url.searchParams.set("response_type", "code");
-    url.searchParams.set("client_id", CODEX_CLIENT_ID);
+    url.searchParams.set("client_id", CODEX_OAUTH_CLIENT_ID);
     url.searchParams.set("redirect_uri", CODEX_REDIRECT_URI);
     url.searchParams.set("scope", "openid profile email offline_access");
     url.searchParams.set("code_challenge", pkceChallenge(verifier));
@@ -210,61 +200,39 @@ export class DesktopModelLoginService {
     }
   }
 
-  private async exchangeClaudeCode(code: string, verifier: string, state: string): Promise<OAuthTokens> {
-    const response = await fetch(CLAUDE_TOKEN_ENDPOINT, {
+  private async exchangeClaudeCode(code: string, verifier: string, state: string): Promise<SubscriptionOAuthTokens> {
+    const response = await fetch(CLAUDE_OAUTH_TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json", "User-Agent": "claude-cli/2.1.153 (external, cli)" },
       body: JSON.stringify({
         code,
         state,
         grant_type: "authorization_code",
-        client_id: CLAUDE_CLIENT_ID,
+        client_id: CLAUDE_OAUTH_CLIENT_ID,
         redirect_uri: CLAUDE_REDIRECT_URI,
         code_verifier: verifier
       })
     });
     if (!response.ok) throw new Error(`Claude 授权码交换失败（HTTP ${String(response.status)}）：${await compactResponse(response)}`);
-    return parseOAuthTokens(await response.json(), "Claude");
+    return parseSubscriptionOAuthTokens(await response.json(), "Claude");
   }
 
-  private async exchangeCodexCode(code: string, verifier: string): Promise<OAuthTokens> {
+  private async exchangeCodexCode(code: string, verifier: string): Promise<SubscriptionOAuthTokens> {
     const body = new URLSearchParams({
       grant_type: "authorization_code",
-      client_id: CODEX_CLIENT_ID,
+      client_id: CODEX_OAUTH_CLIENT_ID,
       code,
       code_verifier: verifier,
       redirect_uri: CODEX_REDIRECT_URI
     });
-    const response = await fetch(CODEX_TOKEN_ENDPOINT, {
+    const response = await fetch(CODEX_OAUTH_TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "biny-desktop/0.2.1" },
       body: body.toString()
     });
     if (!response.ok) throw new Error(`Codex 授权码交换失败（HTTP ${String(response.status)}）：${await compactResponse(response)}`);
-    const tokens = parseOAuthTokens(await response.json(), "Codex");
+    const tokens = parseSubscriptionOAuthTokens(await response.json(), "Codex");
     return { ...tokens, accountId: extractOpenAiAccountId(tokens.accessToken) };
-  }
-
-  private async refreshClaudeTokens(tokens: OAuthTokens): Promise<OAuthTokens> {
-    const response = await fetch(CLAUDE_TOKEN_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "User-Agent": "claude-cli/2.1.153 (external, cli)" },
-      body: JSON.stringify({ grant_type: "refresh_token", refresh_token: tokens.refreshToken, client_id: CLAUDE_CLIENT_ID })
-    });
-    if (!response.ok) throw new Error(`Claude 登录已过期（HTTP ${String(response.status)}），请重新登录。`);
-    return mergeRefreshedTokens(tokens, await response.json(), "Claude");
-  }
-
-  private async refreshCodexTokens(tokens: OAuthTokens): Promise<OAuthTokens> {
-    const body = new URLSearchParams({ grant_type: "refresh_token", refresh_token: tokens.refreshToken, client_id: CODEX_CLIENT_ID });
-    const response = await fetch(CODEX_TOKEN_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "biny-desktop/0.2.1" },
-      body: body.toString()
-    });
-    if (!response.ok) throw new Error(`Codex 登录已过期（HTTP ${String(response.status)}），请重新登录。`);
-    const refreshed = mergeRefreshedTokens(tokens, await response.json(), "Codex");
-    return { ...refreshed, accountId: extractOpenAiAccountId(refreshed.accessToken) ?? tokens.accountId };
   }
 
   private isExpired(pending: PendingAuthorization): boolean {
@@ -333,28 +301,6 @@ function parseClaudePastedAuthorization(value: string | undefined): { code: stri
   const state = pasted.slice(divider + 1);
   if (!/^[A-Za-z0-9_-]+$/.test(code) || !/^[A-Za-z0-9_-]+$/.test(state)) return undefined;
   return { code, state };
-}
-
-function parseOAuthTokens(payload: unknown, provider: string): OAuthTokens {
-  if (!payload || typeof payload !== "object") throw new Error(`${provider} 返回了无效的授权信息。`);
-  const record = payload as Record<string, unknown>;
-  const accessToken = record.access_token;
-  const refreshToken = record.refresh_token;
-  const expiresIn = record.expires_in;
-  if (typeof accessToken !== "string" || !accessToken || typeof refreshToken !== "string" || !refreshToken || typeof expiresIn !== "number" || !Number.isFinite(expiresIn) || expiresIn <= 0) {
-    throw new Error(`${provider} 返回了不完整的授权信息。`);
-  }
-  return { accessToken, refreshToken, expiresAt: Date.now() + expiresIn * 1_000 };
-}
-
-function mergeRefreshedTokens(previous: OAuthTokens, payload: unknown, provider: string): OAuthTokens {
-  const refreshed = parseOAuthTokens(payload, provider);
-  const record = payload as Record<string, unknown>;
-  return {
-    ...refreshed,
-    refreshToken: typeof record.refresh_token === "string" && record.refresh_token ? record.refresh_token : previous.refreshToken,
-    accountId: previous.accountId
-  };
 }
 
 function formatModelName(modelId: string): string {

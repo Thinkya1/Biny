@@ -203,7 +203,7 @@ function testReasoningStreamingRendersContent(): void {
   assert.deepEqual(state.transcript.active.map((item) => item.kind), ["reasoning"]);
   assert.equal(state.transcript.active[0]?.content, "先检查入口文件。");
 
-  state = reduce(state, { type: "reasoning.completed", status: "分析完成" });
+  state = reduce(state, { type: "reasoning.completed" });
   assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["user", "reasoning"]);
   assert.equal(state.transcript.committed[1]?.content, "先检查入口文件。");
   // Pi keeps completed thinking visible by default; Ctrl+E can still collapse it.
@@ -221,7 +221,7 @@ function testReasoningStreamingRendersContent(): void {
   assert.match(collapsedThinking, /Thought/u);
   assert.doesNotMatch(collapsedThinking, /先检查入口文件。/u);
 
-  state = reduce(state, { type: "reasoning.delta", messageId: "message", content: "继续验证。" });
+  state = reduce(state, { type: "reasoning.delta", content: "继续验证。" });
   assert.equal(state.transcript.active.at(-1)?.content, "继续验证。");
 }
 
@@ -727,9 +727,9 @@ function testFooterAndChromeLayout(): void {
 
 function testStatusAndShortcutHints(): void {
   setTheme("dark");
-  assert.match(statusMessage("running", 2), /Working… · 2 queued \(esc to interrupt\)/u);
-  assert.match(statusMessage("waiting_permission", 0), /Waiting for approval/u);
-  assert.equal(statusMessage("idle", 0), "");
+  assert.match(statusMessage("running"), /Working… \(esc to interrupt\)/u);
+  assert.match(statusMessage("waiting_permission"), /Waiting for approval/u);
+  assert.equal(statusMessage("idle"), "");
 
   const busy = shortcutHints("running", "chat").map((hint) => hint.key);
   assert.equal(busy.includes("esc"), true);

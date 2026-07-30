@@ -65,9 +65,9 @@ export const runTaskWithAgent: EvalAgentRunner = async (workspaceRoot, task, sig
   const runtime = await createCommandRuntime(workspaceRoot);
   try {
     let steps = 0;
-    for await (const event of runtime.agent.run(task.prompt, {
-      ...(signal ? { abortSignal: signal } : {}),
-      ...(task.maxSteps === undefined ? {} : { maxSteps: task.maxSteps }),
+    for await (const event of runtime.agent.runAttempt(task.prompt, {
+      abortSignal: signal,
+      maxSteps: task.maxSteps,
       confirmPermission: async () => ({ approved: true, scope: "session" })
     })) {
       if (event.type === "done") steps = event.outcome.steps;

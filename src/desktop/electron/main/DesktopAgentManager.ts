@@ -28,10 +28,11 @@ import type { PermissionMode, PermissionResult } from "../../../permission/Permi
 import { webSearchKeyEnvNames } from "../../../tools/web/search.js";
 import { executeRuntimeCommand } from "../../../runtime/commands.js";
 import {
-  createInteractiveAgentRuntime,
+  createInteractiveAgentHost,
   type AgentRunOutcome,
   type InteractiveAgentRuntime
 } from "../../../runtime/InteractiveAgentRuntime.js";
+import type { CommandRuntime } from "../../../runtime/CommandRuntime.js";
 import { SessionLeaseError } from "../../../runtime/SessionLease.js";
 import { runtimeIsBusy, type AgentHostEvent, type AgentRuntimeUpdate } from "../../../runtime/agentEvents.js";
 import { withAttachmentReferences } from "../../attachmentReferences.js";
@@ -60,12 +61,13 @@ import { DesktopStateStore } from "./DesktopStateStore.js";
 
 interface ManagedRuntime {
   runtime: InteractiveAgentRuntime;
+  commands: CommandRuntime;
   unsubscribe(): void;
 }
 
 export class DesktopAgentManager {
   private readonly runtimes = new Map<string, ManagedRuntime>();
-  private readonly runtimeInitializations = new Map<string, Promise<InteractiveAgentRuntime>>();
+  private readonly runtimeInitializations = new Map<string, Promise<ManagedRuntime>>();
   private readonly liveEvents = new Map<string, Map<string, AgentHostEvent[]>>();
   private readonly runtimeErrors = new Map<string, string>();
   private readonly modelLogin: DesktopModelLoginService;
@@ -145,23 +147,20 @@ export class DesktopAgentManager {
     mode: InteractiveAgentRunMode,
     attachments: DesktopAttachment[]
   ): Promise<DesktopRunReceipt> {
-    await this.requireConfiguredModel(projectId);
-    await this.refreshOAuthCredentials(projectId);
-    const runtime = await this.ensureRuntime(projectId);
+    const { runtime } = await this.ensureRuntime(projectId);
     const snapshot = runtime.getSnapshot();
     if (runtimeIsBusy(snapshot)) {
       throw new Error("当前任务仍在运行。请先停止它，再发送下一条消息。");
     }
-    await runtime.refreshModelFromDisk();
     // 目标会话不是运行时当前会话时需要切过去，但只能在完全空闲时切。
-    if (sessionId && runtime.getInfo().sessionId !== sessionId) {
+    if (sessionId && runtime.getSnapshot().info.sessionId !== sessionId) {
       const snapshot = runtime.getSnapshot();
       if (runtimeIsBusy(snapshot)) {
         throw new Error("The selected session is still running. Return to it or stop the task before resuming another session.");
       }
       await runtime.resumeSession(sessionId);
     }
-    const info = runtime.getInfo();
+    const info = runtime.getSnapshot().info;
     const prompt = withAttachmentReferences(input, attachments);
     const project = this.projects.requireProject(projectId);
     const nativeAttachments = await loadNativeAttachments(this.projects.attachmentsRoot(project), attachments);
@@ -189,10 +188,8 @@ export class DesktopAgentManager {
     mode: InteractiveAgentRunMode,
     attachments: DesktopAttachment[]
   ): Promise<DesktopRunReceipt> {
-    await this.requireConfiguredModel(projectId);
-    await this.refreshOAuthCredentials(projectId);
-    const runtime = await this.ensureRuntime(projectId);
-    if (runtime.getInfo().sessionId !== sessionId) {
+    const { runtime } = await this.ensureRuntime(projectId);
+    if (runtime.getSnapshot().info.sessionId !== sessionId) {
       const snapshot = runtime.getSnapshot();
       if (runtimeIsBusy(snapshot)) {
         throw new Error("当前项目仍有其他会话正在运行，请先停止后再编辑消息。");
@@ -210,8 +207,8 @@ export class DesktopAgentManager {
     await this.state.setSelectedSession(projectId, targetSessionId);
     this.runtimeErrors.delete(projectId);
 
-    const nextRuntime = await this.ensureRuntime(projectId);
-    const info = nextRuntime.getInfo();
+    const { runtime: nextRuntime } = await this.ensureRuntime(projectId);
+    const info = nextRuntime.getSnapshot().info;
     const prompt = withAttachmentReferences(input, attachments);
     const nativeAttachments = await loadNativeAttachments(this.projects.attachmentsRoot(project), attachments);
     const submitted = nextRuntime.submitPrompt(prompt, mode, nativeAttachments);
@@ -234,14 +231,20 @@ export class DesktopAgentManager {
   }
 
   async setPermissionMode(projectId: string, mode: PermissionMode): Promise<DesktopWorkspaceSnapshot> {
-    const runtime = await this.ensureRuntime(projectId);
-    await runtime.setPermissionMode(mode);
+    const { runtime, commands } = await this.ensureRuntime(projectId);
+    await runtime.runExclusiveOperation(
+      "permission",
+      async () => await commands.agent.setPermissionMode(mode)
+    );
     return await this.workspaceSnapshot(projectId);
   }
 
   async switchModel(projectId: string, alias: string, thinking: ThinkingSelection): Promise<ModelRuntimeInfo> {
-    await this.refreshOAuthCredentials(projectId);
-    return await (await this.ensureRuntime(projectId)).switchModel(alias, thinking);
+    const { runtime, commands } = await this.ensureRuntime(projectId);
+    return await runtime.runExclusiveOperation(
+      "switch_model",
+      async () => await commands.agent.switchModel(alias, thinking)
+    );
   }
 
   async startModelLogin(projectId: string, provider: DesktopModelLoginProvider): Promise<DesktopModelLoginStartResult> {
@@ -378,8 +381,11 @@ export class DesktopAgentManager {
     const config = await this.loadProjectConfig(projectId);
     const settings = describeMemorySettings(config);
     if (!settings.enabled) return { settings, totalEntries: 0, topics: [], entries: [] };
-    const runtime = await this.ensureRuntime(projectId);
-    const entries = await runtime.listMemoryEntries();
+    const { runtime, commands } = await this.ensureRuntime(projectId);
+    const entries = await runtime.runExclusiveOperation(
+      "memory",
+      async () => await requireLocalMemory(commands).listEntries()
+    );
     const topicCounts = new Map<string, number>();
     for (const entry of entries) topicCounts.set(entry.topic, (topicCounts.get(entry.topic) ?? 0) + 1);
     return {
@@ -421,12 +427,27 @@ export class DesktopAgentManager {
 
   async searchMemory(projectId: string, query: string): Promise<DesktopMemorySearchMatch[]> {
     this.projects.requireProject(projectId);
-    return await (await this.ensureRuntime(projectId)).searchMemory(query);
+    const { runtime, commands } = await this.ensureRuntime(projectId);
+    return await runtime.runExclusiveOperation(
+      "memory",
+      async () => await requireLocalMemory(commands).findRelevant(query, [], 8)
+    );
   }
 
   async addMemoryEntry(projectId: string, topic: string, note: string): Promise<DesktopMemoryOverview> {
     this.projects.requireProject(projectId);
-    const result = await (await this.ensureRuntime(projectId)).addMemoryEntry(topic, note);
+    const { runtime, commands } = await this.ensureRuntime(projectId);
+    const result = await runtime.runExclusiveOperation(
+      "memory",
+      async () => await requireLocalMemory(commands).write({
+        topic,
+        title: note.split("\n", 1)[0]?.slice(0, 120) ?? "Project note",
+        summary: note,
+        decisions: [],
+        paths: [],
+        keywords: []
+      })
+    );
     if (!result.written) {
       throw new Error(result.path ? "已存在等价的记忆条目，未重复保存。" : "内容太短，至少需要 20 个字符才能作为持久记忆。");
     }
@@ -435,20 +456,32 @@ export class DesktopAgentManager {
 
   async deleteMemoryEntry(projectId: string, topic: string, index: number): Promise<DesktopMemoryOverview> {
     this.projects.requireProject(projectId);
-    const removed = await (await this.ensureRuntime(projectId)).deleteMemoryEntry(topic, index);
+    const { runtime, commands } = await this.ensureRuntime(projectId);
+    const removed = await runtime.runExclusiveOperation(
+      "memory",
+      async () => await requireLocalMemory(commands).deleteEntry(topic, index)
+    );
     if (!removed) throw new Error("未找到该记忆条目，可能已被删除。");
     return await this.memoryOverview(projectId);
   }
 
   async clearMemory(projectId: string): Promise<DesktopMemoryOverview> {
     this.projects.requireProject(projectId);
-    await (await this.ensureRuntime(projectId)).clearMemory();
+    const { runtime, commands } = await this.ensureRuntime(projectId);
+    await runtime.runExclusiveOperation("memory", async () => {
+      const memory = requireLocalMemory(commands);
+      for (const topic of await memory.listTopics()) await memory.forgetTopic(topic);
+    });
     return await this.memoryOverview(projectId);
   }
 
   async compactMemory(projectId: string): Promise<DesktopMemoryCompactionResult[]> {
     this.projects.requireProject(projectId);
-    return await (await this.ensureRuntime(projectId)).compactMemory();
+    const { runtime, commands } = await this.ensureRuntime(projectId);
+    return await runtime.runExclusiveOperation(
+      "memory",
+      async () => await requireLocalMemory(commands).compactTopics()
+    );
   }
 
   /**
@@ -572,7 +605,7 @@ export class DesktopAgentManager {
   }
 
   async compact(projectId: string, hint?: string): Promise<string> {
-    return await (await this.ensureRuntime(projectId)).compactConversation(hint);
+    return await (await this.ensureRuntime(projectId)).runtime.compactConversation(hint);
   }
 
   /**
@@ -582,13 +615,13 @@ export class DesktopAgentManager {
    */
   async runSlashCommand(projectId: string, sessionId: string | undefined, input: string): Promise<DesktopSlashResult> {
     await this.requireConfiguredModel(projectId);
-    const runtime = await this.ensureRuntime(projectId);
+    const { runtime, commands } = await this.ensureRuntime(projectId);
     // /context、/usage 依赖当前会话：用户查看的会话与 runtime 不一致且空闲时先切换。
-    if (sessionId && runtime.getInfo().sessionId !== sessionId) {
+    if (sessionId && runtime.getSnapshot().info.sessionId !== sessionId) {
       const snapshot = runtime.getSnapshot();
       if (!runtimeIsBusy(snapshot)) await runtime.resumeSession(sessionId);
     }
-    const result = await executeRuntimeCommand(runtime, input, "desktop");
+    const result = await executeRuntimeCommand(runtime, commands, input, "desktop");
     if (!result) throw new Error(`未知命令：${input.trim().split(/\s+/, 1)[0] ?? input}`);
     return result;
   }
@@ -602,7 +635,7 @@ export class DesktopAgentManager {
 
   async deleteSession(projectId: string, sessionId: string): Promise<DesktopWorkspaceSnapshot> {
     const managed = this.runtimes.get(projectId);
-    if (managed?.runtime.getInfo().sessionId === sessionId) {
+    if (managed?.runtime.getSnapshot().info.sessionId === sessionId) {
       const snapshot = managed.runtime.getSnapshot();
       if (runtimeIsBusy(snapshot)) throw new Error("Stop the running task before deleting this session.");
       managed.unsubscribe();
@@ -664,9 +697,9 @@ export class DesktopAgentManager {
    * 取得项目运行时，没有就创建。并发调用会复用同一个初始化 promise，避免同一项目被初始化两次
    * （两个运行时抢同一份 session 和运行锁）。
    */
-  private async ensureRuntime(projectId: string): Promise<InteractiveAgentRuntime> {
+  private async ensureRuntime(projectId: string): Promise<ManagedRuntime> {
     if (this.closing) throw new Error("Desktop runtime is shutting down.");
-    const current = this.runtimes.get(projectId)?.runtime;
+    const current = this.runtimes.get(projectId);
     if (current) return current;
     const pending = this.runtimeInitializations.get(projectId);
     if (pending) return await pending;
@@ -697,18 +730,17 @@ export class DesktopAgentManager {
     );
   }
 
-  private async initializeRuntime(projectId: string): Promise<InteractiveAgentRuntime> {
+  private async initializeRuntime(projectId: string): Promise<ManagedRuntime> {
     const project = this.projects.requireProject(projectId);
     if (project.missing) throw new Error(`Project path is unavailable: ${project.path}`);
-    await this.refreshOAuthCredentials(projectId);
     // session 走全局项目目录，附件仍在项目 `.biny`；三端通过同一个 workspace 定位同一份历史。
     const persistenceRoot = await this.projects.dataRoot(project);
-    const runtime = await createInteractiveAgentRuntime(project.path, {
+    const { runtime, commands } = await createInteractiveAgentHost(project.path, {
       persistenceRoot,
       configStore: this.configStore,
       attachmentRoot: this.projects.attachmentsRoot(project)
     });
-    const initialSessionFile = runtime.getInfo().sessionFile;
+    const initialSessionFile = runtime.getSnapshot().info.sessionFile;
     const selectedSessionId = this.state.selectedSessionId(projectId);
     if (selectedSessionId) {
       try {
@@ -725,7 +757,7 @@ export class DesktopAgentManager {
         }
       }
     }
-    const unsubscribe = runtime.subscribeUpdates((update) => {
+    const unsubscribe = runtime.subscribe((update) => {
       const event = update.event;
       if (event) {
         const projectEvents = this.projectEvents(projectId);
@@ -737,9 +769,10 @@ export class DesktopAgentManager {
       }
       this.emit(projectId, update);
     });
-    this.runtimes.set(projectId, { runtime, unsubscribe });
+    const managed = { runtime, commands, unsubscribe };
+    this.runtimes.set(projectId, managed);
     this.runtimeErrors.delete(projectId);
-    return runtime;
+    return managed;
   }
 
   private async requireConfiguredModel(projectId: string): Promise<void> {
@@ -790,34 +823,6 @@ export class DesktopAgentManager {
       models: { ...models, ...Object.fromEntries(configuredModels) },
       thinking: { enabled: false, effort: "high" }
     });
-  }
-
-  private async refreshOAuthCredentials(projectId: string): Promise<void> {
-    this.projects.requireProject(projectId);
-    const current = await this.loadProjectConfig(projectId);
-    let refreshedConfig: AgentConfig | undefined;
-    for (const [alias, provider] of Object.entries(current.providers)) {
-      const oauth = provider.oauth;
-      if (provider.authMode !== "oauth-bearer" || !oauth || !oauth.refreshToken || oauth.expiresAt - Date.now() > 5 * 60 * 1_000) continue;
-      const refreshed = await this.modelLogin.refresh(oauth.provider, {
-        accessToken: provider.apiKey ?? "",
-        refreshToken: oauth.refreshToken,
-        expiresAt: oauth.expiresAt,
-        accountId: oauth.accountId
-      });
-      refreshedConfig ??= structuredClone(current);
-      refreshedConfig.providers[alias] = {
-        ...provider,
-        apiKey: refreshed.accessToken,
-        oauth: {
-          provider: oauth.provider,
-          refreshToken: refreshed.refreshToken,
-          expiresAt: refreshed.expiresAt,
-          accountId: refreshed.accountId
-        }
-      };
-    }
-    if (refreshedConfig) await this.saveProjectConfig(projectId, refreshedConfig);
   }
 
   private async loadProjectConfig(projectId: string): Promise<AgentConfig> {
@@ -897,6 +902,12 @@ function describeCredentialSource(provider: ProviderConfig, apiKeyEnv: string | 
 function isMissingSession(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return message.startsWith("Session not found:") || message.startsWith("Session file not found:");
+}
+
+function requireLocalMemory(services: CommandRuntime) {
+  const memory = services.agent.getLocalMemory();
+  if (!memory) throw new Error("Local memory is disabled (context.memory.enabled = false).");
+  return memory;
 }
 
 function formatModelConnectionError(error: unknown): string {
