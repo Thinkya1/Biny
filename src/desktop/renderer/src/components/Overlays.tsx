@@ -1966,7 +1966,7 @@ function SettingsMemory({ models, onLoad, onSaveSettings, onSearch, onAdd, onDel
       <section>
         <h3>记忆功能</h3>
         <div className="setting-row">
-          <span><strong>启用记忆</strong><small>启用后自动沉淀与检索 .biny/memory 中的可审计项目记忆</small></span>
+          <span><strong>启用记忆</strong><small>启用后在全局 Biny 数据目录的项目分区中自动沉淀与检索可审计记忆</small></span>
           <button aria-checked={enabled} className={`setting-switch${enabled ? " is-on" : ""}`} onClick={() => setEnabled(!enabled)} role="switch" type="button"><span className="setting-switch-knob" /></button>
         </div>
         <div className="setting-row">

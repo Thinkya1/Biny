@@ -10,6 +10,7 @@ import { LocalMemory, redactSecrets } from "../src/agent/context/LocalMemory.js"
 import { WorkspaceContext } from "../src/agent/context/WorkspaceContext.js";
 import { cloneModelMessages, messageReasoning, messageText } from "../src/agent/modelMessages.js";
 import { buildSystemPrompt } from "../src/agent/prompts.js";
+import { BINY_AGENT_DIR_ENV, projectMemoryDir } from "../src/config/paths.js";
 import type { AgentConfig } from "../src/config/schema.js";
 import { defaultConfig } from "../src/config/schema.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
@@ -145,31 +146,40 @@ function promptToModelMessages(prompt: unknown): ModelMessage[] {
 }
 
 async function main(): Promise<void> {
-  testConversationBoundaryPrompt();
-  await testInstructionHierarchyAndCap();
-  await testInstructionLoadingUsesExplicitPaths();
-  await testRepoMapExactCandidate();
-  await testAutomaticContextRejectsExternalSymlinks();
-  await testAutomaticContextSupportsSymlinkedWorkspaceRoot();
-  await testBudgetAndCompaction();
-  await testMidTurnToolResultPruning();
-  await testContextPreparationAbortStopsAutoCompaction();
-  await testRestoreWithoutPersistedBudgetUsesHistoryEstimate();
-  await testSessionReplayAndAgentResume();
-  await testLegacyNonSessionStateMigrates();
-  await testSessionPathBoundaries();
-  await testGlobalSessionsStayProjectScoped();
-  await testSessionReadLimits();
-  await testDeleteSessionReplacementRace();
-  await testFailedCurrentSessionResumeKeepsRecorderUsable();
-  await testTruncatedSessionTailAndDanglingToolRecovery();
-  await testSessionAndToolDisplayRedaction();
-  await testMemoryRedactionDedupAndWriter();
-  await testMemoryQueueLifecycleAndUsagePersistence();
-  await testMemoryStorageBoundaries();
-  await testMemoryEntryManagementAndCjkSearch();
-  await testCredentialAndSymlinkBoundaries();
-  await testToolWriteMarksSnapshotAndRepoMapDirty();
+  const globalRoot = await mkdtemp(path.join(os.tmpdir(), "biny-context-global-"));
+  const previousGlobalRoot = process.env[BINY_AGENT_DIR_ENV];
+  process.env[BINY_AGENT_DIR_ENV] = globalRoot;
+  try {
+    testConversationBoundaryPrompt();
+    await testInstructionHierarchyAndCap();
+    await testInstructionLoadingUsesExplicitPaths();
+    await testRepoMapExactCandidate();
+    await testAutomaticContextRejectsExternalSymlinks();
+    await testAutomaticContextSupportsSymlinkedWorkspaceRoot();
+    await testBudgetAndCompaction();
+    await testMidTurnToolResultPruning();
+    await testContextPreparationAbortStopsAutoCompaction();
+    await testRestoreWithoutPersistedBudgetUsesHistoryEstimate();
+    await testSessionReplayAndAgentResume();
+    await testLegacyAgentStateIsIgnored();
+    await testSessionPathBoundaries();
+    await testGlobalSessionsStayProjectScoped();
+    await testSessionReadLimits();
+    await testDeleteSessionReplacementRace();
+    await testFailedCurrentSessionResumeKeepsRecorderUsable();
+    await testTruncatedSessionTailAndDanglingToolRecovery();
+    await testSessionAndToolDisplayRedaction();
+    await testMemoryRedactionDedupAndWriter();
+    await testMemoryQueueLifecycleAndUsagePersistence();
+    await testMemoryStorageBoundaries();
+    await testMemoryEntryManagementAndCjkSearch();
+    await testCredentialAndSymlinkBoundaries();
+    await testToolWriteMarksSnapshotAndRepoMapDirty();
+  } finally {
+    if (previousGlobalRoot === undefined) delete process.env[BINY_AGENT_DIR_ENV];
+    else process.env[BINY_AGENT_DIR_ENV] = previousGlobalRoot;
+    await rm(globalRoot, { recursive: true, force: true });
+  }
 }
 
 function testConversationBoundaryPrompt(): void {
@@ -673,7 +683,7 @@ async function testSessionAndToolDisplayRedaction(): Promise<void> {
   });
 }
 
-async function testLegacyNonSessionStateMigrates(): Promise<void> {
+async function testLegacyAgentStateIsIgnored(): Promise<void> {
   await withTempWorkspace(async (workspaceRoot) => {
     const legacyRoot = path.join(workspaceRoot, ".agent");
     await fs.mkdir(path.join(legacyRoot, "sessions"), { recursive: true });
@@ -682,8 +692,8 @@ async function testLegacyNonSessionStateMigrates(): Promise<void> {
     await fs.writeFile(path.join(legacyRoot, "attachments", "legacy.png"), "legacy image", "utf8");
 
     await ensureAgentDirs(workspaceRoot);
-    const migratedAttachment = path.join(workspaceRoot, ".biny", "attachments", "legacy.png");
-    assert.equal(await fs.readFile(migratedAttachment, "utf8"), "legacy image");
+    await assert.rejects(fs.access(path.join(workspaceRoot, ".biny", "attachments", "legacy.png")));
+    assert.equal(await fs.readFile(path.join(legacyRoot, "attachments", "legacy.png"), "utf8"), "legacy image");
     await assert.rejects(resolveSessionFile(workspaceRoot, "legacy"), /Session not found/u);
   });
 }
@@ -1001,6 +1011,10 @@ async function testMemoryRedactionDedupAndWriter(): Promise<void> {
   await withTempWorkspace(async (workspaceRoot) => {
     const storeProvider = new ContextTestModel();
     const store = new LocalMemory(workspaceRoot, () => storeProvider.model);
+    const oldMemoryDir = path.join(workspaceRoot, ".biny", "memory");
+    await fs.mkdir(oldMemoryDir, { recursive: true });
+    await fs.writeFile(path.join(oldMemoryDir, "old.md"), "This old project-local memory must not be loaded.", "utf8");
+    assert.deepEqual(await store.listTopics(), []);
     const first = await store.write({
       topic: "debugging",
       title: "Context refresh result",
@@ -1020,7 +1034,7 @@ async function testMemoryRedactionDedupAndWriter(): Promise<void> {
     });
     assert.equal(duplicate.written, false);
 
-    const debugFile = path.join(workspaceRoot, ".biny", "memory", "debugging.md");
+    const debugFile = path.join(projectMemoryDir(await fs.realpath(workspaceRoot)), "debugging.md");
     const stored = await fs.readFile(debugFile, "utf8");
     assert.equal(stored.includes("sk-supersecretvalue123"), false);
     assert.match(stored, /\[redacted\]/);
@@ -1178,7 +1192,8 @@ async function testMemoryStorageBoundaries(): Promise<void> {
       const victim = path.join(outsideRoot, "victim.md");
       const victimContent = "outside-memory-must-stay-unchanged";
       await fs.writeFile(victim, victimContent, "utf8");
-      const memoryDir = path.join(workspaceRoot, ".biny", "memory");
+      const memoryDir = projectMemoryDir(await fs.realpath(workspaceRoot));
+      await fs.mkdir(path.dirname(memoryDir), { recursive: true });
 
       await fs.symlink(outsideRoot, memoryDir);
       await assert.rejects(store.findRelevant("outside-memory", []), /real directory, not a symbolic link/);

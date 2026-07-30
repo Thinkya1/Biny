@@ -207,7 +207,7 @@ const subagentToolNameSchema = z.enum(defaultSubagentAllowedTools);
 
 const extensionsSchema = z.object({
   mcp: z.record(mcpServerSchema).default({}),
-  skills: z.array(z.string().trim().min(1)).max(32).default([".biny/skills", ".agent/skills"]),
+  skills: z.array(z.string().trim().min(1)).max(32).default([".biny/skills"]),
   plugins: z.array(z.string().trim().min(1)).max(32).default([]),
   subagent: z.object({
     enabled: z.boolean().default(false),
@@ -220,7 +220,7 @@ const extensionsSchema = z.object({
     maxCostUsd: z.number().positive().max(100).optional(),
     allowedTools: z.array(subagentToolNameSchema).min(1).default([...defaultSubagentAllowedTools]),
     // 具名子代理定义目录（workspace 相对路径）；全局 ~/.biny/agents 始终生效。
-    agentPaths: z.array(z.string().trim().min(1)).max(32).default([".biny/agents", ".agent/agents"])
+    agentPaths: z.array(z.string().trim().min(1)).max(32).default([".biny/agents"])
   }).default({
     enabled: false,
     maxSteps: 16,
@@ -231,11 +231,11 @@ const extensionsSchema = z.object({
     model: undefined,
     maxCostUsd: undefined,
     allowedTools: [...defaultSubagentAllowedTools],
-    agentPaths: [".biny/agents", ".agent/agents"]
+    agentPaths: [".biny/agents"]
   })
 }).default({
   mcp: {},
-  skills: [".biny/skills", ".agent/skills"],
+  skills: [".biny/skills"],
   plugins: [],
   subagent: {
     enabled: false,
@@ -247,7 +247,7 @@ const extensionsSchema = z.object({
     model: undefined,
     maxCostUsd: undefined,
     allowedTools: [...defaultSubagentAllowedTools],
-    agentPaths: [".biny/agents", ".agent/agents"]
+    agentPaths: [".biny/agents"]
   }
 });
 
@@ -677,7 +677,7 @@ export const defaultConfig: AgentConfig = {
   telemetry: { enabled: false, recordInputs: false, recordOutputs: false },
   extensions: {
     mcp: {},
-    skills: [".biny/skills", ".agent/skills"],
+    skills: [".biny/skills"],
     plugins: [],
     subagent: {
       enabled: false,
@@ -689,7 +689,7 @@ export const defaultConfig: AgentConfig = {
       model: undefined,
       maxCostUsd: undefined,
       allowedTools: [...defaultSubagentAllowedTools],
-      agentPaths: [".biny/agents", ".agent/agents"]
+      agentPaths: [".biny/agents"]
     }
   }
 };

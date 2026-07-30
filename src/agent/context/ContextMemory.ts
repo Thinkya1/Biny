@@ -545,7 +545,7 @@ function assembleContext(
   // 记忆条目要带上来源说明，模型才知道这是跨会话的项目记忆而不是当前对话内容。
   addSystem(
     "stable memory",
-    memoryMatches.length ? `Stable project memory (recalled from .biny/memory):\n${formatMemoryMatches(memoryMatches)}` : "",
+    memoryMatches.length ? `Stable project memory (recalled from the global Biny project partition):\n${formatMemoryMatches(memoryMatches)}` : "",
     false
   );
 

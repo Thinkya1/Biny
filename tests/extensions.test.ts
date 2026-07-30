@@ -107,7 +107,7 @@ function testUsageCostAccounting(): void {
 
 async function testSkillsAndPlugins(workspaceRoot: string): Promise<void> {
   const extensionDefaults = configSchema.parse({ ...defaultConfig, extensions: {} }).extensions;
-  assert.deepEqual(extensionDefaults.skills, [".biny/skills", ".agent/skills"]);
+  assert.deepEqual(extensionDefaults.skills, [".biny/skills"]);
   assert.deepEqual(extensionDefaults.plugins, []);
   assert.throws(
     () => configSchema.parse({ ...defaultConfig, extensions: { ...defaultConfig.extensions, plugins: [" "] } }),
@@ -264,20 +264,6 @@ async function testProgressiveSkills(workspaceRoot: string): Promise<void> {
     assert.deepEqual(legacy.skills.map((skill) => skill.name), ["legacy-skill"]);
     assert.match(legacy.prompt, /exact test command/);
 
-    // 同名技能：先配置的 .biny/skills 优先于旧的 .agent/skills。
-    const binyDup = path.join(workspaceRoot, ".biny", "skills", "dup");
-    const agentDup = path.join(workspaceRoot, ".agent", "skills", "dup");
-    await mkdir(binyDup, { recursive: true });
-    await mkdir(agentDup, { recursive: true });
-    await writeFile(path.join(binyDup, "SKILL.md"), "---\nname: dup\ndescription: biny wins\n---\nBody.", "utf8");
-    await writeFile(path.join(agentDup, "SKILL.md"), "---\nname: dup\ndescription: legacy loses\n---\nBody.", "utf8");
-    const precedence = await loadSkills({
-      workspaceRoot,
-      projectPaths: [".biny/skills", ".agent/skills"],
-      globalRoot: path.join(workspaceRoot, "no-global")
-    });
-    assert.equal(precedence.skills.find((skill) => skill.name === "dup")?.description, "biny wins");
-
     // 以水平分割线开头的正文不应被误判成 frontmatter 丢内容。
     await writeFile(path.join(workspaceRoot, "hr-skill.md"), "---\n\n# Title\n\nStep one: build.\n\n---\n\nMore notes.", "utf8");
     const horizontalRule = await loadSkills({
@@ -302,7 +288,6 @@ async function testProgressiveSkills(workspaceRoot: string): Promise<void> {
   } finally {
     await rm(globalRoot, { recursive: true, force: true });
     await rm(path.join(workspaceRoot, ".biny"), { recursive: true, force: true });
-    await rm(path.join(workspaceRoot, ".agent"), { recursive: true, force: true });
     await rm(path.join(workspaceRoot, "legacy-skill.md"), { force: true });
     await rm(path.join(workspaceRoot, "hr-skill.md"), { force: true });
   }

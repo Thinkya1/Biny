@@ -3,7 +3,7 @@ import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { generateText, Output, type LanguageModel, type TelemetryOptions } from "ai";
 import { z } from "zod";
-import { agentDir } from "../../session/store.js";
+import { globalAgentDir, projectMemoryDir } from "../../config/paths.js";
 import { redactSecrets } from "../../utils/secrets.js";
 import type { MemoryCompactionTopicResult, MemoryEntry, MemoryEntrySummary, MemoryMatch } from "./types.js";
 import type { ModelUsageObserver } from "../../observability/usage.js";
@@ -14,6 +14,7 @@ const memoryModelTimeoutMs = 30_000;
 
 interface PinnedMemoryDirectory {
   workspaceRoot: string;
+  storageRoot: string;
   path: string;
   device: number | bigint;
   inode: number | bigint;
@@ -107,7 +108,7 @@ export class LocalMemory {
       try {
         const existing = await readPinnedMemoryFile(this.workspaceRoot, directory, topicFile, Number.MAX_SAFE_INTEGER);
         signal?.throwIfAborted();
-        if (isDuplicate(existing, entry)) return { written: false, path: path.relative(directory.workspaceRoot, filePath) };
+        if (isDuplicate(existing, entry)) return { written: false, path: path.relative(directory.storageRoot, filePath) };
 
         const index = await readPinnedMemoryFile(this.workspaceRoot, directory, indexFile, maxTopicChars);
         signal?.throwIfAborted();
@@ -129,7 +130,7 @@ export class LocalMemory {
     } finally {
       await indexFile.handle.close();
     }
-    return { written: true, path: path.relative(directory.workspaceRoot, filePath) };
+    return { written: true, path: path.relative(directory.storageRoot, filePath) };
   }
 
   async listTopics(): Promise<string[]> {
@@ -596,22 +597,33 @@ function indexLineForFile(index: string | undefined, fileName: string): string {
 async function resolveMemoryDirectory(workspaceRoot: string, create: boolean): Promise<PinnedMemoryDirectory | undefined> {
   const workspacePath = path.resolve(workspaceRoot);
   const canonicalWorkspace = await fs.realpath(workspacePath);
-  const agentPath = path.join(canonicalWorkspace, path.basename(agentDir(workspaceRoot)));
-  const agent = await ensureRealDirectory(agentPath, create, ".biny");
+  const configuredAgentPath = path.resolve(globalAgentDir());
+  const agent = await ensureRealDirectory(configuredAgentPath, create, "global agent directory");
   if (!agent) return undefined;
-  const canonicalAgent = await fs.realpath(agentPath);
-  if (canonicalAgent !== path.join(canonicalWorkspace, ".biny")) {
-    throw new Error("Local memory storage .biny resolves outside the canonical workspace.");
+  const canonicalAgent = await fs.realpath(configuredAgentPath);
+
+  const memoryRootPath = path.join(canonicalAgent, "memory");
+  const memoryRoot = await ensureRealDirectory(memoryRootPath, create, "global project memory root");
+  if (!memoryRoot) return undefined;
+  const canonicalMemoryRoot = await fs.realpath(memoryRootPath);
+  if (canonicalMemoryRoot !== memoryRootPath) {
+    throw new Error("Global project memory root resolves outside the global agent directory.");
   }
 
-  const memoryPath = path.join(agentPath, "memory");
-  const memory = await ensureRealDirectory(memoryPath, create, ".biny/memory");
+  const memoryPath = projectMemoryDir(canonicalWorkspace);
+  const memory = await ensureRealDirectory(memoryPath, create, "current project memory");
   if (!memory) return undefined;
   const canonicalMemory = await fs.realpath(memoryPath);
-  if (canonicalMemory !== path.join(canonicalAgent, "memory")) {
-    throw new Error("Local memory storage .biny/memory resolves outside the canonical .biny directory.");
+  if (canonicalMemory !== path.join(canonicalMemoryRoot, path.basename(memoryPath))) {
+    throw new Error("Project memory storage resolves outside the current project's global memory directory.");
   }
-  return { workspaceRoot: canonicalWorkspace, path: canonicalMemory, device: memory.dev, inode: memory.ino };
+  return {
+    workspaceRoot: canonicalWorkspace,
+    storageRoot: canonicalAgent,
+    path: canonicalMemory,
+    device: memory.dev,
+    inode: memory.ino
+  };
 }
 
 async function ensureRealDirectory(directory: string, create: boolean, label: string): Promise<Awaited<ReturnType<typeof fs.lstat>> | undefined> {

@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { loadConfig, loadConfigFile, saveConfig, saveConfigFile } from "../src/config/loader.js";
-import { BINY_AGENT_DIR_ENV, globalAgentDir, globalConfigPath, projectSessionsDir } from "../src/config/paths.js";
+import { BINY_AGENT_DIR_ENV, globalAgentDir, globalConfigPath, projectMemoryDir, projectSessionsDir } from "../src/config/paths.js";
 import { defaultConfig } from "../src/config/schema.js";
 import { BINY_KEYCHAIN_SERVICE, MacKeychainCredentialStore } from "../src/config/credentials.js";
 
@@ -24,6 +24,10 @@ async function testGlobalPathResolution(): Promise<void> {
   assert.equal(path.dirname(projectA), path.join(configured, "sessions"));
   assert.notEqual(projectA, projectB);
   assert.equal(projectSessionsDir("/tmp/project-a", { env: { [BINY_AGENT_DIR_ENV]: configured } }), projectA);
+  const memoryA = projectMemoryDir("/tmp/project-a", { env: { [BINY_AGENT_DIR_ENV]: configured } });
+  assert.equal(path.dirname(memoryA), path.join(configured, "memory"));
+  assert.equal(path.basename(memoryA), path.basename(projectA));
+  assert.notEqual(memoryA, projectMemoryDir("/tmp/project-b", { env: { [BINY_AGENT_DIR_ENV]: configured } }));
 }
 
 async function testProjectOverridesAndGlobalPersistence(): Promise<void> {

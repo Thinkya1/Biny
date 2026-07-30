@@ -3,8 +3,8 @@
  *
  * 每个定义是一个带 YAML frontmatter 的 markdown 文件：frontmatter 提供
  * name/description/tools/model 元数据，正文即该子代理的附加 system prompt。
- * 项目定义放在 extensions.subagent.agentPaths（默认 .biny/agents 与 .agent/agents），
- * 全局定义放在 ~/.biny/agents，项目级同名覆盖全局。定义在每次委派时重新读取，
+ * 项目定义放在 extensions.subagent.agentPaths（默认 .biny/agents），全局定义放在
+ * ~/.biny/agents，项目级同名覆盖全局。定义在每次委派时重新读取，
  * 允许会话期间编辑生效。
  */
 import { promises as fs } from "node:fs";

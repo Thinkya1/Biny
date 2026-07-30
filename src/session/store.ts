@@ -14,8 +14,6 @@ import { readSessionTail } from "./limits.js";
 
 const sessionMetadataConcurrency = 8;
 const managedStateDirectories = ["attachments", "logs", "runs", "tasks", "processes", "tool-results", "todos", "turns", "evals"] as const;
-const legacyStateDirectories = new Set([...managedStateDirectories, "memory"]);
-const legacyStateFiles = new Set(["input-history.jsonl", "telemetry.jsonl", "checkpoints.json"]);
 
 interface PathIdentity {
   path: string;
@@ -68,61 +66,6 @@ export async function ensureAgentDirs(workspaceRoot: string): Promise<void> {
     }
   }
   await ensureProjectSessionStorage(canonicalWorkspace);
-  await migrateLegacyAgentState(canonicalWorkspace, canonicalAgent);
-}
-
-/**
- * 旧版把运行状态放在 `.agent`。首次打开时只复制普通文件和真实目录，绝不覆盖 `.biny`
- * 中已有的新数据，也不跟随旧目录里的软链接，避免迁移把写入边界带到工作区之外。
- */
-async function migrateLegacyAgentState(workspaceRoot: string, targetRoot: string): Promise<void> {
-  const legacyRoot = path.join(workspaceRoot, ".agent");
-  let legacy: import("node:fs").Stats;
-  try {
-    legacy = await fs.lstat(legacyRoot);
-  } catch (error) {
-    if (isNotFound(error)) return;
-    throw error;
-  }
-  if (!legacy.isDirectory() || legacy.isSymbolicLink()) return;
-  await copyMissingLegacyEntries(legacyRoot, targetRoot);
-}
-
-async function copyMissingLegacyEntries(source: string, target: string, root = true): Promise<void> {
-  const entries = await fs.readdir(source, { withFileTypes: true });
-  for (const entry of entries) {
-    // 只迁移 Biny 自己生成的状态。技能、具名 agent 等旧扩展目录仍由兼容路径只读加载，
-    // 不能因为一次运行状态迁移顺手复制用户任意目录。
-    if (root && !legacyStateDirectories.has(entry.name) && !legacyStateFiles.has(entry.name)) continue;
-    const sourcePath = path.join(source, entry.name);
-    const targetPath = path.join(target, entry.name);
-    const sourceStat = await fs.lstat(sourcePath);
-    if (sourceStat.isSymbolicLink()) continue;
-    if (sourceStat.isDirectory()) {
-      if (!await ensureMissingMigrationDirectory(targetPath)) continue;
-      await copyMissingLegacyEntries(sourcePath, targetPath, false);
-      continue;
-    }
-    if (!sourceStat.isFile()) continue;
-    try {
-      await fs.copyFile(sourcePath, targetPath, constants.COPYFILE_EXCL);
-    } catch (error) {
-      if (!isAlreadyExists(error)) throw error;
-    }
-  }
-}
-
-/** 迁移只会进入自己创建的目录或已有真实目录；未知软链接一律跳过，不把旧状态写到工作区外。 */
-async function ensureMissingMigrationDirectory(directory: string): Promise<boolean> {
-  try {
-    const existing = await fs.lstat(directory);
-    return existing.isDirectory() && !existing.isSymbolicLink();
-  } catch (error) {
-    if (!isNotFound(error)) throw error;
-  }
-  await fs.mkdir(directory, { mode: 0o700 });
-  const created = await fs.lstat(directory);
-  return created.isDirectory() && !created.isSymbolicLink();
 }
 
 export function sessionFilePath(workspaceRoot: string, sessionId: string): string {
@@ -595,14 +538,6 @@ function unsafeSessionError(fileName: string): Error {
 
 function isSymbolicLinkError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error.code === "ELOOP" || error.code === "EMLINK");
-}
-
-function isNotFound(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-}
-
-function isAlreadyExists(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
 }
 
 function explicitSessionFileName(session: string): string | undefined {

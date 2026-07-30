@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { LocalMemory } from "../src/agent/context/LocalMemory.js";
 import { runMemoryCommand } from "../src/agent/context/memoryCommands.js";
 import { WorkspaceContext } from "../src/agent/context/WorkspaceContext.js";
+import { BINY_AGENT_DIR_ENV, globalAgentDir, projectMemoryDir } from "../src/config/paths.js";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
 import {
   buildSubagentDefinitionsPrompt,
@@ -23,6 +24,9 @@ import type { LanguageModel } from "ai";
 
 async function main(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-named-agents-"));
+  const globalRoot = await mkdtemp(path.join(os.tmpdir(), "biny-named-agents-global-"));
+  const previousGlobalRoot = process.env[BINY_AGENT_DIR_ENV];
+  process.env[BINY_AGENT_DIR_ENV] = globalRoot;
   try {
     await testSubagentDefinitionLoading(workspaceRoot);
     await testSubagentDefinitionBoundaries(workspaceRoot);
@@ -32,7 +36,10 @@ async function main(): Promise<void> {
     await testMemoryTools();
     await testGlobalInstructionFile();
   } finally {
+    if (previousGlobalRoot === undefined) delete process.env[BINY_AGENT_DIR_ENV];
+    else process.env[BINY_AGENT_DIR_ENV] = previousGlobalRoot;
     await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(globalRoot, { recursive: true, force: true });
   }
 }
 
@@ -66,7 +73,7 @@ async function testSubagentDefinitionLoading(workspaceRoot: string): Promise<voi
 
     const definitions = await loadSubagentDefinitions({
       workspaceRoot,
-      projectPaths: [".biny/agents", ".agent/agents"],
+      projectPaths: [".biny/agents"],
       globalRoot
     });
     assert.deepEqual(definitions.map((definition) => definition.name).sort(), ["planner", "reviewer-agent", "scout"]);
@@ -230,12 +237,16 @@ async function testMemoryTopicLifecycle(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-memory-cmd-"));
   try {
     const memory = new LocalMemory(workspaceRoot, unusedModel);
+    const oldMemoryDir = path.join(workspaceRoot, ".biny", "memory");
+    await mkdir(oldMemoryDir, { recursive: true });
+    await writeFile(path.join(oldMemoryDir, "old.md"), "Old project-local memory must remain ignored.", "utf8");
 
     const disabled = await runMemoryCommand(undefined, []);
     assert.match(disabled, /disabled/);
 
     const empty = await runMemoryCommand(memory, ["list"]);
     assert.match(empty, /empty/);
+    assert.deepEqual(await memory.listTopics(), []);
 
     const added = await runMemoryCommand(memory, ["add", "decisions", "Always run pnpm typecheck before committing changes."]);
     assert.match(added, /Saved memory note/);
@@ -281,7 +292,10 @@ async function testMemoryTools(): Promise<void> {
     assert.ok(!("isError" in saveExecution));
     const saved = await saveExecution.execute({ toolCallId: "save-1" }) as { saved: boolean; path?: string };
     assert.equal(saved.saved, true);
-    assert.equal(saved.path, path.join(".biny", "memory", "workflows.md"));
+    assert.equal(saved.path, path.relative(
+      await realpath(globalAgentDir()),
+      path.join(projectMemoryDir(await realpath(workspaceRoot)), "workflows.md")
+    ));
 
     // 无效参数走 isError 分支而不是抛异常。
     const invalid = await saveTool.resolveExecution({ topic: "x", title: "y", summary: "short" });

@@ -1,8 +1,8 @@
 /**
  * Biny 配置与全局 agent 数据的路径解析。
  *
- * 模型配置和项目会话都脱离工作区存放。BINY_AGENT_DIR 改变这一个全局根目录；项目设置及
- * 附件、记忆等其余运行产物仍保留在项目 `.biny`。
+ * 模型配置、项目会话和项目记忆都脱离工作区存放。BINY_AGENT_DIR 改变这一个全局根目录；
+ * 项目 `.biny` 只承载设置、扩展覆盖与尚未迁出的运行产物。
  */
 import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
@@ -31,13 +31,19 @@ export function globalConfigPath(options: PathEnvironment = {}): string {
 
 /** 项目会话按规范化绝对路径隔离，避免不同工作区的 latest、id 前缀和锁互相干扰。 */
 export function projectSessionsDir(workspaceRoot: string, options: PathEnvironment = {}): string {
-  const projectId = createHash("sha256")
-    .update(path.resolve(workspaceRoot))
-    .digest("hex")
-    .slice(0, 24);
+  return projectStateDir("sessions", workspaceRoot, options);
+}
+
+/** Memory 保持项目作用域，但物理存储位于全局 agent 目录，避免污染项目工作区。 */
+export function projectMemoryDir(workspaceRoot: string, options: PathEnvironment = {}): string {
+  return projectStateDir("memory", workspaceRoot, options);
+}
+
+function projectStateDir(kind: "sessions" | "memory", workspaceRoot: string, options: PathEnvironment): string {
+  const projectId = createHash("sha256").update(path.resolve(workspaceRoot)).digest("hex").slice(0, 24);
   const configuredRoot = globalAgentDir(options);
   const canonicalRoot = existsSync(configuredRoot) ? realpathSync(configuredRoot) : configuredRoot;
-  return path.join(canonicalRoot, "sessions", projectId);
+  return path.join(canonicalRoot, kind, projectId);
 }
 
 export function projectBinyDir(workspaceRoot: string): string {

@@ -121,11 +121,14 @@ TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 re
 
 ```text
 ~/.biny/agent/sessions/<project-path-hash>/ 问答历史
+~/.biny/agent/memory/<project-path-hash>/   项目长期记忆
 <project>/.biny/attachments/                图片、音频等会话附件
-<project>/.biny/                            settings、runs、tasks、logs、memory 等
+<project>/.biny/                            settings、runs、tasks、logs 等
 ```
 
-全局模型配置和项目 session 都在 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）；全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表和 UI 状态在 `~/Library/Application Support/Biny/workspaces/default/`，附件、run、memory 等其余项目数据仍在项目 `.biny/`。本次 session 目录切换不读取或复制旧的 `<project>/.biny/sessions/`。
+全局模型配置、项目 session 和项目 Memory 都在 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）；Session 与 Memory 分别按项目隔离在 `sessions/<project-path-hash>/`、`memory/<project-path-hash>/`。全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表和 UI 状态在 `~/Library/Application Support/Biny/workspaces/default/`，附件、run 等其余项目数据暂时仍在项目 `.biny/`。旧的 `<project>/.biny/sessions/` 和 `<project>/.biny/memory/` 不再读取或复制。
+
+项目级 Skill 和 named agent 分别从 `<project>/.biny/skills/`、`<project>/.biny/agents/` 覆盖全局同名定义。旧 `<project>/.agent/` 不再扫描或自动迁移。
 
 同一个 Session 同一时刻只能由一个运行时执行，另一个会返回占用提示；不同 Session 可以并行。
 
