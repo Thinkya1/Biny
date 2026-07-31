@@ -48,7 +48,7 @@ import { sessionEventsToTranscript } from "./sessionTranscript.js";
 import { modelThinkingOptions } from "./modelOptions.js";
 import { createInitialTuiState, tuiReducer } from "./reducer.js";
 import { editorTheme, theme } from "./theme/index.js";
-import { foldableTranscriptItems, latestExpandableTranscript } from "./transcriptText.js";
+import { foldableTranscriptItems, formatSessionAge, latestExpandableTranscript } from "./transcriptText.js";
 import type { PermissionChoice, TuiPermissionRequest, TuiState, TuiStatus } from "./types.js";
 import type { AgentAttachment, AgentRunMode } from "../agent/AgentSession.js";
 
@@ -432,11 +432,12 @@ export class BinyTui {
       },
       () => {
         this.dispatch({ type: "permission.details.toggled" });
-      }
+      },
+      Math.max(10, this.ui.terminal.rows - 4)
     );
     dialog.setDetailsExpanded(this.state.permissionDetailsExpanded);
     this.permissionDialog = dialog;
-    this.showOverlay(dialog);
+    this.showOverlay(dialog, { maxHeight: "100%" });
   }
 
   private answerPermission(choice: PermissionChoice): void {
@@ -716,12 +717,13 @@ export class BinyTui {
       this.showTextViewer("Sessions", "No sessions yet.");
       return;
     }
+    const nowMs = Date.now();
     this.showSelect({
       title: "Resume session",
       hint: "↑↓ navigate · enter resume · esc cancel",
       items: summaries.map((summary) => ({
         value: summary.fileName.replace(/\.jsonl$/, ""),
-        label: sessionLabel(summary),
+        label: sessionLabel(summary, nowMs),
         description: summary.firstUserMessage.replace(/\s+/g, " ").slice(0, 80)
       })),
       onSelect: (item) => {
@@ -772,8 +774,8 @@ export class BinyTui {
   }
 }
 
-function sessionLabel(summary: SessionSummary): string {
-  return summary.fileName.replace(/\.jsonl$/, "");
+function sessionLabel(summary: SessionSummary, nowMs: number): string {
+  return `${summary.fileName.replace(/\.jsonl$/, "")} · ${formatSessionAge(summary.updatedAt, nowMs)}`;
 }
 
 function describeError(error: unknown): string {

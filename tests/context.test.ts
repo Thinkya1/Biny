@@ -738,6 +738,16 @@ async function testSessionAndToolDisplayRedaction(): Promise<void> {
     }, { workspaceRoot, ignore: [], sessionId: "test" });
     assert.equal(JSON.stringify(write).includes(previewSecret), false);
     assert.match(write.preview ?? "", /\[redacted\]/);
+
+    const defaultHiddenBody = "this file body stays behind ctrl+o";
+    const conciseWrite = await createToolPermissionRequest({
+      id: "concise-write",
+      name: "write_file",
+      args: { path: "concise.txt", content: defaultHiddenBody }
+    }, { workspaceRoot, ignore: [], sessionId: "test" });
+    assert.match(conciseWrite.details, /File: concise\.txt/u);
+    assert.equal(conciseWrite.details.includes(defaultHiddenBody), false);
+    assert.match(conciseWrite.preview ?? "", /this file body stays behind ctrl\+o/u);
   });
 }
 

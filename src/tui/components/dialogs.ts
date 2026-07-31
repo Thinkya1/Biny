@@ -135,7 +135,8 @@ export class PermissionDialog extends Container {
   constructor(
     private request: TuiPermissionRequest,
     private readonly onAnswer: (choice: PermissionChoice) => void,
-    private readonly onToggleDetails: () => void
+    private readonly onToggleDetails: () => void,
+    private readonly maxBodyLines = Number.POSITIVE_INFINITY
   ) {
     super();
     this.body = new Text("", 1, 0);
@@ -204,33 +205,50 @@ export class PermissionDialog extends Container {
   }
 
   private refresh(): void {
-    const lines: string[] = [];
-    lines.push(theme.fg("warning", theme.bold(this.request.title)));
-    if (this.request.details) lines.push(theme.fg("muted", this.request.details));
-    if (this.detailsExpanded && this.request.preview) lines.push(theme.fg("dim", this.request.preview));
+    const details: string[] = [];
+    if (this.request.details) details.push(...this.request.details.split(/\r?\n/u));
+    if (this.detailsExpanded && this.request.preview) details.push(...this.request.preview.split(/\r?\n/u));
+
+    const actionLines: string[] = [];
     if (this.request.riskLevel === "critical") {
-      lines.push(theme.fg("error", "Critical or sensitive operation: review before accepting."));
+      actionLines.push(theme.fg("error", "Critical or sensitive operation: review before accepting."));
     }
-    lines.push("");
+    actionLines.push("");
     permissionOptions.forEach((option, index) => {
       const selected = index === this.selectedIndex;
       const prefix = selected ? "→ " : "  ";
       const label = `${prefix}${String(index + 1)}. ${option.label}`;
-      lines.push(
+      actionLines.push(
         (selected ? theme.fg("accent", label) : label)
         + theme.fg("muted", `  ${option.description}`)
       );
     });
     if (this.request.requireFullYes) {
-      lines.push("");
-      lines.push(theme.fg("warning", "Type yes, then press enter, to approve the selected action."));
-      lines.push(`${theme.fg("muted", "> ")}${this.confirmation}${theme.fg("warning", "█")}`);
+      actionLines.push("");
+      actionLines.push(theme.fg("warning", "Type yes, then press enter, to approve the selected action."));
+      actionLines.push(`${theme.fg("muted", "> ")}${this.confirmation}${theme.fg("warning", "█")}`);
       if (this.confirmationAttempted) {
-        lines.push(theme.fg("error", "Confirmation must be the full word yes."));
+        actionLines.push(theme.fg("error", "Confirmation must be the full word yes."));
       }
     }
-    this.body.setText(lines.join("\n"));
+
+    const detailBudget = Math.max(0, this.maxBodyLines - 1 - actionLines.length);
+    const visibleDetails = truncatePermissionDetails(details, detailBudget);
+    this.body.setText([
+      theme.fg("warning", theme.bold(this.request.title)),
+      ...visibleDetails.map((line) => theme.fg("muted", line)),
+      ...actionLines
+    ].join("\n"));
   }
+}
+
+/** 保留权限动作区，避免长预览把 Enter/yes 提示裁掉。 */
+function truncatePermissionDetails(details: string[], maxLines: number): string[] {
+  if (details.length <= maxLines) return details;
+  if (maxLines <= 0) return [];
+  const marker = theme.fg("dim", "… details hidden; press ctrl+o to expand");
+  if (maxLines === 1) return [marker];
+  return [...details.slice(0, maxLines - 1), marker];
 }
 
 /** 单个可打印字符：既不是控制码，也不是多字节的按键序列。 */

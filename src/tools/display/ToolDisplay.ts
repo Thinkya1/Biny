@@ -104,7 +104,7 @@ export const toolDisplayRules: Record<string, ToolDisplayRule> = {
         ? formatUnifiedDiffPreview(filePath, diff ?? "", 16)
         : formatFileContentPreview(filePath, content, 16);
       return {
-        details: `File: ${filePath}\nBytes: ${Buffer.byteLength(content, "utf8")}\n\n${preview}`,
+        details: `File: ${filePath}\nBytes: ${Buffer.byteLength(content, "utf8")}`,
         diff,
         preview,
         changeSummary: oldContent ? `Overwrite ${filePath}` : `Create ${filePath}`
@@ -122,7 +122,7 @@ export const toolDisplayRules: Record<string, ToolDisplayRule> = {
       const diff = createUnifiedDiff(filePath, oldContent, nextContent);
       const preview = formatUnifiedDiffPreview(filePath, diff, 16);
       return {
-        details: `File: ${filePath}\nReplace bytes: ${Buffer.byteLength(oldText, "utf8")} -> ${Buffer.byteLength(newText, "utf8")}\n\n${preview}`,
+        details: `File: ${filePath}\nReplace bytes: ${Buffer.byteLength(oldText, "utf8")} -> ${Buffer.byteLength(newText, "utf8")}`,
         diff,
         preview,
         changeSummary: `Edit ${filePath}`
@@ -139,7 +139,7 @@ export const toolDisplayRules: Record<string, ToolDisplayRule> = {
       const diff = createUnifiedDiff(filePath, oldContent, applied.content);
       const preview = formatUnifiedDiffPreview(filePath, diff, 20);
       return {
-        details: `File: ${filePath}\nEdits: ${String(edits.length)}\nReplacements: ${String(applied.replacements)}\n\n${preview}`,
+        details: `File: ${filePath}\nEdits: ${String(edits.length)}\nReplacements: ${String(applied.replacements)}`,
         diff,
         preview,
         changeSummary: `Apply ${String(edits.length)} edits to ${filePath}`
@@ -156,7 +156,7 @@ export const toolDisplayRules: Record<string, ToolDisplayRule> = {
       const diff = createUnifiedDiff(filePath, oldContent, applied.content);
       const preview = formatUnifiedDiffPreview(filePath, diff, 24);
       return {
-        details: `File: ${filePath}\nHunks: ${String(applied.hunks)}\nChanged lines: ${String(applied.changedLines)}\n\n${preview}`,
+        details: `File: ${filePath}\nHunks: ${String(applied.hunks)}\nChanged lines: ${String(applied.changedLines)}`,
         diff,
         preview,
         changeSummary: `Apply patch to ${filePath}`
@@ -171,7 +171,7 @@ export const toolDisplayRules: Record<string, ToolDisplayRule> = {
       const oldContent = await readExistingFileForDiff(from, context);
       const preview = formatFileContentPreview(from, oldContent, 12);
       return {
-        details: `Move ${from} -> ${to}\nBytes: ${Buffer.byteLength(oldContent, "utf8")}\n\n${preview}`,
+        details: `Move ${from} -> ${to}\nBytes: ${Buffer.byteLength(oldContent, "utf8")}`,
         preview,
         changeSummary: `Move ${from} to ${to}`,
         requireFullYes: true
@@ -186,7 +186,7 @@ export const toolDisplayRules: Record<string, ToolDisplayRule> = {
       const diff = createUnifiedDiff(filePath, oldContent, "");
       const preview = formatUnifiedDiffPreview(filePath, diff, 16);
       return {
-        details: `File: ${filePath}\nBytes: ${Buffer.byteLength(oldContent, "utf8")}\n\n${preview}`,
+        details: `File: ${filePath}\nBytes: ${Buffer.byteLength(oldContent, "utf8")}`,
         diff,
         preview,
         changeSummary: `Delete ${filePath}`,

@@ -1,9 +1,23 @@
 /**
- * Transcript 文案工具。
+ * TUI 文案工具。
  *
  * 与渲染框架无关的纯函数：耗时格式化、thinking 标题、可折叠条目筛选。
  */
 import type { ReasoningTranscriptItem, TranscriptItem, TranscriptState } from "./types.js";
+
+/** 将 session 最后更新时间转换成紧凑的相对时间，供恢复列表展示。 */
+export function formatSessionAge(timestamp: string, nowMs = Date.now()): string {
+  const timestampMs = Date.parse(timestamp);
+  if (!Number.isFinite(timestampMs)) return "--";
+
+  const ageMs = Math.max(0, nowMs - timestampMs);
+  const minuteMs = 60 * 1000;
+  const hourMs = 60 * minuteMs;
+  const dayMs = 24 * hourMs;
+  if (ageMs >= dayMs) return `${String(Math.floor(ageMs / dayMs))}d`;
+  if (ageMs >= hourMs) return `${String(Math.floor(ageMs / hourMs))}h`;
+  return `${String(Math.floor(ageMs / minuteMs))}m`;
+}
 
 export function formatToolDuration(durationMs: number | undefined): string {
   if (durationMs === undefined) return "";

@@ -3,7 +3,7 @@ import { CombinedAutocompleteProvider, visibleWidth } from "@earendil-works/pi-t
 import { createInitialTuiState, tuiReducer, type TuiAction } from "../src/tui/reducer.js";
 import { sessionEventsToTranscript } from "../src/tui/sessionTranscript.js";
 import { diffLineStyle } from "../src/tui/diffLines.js";
-import { foldableTranscriptItems, formatToolDuration, latestExpandableTranscript } from "../src/tui/transcriptText.js";
+import { foldableTranscriptItems, formatSessionAge, formatToolDuration, latestExpandableTranscript } from "../src/tui/transcriptText.js";
 import { TranscriptView } from "../src/tui/components/transcriptView.js";
 import { ThinkingComponent, ToolExecutionComponent, splitToolTitle } from "../src/tui/components/messages.js";
 import { PendingAttachmentsComponent, pendingAttachmentLabel } from "../src/tui/components/pendingAttachments.js";
@@ -903,6 +903,46 @@ function testPermissionDialogRequiresFullYes(): void {
   const rejectDialog = new PermissionDialog(request, (choice) => rejectAnswers.push(choice), () => undefined);
   rejectDialog.handleInput("\u001B");
   assert.deepEqual(rejectAnswers, ["reject"]);
+
+  const normalAnswers: PermissionChoice[] = [];
+  const normalDialog = new PermissionDialog(
+    { ...request, title: "Normal file edit", details: "File: example.ts", requireFullYes: false },
+    (choice) => normalAnswers.push(choice),
+    () => undefined
+  );
+  normalDialog.handleInput("\r");
+  assert.deepEqual(normalAnswers, ["approve_once"]);
+
+  const compactDialog = new PermissionDialog(
+    { ...request, details: Array.from({ length: 30 }, (_, index) => `preview line ${String(index)}`).join("\n") },
+    () => undefined,
+    () => undefined,
+    12
+  );
+  const compactText = plainLines(compactDialog.render(80)).join("\n");
+  assert.match(compactText, /Type yes, then press enter/u);
+  assert.match(compactText, /enter confirm/u);
+  assert.match(compactText, /details hidden/u);
+
+  const fileBody = "secret implementation detail";
+  const fileDialog = new PermissionDialog(
+    {
+      ...request,
+      title: "File write request",
+      details: "File: src/example.ts\nBytes: 31",
+      preview: fileBody,
+      requireFullYes: false,
+      riskLevel: "write"
+    },
+    () => undefined,
+    () => undefined
+  );
+  const conciseFileText = plainLines(fileDialog.render(80)).join("\n");
+  assert.match(conciseFileText, /File: src\/example\.ts/u);
+  assert.equal(conciseFileText.includes(fileBody), false);
+  fileDialog.handleInput("\u000F");
+  fileDialog.setDetailsExpanded(true);
+  assert.match(plainLines(fileDialog.render(80)).join("\n"), /secret implementation detail/u);
 }
 
 function testDiffStylesUseThemeTokens(): void {
@@ -912,6 +952,12 @@ function testDiffStylesUseThemeTokens(): void {
 }
 
 function testTranscriptTextHelpers(): void {
+  const now = Date.parse("2026-07-31T12:00:00.000Z");
+  assert.equal(formatSessionAge("2026-07-30T12:00:00.000Z", now), "1d");
+  assert.equal(formatSessionAge("2026-07-31T09:00:00.000Z", now), "3h");
+  assert.equal(formatSessionAge("2026-07-31T11:45:00.000Z", now), "15m");
+  assert.equal(formatSessionAge("not-a-time", now), "--");
+
   assert.equal(formatToolDuration(undefined), "");
   assert.equal(formatToolDuration(940), "940ms");
   assert.equal(formatToolDuration(1_234), "1.2s");
