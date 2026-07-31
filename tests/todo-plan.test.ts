@@ -13,6 +13,7 @@ async function main(): Promise<void> {
     await testReplaceAndPrompt(workspaceRoot);
     await testConstraints(workspaceRoot);
     await testSurvivesReload(workspaceRoot);
+    await testSwitchesSessionTruthSource(workspaceRoot);
     await testToolRoundTrip(workspaceRoot);
     console.log("todo plan tests passed");
   } finally {
@@ -66,6 +67,36 @@ async function testSurvivesReload(workspaceRoot: string): Promise<void> {
   const other = new TodoStore(workspaceRoot, "plan-d");
   await other.initialize();
   assert.deepEqual(other.list(), []);
+}
+
+/** resume 会复用同一个 runtime；切换 session 后读写都必须跟随恢复的 session。 */
+async function testSwitchesSessionTruthSource(workspaceRoot: string): Promise<void> {
+  const original = new TodoStore(workspaceRoot, "plan-resume-source");
+  await original.initialize();
+  await original.replace([{ content: "source item", status: "pending" }]);
+
+  const resumed = new TodoStore(workspaceRoot, "plan-resume-target");
+  await resumed.initialize();
+  await resumed.replace([{ content: "target item", status: "in_progress" }]);
+
+  const runtimeStore = new TodoStore(workspaceRoot, "runtime-draft");
+  await runtimeStore.initialize();
+  await runtimeStore.replace([{ content: "draft item", status: "pending" }]);
+
+  await runtimeStore.useSession("plan-resume-target");
+  assert.deepEqual(runtimeStore.list(), [{ content: "target item", status: "in_progress" }]);
+  await runtimeStore.replace([{ content: "target item", status: "completed" }]);
+
+  await runtimeStore.useSession("plan-resume-source");
+  assert.deepEqual(runtimeStore.list(), [{ content: "source item", status: "pending" }]);
+
+  const targetReloaded = new TodoStore(workspaceRoot, "plan-resume-target");
+  await targetReloaded.initialize();
+  assert.deepEqual(targetReloaded.list(), [{ content: "target item", status: "completed" }]);
+
+  const draftReloaded = new TodoStore(workspaceRoot, "runtime-draft");
+  await draftReloaded.initialize();
+  assert.deepEqual(draftReloaded.list(), [{ content: "draft item", status: "pending" }]);
 }
 
 async function testToolRoundTrip(workspaceRoot: string): Promise<void> {

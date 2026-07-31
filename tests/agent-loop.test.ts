@@ -3,15 +3,58 @@ import { tool, type LanguageModel, type ModelMessage, type TextStreamPart, type 
 import { z } from "zod";
 import { runAgentLoop } from "../src/agent/agentLoop.js";
 
-type ScriptedStep = { kind: "tool-call"; toolCallId: string } | { kind: "stop"; text: string } | { kind: "length"; text: string };
+type ScriptedStep =
+  | { kind: "tool-call"; toolCallId: string; finishReason?: "stop" | "tool-calls" }
+  | { kind: "empty-tool-finish"; text?: string }
+  | { kind: "stop"; text: string }
+  | { kind: "length"; text: string };
 
 async function main(): Promise<void> {
   await testContinuesWhileToolCallsRemain();
+  await testActualToolCallOverridesProviderStop();
+  await testToolCallFinishWithoutActualCallYields();
   await testStopsAtMaxSteps();
   await testTruncatedOutputStopsTheLoop();
   await testTransformContextRunsPerStepAndCarriesForward();
   await testSingleStartAndFinishPerRun();
   console.log("agent loop tests passed");
+}
+
+/** Provider 错报 stop 时，assistant 正文里的合法调用仍必须执行并带入下一步。 */
+async function testActualToolCallOverridesProviderStop(): Promise<void> {
+  const model = scriptedModel([
+    { kind: "tool-call", toolCallId: "call-stop", finishReason: "stop" },
+    { kind: "stop", text: "done after mismatched stop" }
+  ]);
+  const result = await runAgentLoop([userMessage("go")], {
+    model: model.model,
+    tools: pingTools(),
+    maxSteps: 8,
+    onPart: () => undefined
+  });
+  assert.equal(model.calls.length, 2);
+  assert.equal(result.steps[0]?.finishReason, "stop");
+  assert.equal(result.steps[0]?.toolCalls.length, 1);
+  assert.equal(result.kind, "model_yielded");
+  assert.equal(result.text, "done after mismatched stop");
+}
+
+/** finishReason=tool-calls 但正文没有合法调用时必须把控制权交回上层，不能空转。 */
+async function testToolCallFinishWithoutActualCallYields(): Promise<void> {
+  const model = scriptedModel([
+    { kind: "empty-tool-finish", text: "no call" },
+    { kind: "stop", text: "should never run" }
+  ]);
+  const result = await runAgentLoop([userMessage("go")], {
+    model: model.model,
+    tools: pingTools(),
+    maxSteps: 8,
+    onPart: () => undefined
+  });
+  assert.equal(model.calls.length, 1);
+  assert.equal(result.kind, "model_yielded");
+  assert.equal(result.finishReason, "tool-calls");
+  assert.equal(result.steps[0]?.toolCalls.length, 0);
 }
 
 /** tool-calls 续跑、stop 收尾：一次运行 = 两次 provider 请求。 */
@@ -164,6 +207,22 @@ function stepStream(step: ScriptedStep): ReadableStream<unknown> {
         controller.enqueue({ type: "tool-input-delta", id: step.toolCallId, delta: "{}" });
         controller.enqueue({ type: "tool-input-end", id: step.toolCallId });
         controller.enqueue({ type: "tool-call", toolCallId: step.toolCallId, toolName: "ping", input: "{}" });
+        controller.enqueue({
+          type: "finish",
+          finishReason: step.finishReason === "stop"
+            ? { unified: "stop", raw: "stop" }
+            : { unified: "tool-calls", raw: "tool_calls" },
+          usage: { inputTokens: 1, outputTokens: 1 }
+        });
+        controller.close();
+        return;
+      }
+      if (step.kind === "empty-tool-finish") {
+        if (step.text) {
+          controller.enqueue({ type: "text-start", id: "text-1" });
+          controller.enqueue({ type: "text-delta", id: "text-1", delta: step.text });
+          controller.enqueue({ type: "text-end", id: "text-1" });
+        }
         controller.enqueue({
           type: "finish",
           finishReason: { unified: "tool-calls", raw: "tool_calls" },

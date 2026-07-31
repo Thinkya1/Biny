@@ -20,8 +20,16 @@ export interface AgentLoopStep {
   finishReason: FinishReason;
   usage: LanguageModelUsage;
   responseMessages: ModelMessage[];
+  /** 从 assistant 消息正文解析出的合法工具调用；续跑只认这里，不信 finishReason。 */
+  toolCalls: AgentLoopToolCall[];
   /** 这一步结束时的完整 context，供调用方按步落盘。 */
   messages: ModelMessage[];
+}
+
+export interface AgentLoopToolCall {
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
 }
 
 export interface AgentLoopStepInfo {
@@ -32,7 +40,11 @@ export interface AgentLoopStepInfo {
 }
 
 /** 循环停下来的原因，供调用方区分「模型说完了」和「我们不让它继续」。 */
-export type AgentLoopStopReason = "model_stop" | "step_limit" | "output_truncated";
+export type AgentLoopStopReason =
+  | "model_stop"
+  | "step_limit"
+  | "output_truncated"
+  | "coordinator_checkpoint";
 
 export interface AgentLoopConfig {
   model: LanguageModel;
@@ -55,11 +67,27 @@ export interface AgentLoopConfig {
   onStepStart?: (info: AgentLoopStepInfo) => void;
   /** 每个 provider step 结束后触发，可用于按步落盘。约定同样不得抛异常。 */
   onStepEnd?: (step: AgentLoopStep) => Promise<void> | void;
+  /**
+   * 实际工具调用完成并回填结果后，允许上层在下一次 provider 请求前接管。
+   *
+   * 这只形成低层 checkpoint，不代表任务完成。典型用途是让 Coordinator 检查工具调用量、
+   * 重复动作等结构化预算。
+   */
+  continueAfterToolCalls?: (step: AgentLoopStep) => boolean;
+  /** Provider/SDK 标记为 schema-invalid 的调用由上层拒绝，不得作为合法续跑依据。 */
+  isToolCallValid?: (call: AgentLoopToolCall) => boolean;
   /** 流式分片出口。 */
   onPart: (part: TextStreamPart<ToolSet>) => void;
 }
 
 export interface AgentLoopResult {
+  kind:
+    | "model_yielded"
+    | "coordinator_checkpoint"
+    | "budget_exhausted"
+    | "output_truncated"
+    | "cancelled"
+    | "fatal_error";
   /** 循环结束时的完整 context。 */
   messages: ModelMessage[];
   /** 本次运行新产生的 assistant/tool 消息。 */
@@ -69,7 +97,12 @@ export interface AgentLoopResult {
   text: string;
   /** 最后一步的 finishReason。 */
   finishReason: FinishReason;
+  /** Provider 对最后一次响应给出的诊断值，不参与完成判断。 */
+  providerFinishReason: FinishReason;
   stopReason: AgentLoopStopReason;
+  assistantMessage?: ModelMessage;
+  budget: { stepsUsed: number; stepLimit: number };
+  error?: Error;
 }
 
 export async function runAgentLoop(
@@ -86,78 +119,125 @@ export async function runAgentLoop(
   const steps: AgentLoopStep[] = [];
   let finishReason: FinishReason = "stop";
   let stopReason: AgentLoopStopReason = "model_stop";
+  let kind: AgentLoopResult["kind"] = "model_yielded";
+  let loopError: Error | undefined;
   // 一次运行对外只暴露一个 start/finish；每步的 streamText 各自有一对，逐个转发会让
   // 消费者以为发生了多次运行。
   let startForwarded = false;
   let deferredFinish: TextStreamPart<ToolSet> | undefined;
 
-  for (let index = 0; index < config.maxSteps; index += 1) {
-    signal?.throwIfAborted();
-    const info: AgentLoopStepInfo = { index, completed: steps };
-    if (config.transformContext) messages = await config.transformContext(messages, info);
-    config.onStepStart?.(info);
+  try {
+    for (let index = 0; index < config.maxSteps; index += 1) {
+      signal?.throwIfAborted();
+      const info: AgentLoopStepInfo = { index, completed: steps };
+      if (config.transformContext) messages = await config.transformContext(messages, info);
+      config.onStepStart?.(info);
 
-    const result = streamText({
-      ...config.streamOptions,
-      model: config.model,
-      messages,
-      tools: config.tools,
-      allowSystemInMessages: true,
-      abortSignal: signal,
-      // 不传 stopWhen：SDK 默认 isStepCount(1)，一次调用就是一个 provider step。
-      // 续跑判定在下面由本循环做。
-      onError: () => undefined
-    });
+      const result = streamText({
+        ...config.streamOptions,
+        model: config.model,
+        messages,
+        tools: config.tools,
+        allowSystemInMessages: true,
+        abortSignal: signal,
+        // 不传 stopWhen：SDK 默认 isStepCount(1)，一次调用就是一个 provider step。
+        // 续跑判定在下面由本循环做。
+        onError: () => undefined
+      });
 
-    for await (const part of result.fullStream) {
-      if (part.type === "start") {
-        if (startForwarded) continue;
-        startForwarded = true;
+      for await (const part of result.fullStream) {
+        if (part.type === "start") {
+          if (startForwarded) continue;
+          startForwarded = true;
+        }
+        if (part.type === "finish") {
+          deferredFinish = part as TextStreamPart<ToolSet>;
+          continue;
+        }
+        config.onPart(part as TextStreamPart<ToolSet>);
       }
-      if (part.type === "finish") {
-        deferredFinish = part as TextStreamPart<ToolSet>;
-        continue;
+
+      const [stepFinishReason, stepResponseMessages, stepUsage, stepText] = await Promise.all([
+        result.finishReason,
+        result.responseMessages,
+        result.usage,
+        result.text
+      ]);
+      const parsedToolCalls = extractToolCalls(stepResponseMessages);
+      const toolCalls = config.isToolCallValid
+        ? parsedToolCalls.filter(config.isToolCallValid)
+        : parsedToolCalls;
+      responseMessages.push(...stepResponseMessages);
+      messages = [...messages, ...stepResponseMessages];
+      const step: AgentLoopStep = {
+        index,
+        text: stepText,
+        finishReason: stepFinishReason,
+        usage: stepUsage,
+        responseMessages: stepResponseMessages,
+        toolCalls,
+        messages: [...messages]
+      };
+      steps.push(step);
+      finishReason = stepFinishReason;
+      await config.onStepEnd?.(step);
+
+      if (stepFinishReason === "length") {
+        // 输出被 token 上限截断后，即使里面碰巧带了工具调用，也不能在残缺上下文上继续推理。
+        stopReason = "output_truncated";
+        kind = "output_truncated";
+        break;
       }
-      config.onPart(part as TextStreamPart<ToolSet>);
+      if (toolCalls.length === 0) {
+        // Provider 的 finishReason 只用于诊断。没有实际工具调用才代表模型把控制权交回上层。
+        stopReason = "model_stop";
+        kind = "model_yielded";
+        break;
+      }
+      if (config.continueAfterToolCalls?.(step) === false) {
+        stopReason = "coordinator_checkpoint";
+        kind = "coordinator_checkpoint";
+        break;
+      }
+      stopReason = "step_limit";
+      kind = "budget_exhausted";
     }
-
-    const [stepFinishReason, stepResponseMessages, stepUsage, stepText] = await Promise.all([
-      result.finishReason,
-      result.responseMessages,
-      result.usage,
-      result.text
-    ]);
-    responseMessages.push(...stepResponseMessages);
-    messages = [...messages, ...stepResponseMessages];
-    const step: AgentLoopStep = {
-      index,
-      text: stepText,
-      finishReason: stepFinishReason,
-      usage: stepUsage,
-      responseMessages: stepResponseMessages,
-      messages: [...messages]
-    };
-    steps.push(step);
-    finishReason = stepFinishReason;
-    await config.onStepEnd?.(step);
-
-    if (stepFinishReason === "length") {
-      // 输出被 token 上限截断，这一步的 assistant 消息本身是残的。基于它再发一次请求，
-      // 等于让模型在半句话上继续推理。停在这里，把不完整交给调用方处理。
-      //
-      // pi 在这里还会把该步的所有 tool call 判失败（截断意味着参数可能是残的）。我们做
-      // 不到：工具由 SDK 在 step 内部就执行了。要补上这一层，得先把工具结算也拿回来
-      // （schema-only tools + 自己执行），那是另一档改动。
-      stopReason = "output_truncated";
-      break;
-    }
-    if (stepFinishReason !== "tool-calls") {
-      stopReason = "model_stop";
-      break;
-    }
-    stopReason = "step_limit";
+  } catch (error) {
+    loopError = error instanceof Error ? error : new Error(String(error));
+    kind = signal?.aborted ? "cancelled" : "fatal_error";
   }
 
   if (deferredFinish) config.onPart(deferredFinish);
-  return { messages, responseMessages, steps, text: steps[steps.length - 1]?.text ?? "", finishReason, stopReason };
+  return {
+    kind,
+    messages,
+    responseMessages,
+    steps,
+    text: steps[steps.length - 1]?.text ?? "",
+    finishReason,
+    providerFinishReason: finishReason,
+    stopReason,
+    assistantMessage: [...responseMessages].reverse().find((message) => message.role === "assistant"),
+    budget: { stepsUsed: steps.length, stepLimit: config.maxSteps },
+    error: loopError
+  };
+}
+
+/** 只接受消息正文里的完整工具调用；finishReason 不参与解析，也不能凭空制造调用。 */
+export function extractToolCalls(messages: readonly ModelMessage[]): AgentLoopToolCall[] {
+  const calls: AgentLoopToolCall[] = [];
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (
+        part.type !== "tool-call"
+        || typeof part.toolCallId !== "string"
+        || !part.toolCallId
+        || typeof part.toolName !== "string"
+        || !part.toolName
+      ) continue;
+      calls.push({ toolCallId: part.toolCallId, toolName: part.toolName, input: part.input });
+    }
+  }
+  return calls;
 }

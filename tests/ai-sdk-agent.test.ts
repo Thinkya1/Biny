@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { AgentSession } from "../src/agent/AgentSession.js";
+import { CompletionStateStore } from "../src/agent/completionState.js";
 import type { AgentPermissionRequest, AgentPermissionResult, AgentSessionEvent } from "../src/agent/types.js";
 import { configSchema, defaultConfig, type AgentConfig } from "../src/config/schema.js";
 import type { AgentConfigStore } from "../src/config/store.js";
@@ -13,6 +14,8 @@ import { PermissionManager } from "../src/permission/PermissionManager.js";
 import { SessionRecorder } from "../src/session/recorder.js";
 import { ensureAgentDirs } from "../src/session/store.js";
 import { TurnStore } from "../src/session/turnStore.js";
+import { TodoStore } from "../src/session/todoStore.js";
+import { createCompletionStateTools } from "../src/tools/completion.js";
 import { createReadFileTool } from "../src/tools/file/readFile.js";
 import { ToolRegistry } from "../src/tools/registry.js";
 import type { Tool } from "../src/tools/types.js";
@@ -42,6 +45,11 @@ async function main(): Promise<void> {
   await testStalePermissionPreviewPreventsExecution();
   await testCanonicalPermissionPathCannotBypassDeny();
   await testModelFailureIsNotRetried();
+  await testPendingTodoUsesBoundedSystemContinuation();
+  await testStructuredBlockerStopsWithoutCompletion();
+  await testVerificationFailureReturnsToSameAgentLoop();
+  await testSoftStepLimitWarnsWithoutStopping();
+  await testResumableHardLimitKeepsVerificationFacts();
   await testStepLimitIsIncompleteAndDoesNotQueueSuccessfulMemory();
   await testHarnessCanDeferSuccessfulMemoryUntilAcceptance();
   await testPreAbortedRunStopsBeforeRequest();
@@ -214,6 +222,8 @@ async function testStepLimitIsIncompleteAndDoesNotQueueSuccessfulMemory(): Promi
       registry.register(readFileTool());
       const { agent, cleanup } = await createAgent(registry, (config) => {
         config.agent.maxSteps = maxSteps;
+        config.agent.hardStepLimit = maxSteps;
+        config.agent.maxRepeatedActions = maxSteps + 1;
       });
       const memory = (agent as unknown as {
         contextMemory: { queueSuccessfulTask(input: string, output: string): void };
@@ -227,16 +237,13 @@ async function testStepLimitIsIncompleteAndDoesNotQueueSuccessfulMemory(): Promi
       try {
         const outcome = await agent.runTask(`continue through ${String(maxSteps)} tool steps`);
         assert.equal(outcome.status, "incomplete");
-        assert.equal(outcome.stopReason, "step_limit");
+        assert.equal(outcome.stopReason, "hard_step_limit");
         assert.equal(outcome.finishReason, "tool-calls");
         assert.equal(outcome.steps, maxSteps);
+        assert.equal(outcome.resumable, true);
         assert.equal(requestCount, maxSteps);
         assert.equal(successfulTaskCount, 0);
-        assert.equal(await agent.interruptedTurn(), undefined);
-        await assert.rejects(
-          collect(agent.continueInterruptedTurn()),
-          /There is no interrupted turn to continue/u
-        );
+        assert.equal((await agent.interruptedTurn())?.completedSteps, 0);
       } finally {
         await cleanup(agent);
       }
@@ -526,6 +533,7 @@ async function testAgentStreamsFinalAnswer(): Promise<void> {
     assert.equal(calls, 1);
     assert.equal(events.some((event) => event.type === "assistant.delta"), true);
     assert.equal(events.some((event) => event.type === "done" && event.content === "hello"), true);
+    assert.equal(events.find((event) => event.type === "done")?.outcome.stopReason, "completion_gate");
     await agent.close();
     const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; usage?: { inputTokens?: number }; contextState?: { budget?: { source?: string } } });
     const assistant = sessionEvents.find((event) => event.type === "assistant_message");
@@ -536,6 +544,270 @@ async function testAgentStreamsFinalAnswer(): Promise<void> {
   } finally {
     globalThis.fetch = originalFetch;
     await cleanup(agent, true);
+  }
+}
+
+async function testPendingTodoUsesBoundedSystemContinuation(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    requests.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+    return sseResponse([
+      { choices: [{ index: 0, delta: { content: "not finished" }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      "[DONE]"
+    ]);
+  }) as typeof fetch;
+
+  const { agent, todos, cleanup } = await createAgent(undefined, (config) => {
+    config.agent.maxCompletionContinuations = 1;
+    config.agent.maxRepeatedActions = 10;
+  });
+  try {
+    await todos.replace([{ content: "finish the remaining work", status: "pending" }]);
+    const events = await collect(runAgent(agent, "keep working"));
+    const outcome = events.find((event) => event.type === "done")?.outcome;
+    assert.equal(requests.length, 2, "pending Todo must trigger one same-loop continuation");
+    assert.match(JSON.stringify(requests[1]), /Biny completion gate/u);
+    assert.equal(outcome?.status, "incomplete");
+    assert.equal(outcome?.stopReason, "completion_continuation_limit");
+    assert.equal(outcome?.resumable, true);
+    assert.equal(events.some((event) => event.type === "status" && event.status === "completed"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await cleanup(agent);
+  }
+}
+
+async function testStructuredBlockerStopsWithoutCompletion(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = (async (): Promise<Response> => {
+    requests += 1;
+    if (requests === 1) {
+      return sseResponse([
+        { choices: [{ index: 0, delta: { tool_calls: [{
+          index: 0,
+          id: "blocked-state",
+          type: "function",
+          function: {
+            name: "report_blocked",
+            arguments: "{\"reason\":\"missing_user_input\",\"summary\":\"A deployment target is required.\",\"requiredAction\":\"Choose staging or production.\",\"affectedTodoIds\":[\"deploy\"]}"
+          }
+        }] }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        "[DONE]"
+      ]);
+    }
+    return sseResponse([
+      { choices: [{ index: 0, delta: { content: "waiting for target" }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      "[DONE]"
+    ]);
+  }) as typeof fetch;
+
+  const fixture = await createAgent(new ToolRegistry(), undefined, true);
+  let confirmations = 0;
+  try {
+    const events = await collect(runAgent(fixture.agent, "deploy the project", async () => {
+      confirmations += 1;
+      return { approved: true, scope: "once" };
+    }));
+    const outcome = events.find((event) => event.type === "done")?.outcome;
+    assert.equal(requests, 2);
+    assert.equal(outcome?.status, "blocked");
+    assert.equal(outcome?.stopReason, "blocked");
+    assert.equal(outcome?.blockedReason, "missing_user_input");
+    assert.equal(outcome?.requiredAction, "Choose staging or production.");
+    assert.deepEqual(outcome?.affectedTodoIds, ["deploy"]);
+    assert.equal(confirmations, 0, "recording a blocker must not request side-effect permission");
+    assert.equal(events.some((event) => event.type === "status" && event.status === "completed"), false);
+    assert.equal((await fixture.agent.interruptedTurn())?.completedSteps, 0);
+    await assert.rejects(
+      async () => await collect(fixture.agent.continueInterruptedTurn()),
+      /requires a new user message/i
+    );
+    const resumed = await collect(runAgent(fixture.agent, "Use staging."));
+    assert.equal(resumed.find((event) => event.type === "done")?.outcome.status, "completed");
+    assert.equal(requests, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fixture.cleanup(fixture.agent);
+  }
+}
+
+async function testVerificationFailureReturnsToSameAgentLoop(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<Record<string, unknown>> = [];
+  let workspaceRoot = "";
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    requests.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+    if (requests.length === 1) {
+      return sseResponse([
+        { choices: [{ index: 0, delta: { tool_calls: [{
+          index: 0,
+          id: "request-verification",
+          type: "function",
+          function: {
+            name: "request_verification",
+            arguments: "{\"checks\":[{\"id\":\"verified-file\",\"kind\":\"command\",\"description\":\"verified.txt exists\",\"command\":\"test -f verified.txt\"}]}"
+          }
+        }] }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        "[DONE]"
+      ]);
+    }
+    if (requests.length === 2) {
+      return sseResponse([
+        { choices: [{ index: 0, delta: { content: "ready to verify" }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+        "[DONE]"
+      ]);
+    }
+    if (requests.length === 3) {
+      return sseResponse([
+        { choices: [{ index: 0, delta: { tool_calls: [{
+          index: 0,
+          id: "verification-fix",
+          type: "function",
+          function: { name: "write_file", arguments: "{\"path\":\"verified.txt\",\"content\":\"ok\"}" }
+        }] }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        "[DONE]"
+      ]);
+    }
+    return sseResponse([
+      { choices: [{ index: 0, delta: { content: "verified" }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      "[DONE]"
+    ]);
+  }) as typeof fetch;
+
+  const registry = new ToolRegistry();
+  registry.register(writeTool(async () => {
+    await writeFile(path.join(workspaceRoot, "verified.txt"), "ok", "utf8");
+  }));
+  const fixture = await createAgent(registry, undefined, true);
+  workspaceRoot = fixture.workspaceRoot;
+  let confirmations = 0;
+  try {
+    const events = await collect(runAgent(fixture.agent, "create and verify the file", async () => {
+      confirmations += 1;
+      return { approved: true, scope: "once", confirmation: "yes" };
+    }));
+    const outcome = events.find((event) => event.type === "done")?.outcome;
+    assert.equal(requests.length, 4);
+    assert.match(JSON.stringify(requests[2]), /Independent verification failed/u);
+    assert.equal(confirmations, 3, "each verifier execution and the workspace write must pass permission policy");
+    assert.equal(outcome?.status, "completed");
+    assert.equal(outcome?.stopReason, "completion_gate");
+    assert.equal(await readFile(path.join(workspaceRoot, "verified.txt"), "utf8"), "ok");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fixture.cleanup(fixture.agent);
+  }
+}
+
+async function testSoftStepLimitWarnsWithoutStopping(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    requests.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+    if (requests.length === 1) {
+      return sseResponse([
+        { choices: [{ index: 0, delta: { tool_calls: [{
+          index: 0,
+          id: "soft-limit-read",
+          type: "function",
+          function: { name: "read_file", arguments: "{\"path\":\"README.md\"}" }
+        }] }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        "[DONE]"
+      ]);
+    }
+    return sseResponse([
+      { choices: [{ index: 0, delta: { content: "done after warning" }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      "[DONE]"
+    ]);
+  }) as typeof fetch;
+
+  const registry = new ToolRegistry();
+  registry.register(readFileTool());
+  const fixture = await createAgent(registry, (config) => {
+    config.agent.softStepLimit = 1;
+    config.agent.hardStepLimit = 4;
+    config.agent.maxRepeatedActions = 10;
+  });
+  try {
+    const outcome = await fixture.agent.runTask("finish after reading");
+    assert.equal(requests.length, 2);
+    assert.match(JSON.stringify(requests[1]), /Biny run budget/u);
+    assert.equal(outcome.status, "completed");
+    assert.equal(outcome.stopReason, "completion_gate");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fixture.cleanup(fixture.agent);
+  }
+}
+
+async function testResumableHardLimitKeepsVerificationFacts(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  let workspaceRoot = "";
+  globalThis.fetch = (async (): Promise<Response> => {
+    requests += 1;
+    if (requests === 1) {
+      return sseResponse([
+        { choices: [{ index: 0, delta: { tool_calls: [{
+          index: 0,
+          id: "hard-limit-write",
+          type: "function",
+          function: { name: "write_file", arguments: "{\"path\":\"changed.txt\",\"content\":\"changed\"}" }
+        }] }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        "[DONE]"
+      ]);
+    }
+    return sseResponse([
+      { choices: [{ index: 0, delta: { content: "resume and verify" }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      "[DONE]"
+    ]);
+  }) as typeof fetch;
+
+  const registry = new ToolRegistry();
+  registry.register(writeTool(async () => {
+    await writeFile(path.join(workspaceRoot, "changed.txt"), "changed", "utf8");
+  }));
+  const fixture = await createAgent(registry, (config) => {
+    config.agent.softStepLimit = 1;
+    config.agent.hardStepLimit = 2;
+    config.agent.maxRepeatedActions = 10;
+  });
+  workspaceRoot = fixture.workspaceRoot;
+  try {
+    await writeFile(path.join(workspaceRoot, "package.json"), JSON.stringify({
+      scripts: {
+        test: "node -e \"require('node:fs').writeFileSync('verification-ran.txt','yes')\""
+      }
+    }), "utf8");
+    const first = await fixture.agent.runTask("change the file", {
+      maxSteps: 1,
+      confirmPermission: async () => ({ approved: true, scope: "once", confirmation: "yes" })
+    });
+    assert.equal(first.status, "incomplete");
+    assert.equal(first.stopReason, "hard_step_limit");
+    assert.equal((await fixture.agent.interruptedTurn())?.completedSteps, 0);
+
+    const resumed = await collect(fixture.agent.continueInterruptedTurn({
+      confirmPermission: async () => ({ approved: true, scope: "once", confirmation: "yes" })
+    }));
+    assert.equal(resumed.find((event) => event.type === "done")?.outcome.status, "completed");
+    assert.equal(await readFile(path.join(workspaceRoot, "verification-ran.txt"), "utf8"), "yes");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fixture.cleanup(fixture.agent);
   }
 }
 
@@ -568,9 +840,16 @@ async function testAgentRunsToolAndKeepsSessionEvents(): Promise<void> {
     assert.equal(events.some((event) => event.type === "tool.completed" && event.toolCallId === "read-1"), true);
     assert.equal(events.some((event) => event.type === "done" && event.content === "README read"), true);
     await agent.close();
-    const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; contextUsage?: { usedTokens?: number } });
-    assert.deepEqual(sessionEvents.map((event) => event.type), ["user_message", "tool_call", "tool_result", "assistant_message"]);
+    const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      type: string;
+      contextUsage?: { usedTokens?: number };
+      status?: string;
+      stopReason?: string;
+    });
+    assert.deepEqual(sessionEvents.map((event) => event.type), ["user_message", "tool_call", "tool_result", "assistant_message", "turn_status"]);
     assert.equal(typeof sessionEvents[0]?.contextUsage?.usedTokens, "number");
+    assert.equal(sessionEvents.at(-1)?.status, "completed");
+    assert.equal(sessionEvents.at(-1)?.stopReason, "completion_gate");
   } finally {
     globalThis.fetch = originalFetch;
     await cleanup(agent, true);
@@ -620,8 +899,15 @@ async function testInvalidToolInputUsesCoordinatorValidation(): Promise<void> {
         "[DONE]"
       ]);
     }
+    if (requests.length === 2) {
+      return sseResponse([
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "read-corrected", type: "function", function: { name: "read_file", arguments: "{\"path\":\"README.md\"}" } }] }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        "[DONE]"
+      ]);
+    }
     return sseResponse([
-      { choices: [{ index: 0, delta: { content: "invalid handled" }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: { content: "invalid input corrected" }, finish_reason: null }] },
       { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
       "[DONE]"
     ]);
@@ -632,8 +918,10 @@ async function testInvalidToolInputUsesCoordinatorValidation(): Promise<void> {
   const { agent, cleanup } = await createAgent(registry);
   try {
     const events = await collect(runAgent(agent, "Read README.md"));
-    assert.equal(requests.length, 2);
+    assert.equal(requests.length, 3);
     assert.equal(events.some((event) => event.type === "error" && /invalid tool arguments/i.test(event.message)), true);
+    assert.equal(events.some((event) => event.type === "tool.completed" && event.toolCallId === "read-corrected"), true);
+    assert.equal(events.find((event) => event.type === "done")?.outcome.status, "completed");
   } finally {
     globalThis.fetch = originalFetch;
     await cleanup(agent);
@@ -1164,11 +1452,16 @@ async function testPreAbortedPlanRecordsAttempt(): Promise<void> {
       abortSignal: controller.signal
     }));
     assert.equal(calls, 0);
-    assert.equal(events.find((event) => event.type === "done")?.outcome.status, "aborted");
+    assert.equal(events.find((event) => event.type === "done")?.outcome.status, "cancelled");
     await agent.close();
-    const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; content?: string });
-    assert.deepEqual(sessionEvents.map((event) => event.type), ["user_message"]);
+    const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      type: string;
+      content?: string;
+      status?: string;
+    });
+    assert.deepEqual(sessionEvents.map((event) => event.type), ["user_message", "turn_status"]);
     assert.equal(sessionEvents[0]?.content, "inspect cancellation");
+    assert.equal(sessionEvents[1]?.status, "cancelled");
   } finally {
     globalThis.fetch = originalFetch;
     await cleanup(agent, true);
@@ -1303,14 +1596,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 async function createAgent(
   registry = new ToolRegistry(),
-  configure?: (config: AgentConfig) => void
-): Promise<{ agent: AgentSession; permissionManager: PermissionManager; sessionFile: string; workspaceRoot: string; cleanup: (agent: AgentSession, alreadyClosed?: boolean) => Promise<void> }> {
+  configure?: (config: AgentConfig) => void,
+  includeCompletionTools = false
+): Promise<{
+  agent: AgentSession;
+  permissionManager: PermissionManager;
+  sessionFile: string;
+  workspaceRoot: string;
+  todos: TodoStore;
+  completionState: CompletionStateStore;
+  cleanup: (agent: AgentSession, alreadyClosed?: boolean) => Promise<void>;
+}> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-sdk-runtime-"));
   await ensureAgentDirs(workspaceRoot);
   const config = configFor();
   configure?.(config);
   const recorder = new SessionRecorder(workspaceRoot);
   const permissionManager = new PermissionManager(config.permission);
+  const todos = new TodoStore(workspaceRoot, recorder.sessionId);
+  await todos.initialize();
+  const completionState = new CompletionStateStore();
+  if (includeCompletionTools) {
+    for (const tool of createCompletionStateTools(completionState)) {
+      registry.registerBuiltinTool(tool);
+    }
+  }
   const agent = new AgentSession({
     workspaceRoot,
     config,
@@ -1318,6 +1628,8 @@ async function createAgent(
     toolRegistry: registry,
     permissionManager,
     recorder,
+    todoStore: todos,
+    completionState,
     attachmentRoot: workspaceRoot
   });
   await agent.initialize();
@@ -1326,6 +1638,8 @@ async function createAgent(
     permissionManager,
     sessionFile: recorder.filePath,
     workspaceRoot,
+    todos,
+    completionState,
     cleanup: async (current, alreadyClosed = false) => {
       if (!alreadyClosed) await current.close();
       await rm(workspaceRoot, { recursive: true, force: true });

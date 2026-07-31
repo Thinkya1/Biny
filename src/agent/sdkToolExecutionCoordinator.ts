@@ -86,6 +86,41 @@ export interface AgentStepContext {
   reasoningBlocks?: ReasoningBlock[];
 }
 
+/**
+ * 工具副作用的 admission 预算。
+ *
+ * 额度必须在 ToolScheduler 和权限请求之前原子占用；否则一个 provider 批次可以先执行完所有
+ * 并行调用，再由上层在步结束后发现超限。
+ */
+export interface ToolExecutionBudget {
+  maxToolCalls: number;
+  maxRepeatedActions: number;
+  /** 进程内断点续跑时，已占用的调用额度。显式新预算窗口应传 0。 */
+  initialToolCallCount?: number;
+  /**
+   * 旧断点只持久化了最大重复次数，没有逐动作计数。恢复时保守继承这个上界，避免重启绕过
+   * 重复动作限制；显式新预算窗口应传 0。
+   */
+  initialMaxRepeatedActionCount?: number;
+}
+
+export interface ToolExecutionBudgetSnapshot {
+  accountedToolCalls: number;
+  maxRepeatedActionCount: number;
+}
+
+type ToolBudgetReason = "tool_call_limit" | "repeated_action_limit";
+
+interface ToolBudgetRejection {
+  status: "budget_rejected";
+  reason: ToolBudgetReason;
+  resumable: true;
+  limit: number;
+  attemptedToolCallCount: number;
+  attemptedActionCount: number;
+  error: string;
+}
+
 export class SdkToolExecutionCoordinator {
   private readonly admissionScheduler: ToolScheduler<unknown>;
   private readonly scheduler: ToolScheduler<ToolExecutionOutcome>;
@@ -102,14 +137,29 @@ export class SdkToolExecutionCoordinator {
   private readonly hooks: HookRunner;
   /** 本回合是否已建过快照；每回合只建一个，建在第一次真正改动之前。 */
   private checkpointTaken = false;
+  private accountedToolCallCount = 0;
+  private restoredMaxRepeatedActionCount = 0;
+  private readonly accountedActionCounts = new Map<string, number>();
 
   constructor(
     private readonly context: AgentRuntimeContext,
     private readonly permissionManager: PermissionManager,
     private readonly emit: (event: AgentToolEvent | Extract<AgentSessionEvent, { type: "error" }>) => void,
     private readonly getStepContext: () => AgentStepContext = () => ({}),
-    private readonly allowedToolNames?: ReadonlySet<string>
+    private readonly allowedToolNames?: ReadonlySet<string>,
+    private readonly executionBudget?: ToolExecutionBudget
   ) {
+    if (executionBudget) {
+      assertPositiveSafeInteger(executionBudget.maxToolCalls, "maxToolCalls");
+      assertPositiveSafeInteger(executionBudget.maxRepeatedActions, "maxRepeatedActions");
+      assertNonNegativeSafeInteger(executionBudget.initialToolCallCount ?? 0, "initialToolCallCount");
+      assertNonNegativeSafeInteger(
+        executionBudget.initialMaxRepeatedActionCount ?? 0,
+        "initialMaxRepeatedActionCount"
+      );
+      this.accountedToolCallCount = executionBudget.initialToolCallCount ?? 0;
+      this.restoredMaxRepeatedActionCount = executionBudget.initialMaxRepeatedActionCount ?? 0;
+    }
     this.diagnostics = context.config.diagnostics.enabled
       ? new DiagnosticsRunner(context.workspaceRoot, context.config.diagnostics)
       : undefined;
@@ -144,6 +194,17 @@ export class SdkToolExecutionCoordinator {
     while (this.pendingExecutions.size > 0) {
       await Promise.allSettled([...this.pendingExecutions]);
     }
+  }
+
+  getExecutionBudgetSnapshot(): ToolExecutionBudgetSnapshot {
+    return {
+      accountedToolCalls: this.accountedToolCallCount,
+      maxRepeatedActionCount: Math.max(
+        this.restoredMaxRepeatedActionCount,
+        0,
+        ...this.accountedActionCounts.values()
+      )
+    };
   }
 
   observeToolCall(toolCallId: string): string | undefined {
@@ -247,6 +308,11 @@ export class SdkToolExecutionCoordinator {
         const message = abortedToolMessage(call.name, signal.reason);
         return await finish({ status: "aborted", error: message }, message);
       }
+      const budgetRejection = this.admitToolCall(call);
+      if (budgetRejection) {
+        this.emit({ type: "tool.started", toolCallId: call.id, tool: call.name, args: call.args });
+        return await finish(budgetRejection, budgetRejection.error);
+      }
 
       return await this.admissionScheduler.schedule({
         accesses: ToolAccesses.none(),
@@ -291,7 +357,7 @@ export class SdkToolExecutionCoordinator {
               if (gatedEvaluation.decision === "allow") return { approved: true as const, scope: "once" as const };
               const result = this.context.confirmPermission
                 ? await this.context.confirmPermission(permissionRequest)
-                : await confirmPermissionRequest(permissionRequest);
+                : await confirmPermissionRequest(permissionRequest, signal);
               signal?.throwIfAborted();
               const validatedResult = validateStrongConfirmation(permissionRequest, result);
               this.permissionManager.applyResult(permissionRequest, validatedResult);
@@ -340,6 +406,9 @@ export class SdkToolExecutionCoordinator {
                 : undefined;
               const blocked = await this.runBeforeToolHooks(call.name, prepared.args, signal);
               if (blocked) return blocked;
+              if (hasWritableAccess(prepared.execution.accesses ?? ToolAccesses.all())) {
+                await this.context.beforeWorkspaceMutation?.().catch(() => undefined);
+              }
               await this.ensureCheckpoint(toolDefinition.risk, call.name);
               return await this.executeResolvedTool(call, prepared.execution, source, signal, approvedFile);
             }
@@ -737,6 +806,52 @@ export class SdkToolExecutionCoordinator {
     return this.context.recorder.nextToolCallSequence();
   }
 
+  /**
+   * 没有 await 的同步临界区：同一批并行 execute 即使同时恢复 microtask，也会逐个检查并占用
+   * 额度，后来的调用无法越过前一个调用刚提交的计数。
+   */
+  private admitToolCall(call: { name: string; args: unknown }): ToolBudgetRejection | undefined {
+    const budget = this.executionBudget;
+    if (!budget) return undefined;
+    const attemptedToolCallCount = this.accountedToolCallCount + 1;
+    const fingerprint = `${call.name}\0${stableJson(call.args)}`;
+    const actionCount = this.accountedActionCounts.get(fingerprint) ?? 0;
+    const attemptedRestoredCount = this.restoredMaxRepeatedActionCount > 0
+      ? this.restoredMaxRepeatedActionCount + 1
+      : 0;
+    const attemptedActionCount = Math.max(actionCount + 1, attemptedRestoredCount);
+    // 被重复动作规则拒绝的调用仍是真实 provider Tool Call，也必须消耗总调用额度。先原子记账，
+    // 再选择拒绝原因，保证同一批后续调用看见最新计数。
+    this.accountedToolCallCount = attemptedToolCallCount;
+    this.accountedActionCounts.set(fingerprint, actionCount + 1);
+    this.restoredMaxRepeatedActionCount = attemptedRestoredCount;
+
+    if (attemptedToolCallCount > budget.maxToolCalls) {
+      return {
+        status: "budget_rejected",
+        reason: "tool_call_limit",
+        resumable: true,
+        limit: budget.maxToolCalls,
+        attemptedToolCallCount,
+        attemptedActionCount,
+        error: `Tool ${call.name} was not executed because the run reached its ${String(budget.maxToolCalls)}-call limit.`
+      };
+    }
+    if (attemptedActionCount > budget.maxRepeatedActions) {
+      return {
+        status: "budget_rejected",
+        reason: "repeated_action_limit",
+        resumable: true,
+        limit: budget.maxRepeatedActions,
+        attemptedToolCallCount,
+        attemptedActionCount,
+        error: `Tool ${call.name} was not executed because the same structured action reached its repeat limit of ${String(budget.maxRepeatedActions)}.`
+      };
+    }
+
+    return undefined;
+  }
+
   private duplicateAuditId(toolCallId: string, sequence: number): string {
     const count = (this.duplicateExecutionCounts.get(toolCallId) ?? 0) + 1;
     this.duplicateExecutionCounts.set(toolCallId, count);
@@ -792,8 +907,28 @@ function stableJson(value: unknown): string {
   return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
 }
 
+function assertPositiveSafeInteger(value: number, field: string): void {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(`Tool execution budget ${field} must be a positive safe integer.`);
+  }
+}
+
+function assertNonNegativeSafeInteger(value: number, field: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`Tool execution budget ${field} must be a non-negative safe integer.`);
+  }
+}
+
 function isToolExecutionError(execution: unknown): execution is { isError: true; result: unknown; errorMessage: string } {
   return typeof execution === "object" && execution !== null && "isError" in execution && execution.isError === true && "errorMessage" in execution && typeof execution.errorMessage === "string";
+}
+
+function hasWritableAccess(accesses: RunnableToolExecution["accesses"]): boolean {
+  return accesses?.some((access) =>
+    access.kind === "all"
+    || access.operation === "write"
+    || access.operation === "readwrite"
+  ) ?? false;
 }
 
 function formatToolError(toolName: string, error: unknown): string {

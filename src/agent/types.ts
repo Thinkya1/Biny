@@ -12,27 +12,34 @@ import type { ContextMemory } from "./context/ContextMemory.js";
 export type AgentPermissionRequest = PermissionPrompt;
 export type AgentPermissionResult = PermissionResult;
 
-export type AgentTurnStatus = "completed" | "incomplete" | "failed" | "aborted";
+export type AgentTurnStatus = "completed" | "incomplete" | "blocked" | "cancelled" | "failed" | "aborted";
 
 /**
- * Why one bounded AgentSession attempt stopped. `step_limit` and
- * `tool_pending` are deliberately non-success terminal reasons: callers may
- * continue them through the task harness, but must never present them as a
- * completed task.
+ * AgentSession 的终止原因。新普通 Loop 用 completion_gate / hard_step_limit /
+ * no_progress_after_continuation 等结构化原因；step_limit、tool_pending、model_stop 和 aborted
+ * 保留给旧宿主、旧 TaskRun 与历史事件兼容。
  */
 export type AgentTurnStopReason =
   | "model_stop"
+  | "completion_gate"
   | "step_limit"
+  | "hard_step_limit"
+  | "tool_call_limit"
+  | "completion_continuation_limit"
+  | "no_progress_after_continuation"
+  | "repeated_action_limit"
   | "tool_pending"
   | "timeout"
   | "verification_failed"
   | "model_length"
   | "content_filter"
   | "provider_error"
+  | "blocked"
+  | "cancelled"
   | "aborted"
   | "budget_exhausted";
 
-/** Structured result for a single bounded model/tool turn. */
+/** 一个统一模型/工具回合的结构化终态；只有 Completion Gate 能产生 completed。 */
 export interface AgentTurnOutcome {
   status: AgentTurnStatus;
   stopReason: AgentTurnStopReason;
@@ -41,6 +48,10 @@ export interface AgentTurnOutcome {
   output: string;
   usage?: SessionUsage;
   error?: string;
+  resumable?: boolean;
+  blockedReason?: string;
+  requiredAction?: string;
+  affectedTodoIds?: string[];
 }
 
 export type AgentSessionUpdate =
@@ -77,8 +88,19 @@ export interface AgentRuntimeContext {
   confirmPermission?: (request: AgentPermissionRequest) => Promise<AgentPermissionResult>;
   /** 回合内首次改动工作区前建快照；未提供或抛错时工具照常执行。 */
   createCheckpoint?: (label: string) => Promise<unknown>;
+  /** 工具第一次获得可写资源后、真正执行前捕获 Completion Gate 的事实基线。 */
+  beforeWorkspaceMutation?: () => Promise<void>;
   quarantineExternalTool?: (tool: string, toolCallId: string, settlement: Promise<unknown>) => void;
   abortSignal?: AbortSignal;
 }
 
-export type AgentStatus = "thinking" | "running" | "waiting_permission" | "completed" | "incomplete" | "aborted" | "error";
+export type AgentStatus =
+  | "thinking"
+  | "running"
+  | "waiting_permission"
+  | "completed"
+  | "incomplete"
+  | "blocked"
+  | "cancelled"
+  | "aborted"
+  | "error";

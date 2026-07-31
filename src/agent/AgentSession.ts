@@ -16,7 +16,11 @@ import { runPermissionCommand } from "../permission/commands.js";
 import { listSessionSummaries, parseSessionEvents, type SessionSummary } from "../session/events.js";
 import { SessionRecorder, type ReasoningBlock } from "../session/recorder.js";
 import { replaySessionEvents, type SessionReplay } from "../session/replay.js";
-import { TurnStore, type InterruptedTurn } from "../session/turnStore.js";
+import {
+  TurnStore,
+  type InterruptedTurn,
+  type InterruptedTurnTerminal
+} from "../session/turnStore.js";
 import { ensureAgentDirs, resolveSessionFile, sessionIdFromFile } from "../session/store.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { runAgentLoop, type AgentLoopConfig, type AgentLoopResult } from "./agentLoop.js";
@@ -43,6 +47,36 @@ import { modelCapabilities } from "../ai/capabilities.js";
 import { createLanguageModelForConfig } from "../llm/factory.js";
 import { readAttachment, type AgentAttachment } from "../attachments/store.js";
 import type { AttachmentReference } from "../attachments/store.js";
+import { TodoStore } from "../session/todoStore.js";
+import { CompletionStateStore } from "./completionState.js";
+import {
+  CompletionGate,
+  RunFactsCollector,
+  type CompletionDecision,
+  type CompletionGateVerifier,
+  type CompletionVerification,
+  type ProcessFact,
+  type RunFacts,
+  type StructuredVerificationCheck,
+  type VerificationFact
+} from "./completionGate.js";
+import { resolveRunBudget, type RunBudget } from "./runBudget.js";
+import {
+  deriveAgentVerificationPlan,
+  type AgentVerificationFacts,
+  type AgentVerificationPlan
+} from "./verification.js";
+import { AcceptanceVerifier, type ManagedProcessInspector } from "../harness/AcceptanceVerifier.js";
+import {
+  createControlledAcceptanceCommandExecutor,
+  type AcceptanceCommandAuditEvent,
+  type AcceptanceCommandExecutor
+} from "../harness/AcceptanceCommandExecutor.js";
+import {
+  captureWorkspaceState,
+  diffWorkspaceStates,
+  type WorkspaceStateSnapshot
+} from "../harness/WorkspaceState.js";
 
 export interface AgentSessionOptions {
   workspaceRoot: string;
@@ -62,6 +96,12 @@ export interface AgentSessionOptions {
   mcpPrompt?: () => string;
   /** 模型自己维护的计划清单；每回合实时读取，历史压缩不会让它丢失。 */
   todoPrompt?: () => string | undefined;
+  /** Todo 真值源；Completion Gate 与 session resume 共用同一个实例。 */
+  todoStore?: TodoStore;
+  /** 模型声明的 blocked / verification 状态，只在当前根回合内有效。 */
+  completionState?: CompletionStateStore;
+  /** Completion Gate 检查本回合启动的受管进程。 */
+  managedProcesses?: ManagedProcessInspector;
   /** 回合内首次改动工作区前建快照，供 /undo 回退；不在 git 仓库时省略。 */
   createCheckpoint?: (label: string) => Promise<unknown>;
   /** 会话恢复时按虚拟路径重新读取项目级附件。 */
@@ -72,7 +112,7 @@ export interface AgentRunOptions {
   abortSignal?: AbortSignal;
   confirmPermission?: (request: AgentPermissionRequest) => Promise<AgentPermissionResult>;
   mode?: AgentRunMode;
-  /** Per-attempt cap, bounded by the configured circuit breaker. */
+  /** 本次调用可消费的硬 step 上限；普通根回合默认使用配置的 hardStepLimit。 */
   maxSteps?: number;
   /** A task harness may defer success memory until external acceptance checks pass. */
   deferSuccessfulMemory?: boolean;
@@ -87,12 +127,16 @@ export interface AgentRunOptions {
   sessionUserMessage?: string;
   /** Whether this attempt should append a user message to the visible session transcript. */
   recordSessionUserMessage?: boolean;
+  /** 宿主显式要求 Completion Gate 执行确定性验证；不从用户文本关键词推断。 */
+  verificationRequired?: boolean;
+  /** 宿主提供的结构化验证条件，会与模型通过 request_verification 声明的条件合并。 */
+  verificationChecks?: StructuredVerificationCheck[];
   attachments?: AgentAttachment[];
 }
 
 export type AgentPromptOptions = Pick<
   AgentRunOptions,
-  "abortSignal" | "confirmPermission" | "mode" | "attachments"
+  "abortSignal" | "confirmPermission" | "mode" | "verificationRequired" | "verificationChecks" | "attachments"
 >;
 
 export type AgentAttemptOptions = Omit<AgentRunOptions, "mode">;
@@ -201,7 +245,7 @@ export class AgentSession {
       this.options.skillPrompt?.trim(),
       this.options.subagentPrompt?.trim(),
       this.options.mcpPrompt?.().trim(),
-      this.options.todoPrompt?.()?.trim()
+      (this.options.todoStore?.promptSection() ?? this.options.todoPrompt?.())?.trim()
     ].filter(Boolean);
     return sections.length ? sections.join("\n\n") : undefined;
   }
@@ -220,7 +264,18 @@ export class AgentSession {
   async *continueInterruptedTurn(runOptions: AgentRunOptions = {}): AsyncGenerator<AgentSessionEvent> {
     const turn = await this.turnStore.load();
     if (!turn) throw new Error("There is no interrupted turn to continue.");
-    const turnLimit = runOptions.maxSteps ?? this.options.config.agent.maxSteps;
+    if (
+      turn.terminal?.status === "blocked"
+      && (turn.terminal.blockedReason === "missing_user_input"
+        || turn.terminal.blockedReason === "unsafe_action_required")
+    ) {
+      throw new Error(
+        turn.terminal.requiredAction
+          ? `This blocked turn requires a new user message: ${turn.terminal.requiredAction}`
+          : "This blocked turn requires a new user message before it can continue."
+      );
+    }
+    const turnLimit = runOptions.maxSteps ?? resolveRunBudget(this.options.config.agent).hardStepLimit;
     const remainingSteps = turnLimit - turn.completedSteps;
     if (remainingSteps < 1) {
       await this.turnStore.clear().catch(() => undefined);
@@ -229,12 +284,17 @@ export class AgentSession {
         + "Send a new user message to start another turn."
       );
     }
+    if (turn.terminal?.status === "blocked") this.options.completionState?.clearBlocked();
+    const continuationMessages = turn.terminal
+      ? [...turn.messages, runtimeContinuationMessage(turn.terminal)]
+      : turn.messages;
     yield* this.runTurn(turn.prompt, {
       ...runOptions,
       maxSteps: remainingSteps,
-      continueFrom: turn.messages,
+      continueFrom: continuationMessages,
       recordSessionUserMessage: false,
-      completedStepsBeforeRun: turn.completedSteps
+      completedStepsBeforeRun: turn.completedSteps,
+      initialRunFacts: restartRunFactsBudget(readRunFacts(turn.facts), turn.completedSteps === 0)
     });
   }
 
@@ -259,7 +319,10 @@ export class AgentSession {
 
   private async *runTurn(
     input: string,
-    runOptions: AgentRunOptions & { completedStepsBeforeRun?: number } = {}
+    runOptions: AgentRunOptions & {
+      completedStepsBeforeRun?: number;
+      initialRunFacts?: RunFacts;
+    } = {}
   ): AsyncGenerator<AgentSessionEvent> {
     const release = this.beginOperation("agent turn");
     const turnController = new AbortController();
@@ -270,9 +333,24 @@ export class AgentSession {
     const modelInput = runOptions.modelInput ?? input;
     const continuing = Boolean(runOptions.continueFrom?.length);
     const completedStepsBeforeRun = continuing ? runOptions.completedStepsBeforeRun ?? 0 : 0;
+    if (!continuing) this.options.completionState?.reset();
     if (!Number.isSafeInteger(completedStepsBeforeRun) || completedStepsBeforeRun < 0) {
       throw new RangeError("Completed turn steps must be a non-negative safe integer.");
     }
+    let workspaceBaseline: Promise<WorkspaceStateSnapshot> | undefined;
+    const captureWorkspaceBaseline = async (): Promise<void> => {
+      const baseline = workspaceBaseline ??= captureWorkspaceState(
+        this.options.workspaceRoot,
+        this.options.config.workspace.ignore
+      );
+      try {
+        await baseline;
+      } catch {
+        // 已知文件工具仍会直接记录 changedFiles；快照不可用时不要留下一个稍后必然 reject
+        // 的 Promise，把本来成功的工具调用变成回合级 provider_error。
+        if (workspaceBaseline === baseline) workspaceBaseline = undefined;
+      }
+    };
     const usageBeforePreparation = this.usageRecords.length;
     let userMessageRecorded = false;
     const recordUserMessage = (): void => {
@@ -295,9 +373,11 @@ export class AgentSession {
     if (!continuing) await this.turnStore.clear().catch(() => undefined);
     if (abortSignal.aborted) {
       recordUserMessage();
-      const outcome = abortedTurn("Current turn interrupted before execution.", completedStepsBeforeRun);
+      const outcome = cancelledTurn("Current turn cancelled before execution.", completedStepsBeforeRun);
+      await this.turnStore.clear().catch(() => undefined);
+      this.recordTurnOutcome(outcome);
       yield { type: "error", message: outcome.error ?? "Current turn interrupted." };
-      yield { type: "status", status: "aborted" };
+      yield { type: "status", status: "cancelled" };
       yield doneEvent(outcome);
       return;
     }
@@ -306,11 +386,13 @@ export class AgentSession {
     } catch (error) {
       recordUserMessage();
       const outcome = abortSignal.aborted
-        ? abortedTurn("Current turn interrupted during model preparation.", completedStepsBeforeRun)
+        ? cancelledTurn("Current turn cancelled during model preparation.", completedStepsBeforeRun)
         : failedTurn(errorMessage(error), completedStepsBeforeRun, "provider_error");
       this.recordError(outcome.error);
+      if (outcome.status === "cancelled") await this.turnStore.clear().catch(() => undefined);
+      this.recordTurnOutcome(outcome);
       yield { type: "error", message: outcome.error ?? "Agent run failed." };
-      yield { type: "status", status: outcome.status === "aborted" ? "aborted" : "error" };
+      yield { type: "status", status: outcome.status === "cancelled" ? "cancelled" : "error" };
       yield doneEvent(outcome);
       return;
     }
@@ -319,6 +401,7 @@ export class AgentSession {
       recordUserMessage();
       const outcome = failedTurn("Vercel AI SDK model is not configured.", completedStepsBeforeRun);
       this.recordError(outcome.error);
+      this.recordTurnOutcome(outcome);
       yield { type: "error", message: outcome.error ?? "Agent run failed." };
       yield { type: "status", status: "error" };
       yield doneEvent(outcome);
@@ -350,32 +433,73 @@ export class AgentSession {
     } catch (error) {
       recordUserMessage();
       const outcome = abortSignal.aborted
-        ? abortedTurn("Current turn interrupted during context preparation.", completedStepsBeforeRun)
+        ? cancelledTurn("Current turn cancelled during context preparation.", completedStepsBeforeRun)
         : failedTurn(errorMessage(error), completedStepsBeforeRun, isTimeoutFailure(error) ? "timeout" : "provider_error");
       this.recordError(outcome.error);
+      if (outcome.status === "cancelled") await this.turnStore.clear().catch(() => undefined);
+      this.recordTurnOutcome(outcome);
       yield { type: "error", message: outcome.error ?? "Agent run failed." };
-      yield { type: "status", status: outcome.status === "aborted" ? "aborted" : "error" };
+      yield { type: "status", status: outcome.status === "cancelled" ? "cancelled" : "error" };
       yield doneEvent(outcome);
       return;
     }
     }
     if (abortSignal.aborted) {
       recordUserMessage();
-      const outcome = abortedTurn("Current turn interrupted during context preparation.", completedStepsBeforeRun);
+      const outcome = cancelledTurn("Current turn cancelled during context preparation.", completedStepsBeforeRun);
       this.recordError(outcome.error);
+      await this.turnStore.clear().catch(() => undefined);
+      this.recordTurnOutcome(outcome);
       yield { type: "error", message: outcome.error ?? "Current turn interrupted." };
-      yield { type: "status", status: "aborted" };
+      yield { type: "status", status: "cancelled" };
       yield doneEvent(outcome);
       return;
     }
     const permissionManager = this.options.permissionManager;
-    const maxSteps = runOptions.maxSteps ?? this.options.config.agent.maxSteps;
-    if (!Number.isSafeInteger(maxSteps) || maxSteps < 1 || maxSteps > this.options.config.agent.maxSteps) {
-      throw new RangeError(`Agent attempt maxSteps must be between 1 and ${String(this.options.config.agent.maxSteps)}.`);
+    const configuredBudget = resolveRunBudget(this.options.config.agent);
+    const remainingConfiguredSteps = configuredBudget.hardStepLimit - completedStepsBeforeRun;
+    const requestedSteps = runOptions.maxSteps ?? remainingConfiguredSteps;
+    if (
+      !Number.isSafeInteger(requestedSteps)
+      || requestedSteps < 1
+      || requestedSteps > remainingConfiguredSteps
+    ) {
+      throw new RangeError(
+        `Agent run maxSteps must be between 1 and ${String(Math.max(0, remainingConfiguredSteps))}; `
+        + `the configured hard limit is ${String(configuredBudget.hardStepLimit)}.`
+      );
     }
+    const runBudget: RunBudget = {
+      ...configuredBudget,
+      softStepLimit: Math.min(configuredBudget.softStepLimit, completedStepsBeforeRun + requestedSteps),
+      hardStepLimit: completedStepsBeforeRun + requestedSteps
+    };
     const stepContext: AgentStepContext = { assistantContent: "", reasoningContent: "", reasoningProviderOptions: undefined, reasoningBlocks: [] };
     const queue = new AsyncEventQueue<AgentSessionEvent>();
-    const runtime = this.runtimeContext(effectiveRunOptions);
+    const facts = new RunFactsCollector(runOptions.initialRunFacts);
+    if (runOptions.verificationRequired === true) facts.setUserRequestedVerification(true);
+    let pendingApprovalCount = 0;
+    const permissionHandler = effectiveRunOptions.confirmPermission;
+    const confirmPermission = permissionHandler === undefined
+      ? undefined
+      : async (request: AgentPermissionRequest): Promise<AgentPermissionResult> => {
+        pendingApprovalCount += 1;
+        facts.setPendingApprovals(pendingApprovalCount);
+        try {
+          return await permissionHandler(request);
+        } finally {
+          pendingApprovalCount = Math.max(0, pendingApprovalCount - 1);
+          facts.setPendingApprovals(pendingApprovalCount);
+        }
+      };
+    const observeWorkspaceMutation = async (): Promise<void> => {
+      facts.markWorkspaceMutationObserved();
+      await captureWorkspaceBaseline();
+    };
+    const runtime = this.runtimeContext(
+      { ...effectiveRunOptions, confirmPermission },
+      observeWorkspaceMutation
+    );
     const allowedToolNames = mode === "plan"
       ? new Set(this.options.toolRegistry.list().filter((tool) => tool.risk === "read").map((tool) => tool.name))
       : undefined;
@@ -394,6 +518,14 @@ export class AgentSession {
       } else if (event.type === "reasoning.completed") {
         reasoningActive = false;
       }
+      if (
+        event.type === "tool.started"
+        || event.type === "tool.progress"
+        || event.type === "tool.completed"
+        || event.type === "tool.failed"
+      ) {
+        facts.observeToolEvent(event);
+      }
       queue.push(event);
     };
     const coordinator = new SdkToolExecutionCoordinator(
@@ -401,53 +533,156 @@ export class AgentSession {
       permissionManager,
       emitUpdate,
       () => ({ ...stepContext }),
-      allowedToolNames
+      allowedToolNames,
+      {
+        maxToolCalls: runBudget.maxToolCalls,
+        maxRepeatedActions: runBudget.maxRepeatedActions,
+        initialToolCallCount: runOptions.initialRunFacts?.actualToolCallCount,
+        initialMaxRepeatedActionCount: runOptions.initialRunFacts?.maxRepeatedActionCount
+      }
     );
-    const loopConfig: AgentLoopConfig = {
-      model,
-      tools: coordinator.createTools(),
-      maxSteps,
-      streamOptions: {
-        maxRetries: settings?.maxRetries ?? 0,
-        providerOptions: settings?.providerOptions,
-        reasoning: settings?.reasoning,
-        timeout: settings?.timeoutMs,
-        maxOutputTokens: settings?.maxOutputTokens,
-        telemetry: createSdkTelemetry(this.options.config, this.persistenceRoot(), "biny.agent")
-      },
-      // 回合内上下文治理的落点。剪枝失败不该打断这一步，退回原 messages 让 provider 自己报错。
-      transformContext: async (stepMessages) => {
-        try {
-          return this.contextMemory.pruneToolResultsForStep(stepMessages);
-        } catch {
-          return stepMessages;
-        }
-      },
-      onPart: handlePart,
-      onStepEnd: async (step) => {
-        // 每步各自是一次 provider 请求，用量按步记录而不是等回合结束一次性归并。
-        stepUsageRecords.push(this.recordModelUsage(step.usage, mode === "plan" ? "plan" : "agent"));
-        if (step.usage.inputTokens !== undefined) this.contextMemory.recordProviderUsage(step.usage);
-        const completedSteps = completedStepsBeforeRun + step.index + 1;
-        if (step.finishReason === "tool-calls" && step.index + 1 < maxSteps) {
-          // 只有 Agent Loop 本来还会进入下一步时才保留断点。正常完成、输出截断和 step-limit
-          // 都是已经返回给用户的终态，不能被 /continue 误认成异常中断。
-          await this.turnStore.save(runOptions.sessionUserMessage ?? input, step.messages, completedSteps)
-            .catch(() => undefined);
-        } else {
-          await this.turnStore.clear().catch(() => undefined);
-        }
+    const sdkTools = coordinator.createTools();
+    const stepUsageRecords: SessionUsage[] = [];
+    const verificationAuditSequences = new Map<string, number>();
+    const recordVerificationCommandAudit = async (
+      event: AcceptanceCommandAuditEvent
+    ): Promise<void> => {
+      const args = { command: event.request.command, cwd: event.request.cwd };
+      if (event.type === "command.started") {
+        const sequence = this.recorder.nextToolCallSequence();
+        verificationAuditSequences.set(event.toolCallId, sequence);
+        this.recorder.record({
+          type: "tool_call",
+          tool: "run_command",
+          args,
+          toolCallId: event.toolCallId,
+          sequence,
+          auditOnly: true
+        });
+        emitUpdate({
+          type: "tool.started",
+          toolCallId: event.toolCallId,
+          tool: "run_command",
+          args,
+          description: event.request.description ?? `Verify ${event.request.criterionId}`
+        });
+        return;
+      }
+      const sequence = verificationAuditSequences.get(event.toolCallId)
+        ?? this.recorder.nextToolCallSequence();
+      verificationAuditSequences.delete(event.toolCallId);
+      const result = event.type === "command.completed"
+        ? event.result
+        : {
+          status: event.failureKind === "permission_required"
+            ? "permission_required"
+            : event.failureKind === "permission_denied" ? "denied" : "failed",
+          approved: event.failureKind === "execution_error" ? undefined : false,
+          error: event.error,
+          verification: true
+        };
+      this.recorder.record({
+        type: "tool_result",
+        tool: "run_command",
+        result,
+        toolCallId: event.toolCallId,
+        sequence,
+        auditOnly: true
+      });
+      if (event.type === "command.completed") {
+        emitUpdate({
+          type: "tool.completed",
+          toolCallId: event.toolCallId,
+          tool: "run_command",
+          result
+        });
+      } else {
+        emitUpdate({
+          type: "tool.failed",
+          toolCallId: event.toolCallId,
+          tool: "run_command",
+          error: event.error,
+          result
+        });
       }
     };
-    const stepUsageRecords: SessionUsage[] = [];
+    const verificationCommandExecutor = createControlledAcceptanceCommandExecutor({
+      workspaceRoot: this.options.workspaceRoot,
+      ignore: this.options.config.workspace.ignore,
+      sandbox: this.options.config.sandbox,
+      permissionManager,
+      sessionId: this.recorder.sessionId,
+      confirmPermission,
+      maxConcurrency: this.options.config.agent.maxConcurrentTools,
+      maxQueuedCommands: this.options.config.agent.maxQueuedToolCalls,
+      beforeCommandExecution: async () => await observeWorkspaceMutation(),
+      onAuditEvent: recordVerificationCommandAudit
+    });
+    let verificationResultSequence = 0;
+    const recordVerificationResult = (verification: VerificationFact): void => {
+      facts.recordVerification(verification);
+      verificationResultSequence += 1;
+      const toolCallId = `completion-verifier:${this.recorder.sessionId}:${String(verificationResultSequence)}`;
+      const sequence = this.recorder.nextToolCallSequence();
+      const args = { checks: verification.evidence.map((evidence) => evidence.id) };
+      this.recorder.record({
+        type: "tool_call",
+        tool: "completion_verifier",
+        args,
+        toolCallId,
+        sequence,
+        auditOnly: true
+      });
+      emitUpdate({
+        type: "tool.started",
+        toolCallId,
+        tool: "completion_verifier",
+        args,
+        description: "Evaluate deterministic completion checks"
+      });
+      this.recorder.record({
+        type: "tool_result",
+        tool: "completion_verifier",
+        result: verification,
+        toolCallId,
+        sequence,
+        auditOnly: true
+      });
+      emitUpdate({
+        type: "tool.completed",
+        toolCallId,
+        tool: "completion_verifier",
+        result: verification
+      });
+    };
+    const completionGate = new CompletionGate({
+      verifier: createCompletionGateVerifier({
+        workspaceRoot: this.options.workspaceRoot,
+        ignore: this.options.config.workspace.ignore,
+        managedProcesses: this.options.managedProcesses,
+        commandExecutor: verificationCommandExecutor
+      }),
+      listTodos: () => this.options.todoStore?.list() ?? [],
+      listRequestedChecks: () => [
+        ...(runOptions.verificationChecks ?? []).map((check) => ({ ...check })),
+        ...(this.options.completionState?.listChecks() ?? [])
+      ],
+      blockedState: () => this.options.completionState?.getBlocked(),
+      onVerification: recordVerificationResult
+    });
 
     recordUserMessage();
     yield { type: "status", status: "thinking" };
 
-    let loopResult: AgentLoopResult | undefined;
+    let finalLoopResult: AgentLoopResult | undefined;
+    let completionDecision: CompletionDecision | undefined;
+    let finalMessages = messages;
+    const completedLoopSteps: AgentLoopResult["steps"] = [];
     let streamError: unknown;
     let observedSteps = 0;
     const invalidToolCalls: Array<{ toolName: string; toolCallId: string; input: unknown }> = [];
+    const invalidToolCallIds = new Set<string>();
+    let handledInvalidToolCalls = 0;
     let duplicateToolCallError: Error | undefined;
     let streamFailureReported = false;
     // 整个回合的 reasoning 展示文本；stepContext.reasoningContent 每步会清空。
@@ -500,17 +735,169 @@ export class AgentSession {
           turnController.abort(duplicateToolCallError);
         }
         if (part.invalid) {
-          invalidToolCalls.push({
-            toolName: part.toolName,
-            toolCallId: part.toolCallId,
-            input: part.input
-          });
+          if (!invalidToolCallIds.has(part.toolCallId)) {
+            invalidToolCallIds.add(part.toolCallId);
+            invalidToolCalls.push({
+              toolName: part.toolName,
+              toolCallId: part.toolCallId,
+              input: part.input
+            });
+          }
         }
       }
     }
+    const handlePendingInvalidToolCalls = async (): Promise<void> => {
+      while (handledInvalidToolCalls < invalidToolCalls.length) {
+        const call = invalidToolCalls[handledInvalidToolCalls];
+        handledInvalidToolCalls += 1;
+        if (!call) continue;
+        await coordinator.handleInvalidToolCall(
+          call.toolName,
+          call.toolCallId,
+          call.input,
+          abortSignal
+        );
+      }
+    };
     streamTask = (async (): Promise<void> => {
       try {
-        loopResult = await runAgentLoop(messages, loopConfig, abortSignal);
+        let softLimitWarningInjected = completedStepsBeforeRun >= runBudget.softStepLimit;
+        while (!completionDecision) {
+          const segmentStepOffset = completedLoopSteps.length;
+          const absoluteCompletedSteps = completedStepsBeforeRun + segmentStepOffset;
+          const remainingSteps = runBudget.hardStepLimit - absoluteCompletedSteps;
+          if (remainingSteps < 1) {
+            completionDecision = {
+              kind: "incomplete",
+              reason: "hard_step_limit",
+              summary: `The run reached its hard limit of ${String(runBudget.hardStepLimit)} provider steps.`,
+              resumable: true
+            };
+            break;
+          }
+          const loopConfig: AgentLoopConfig = {
+            model,
+            tools: sdkTools,
+            maxSteps: remainingSteps,
+            streamOptions: {
+              maxRetries: runBudget.maxProviderRetries,
+              providerOptions: settings?.providerOptions,
+              reasoning: settings?.reasoning,
+              timeout: settings?.timeoutMs,
+              maxOutputTokens: settings?.maxOutputTokens,
+              telemetry: createSdkTelemetry(this.options.config, this.persistenceRoot(), "biny.agent")
+            },
+            // 软限制只提示收敛，不终止；硬限制仍由循环外的 Completion Gate 判定为 incomplete。
+            transformContext: async (stepMessages, info) => {
+              let nextMessages = stepMessages;
+              const absoluteStepIndex = completedStepsBeforeRun + segmentStepOffset + info.index;
+              if (!softLimitWarningInjected && absoluteStepIndex >= runBudget.softStepLimit) {
+                softLimitWarningInjected = true;
+                nextMessages = [
+                  ...nextMessages,
+                  {
+                    role: "system",
+                    content: [
+                      "## Biny run budget",
+                      "",
+                      `The soft limit of ${String(runBudget.softStepLimit)} provider steps has been reached.`,
+                      "Review unfinished work, avoid repeated actions, run the necessary checks, and converge without claiming completion early."
+                    ].join("\n")
+                  }
+                ];
+              }
+              try {
+                return this.contextMemory.pruneToolResultsForStep(nextMessages);
+              } catch {
+                return nextMessages;
+              }
+            },
+            onPart: handlePart,
+            onStepEnd: async (step) => {
+              // SDK 会在 fullStream 里标出 schema-invalid 调用；必须先把结构化失败落盘并交给
+              // RunFacts，再允许下一次 provider 请求或 Completion Gate 判断。
+              if (!duplicateToolCallError) await handlePendingInvalidToolCalls();
+              facts.observeActualToolCalls(step.toolCalls);
+              stepUsageRecords.push(this.recordModelUsage(step.usage, mode === "plan" ? "plan" : "agent"));
+              if (step.usage.inputTokens !== undefined) this.contextMemory.recordProviderUsage(step.usage);
+              const completedSteps = completedStepsBeforeRun + segmentStepOffset + step.index + 1;
+              if (step.toolCalls.length > 0 && completedSteps < runBudget.hardStepLimit) {
+                await this.turnStore.save(
+                  runOptions.sessionUserMessage ?? input,
+                  step.messages,
+                  completedSteps,
+                  facts.snapshot(false)
+                )
+                  .catch(() => undefined);
+              }
+            },
+            isToolCallValid: (call) => !invalidToolCallIds.has(call.toolCallId),
+            continueAfterToolCalls: () => {
+              const snapshot = facts.snapshot(abortSignal.aborted);
+              return snapshot.actualToolCallCount < runBudget.maxToolCalls
+                && snapshot.maxRepeatedActionCount < runBudget.maxRepeatedActions;
+            }
+          };
+          const segment = await runAgentLoop(finalMessages, loopConfig, abortSignal);
+          finalLoopResult = segment;
+          finalMessages = segment.messages;
+          completedLoopSteps.push(...segment.steps.map((step) => ({
+            ...step,
+            index: segmentStepOffset + step.index
+          })));
+
+          await coordinator.waitForIdle();
+          await refreshRunFacts(
+            facts,
+            workspaceBaseline,
+            this.options.workspaceRoot,
+            this.options.config.workspace.ignore,
+            this.options.managedProcesses
+          );
+
+          if (segment.kind === "fatal_error") throw segment.error ?? new Error("Agent loop failed.");
+          if (segment.kind === "cancelled") {
+            completionDecision = { kind: "cancelled" };
+            break;
+          }
+          if (segment.kind === "output_truncated") {
+            completionDecision = {
+              kind: "incomplete",
+              reason: "model_output_limit",
+              summary: "The model reached its output limit before completing the turn.",
+              resumable: true
+            };
+            break;
+          }
+          if (
+            segment.kind === "model_yielded"
+            && segment.providerFinishReason !== "stop"
+            && segment.providerFinishReason !== "tool-calls"
+          ) {
+            throw new Error(providerStopMessage(segment.providerFinishReason));
+          }
+
+          const snapshot = facts.snapshot(abortSignal.aborted);
+          const decision = await completionGate.decide(snapshot, {
+            steps: completedStepsBeforeRun + completedLoopSteps.length,
+            softStepLimit: runBudget.softStepLimit,
+            hardStepLimit: runBudget.hardStepLimit,
+            maxToolCalls: runBudget.maxToolCalls,
+            maxCompletionContinuations: runBudget.maxCompletionContinuations,
+            maxRepeatedActions: runBudget.maxRepeatedActions
+          }, abortSignal);
+          if (decision.kind !== "continue") {
+            completionDecision = decision;
+            break;
+          }
+          finalMessages = [...finalMessages, decision.feedback];
+          await this.turnStore.save(
+            runOptions.sessionUserMessage ?? input,
+            finalMessages,
+            completedStepsBeforeRun + completedLoopSteps.length,
+            facts.snapshot(false)
+          ).catch(() => undefined);
+        }
       } catch (error) {
         // 重复 tool call 这类情况已经推过 fatal error 并主动 abort 了；循环随后抛出的
         // 中断异常是同一件事的后果，不能再报一次。首个原因也要保留，不被中断异常覆盖。
@@ -520,11 +907,7 @@ export class AgentSession {
           queue.push({ type: "error", message: error instanceof Error ? error.message : String(error) });
         }
       } finally {
-        if (!duplicateToolCallError) {
-          await Promise.all(invalidToolCalls.map(async (call) => {
-            await coordinator.handleInvalidToolCall(call.toolName, call.toolCallId, call.input, abortSignal);
-          }));
-        }
+        if (!duplicateToolCallError) await handlePendingInvalidToolCalls();
         await coordinator.waitForIdle();
         if (reasoningActive) emitUpdate({ type: "reasoning.completed" });
         queue.close();
@@ -544,12 +927,15 @@ export class AgentSession {
       // producing partial output. Do not let a partial answer commit history or
       // look like a successful turn.
       if (streamError !== undefined) throw streamError;
-      if (!loopResult) throw new Error("Agent loop ended without a result.");
-      const content = loopResult.text;
-      const steps = loopResult.steps;
+      if (!finalLoopResult && !completionDecision) throw new Error("Agent loop ended without a result.");
+      if (!completionDecision) throw new Error("Completion gate ended without a decision.");
+      if (completionDecision.kind === "continue") {
+        throw new Error("Completion gate returned an unconsumed continuation.");
+      }
+      const content = finalLoopResult?.text ?? "";
       // 循环自己拼 context：每步的 responseMessages 已经按序并入，剪枝后的 messages 也
       // 在里面，所以直接用循环的最终结果，而不是 [初始 messages + 全部响应]。
-      this.contextMemory.replaceHistory(loopResult.messages);
+      this.contextMemory.replaceHistory(finalMessages);
       // 每步的用量已在 onStepEnd 逐条记账；回合级记录用它们的合计，避免重复计费。
       const usageRecord = sumSessionUsage(stepUsageRecords);
       this.recorder.record({
@@ -563,14 +949,14 @@ export class AgentSession {
         relatedUsage: this.takeRelatedUsage(),
         contextState: this.contextMemory.snapshot()
       });
-      const outcome = finishedTurn(
+      const outcome = completionOutcome(
+        completionDecision,
         content,
-        loopResult.finishReason,
-        completedStepsBeforeRun + steps.length,
-        completedStepsBeforeRun + maxSteps,
+        finalLoopResult?.providerFinishReason,
+        completedStepsBeforeRun + completedLoopSteps.length,
         usageRecord
       );
-      if (content && (outcome.status === "completed" || outcome.status === "incomplete")) {
+      if (content && (outcome.status === "completed" || outcome.status === "incomplete" || outcome.status === "blocked")) {
         yield { type: "assistant.completed", content };
       }
       if (outcome.status === "completed") {
@@ -580,22 +966,47 @@ export class AgentSession {
         yield { type: "status", status: "completed" };
       } else if (outcome.status === "incomplete") {
         yield { type: "status", status: "incomplete" };
+      } else if (outcome.status === "blocked") {
+        yield { type: "status", status: "blocked" };
+      } else if (outcome.status === "cancelled") {
+        yield { type: "status", status: "cancelled" };
       } else {
-        this.recordError(outcome.error ?? `Agent stopped with finish reason ${outcome.finishReason ?? "unknown"}.`);
+        this.recordError(outcome.error ?? `Agent stopped with provider finish reason ${outcome.finishReason ?? "unknown"}.`);
         yield { type: "error", message: outcome.error ?? "Agent run failed." };
         yield { type: "status", status: "error" };
       }
-      await this.turnStore.clear().catch(() => undefined);
+      if (outcome.status === "blocked" || outcome.status === "incomplete" && outcome.resumable === true) {
+        // 显式 /continue 可以从相同 context 开一个新的预算窗口；不会像旧 Durable Attempt
+        // 那样在后台自动重试。
+        await this.turnStore.save(
+          runOptions.sessionUserMessage ?? input,
+          finalMessages,
+          0,
+          facts.snapshot(false),
+          {
+            status: outcome.status,
+            stopReason: outcome.stopReason,
+            summary: outcome.error ?? `${outcome.status} (${outcome.stopReason})`,
+            blockedReason: outcome.blockedReason,
+            requiredAction: outcome.requiredAction
+          }
+        ).catch(() => undefined);
+      } else {
+        await this.turnStore.clear().catch(() => undefined);
+      }
+      this.recordTurnOutcome(outcome);
       yield doneEvent(outcome);
     } catch (error) {
       const failure = streamError ?? error;
       const message = errorMessage(failure);
       const outcome = runOptions.abortSignal?.aborted
-        ? abortedTurn(message || "Current turn interrupted.", completedStepsBeforeRun + observedSteps)
+        ? cancelledTurn(message || "Current turn cancelled.", completedStepsBeforeRun + observedSteps)
         : failedTurn(message, completedStepsBeforeRun + observedSteps, isTimeoutFailure(failure) ? "timeout" : "provider_error");
       this.recordError(message);
+      if (outcome.status === "cancelled") await this.turnStore.clear().catch(() => undefined);
+      this.recordTurnOutcome(outcome);
       if (!streamFailureReported) yield { type: "error", message };
-      yield { type: "status", status: outcome.status === "aborted" ? "aborted" : "error" };
+      yield { type: "status", status: outcome.status === "cancelled" ? "cancelled" : "error" };
       yield doneEvent(outcome);
     }
     } finally {
@@ -652,6 +1063,8 @@ export class AgentSession {
       this.unpersistedRelatedUsage = [];
       const messages = await this.rehydrateSessionAttachments(replay.messages, replay.events);
       this.contextMemory.restore(messages, replay.contextState ?? replay.contextUsage);
+      await this.options.todoStore?.useSession(replacementRecorder.sessionId);
+      restoreCompletionState(this.options.completionState, replay.events);
       this.recorder = replacementRecorder;
       this.turnStore = new TurnStore(this.persistenceRoot(), replacementRecorder.sessionId);
       return { ...replay, messages, filePath, sessionId: replacementRecorder.sessionId };
@@ -834,6 +1247,20 @@ export class AgentSession {
     });
   }
 
+  private recordTurnOutcome(outcome: AgentTurnOutcome): void {
+    this.recorder.record({
+      type: "turn_status",
+      status: outcome.status,
+      stopReason: outcome.stopReason,
+      steps: outcome.steps,
+      summary: outcome.error,
+      resumable: outcome.resumable,
+      blockedReason: outcome.blockedReason,
+      requiredAction: outcome.requiredAction,
+      affectedTodoIds: outcome.affectedTodoIds
+    });
+  }
+
   recordHostedUserMessage(content: string): void {
     this.assertNotQuarantined("hosted user message");
     this.recorder.record({
@@ -927,7 +1354,10 @@ export class AgentSession {
     return this.unpersistedRelatedUsage.splice(0, this.unpersistedRelatedUsage.length);
   }
 
-  private runtimeContext(runOptions: AgentRunOptions): AgentRuntimeContext {
+  private runtimeContext(
+    runOptions: AgentRunOptions,
+    beforeWorkspaceMutation?: () => Promise<void>
+  ): AgentRuntimeContext {
     const model = this.options.modelManager?.getModel() ?? this.options.model;
     if (!model) throw new Error("Vercel AI SDK model is not configured.");
     return {
@@ -940,6 +1370,7 @@ export class AgentSession {
       permissionManager: this.options.permissionManager,
       confirmPermission: runOptions.confirmPermission,
       createCheckpoint: this.options.createCheckpoint,
+      beforeWorkspaceMutation,
       quarantineExternalTool: (tool, toolCallId, settlement) => {
         if (this.lingeringExternalTools.has(settlement)) return;
         this.lingeringExternalTools.set(settlement, { tool, toolCallId });
@@ -1037,56 +1468,51 @@ function doneEvent(outcome: AgentTurnOutcome): Extract<AgentSessionEvent, { type
   };
 }
 
-function finishedTurn(
+function completionOutcome(
+  decision: Exclude<CompletionDecision, { kind: "continue" }>,
   output: string,
-  finishReason: string,
+  finishReason: string | undefined,
   steps: number,
-  maxSteps: number,
   usage: SessionUsage
 ): AgentTurnOutcome {
-  if (finishReason === "stop") {
-    return { status: "completed", stopReason: "model_stop", finishReason, steps, output, usage };
+  if (decision.kind === "complete") {
+    return { status: "completed", stopReason: "completion_gate", finishReason, steps, output, usage };
   }
-  if (finishReason === "tool-calls") {
+  if (decision.kind === "blocked") {
     return {
-      status: "incomplete",
-      stopReason: steps >= maxSteps ? "step_limit" : "tool_pending",
-      finishReason,
-      steps,
-      output,
-      usage
-    };
-  }
-  if (finishReason === "length") {
-    return {
-      status: "incomplete",
-      stopReason: "model_length",
+      status: "blocked",
+      stopReason: "blocked",
       finishReason,
       steps,
       output,
       usage,
-      error: "The model reached its output limit before completing the turn."
+      error: decision.summary,
+      resumable: decision.reason !== "missing_user_input" && decision.reason !== "unsafe_action_required",
+      blockedReason: decision.reason,
+      requiredAction: decision.requiredAction,
+      affectedTodoIds: decision.affectedTodoIds
     };
   }
-  if (finishReason === "content-filter") {
+  if (decision.kind === "incomplete") {
     return {
-      status: "failed",
-      stopReason: "content_filter",
+      status: "incomplete",
+      stopReason: decision.reason === "model_output_limit" ? "model_length" : decision.reason,
       finishReason,
       steps,
       output,
       usage,
-      error: "The model response was stopped by the provider content filter."
+      error: decision.summary,
+      resumable: decision.resumable
     };
   }
   return {
-    status: "failed",
-    stopReason: "provider_error",
+    status: "cancelled",
+    stopReason: "cancelled",
     finishReason,
     steps,
     output,
     usage,
-    error: `The model stopped without a successful terminal response (${finishReason || "unknown"}).`
+    error: "Current turn was cancelled."
   };
 }
 
@@ -1106,15 +1532,273 @@ function failedTurn(
   };
 }
 
-function abortedTurn(message: string, steps: number): AgentTurnOutcome {
+function cancelledTurn(message: string, steps: number): AgentTurnOutcome {
   return {
-    status: "aborted",
-    stopReason: "aborted",
+    status: "cancelled",
+    stopReason: "cancelled",
     finishReason: undefined,
     steps,
     output: "",
     usage: undefined,
     error: message
+  };
+}
+
+function createCompletionGateVerifier(options: {
+  workspaceRoot: string;
+  ignore?: string[];
+  managedProcesses?: ManagedProcessInspector;
+  commandExecutor: AcceptanceCommandExecutor;
+}): CompletionGateVerifier {
+  const verifier = new AcceptanceVerifier({
+    workspaceRoot: options.workspaceRoot,
+    ignore: options.ignore,
+    managedProcesses: options.managedProcesses,
+    commandExecutor: options.commandExecutor
+  });
+  let plan: AgentVerificationPlan = { required: false, criteria: [], reasons: [] };
+  return {
+    derive: async (
+      facts: RunFacts,
+      requestedChecks: readonly StructuredVerificationCheck[]
+    ): Promise<CompletionVerification> => {
+      const checks: NonNullable<AgentVerificationFacts["checks"]> = requestedChecks.flatMap((check) => {
+        if (check.kind !== "command" || !check.command) return [];
+        return [{
+          id: check.id,
+          command: check.command,
+          cwd: check.cwd,
+          timeoutMs: undefined,
+          description: check.description
+        }];
+      });
+      const processes = new Map<string, NonNullable<AgentVerificationFacts["startedProcesses"]>[number]>();
+      for (const processId of facts.startedProcessIds) {
+        const process = facts.activeProcesses.find((candidate) => candidate.processId === processId);
+        const readinessType = processReadinessType(process?.readiness);
+        processes.set(processId, {
+          processId,
+          cwd: process?.cwd,
+          url: process?.url,
+          readinessType,
+          requireHttpReadiness: readinessType === "http" ? true : undefined,
+          description: process?.command
+        });
+      }
+      for (const check of requestedChecks) {
+        if (check.kind !== "managed_process" || !check.processId) continue;
+        processes.set(check.processId, {
+          processId: check.processId,
+          cwd: check.cwd,
+          url: undefined,
+          readinessType: undefined,
+          requireHttpReadiness: undefined,
+          description: check.description
+        });
+      }
+      plan = await deriveAgentVerificationPlan(
+        options.workspaceRoot,
+        {
+          changedFiles: facts.changedFiles,
+          workspaceMutationObserved: facts.workspaceMutationObserved,
+          userRequestedVerification: facts.userRequestedVerification,
+          checks,
+          startedProcesses: [...processes.values()]
+        },
+        options.ignore
+      );
+      return {
+        required: plan.required,
+        checks: requestedChecks.map((check) => ({ ...check }))
+      };
+    },
+    verify: async (
+      _requirement: CompletionVerification,
+      signal?: AbortSignal
+    ): Promise<VerificationFact> => {
+      const result = await verifier.verifyCriteria(plan.criteria, {
+        signal,
+        requireCriteria: true
+      });
+      return {
+        passed: result.passed,
+        summary: result.summary,
+        evidence: result.evidence.map((evidence) => ({
+          id: evidence.criterionId,
+          passed: evidence.passed,
+          summary: evidence.summary,
+          details: evidence.details
+        }))
+      };
+    }
+  };
+}
+
+async function refreshRunFacts(
+  facts: RunFactsCollector,
+  workspaceBaseline: Promise<WorkspaceStateSnapshot> | undefined,
+  workspaceRoot: string,
+  ignore: string[],
+  managedProcesses?: ManagedProcessInspector
+): Promise<void> {
+  if (workspaceBaseline) {
+    try {
+      const [before, after] = await Promise.all([
+        workspaceBaseline,
+        captureWorkspaceState(workspaceRoot, ignore)
+      ]);
+      facts.setChangedFiles(diffWorkspaceStates(before, after).changedFiles);
+    } catch {
+      // 已知文件工具的路径已经由 RunFactsCollector 记录；快照失败时保留这些事实。
+    }
+  }
+  if (!managedProcesses) return;
+  let processes: Awaited<ReturnType<ManagedProcessInspector["listProcesses"]>>;
+  try {
+    processes = await managedProcesses.listProcesses();
+  } catch {
+    return;
+  }
+  facts.setActiveProcesses(processes.map((process): ProcessFact => ({
+    processId: process.processId,
+    state: process.state,
+    command: process.command,
+    cwd: process.cwd,
+    url: process.url,
+    readiness: process.readiness
+  })));
+}
+
+function processReadinessType(value: unknown): "http" | "tcp" | "log" | undefined {
+  if (typeof value !== "object" || value === null || !("type" in value)) return undefined;
+  const type = value.type;
+  return type === "http" || type === "tcp" || type === "log" ? type : undefined;
+}
+
+function providerStopMessage(finishReason: string): string {
+  if (finishReason === "content-filter") {
+    return "The model response was stopped by the provider content filter.";
+  }
+  return `The provider ended the response without a usable model yield (${finishReason || "unknown"}).`;
+}
+
+function restoreCompletionState(
+  store: CompletionStateStore | undefined,
+  events: SessionReplay["events"]
+): void {
+  if (!store) return;
+  store.reset();
+  for (const event of events) {
+    if (event.type === "user_message" && !event.auditOnly) {
+      store.reset();
+      continue;
+    }
+    if (event.type !== "tool_result") continue;
+    if (event.tool === "report_blocked") {
+      const blocked = readBlockedState(event.result);
+      if (blocked) store.reportBlocked(blocked);
+    } else if (event.tool === "request_verification") {
+      const checks = readVerificationChecks(event.result);
+      if (checks) store.replaceChecks(checks);
+    }
+  }
+}
+
+function readBlockedState(value: unknown): ReturnType<CompletionStateStore["getBlocked"]> {
+  if (!isRecord(value)) return undefined;
+  const reason = value.reason;
+  if (
+    reason !== "missing_user_input"
+    && reason !== "waiting_for_approval"
+    && reason !== "permission_denied"
+    && reason !== "missing_dependency"
+    && reason !== "environment_unavailable"
+    && reason !== "external_service_failure"
+    && reason !== "unsafe_action_required"
+  ) return undefined;
+  if (typeof value.summary !== "string" || !value.summary) return undefined;
+  const requiredAction = typeof value.requiredAction === "string" ? value.requiredAction : undefined;
+  const affectedTodoIds = Array.isArray(value.affectedTodoIds)
+    ? value.affectedTodoIds.filter((item): item is string => typeof item === "string")
+    : undefined;
+  return {
+    reason,
+    summary: value.summary,
+    requiredAction,
+    affectedTodoIds
+  };
+}
+
+function readVerificationChecks(value: unknown): StructuredVerificationCheck[] | undefined {
+  if (!isRecord(value) || !Array.isArray(value.checks)) return undefined;
+  const checks = value.checks.flatMap((item): StructuredVerificationCheck[] => {
+    if (
+      !isRecord(item)
+      || item.kind !== "command"
+      || typeof item.id !== "string"
+      || typeof item.description !== "string"
+      || typeof item.command !== "string"
+    ) return [];
+    return [{
+      id: item.id,
+      kind: "command",
+      description: item.description,
+      command: item.command,
+      cwd: typeof item.cwd === "string" ? item.cwd : undefined,
+      processId: undefined
+    }];
+  });
+  return checks.length ? checks : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readRunFacts(value: unknown): RunFacts | undefined {
+  if (!isRecord(value)) return undefined;
+  if (
+    !Number.isSafeInteger(value.actualToolCallCount)
+    || typeof value.actualToolCallCount !== "number"
+    || value.actualToolCallCount < 0
+    || !Array.isArray(value.changedFiles)
+    || !Array.isArray(value.executedCommands)
+    || !Array.isArray(value.failedToolCalls)
+    || !Number.isSafeInteger(value.pendingApprovals)
+    || typeof value.pendingApprovals !== "number"
+    || !Number.isSafeInteger(value.activeToolCalls)
+    || typeof value.activeToolCalls !== "number"
+    || !Array.isArray(value.activeProcesses)
+    || !Array.isArray(value.startedProcessIds)
+    || !Array.isArray(value.verificationResults)
+    || typeof value.userCancelled !== "boolean"
+    || !Number.isSafeInteger(value.maxRepeatedActionCount)
+    || typeof value.maxRepeatedActionCount !== "number"
+  ) return undefined;
+  return structuredClone(value) as unknown as RunFacts;
+}
+
+function restartRunFactsBudget(facts: RunFacts | undefined, restartBudget: boolean): RunFacts | undefined {
+  if (!facts || !restartBudget) return facts;
+  return {
+    ...facts,
+    actualToolCallCount: 0,
+    pendingApprovals: 0,
+    activeToolCalls: 0,
+    userCancelled: false,
+    maxRepeatedActionCount: 0
+  };
+}
+
+function runtimeContinuationMessage(terminal: InterruptedTurnTerminal): ModelMessage {
+  return {
+    role: "system",
+    content: [
+      "## Biny runtime continuation",
+      "",
+      `The previous run stopped as ${terminal.status} (${terminal.stopReason}): ${terminal.summary}`,
+      "The user explicitly requested continuation. Re-evaluate the remaining structured facts and continue the same task without repeating completed work."
+    ].join("\n")
   };
 }
 

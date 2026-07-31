@@ -168,6 +168,7 @@ async function main(): Promise<void> {
     await testDeleteSessionReplacementRace();
     await testFailedCurrentSessionResumeKeepsRecorderUsable();
     await testTruncatedSessionTailAndDanglingToolRecovery();
+    await testTurnStatusPersistence();
     await testSessionAndToolDisplayRedaction();
     await testMemoryRedactionDedupAndWriter();
     await testMemoryQueueLifecycleAndUsagePersistence();
@@ -555,7 +556,13 @@ async function testSessionReplayAndAgentResume(): Promise<void> {
     const secondFile = sessionFilePath(workspaceRoot, "second-session");
     await fs.writeFile(secondFile, `${JSON.stringify({ type: "user_message", content: "second session" })}\n`, "utf8");
     await agent.resume("second-session");
-    assert.equal(await fs.readFile(filePath, "utf8"), savedBeforeSwitch);
+    const eventsBeforeSwitch = parseSessionEvents(savedBeforeSwitch);
+    const eventsAfterSwitch = parseSessionEvents(await fs.readFile(filePath, "utf8"));
+    assert.deepEqual(eventsAfterSwitch.slice(0, eventsBeforeSwitch.length), eventsBeforeSwitch);
+    assert.equal(
+      eventsAfterSwitch.slice(eventsBeforeSwitch.length).every((event) => event.type === "turn_status"),
+      true
+    );
     await agent.close();
   });
 }
@@ -607,6 +614,57 @@ async function testTruncatedSessionTailAndDanglingToolRecovery(): Promise<void> 
     const summaries = await listSessionSummaries(workspaceRoot);
     assert.equal(summaries.some((summary) => summary.fileName === path.basename(healthyListFile)), true);
     assert.equal(summaries.some((summary) => summary.fileName === path.basename(corruptListFile)), false);
+  });
+}
+
+async function testTurnStatusPersistence(): Promise<void> {
+  await withTempWorkspace(async (workspaceRoot) => {
+    await ensureAgentDirs(workspaceRoot);
+    const secret = "not-a-real-turn-status-secret";
+    const recorder = new SessionRecorder(workspaceRoot, "turn-status-session");
+    recorder.record({ type: "user_message", content: "finish the project" });
+    recorder.record({ type: "assistant_message", content: "I made partial progress." });
+    recorder.record({
+      type: "turn_status",
+      status: "incomplete",
+      stopReason: "hard_step_limit",
+      steps: 96,
+      summary: `Authorization: Bearer ${secret}`,
+      resumable: true,
+      blockedReason: undefined,
+      requiredAction: `apiKey=${secret}`,
+      affectedTodoIds: ["todo-1"]
+    });
+    await recorder.close();
+
+    const raw = await fs.readFile(recorder.filePath, "utf8");
+    assert.equal(raw.includes(secret), false);
+    const events = parseSessionEvents(raw);
+    const terminal = events.at(-1);
+    assert.equal(terminal?.type, "turn_status");
+    if (terminal?.type !== "turn_status") throw new Error("Expected a persisted turn_status event.");
+    assert.equal(terminal.status, "incomplete");
+    assert.equal(terminal.stopReason, "hard_step_limit");
+    assert.equal(terminal.steps, 96);
+    assert.equal(terminal.resumable, true);
+    assert.deepEqual(terminal.affectedTodoIds, ["todo-1"]);
+
+    const summary = (await listSessionSummaries(workspaceRoot)).find((item) => item.fileName === "turn-status-session.jsonl");
+    assert.equal(summary?.lastTurnStatus?.status, "incomplete");
+    assert.equal(summary?.lastTurnStatus?.resumable, true);
+    assert.equal(summary?.lastAssistantMessage, "I made partial progress.");
+
+    const replay = await replaySession(recorder.filePath);
+    assert.deepEqual(replay.messages.map((message) => message.role), ["user", "assistant"]);
+    assert.throws(
+      () => parseSessionEvents(JSON.stringify({
+        type: "turn_status",
+        status: "unknown",
+        stopReason: "test",
+        steps: -1
+      })),
+      /Invalid session event at line 1/u
+    );
   });
 }
 
@@ -937,7 +995,8 @@ async function testFailedCurrentSessionResumeKeepsRecorderUsable(): Promise<void
     assert.equal((await agent.runTask("continue in a healthy session")).output, "ok");
     await agent.close();
     const fallbackEvents = await readSessionEvents(fallbackSession.sessionFile);
-    assert.deepEqual(fallbackEvents.map((event) => event.type), ["user_message", "assistant_message"]);
+    assert.deepEqual(fallbackEvents.map((event) => event.type), ["user_message", "assistant_message", "turn_status"]);
+    assert.equal(fallbackEvents.at(-1)?.type === "turn_status" ? fallbackEvents.at(-1).status : undefined, "completed");
   });
 }
 

@@ -52,12 +52,26 @@ async function testRoundTripKeepsToolResults(root: string): Promise<void> {
     { role: "assistant", content: [{ type: "tool-call", toolCallId: "c1", toolName: "read_file", input: { path: "a.ts" } }] },
     { role: "tool", content: [{ type: "tool-result", toolCallId: "c1", toolName: "read_file", output: { type: "text", value: "file body" } }] }
   ];
-  await store.save("refactor the parser", messages, 3);
+  const facts = {
+    actualToolCallCount: 1,
+    changedFiles: ["a.ts"]
+  };
+  await store.save("refactor the parser", messages, 3, facts, {
+    status: "incomplete",
+    stopReason: "hard_step_limit",
+    summary: "The run reached its hard step limit."
+  });
 
   const loaded = await new TurnStore(root, "session-a").load();
   assert.equal(loaded?.completedSteps, 3);
   assert.equal(loaded?.prompt, "refactor the parser");
   assert.equal(loaded?.messages.length, 3);
+  assert.deepEqual(loaded?.facts, facts);
+  assert.deepEqual(loaded?.terminal, {
+    status: "incomplete",
+    stopReason: "hard_step_limit",
+    summary: "The run reached its hard step limit."
+  });
   const toolMessage = loaded?.messages[2];
   assert.equal(toolMessage?.role, "tool");
   assert.equal(JSON.stringify(toolMessage).includes("file body"), true, "tool results must survive the round trip");
