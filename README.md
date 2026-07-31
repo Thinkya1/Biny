@@ -16,8 +16,8 @@
 - **完整工具集** —— 文件读写与补丁、代码搜索、Git、Shell、长期进程管理、联网搜索与网页抓取、跨回合待办清单。
 - **执行可控** —— 读写和命令执行走统一权限策略，高风险操作必须完整输入 `yes`；可选的 macOS 沙箱把 `run_command` 的写入限制在工作区内。
 - **可回退** —— 每个回合首次改动工作区前自动建快照，`/undo` 回退。快照挂在独立 ref 上，不碰你的暂存区、分支和 `git log`。
-- **可恢复** —— 消息、工具调用和续跑状态都写在本机；进程退出或断网导致回合异常中断后，`/continue` 从最后一个完成的工具步继续，不重跑已完成工具。可续跑的 `blocked / incomplete` 只在用户显式 `/continue` 后开启新的安全预算，不会在后台自动创建 Attempt；缺少用户信息或需要不安全操作时，必须发送新的用户消息。
-- **统一完成门** —— Provider 的 `stop` 只表示一次响应结束。模型停止调用工具后，Completion Gate 会检查 Todo、审批、活跃执行、结构化阻塞、预算和独立验证，再决定 `completed / blocked / incomplete / cancelled`；验证失败会回到当前 Agent Loop 修复。
+- **可恢复** —— 消息、工具调用和续跑状态都写在本机；进程退出或断网导致回合异常中断后，`/continue` 从最后一个完成的工具步继续，不重跑已完成工具。可续跑的 `blocked / incomplete` 只在用户显式 `/continue` 后开启新的安全预算，原 Turn 终态仍保留在 Session JSONL；缺少用户信息或需要不安全操作时，必须发送新的用户消息。
+- **统一完成门** —— Provider 的 `stop` 只表示一次响应结束。模型停止调用工具后，Completion Gate 会检查 Todo、审批、活跃执行、结构化阻塞、预算和独立验证，再决定 `completed / blocked / incomplete / cancelled`；陈旧 Todo 的 continuation 有无进展上限，后续同动作成功可以覆盖旧失败，验证失败会回到当前 Agent Loop 修复。
 - **可扩展** —— Skill、Plugin、MCP server（stdio / http）、具名子代理，以及跨会话的持久记忆。
 - **Plan 模式** —— 先出计划，不执行会产生副作用的操作。
 - **统一交互、按策略限权** —— Desktop、TUI 和 `biny run` 的普通输入都直接进入同一个 AgentSession，不再根据“修改、修复、启动”等自然语言关键词切换执行框架；Chat 和单次任务使用当前权限策略，Plan 只开放只读工具。
@@ -116,6 +116,8 @@ macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON �
 
 Agent 预算默认软限制为 32 个 provider step、硬限制为 96 个 step。达到软限制只会注入收敛提醒；达到硬限制返回可恢复的 `incomplete`，绝不会发布 `run.completed`。旧配置继续兼容：`maxSteps` 映射软限制，`maxTaskSteps` 映射硬限制；同一配置层里显式的新字段优先。`maxProviderRetries` 默认 0，Provider 的 `finishReason` 仍会记录用于诊断，但实际工具调用才决定 Loop 是否继续。
 
+当前没有单独的 Durable Task 执行框架。普通问答、代码修改、启动项目和多步工具任务都进入同一个 Agent Loop；验证器只根据文件变化、结构化检查、受管进程等运行事实启动。验证命令的 stdout/stderr 在模型上下文中最多保留 4000 字符摘要，完整结果通过对应的审计 `tool_call` 记录在 Session JSONL 中。
+
 TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 reasoning effort，才会继续打开对应的档位选择器。列表不会把所有模型强行显示成同一套档位：例如 DeepSeek V4 Pro 使用自身声明的三档 `low`、`medium`、`high`，DeepSeek V4 Flash 不显示思考档位。这里的名称是模型/Provider 支持的配置选项，不代表跨模型可比较的真实推理程度。模型目录刷新后，实时模型会进入同一注册表，也可以用 `provider/model-id` 引用；选中的实时模型元数据会写入全局模型配置。
 
 联网搜索启用后默认走 AnySearch（`ANYSEARCH_API_KEY`，也可用匿名额度），另支持 Google、DuckDuckGo、Brave 和 Tavily，在 `web.search` 里切换。桌面端的 **设置 → 联网搜索** 提供独立浏览器和 Cookie-Editor JSON 导入/导出；在其中登录后，Google 搜索与 `web_fetch` 会按域名、路径和 HTTPS 规则使用对应 Cookie。
@@ -132,7 +134,7 @@ TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 re
 ~/.biny/agent/sessions/<project-path-hash>/ 问答历史
 ~/.biny/agent/memory/<project-path-hash>/   项目长期记忆
 <project>/.biny/attachments/                图片、音频等会话附件
-<project>/.biny/                            settings、runs、tasks、logs 等
+<project>/.biny/                            settings、runs、turns、todos、logs 等
 ```
 
 全局模型配置、项目 session 和项目 Memory 都在 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）；Session 与 Memory 分别按项目隔离在 `sessions/<project-path-hash>/`、`memory/<project-path-hash>/`。全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表和 UI 状态在 `~/Library/Application Support/Biny/workspaces/default/`，附件、run 等其余项目数据暂时仍在项目 `.biny/`。旧的 `<project>/.biny/sessions/` 和 `<project>/.biny/memory/` 不再读取或复制。
