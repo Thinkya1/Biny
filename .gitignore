@@ -14,6 +14,10 @@ TODO.local.md
 ARCHITECTURE.local.md
 /.agents
 
+# 本地文档不进入仓库，仅发布根目录 README
+*.md
+!/README.md
+
 # Local agent evaluation runs and reports
 /jobs/
 /reports/
