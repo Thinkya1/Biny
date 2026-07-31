@@ -12,7 +12,7 @@ import {
   type ManagedProcessInspector
 } from "../harness/AcceptanceVerifier.js";
 import type { AcceptanceCommandExecutor } from "../harness/AcceptanceCommandExecutor.js";
-import type { AcceptanceCriterion } from "../harness/types.js";
+import type { AcceptanceCriterion } from "../harness/acceptanceTypes.js";
 import { isIgnoredPath } from "../workspace/ignore.js";
 
 const ignoredDirectoryNames = new Set([

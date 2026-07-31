@@ -13,7 +13,7 @@ import { globalAgentDir, projectSessionsDir } from "../config/paths.js";
 import { readSessionTail } from "./limits.js";
 
 const sessionMetadataConcurrency = 8;
-const managedStateDirectories = ["attachments", "logs", "runs", "tasks", "processes", "tool-results", "todos", "turns", "evals"] as const;
+const managedStateDirectories = ["attachments", "logs", "runs", "processes", "tool-results", "todos", "turns", "evals"] as const;
 
 interface PathIdentity {
   path: string;

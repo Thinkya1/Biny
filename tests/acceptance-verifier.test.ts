@@ -12,8 +12,7 @@ import {
   type AcceptanceCommandExecutor
 } from "../src/harness/AcceptanceCommandExecutor.js";
 import { AcceptanceVerifier } from "../src/harness/AcceptanceVerifier.js";
-import { compileTaskContract } from "../src/harness/TaskContractCompiler.js";
-import type { AcceptanceCriterion, AgentAttemptExecution, TaskContract, TaskVerificationMode } from "../src/harness/types.js";
+import type { AcceptanceCriterion } from "../src/harness/acceptanceTypes.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
 import {
   captureWorkspaceState,
@@ -21,7 +20,6 @@ import {
   workspaceStateDigest
 } from "../src/harness/WorkspaceState.js";
 
-await testRequiresTerminalModelStop();
 await testCriteriaVerificationDoesNotRequireAgentCompletion();
 await testCriteriaVerificationSupportsCancellation();
 await testDeterministicTaskCannotPassWithoutCriteria();
@@ -35,28 +33,7 @@ await testVerifierExecutesCommandsIndependently();
 await testCommandCriterionRequiresControlledExecutor();
 await testAutoDiscoveredCheckCannotBypassDefaultAsk();
 await testControlledExecutorUsesApprovalSandboxAndAudit();
-
-async function testRequiresTerminalModelStop(): Promise<void> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-verifier-outcome-"));
-  try {
-    const verifier = new AcceptanceVerifier({
-      workspaceRoot: root,
-      commandExecutor: trustedCommandExecutor(root)
-    });
-    const result = await verifier.verify(contract("continue", []), attempt({
-      outcomeStatus: "incomplete",
-      stopReason: "step_limit"
-    }));
-    assert.equal(result.passed, false);
-    assert.match(result.summary, /step_limit/u);
-    const completed = await verifier.verify(contract("done", []), attempt({
-      stopReason: "completion_gate"
-    }));
-    assert.equal(completed.passed, true, completed.summary);
-  } finally {
-    await fs.rm(root, { recursive: true, force: true });
-  }
-}
+await testLongCommandOutputKeepsBoundedSummaryAndFullAudit();
 
 async function testCriteriaVerificationDoesNotRequireAgentCompletion(): Promise<void> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-verifier-criteria-"));
@@ -106,7 +83,9 @@ async function testVerifierSelectsReadyManagedProcess(): Promise<void> {
         ]
       }
     });
-    const result = await verifier.verify(contract("keep the service running", [{ id: "service", kind: "managed_process", cwd: "." }]), attempt({}));
+    const result = await verifier.verifyCriteria([
+      { id: "service", kind: "managed_process", cwd: "." }
+    ]);
     assert.equal(result.passed, true, result.summary);
     assert.equal(result.evidence[0]?.details?.processId, "ready-second");
   } finally {
@@ -253,12 +232,12 @@ async function testLaunchProcessRequiresHttpReadiness(): Promise<void> {
         }]
       }
     });
-    const result = await verifier.verify(contract("start the project", [{
-        id: "service",
-        kind: "managed_process",
-        processId: "process-log-only",
-        requireHttpReadiness: true
-      }]), attempt({}));
+    const result = await verifier.verifyCriteria([{
+      id: "service",
+      kind: "managed_process",
+      processId: "process-log-only",
+      requireHttpReadiness: true
+    }]);
     assert.equal(result.passed, false);
     assert.match(result.summary, /required HTTP readiness/u);
   } finally {
@@ -381,7 +360,7 @@ async function testDeterministicTaskCannotPassWithoutCriteria(): Promise<void> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-verifier-empty-deterministic-"));
   try {
     const verifier = new AcceptanceVerifier({ workspaceRoot: root });
-    const result = await verifier.verify(contract("implement a code change", [], "deterministic"), attempt({}));
+    const result = await verifier.verifyCriteria([], { requireCriteria: true });
     assert.equal(result.passed, false);
     assert.match(result.summary, /no executable acceptance criteria/u);
   } finally {
@@ -395,11 +374,15 @@ async function testWorkspaceChangeUsesTaskBaseline(): Promise<void> {
     await fs.writeFile(path.join(root, "source.txt"), "before\n");
     const baselineDigest = await workspaceStateDigest(root);
     const verifier = new AcceptanceVerifier({ workspaceRoot: root });
-    const unchanged = await verifier.verify(contract("change source", [{ id: "workspace", kind: "workspace_changed", baselineDigest }]), attempt({}));
+    const unchanged = await verifier.verifyCriteria([
+      { id: "workspace", kind: "workspace_changed", baselineDigest }
+    ]);
     assert.equal(unchanged.passed, false);
 
     await fs.writeFile(path.join(root, "source.txt"), "after\n");
-    const changed = await verifier.verify(contract("change source", [{ id: "workspace", kind: "workspace_changed", baselineDigest }]), attempt({}));
+    const changed = await verifier.verifyCriteria([
+      { id: "workspace", kind: "workspace_changed", baselineDigest }
+    ]);
     assert.equal(changed.passed, true, changed.summary);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
@@ -419,12 +402,12 @@ async function testVerifierExecutesCommandsIndependently(): Promise<void> {
         headers: { "content-type": "application/json" }
       });
     }) as typeof fetch;
-    const task = contract("start and verify", [
+    const criteria: AcceptanceCriterion[] = [
         { id: "manifest", kind: "file_exists", path: "package.json" },
         { id: "build", kind: "command_succeeded", command: "node -e \"process.exit(0)\"" },
         { id: "http", kind: "http", url },
         { id: "process", kind: "managed_process", processId: "process-1", requireHttpReadiness: true }
-      ]);
+      ];
     const verifier = new AcceptanceVerifier({
       workspaceRoot: root,
       commandExecutor: trustedCommandExecutor(root),
@@ -432,28 +415,14 @@ async function testVerifierExecutesCommandsIndependently(): Promise<void> {
         listProcesses: () => [{ processId: "process-1", state: "running", url, readiness: { type: "http", passed: true } }]
       }
     });
-    const result = await verifier.verify(task, attempt({
-      toolEvidence: [{
-        toolCallId: "tool-1",
-        tool: "run_command",
-        args: { command: "node -e \"process.exit(0)\"" },
-        result: { exitCode: 17, status: "failed" },
-        observedAt: new Date().toISOString()
-      }]
-    }));
+    const result = await verifier.verifyCriteria(criteria);
     assert.equal(result.passed, true, result.summary);
     assert.equal(result.evidence.length, 4);
     assert.equal(result.evidence.find((evidence) => evidence.criterionId === "build")?.details?.execution, "independent_verifier");
 
-    const independentFailure = await verifier.verify(contract("verify the failing command", [{ id: "build", kind: "command_succeeded", command: "node -e \"process.exit(5)\"" }]), attempt({
-      toolEvidence: [{
-        toolCallId: "tool-2",
-        tool: "run_command",
-        args: { command: "node -e \"process.exit(5)\"" },
-        result: { exitCode: 0, status: "completed" },
-        observedAt: new Date().toISOString()
-      }]
-    }));
+    const independentFailure = await verifier.verifyCriteria([
+      { id: "build", kind: "command_succeeded", command: "node -e \"process.exit(5)\"" }
+    ]);
     assert.equal(independentFailure.passed, false);
     assert.match(independentFailure.summary, /independent verifier run/u);
   } finally {
@@ -462,30 +431,42 @@ async function testVerifierExecutesCommandsIndependently(): Promise<void> {
   }
 }
 
-function attempt(overrides: Partial<AgentAttemptExecution>): AgentAttemptExecution {
-  return {
-    output: "done",
-    runtimeSteps: 1,
-    outcomeStatus: "completed",
-    stopReason: "model_stop",
-    finishReason: "stop",
-    attemptToolEvidence: [],
-    toolEvidence: [],
-    ...overrides
-  };
-}
-
-function contract(
-  objective: string,
-  acceptanceCriteria: AcceptanceCriterion[],
-  verificationMode: TaskVerificationMode = "model_only"
-): TaskContract {
-  return compileTaskContract({
-    objective,
-    taskType: "conversation",
-    acceptanceCriteria,
-    verificationMode
-  });
+async function testLongCommandOutputKeepsBoundedSummaryAndFullAudit(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-verifier-output-summary-"));
+  try {
+    const audit: AcceptanceCommandAuditEvent[] = [];
+    const verifier = new AcceptanceVerifier({
+      workspaceRoot: root,
+      commandExecutor: createControlledAcceptanceCommandExecutor({
+        workspaceRoot: root,
+        sandbox: { mode: "off", allowNetwork: true },
+        permissionManager: new PermissionManager({
+          mode: "full-access",
+          allowTools: [],
+          denyPaths: []
+        }),
+        sessionId: "verification-output-test",
+        onAuditEvent: (event) => {
+          audit.push(event);
+        }
+      })
+    });
+    const result = await verifier.verifyCriteria([{
+      id: "large-output",
+      kind: "command_succeeded",
+      command: "node -e \"process.stdout.write('x'.repeat(6000))\""
+    }], { requireCriteria: true });
+    const details = result.evidence[0]?.details;
+    assert.equal(result.passed, true, result.summary);
+    assert.equal(details?.stdoutTruncated, true);
+    assert.equal(details?.stdoutChars, 6_000);
+    assert.ok(String(details?.stdout ?? "").length <= 4_000);
+    const completed = audit.find((event) => event.type === "command.completed");
+    assert.equal(completed?.result.stdout.length, 6_000);
+    assert.equal(details?.fullEvidenceToolCallId, completed?.toolCallId);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 }
 
 function trustedCommandExecutor(workspaceRoot: string): AcceptanceCommandExecutor {

@@ -42,6 +42,8 @@ export interface AcceptanceCommandResult {
   stderr: string;
   exitCode: number;
   error?: string;
+  /** Session JSONL 中保存完整命令结果的 tool_call id。 */
+  evidenceToolCallId?: string;
 }
 
 export interface AcceptanceCommandExecutor {
@@ -217,7 +219,7 @@ export function createControlledAcceptanceCommandExecutor(
         }
 
         await options.beforeCommandExecution?.(request);
-        const result = await scheduler.schedule({
+        const commandResult = await scheduler.schedule({
           accesses: execution.accesses ?? ToolAccesses.all(),
           signal: request.signal,
           start: async () => {
@@ -228,6 +230,10 @@ export function createControlledAcceptanceCommandExecutor(
             });
           }
         });
+        const result: AcceptanceCommandResult = {
+          ...commandResult,
+          evidenceToolCallId: toolCallId
+        };
         await options.onAuditEvent?.({
           type: "command.completed",
           toolCallId,

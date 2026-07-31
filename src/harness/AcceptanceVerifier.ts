@@ -16,12 +16,7 @@ import {
 } from "../workspace/resolvePath.js";
 import type { AcceptanceCommandExecutor } from "./AcceptanceCommandExecutor.js";
 import { workspaceStateDigest } from "./WorkspaceState.js";
-import type {
-  AcceptanceCriterion,
-  AcceptanceEvidence,
-  AgentAttemptExecution,
-  TaskContract
-} from "./types.js";
+import type { AcceptanceCriterion, AcceptanceEvidence } from "./acceptanceTypes.js";
 
 export interface ManagedProcessInspection {
   processId: string;
@@ -75,39 +70,9 @@ export class AcceptanceVerifier {
     }
   }
 
-  async verify(task: TaskContract, attempt: AgentAttemptExecution): Promise<AcceptanceVerificationResult> {
-    // Agent 没有正常收尾就没必要跑后面的检查：此时工作区可能停在中间状态，
-    // 即使个别条件碰巧通过也不能算验收成功。
-    if (
-      attempt.outcomeStatus !== "completed"
-      || attempt.stopReason !== "completion_gate" && attempt.stopReason !== "model_stop"
-    ) {
-      const evidence = [this.evidence(
-        "agent_outcome",
-        false,
-        attempt.error ?? `Agent attempt is ${attempt.outcomeStatus} (${attempt.stopReason}); Completion Gate approval is required.`,
-        {
-          finishReason: attempt.finishReason,
-          runtimeSteps: attempt.runtimeSteps
-        }
-      )];
-      return {
-        passed: false,
-        summary: evidence[0]?.summary ?? "Agent attempt did not complete.",
-        evidence
-      };
-    }
-
-    return await this.verifyCriteria(task.acceptanceCriteria, {
-      requireCriteria: task.verificationMode === "deterministic"
-    });
-  }
-
   /**
-   * 只验证可执行条件，不依赖 Agent 是否已经被上层标成 completed。
-   *
-   * 普通 Agent Loop 在 `model_yielded` 后调用这个入口；最终 completed / continue 由
-   * Completion Gate 决定。旧 Durable Task 仍可通过 `verify(task, attempt)` 保持兼容。
+   * 只验证可执行条件，不依赖 Agent 是否已经被上层标成 completed。普通 Agent Loop 在
+   * `model_yielded` 后调用；最终 completed / continue 仍由 Completion Gate 决定。
    */
   async verifyCriteria(
     criteria: readonly AcceptanceCriterion[],
@@ -229,6 +194,8 @@ export class AcceptanceVerifier {
       description: criterion.description
     });
     const passed = result.status === "completed" && result.exitCode === 0;
+    const stdout = compactOutput(result.stdout);
+    const stderr = compactOutput(result.stderr);
     return this.evidence(
       criterion.id,
       passed,
@@ -242,8 +209,13 @@ export class AcceptanceVerifier {
         status: result.status,
         exitCode: result.exitCode,
         sandbox: result.sandbox,
-        stdout: compactOutput(result.stdout),
-        stderr: compactOutput(result.stderr)
+        stdout: stdout.preview,
+        stderr: stderr.preview,
+        stdoutTruncated: stdout.truncated,
+        stderrTruncated: stderr.truncated,
+        stdoutChars: stdout.totalChars,
+        stderrChars: stderr.totalChars,
+        fullEvidenceToolCallId: result.evidenceToolCallId
       }
     );
   }
@@ -416,10 +388,18 @@ function readString(value: unknown, key: string): string | undefined {
   return isRecord(value) && typeof value[key] === "string" ? value[key] : undefined;
 }
 
-function compactOutput(value: string): string | undefined {
-  if (!value) return undefined;
+function compactOutput(value: string): {
+  preview?: string;
+  truncated: boolean;
+  totalChars: number;
+} {
+  if (!value) return { preview: undefined, truncated: false, totalChars: 0 };
   const maxChars = 4_000;
-  return value.length <= maxChars ? value : `${value.slice(0, maxChars - 1)}…`;
+  return {
+    preview: value.length <= maxChars ? value : `${value.slice(0, maxChars - 1)}…`,
+    truncated: value.length > maxChars,
+    totalChars: value.length
+  };
 }
 
 function readBoolean(value: unknown, key: string): boolean | undefined {
