@@ -29,6 +29,8 @@ export interface InterruptedTurn {
   facts?: unknown;
   /** blocked / incomplete 终态的恢复边界；普通工具步断点没有该字段。 */
   terminal?: InterruptedTurnTerminal;
+  /** 同一 Turn 续跑前已经发生的终态；新预算窗口不能覆盖原终态。 */
+  previousTerminals?: InterruptedTurnTerminal[];
   updatedAt: string;
 }
 
@@ -48,7 +50,8 @@ export class TurnStore {
     messages: readonly ModelMessage[],
     completedSteps: number,
     facts?: unknown,
-    terminal?: InterruptedTurnTerminal
+    terminal?: InterruptedTurnTerminal,
+    previousTerminals?: readonly InterruptedTurnTerminal[]
   ): Promise<void> {
     await ensureAgentDirs(this.persistenceRoot);
     const payload: InterruptedTurn = {
@@ -58,6 +61,7 @@ export class TurnStore {
       completedSteps,
       facts,
       terminal,
+      previousTerminals: previousTerminals ? [...previousTerminals] : undefined,
       updatedAt: new Date().toISOString()
     };
     const target = this.filePath();
@@ -94,6 +98,9 @@ function isInterruptedTurn(value: unknown): value is InterruptedTurn {
     && Number.isSafeInteger(candidate.completedSteps)
     && (candidate.completedSteps ?? -1) >= 0
     && (candidate.terminal === undefined || isInterruptedTurnTerminal(candidate.terminal))
+    && (candidate.previousTerminals === undefined
+      || Array.isArray(candidate.previousTerminals)
+      && candidate.previousTerminals.every(isInterruptedTurnTerminal))
     && typeof candidate.updatedAt === "string";
 }
 

@@ -1,9 +1,8 @@
 /**
  * 用户消息的展示文本提取。
  *
- * 写进 session 的 user_message 可能被 harness 包了一层脚手架（验收说明、续跑指令、上一次
- * 尝试的反馈），这些内容是给模型看的，回放和界面上只应展示用户真正输入的那部分。
- * 这里靠固定前缀/标记做切分，同时兼容历史 session 的旧格式。
+ * 早期 Durable Task 写进 session 的 user_message 可能包了一层验收脚手架。当前普通 Loop
+ * 不再生成这种消息，但回放旧 session 时仍要只展示用户真正输入的部分。
  */
 const verifierAttemptMarker = "\n\nThis is a verifier-driven task.";
 const continuationPrefix = "Continue the same project-level task autonomously.";

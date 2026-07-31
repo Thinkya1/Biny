@@ -28,7 +28,6 @@ async function main(): Promise<void> {
   await testImageAttachmentStoresOnlyReferenceInSession();
   await testAttachmentStorageRejectsSymlink();
   await testImageAttachmentIsRehydratedOnResume();
-  await testInternalAttemptPersistsOnlyPublicPrompt();
   await testAgentRunsToolAndKeepsSessionEvents();
   await testPlanModeExposesOnlyReadTools();
   await testInvalidToolInputUsesCoordinatorValidation();
@@ -51,7 +50,6 @@ async function main(): Promise<void> {
   await testSoftStepLimitWarnsWithoutStopping();
   await testResumableHardLimitKeepsVerificationFacts();
   await testStepLimitIsIncompleteAndDoesNotQueueSuccessfulMemory();
-  await testHarnessCanDeferSuccessfulMemoryUntilAcceptance();
   await testPreAbortedRunStopsBeforeRequest();
   await testPreAbortedPlanRecordsAttempt();
   await testConsumerReturnAbortsAndDrainsStream();
@@ -250,39 +248,6 @@ async function testStepLimitIsIncompleteAndDoesNotQueueSuccessfulMemory(): Promi
     }
   } finally {
     globalThis.fetch = originalFetch;
-  }
-}
-
-async function testHarnessCanDeferSuccessfulMemoryUntilAcceptance(): Promise<void> {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (): Promise<Response> => sseResponse([
-    { choices: [{ index: 0, delta: { content: "model says done" }, finish_reason: null }] },
-    { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
-    "[DONE]"
-  ])) as typeof fetch;
-
-  const { agent, cleanup } = await createAgent(undefined, (config) => {
-    config.context.memory.enabled = true;
-    config.context.memory.autoRemember = true;
-  });
-  const memory = (agent as unknown as {
-    contextMemory: { queueSuccessfulTask(input: string, output: string): void };
-  }).contextMemory;
-  const originalQueueSuccessfulTask = memory.queueSuccessfulTask.bind(memory);
-  let successfulTaskCount = 0;
-  memory.queueSuccessfulTask = (input, output) => {
-    successfulTaskCount += 1;
-    originalQueueSuccessfulTask(input, output);
-  };
-  try {
-    const outcome = await agent.runTask("finish only after verification", { deferSuccessfulMemory: true });
-    assert.equal(outcome.status, "completed");
-    assert.equal(successfulTaskCount, 0, "a model stop is not yet a verified task success");
-    agent.rememberSuccessfulTask("finish only after verification", outcome.output);
-    assert.equal(successfulTaskCount, 1);
-  } finally {
-    globalThis.fetch = originalFetch;
-    await cleanup(agent);
   }
 }
 
@@ -798,13 +763,31 @@ async function testResumableHardLimitKeepsVerificationFacts(): Promise<void> {
     });
     assert.equal(first.status, "incomplete");
     assert.equal(first.stopReason, "hard_step_limit");
-    assert.equal((await fixture.agent.interruptedTurn())?.completedSteps, 0);
+    const interrupted = await fixture.agent.interruptedTurn();
+    assert.equal(interrupted?.completedSteps, 0, "an incomplete resume starts a fresh budget window");
+    assert.equal(interrupted?.terminal?.status, "incomplete");
+    assert.equal(interrupted?.terminal?.stopReason, "hard_step_limit");
 
     const resumed = await collect(fixture.agent.continueInterruptedTurn({
       confirmPermission: async () => ({ approved: true, scope: "once", confirmation: "yes" })
     }));
-    assert.equal(resumed.find((event) => event.type === "done")?.outcome.status, "completed");
+    const resumedOutcome = resumed.find((event) => event.type === "done")?.outcome;
+    assert.equal(resumedOutcome?.status, "completed");
+    assert.equal(resumedOutcome?.steps, 1, "the resumed run must count from its new budget window");
     assert.equal(await readFile(path.join(workspaceRoot, "verification-ran.txt"), "utf8"), "yes");
+    const terminalEvents = (await readFile(fixture.sessionFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { type: string; status?: string; stopReason?: string })
+      .filter((event) => event.type === "turn_status");
+    assert.deepEqual(
+      terminalEvents.map((event) => [event.status, event.stopReason]),
+      [
+        ["incomplete", "hard_step_limit"],
+        ["completed", "completion_gate"]
+      ],
+      "resuming must append a new terminal event without overwriting the original Turn status"
+    );
   } finally {
     globalThis.fetch = originalFetch;
     await fixture.cleanup(fixture.agent);
@@ -850,37 +833,6 @@ async function testAgentRunsToolAndKeepsSessionEvents(): Promise<void> {
     assert.equal(typeof sessionEvents[0]?.contextUsage?.usedTokens, "number");
     assert.equal(sessionEvents.at(-1)?.status, "completed");
     assert.equal(sessionEvents.at(-1)?.stopReason, "completion_gate");
-  } finally {
-    globalThis.fetch = originalFetch;
-    await cleanup(agent, true);
-  }
-}
-
-async function testInternalAttemptPersistsOnlyPublicPrompt(): Promise<void> {
-  const originalFetch = globalThis.fetch;
-  const requests: Array<Record<string, unknown>> = [];
-  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    requests.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
-    return sseResponse([
-    { choices: [{ index: 0, delta: { content: "done" }, finish_reason: null }] },
-    { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
-    "[DONE]"
-    ]);
-  }) as typeof fetch;
-
-  const { agent, cleanup, sessionFile } = await createAgent();
-  try {
-    await collect(agent.runAttempt("用户原始提示词", {
-      modelInput: "internal verifier prompt",
-      sessionUserMessage: "用户原始提示词",
-      confirmPermission: async () => ({ approved: true, scope: "once" })
-    }));
-    await agent.close();
-    const sessionEvents = (await readFile(sessionFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { type: string; content?: string });
-    assert.equal(sessionEvents[0]?.type, "user_message");
-    assert.equal(sessionEvents[0]?.content, "用户原始提示词");
-    assert.doesNotMatch(sessionEvents[0]?.content ?? "", /internal verifier prompt/u);
-    assert.match(JSON.stringify(requests), /internal verifier prompt/u);
   } finally {
     globalThis.fetch = originalFetch;
     await cleanup(agent, true);

@@ -16,8 +16,8 @@ export type AgentTurnStatus = "completed" | "incomplete" | "blocked" | "cancelle
 
 /**
  * AgentSession 的终止原因。新普通 Loop 用 completion_gate / hard_step_limit /
- * no_progress_after_continuation 等结构化原因；step_limit、tool_pending、model_stop 和 aborted
- * 保留给旧宿主、旧 TaskRun 与历史事件兼容。
+ * no_progress_after_continuation 等结构化原因；step_limit、tool_pending、model_stop 和
+ * aborted 仅保留给旧宿主与历史 Session 事件兼容。
  */
 export type AgentTurnStopReason =
   | "model_stop"

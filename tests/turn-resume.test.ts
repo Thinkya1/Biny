@@ -60,7 +60,12 @@ async function testRoundTripKeepsToolResults(root: string): Promise<void> {
     status: "incomplete",
     stopReason: "hard_step_limit",
     summary: "The run reached its hard step limit."
-  });
+  }, [{
+    status: "blocked",
+    stopReason: "blocked",
+    summary: "Waiting for approval.",
+    blockedReason: "waiting_for_approval"
+  }]);
 
   const loaded = await new TurnStore(root, "session-a").load();
   assert.equal(loaded?.completedSteps, 3);
@@ -72,6 +77,12 @@ async function testRoundTripKeepsToolResults(root: string): Promise<void> {
     stopReason: "hard_step_limit",
     summary: "The run reached its hard step limit."
   });
+  assert.deepEqual(loaded?.previousTerminals, [{
+    status: "blocked",
+    stopReason: "blocked",
+    summary: "Waiting for approval.",
+    blockedReason: "waiting_for_approval"
+  }]);
   const toolMessage = loaded?.messages[2];
   assert.equal(toolMessage?.role, "tool");
   assert.equal(JSON.stringify(toolMessage).includes("file body"), true, "tool results must survive the round trip");

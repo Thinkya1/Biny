@@ -114,18 +114,12 @@ export interface AgentRunOptions {
   mode?: AgentRunMode;
   /** 本次调用可消费的硬 step 上限；普通根回合默认使用配置的 hardStepLimit。 */
   maxSteps?: number;
-  /** A task harness may defer success memory until external acceptance checks pass. */
-  deferSuccessfulMemory?: boolean;
-  /** Model-visible prompt when the public user input must remain separate. */
-  modelInput?: string;
   /**
    * 从已有 context 直接续跑，跳过上下文组装，也不再记一条用户消息。
    * 对齐 pi 的 `agentLoopContinue`：续跑的是同一个回合，不是新的一轮对话。
    */
   continueFrom?: ModelMessage[];
-  /** Public session message when the model input is an internal task-attempt prompt. */
-  sessionUserMessage?: string;
-  /** Whether this attempt should append a user message to the visible session transcript. */
+  /** 续跑同一 Turn 时不重复追加公开用户消息。 */
   recordSessionUserMessage?: boolean;
   /** 宿主显式要求 Completion Gate 执行确定性验证；不从用户文本关键词推断。 */
   verificationRequired?: boolean;
@@ -138,8 +132,6 @@ export type AgentPromptOptions = Pick<
   AgentRunOptions,
   "abortSignal" | "confirmPermission" | "mode" | "verificationRequired" | "verificationChecks" | "attachments"
 >;
-
-export type AgentAttemptOptions = Omit<AgentRunOptions, "mode">;
 
 export type { AgentAttachment } from "../attachments/store.js";
 
@@ -158,7 +150,7 @@ export interface AgentSessionInfo {
   skills?: string[];
 }
 
-/** 普通交互统一走 chat；plan 只改变工具策略。durable execution 不属于交互 mode。 */
+/** 普通交互统一走 chat；plan 只改变工具策略。 */
 export type AgentRunMode = "chat" | "plan";
 export type InteractiveAgentRunMode = AgentRunMode;
 
@@ -288,13 +280,18 @@ export class AgentSession {
     const continuationMessages = turn.terminal
       ? [...turn.messages, runtimeContinuationMessage(turn.terminal)]
       : turn.messages;
+    const previousTerminals = [
+      ...(turn.previousTerminals ?? []),
+      ...(turn.terminal ? [turn.terminal] : [])
+    ];
     yield* this.runTurn(turn.prompt, {
       ...runOptions,
       maxSteps: remainingSteps,
       continueFrom: continuationMessages,
       recordSessionUserMessage: false,
       completedStepsBeforeRun: turn.completedSteps,
-      initialRunFacts: restartRunFactsBudget(readRunFacts(turn.facts), turn.completedSteps === 0)
+      initialRunFacts: restartRunFactsBudget(readRunFacts(turn.facts), turn.completedSteps === 0),
+      previousTerminals
     });
   }
 
@@ -312,16 +309,12 @@ export class AgentSession {
     yield* this.runTurn(input, options);
   }
 
-  /** Durable task harness 的单次有界尝试；不暴露为交互 mode。 */
-  async *runAttempt(input: string, options: AgentAttemptOptions = {}): AsyncGenerator<AgentSessionEvent> {
-    yield* this.runTurn(input, { ...options, mode: "chat" });
-  }
-
   private async *runTurn(
     input: string,
     runOptions: AgentRunOptions & {
       completedStepsBeforeRun?: number;
       initialRunFacts?: RunFacts;
+      previousTerminals?: InterruptedTurnTerminal[];
     } = {}
   ): AsyncGenerator<AgentSessionEvent> {
     const release = this.beginOperation("agent turn");
@@ -330,7 +323,6 @@ export class AgentSession {
       ? AbortSignal.any([runOptions.abortSignal, turnController.signal])
       : turnController.signal;
     const effectiveRunOptions: AgentRunOptions = { ...runOptions, abortSignal };
-    const modelInput = runOptions.modelInput ?? input;
     const continuing = Boolean(runOptions.continueFrom?.length);
     const completedStepsBeforeRun = continuing ? runOptions.completedStepsBeforeRun ?? 0 : 0;
     if (!continuing) this.options.completionState?.reset();
@@ -359,7 +351,7 @@ export class AgentSession {
       if (runOptions.recordSessionUserMessage === false) return;
       this.recorder.record({
         type: "user_message",
-        content: runOptions.sessionUserMessage ?? input,
+        content: input,
         attachments: sessionAttachments(runOptions.attachments),
         skills: this.options.skillPaths,
         contextUsage: this.contextMemory.getBudget(),
@@ -425,7 +417,7 @@ export class AgentSession {
         this.options.toolRegistry.list().map((tool) => tool.name)
       );
       messages = await this.contextMemory.prepareTurn(
-        modelInput,
+        input,
         systemPrompt,
         abortSignal,
         this.supportedAttachments(runOptions.attachments)
@@ -823,10 +815,12 @@ export class AgentSession {
               const completedSteps = completedStepsBeforeRun + segmentStepOffset + step.index + 1;
               if (step.toolCalls.length > 0 && completedSteps < runBudget.hardStepLimit) {
                 await this.turnStore.save(
-                  runOptions.sessionUserMessage ?? input,
+                  input,
                   step.messages,
                   completedSteps,
-                  facts.snapshot(false)
+                  facts.snapshot(false),
+                  undefined,
+                  runOptions.previousTerminals
                 )
                   .catch(() => undefined);
               }
@@ -892,10 +886,12 @@ export class AgentSession {
           }
           finalMessages = [...finalMessages, decision.feedback];
           await this.turnStore.save(
-            runOptions.sessionUserMessage ?? input,
+            input,
             finalMessages,
             completedStepsBeforeRun + completedLoopSteps.length,
-            facts.snapshot(false)
+            facts.snapshot(false),
+            undefined,
+            runOptions.previousTerminals
           ).catch(() => undefined);
         }
       } catch (error) {
@@ -960,9 +956,7 @@ export class AgentSession {
         yield { type: "assistant.completed", content };
       }
       if (outcome.status === "completed") {
-        if (!runOptions.deferSuccessfulMemory) {
-          this.rememberSuccessfulTask(runOptions.sessionUserMessage ?? input, content);
-        }
+        this.rememberSuccessfulTask(input, content);
         yield { type: "status", status: "completed" };
       } else if (outcome.status === "incomplete") {
         yield { type: "status", status: "incomplete" };
@@ -976,10 +970,10 @@ export class AgentSession {
         yield { type: "status", status: "error" };
       }
       if (outcome.status === "blocked" || outcome.status === "incomplete" && outcome.resumable === true) {
-        // 显式 /continue 可以从相同 context 开一个新的预算窗口；不会像旧 Durable Attempt
-        // 那样在后台自动重试。
+        // 显式 /continue 可以从相同 context 开一个新的预算窗口；原终态保留在
+        // previousTerminals 和 Session JSONL 中，不会被续跑中的新断点覆盖。
         await this.turnStore.save(
-          runOptions.sessionUserMessage ?? input,
+          input,
           finalMessages,
           0,
           facts.snapshot(false),
@@ -989,7 +983,8 @@ export class AgentSession {
             summary: outcome.error ?? `${outcome.status} (${outcome.stopReason})`,
             blockedReason: outcome.blockedReason,
             requiredAction: outcome.requiredAction
-          }
+          },
+          runOptions.previousTerminals
         ).catch(() => undefined);
       } else {
         await this.turnStore.clear().catch(() => undefined);

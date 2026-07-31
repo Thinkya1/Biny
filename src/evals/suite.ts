@@ -64,17 +64,14 @@ export const builtinEvalTasks: EvalTask[] = [
 export const runTaskWithAgent: EvalAgentRunner = async (workspaceRoot, task, signal) => {
   const runtime = await createCommandRuntime(workspaceRoot);
   try {
-    let steps = 0;
-    for await (const event of runtime.agent.runAttempt(task.prompt, {
+    const outcome = await runtime.agent.runTask(task.prompt, {
       abortSignal: signal,
       maxSteps: task.maxSteps,
       confirmPermission: async () => ({ approved: true, scope: "session" })
-    })) {
-      if (event.type === "done") steps = event.outcome.steps;
-    }
+    });
     const usage = runtime.agent.usageSummary();
     return {
-      steps,
+      steps: outcome.steps,
       totalTokens: usage.totalTokens,
       ...(usage.pricingKnown ? { costUsd: usage.costUsd } : {}),
       pricingKnown: usage.pricingKnown
