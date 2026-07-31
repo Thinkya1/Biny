@@ -43,6 +43,7 @@ interface WorkspaceProps {
   onOpenExternal(url: string): void;
   onPanelNotice(message: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
+  onContinue(): void;
   onRetry(input: string): void;
   onEditUserMessage(input: string, userMessageIndex: number): Promise<void>;
   onCreateBranch(): void;
@@ -90,6 +91,7 @@ export function Workspace({
   onOpenExternal,
   onPanelNotice,
   onResolvePermission,
+  onContinue,
   onRetry,
   onEditUserMessage,
   onCreateBranch,
@@ -299,10 +301,11 @@ export function Workspace({
               onOpenExternal={onOpenExternal}
               onResolvePermission={onResolvePermission}
               onRollbackFiles={onRollbackFiles}
-            onRetry={onRetry}
-            projectId={projectId}
-            sessionId={sessionId}
-            turns={turns}
+              onContinue={onContinue}
+              onRetry={onRetry}
+              projectId={projectId}
+              sessionId={sessionId}
+              turns={turns}
             />
           ) : <EmptyState onOpenProject={onOpenProject} project={project} />}
           <div className="composer-spacer" />
@@ -644,4 +647,3 @@ function LoadingState(): React.JSX.Element {
 function RuntimeError({ error }: { error: string }): React.JSX.Element {
   return <div className="runtime-error-state"><Icon name="warning" size={22} /><h2>Agent Runtime 无法启动</h2><p>{error}</p><small>如果提示另一个 Biny/CLI 会话占用，请先退出该会话或切换项目；其他错误请检查共享配置后重试。</small></div>;
 }
-

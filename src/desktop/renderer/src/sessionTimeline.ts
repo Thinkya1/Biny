@@ -15,7 +15,16 @@ import type { SessionEvent } from "../../../session/recorder.js";
 import type { SessionUsage } from "../../../session/metadata.js";
 import { publicUserMessage } from "../../../session/publicMessage.js";
 
-export type TimelineRunStatus = "idle" | "running" | "waiting_permission" | "completed" | "incomplete" | "aborted" | "failed";
+export type TimelineRunStatus =
+  | "idle"
+  | "running"
+  | "waiting_permission"
+  | "completed"
+  | "blocked"
+  | "incomplete"
+  | "cancelled"
+  | "aborted"
+  | "failed";
 export type TimelineToolStatus = "waiting" | "running" | "success" | "failed" | "denied" | "aborted";
 
 export interface TimelinePermission {
@@ -128,6 +137,7 @@ export interface TimelineTurn {
   durationMs?: number;
   usage?: SessionUsage;
   timestamp?: string;
+  resumable?: boolean;
 }
 
 export interface TimelineChangedFile {
@@ -208,6 +218,20 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
           label: modelLabel(event.usage.provider, event.usage.model),
           reasoning: ""
         };
+      }
+      continue;
+    }
+    if (event.type === "turn_status") {
+      const turn = ensureTurn(event.time);
+      turn.status = event.status;
+      turn.timestamp = event.time ?? turn.timestamp;
+      turn.resumable = event.resumable;
+      turn.error = event.status === "completed"
+        ? undefined
+        : historicalTurnStatusSummary(event);
+      for (const tool of turn.tools) {
+        if (tool.status !== "running" && tool.status !== "waiting") continue;
+        tool.status = event.status === "failed" ? "failed" : "aborted";
       }
       continue;
     }
@@ -438,12 +462,38 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       turn.status = "running";
     } else if (event.type === "run.completed") {
       turn.status = "completed";
+      turn.resumable = undefined;
       turn.timestamp = event.timestamp;
       turn.durationMs = event.durationMs;
       finishReasoning(event.runId, event.timestamp);
       turn.usage = event.usage;
+    } else if (event.type === "run.blocked") {
+      turn.status = "blocked";
+      turn.resumable = event.resumable;
+      turn.timestamp = event.timestamp;
+      turn.error = event.requiredAction
+        ? `${event.summary}\nRequired action: ${event.requiredAction}`
+        : event.summary;
+      turn.durationMs = event.durationMs;
+      finishReasoning(event.runId, event.timestamp);
+      turn.usage = event.usage;
+      for (const tool of turn.tools) {
+        if (tool.status === "running" || tool.status === "waiting") tool.status = "aborted";
+      }
     } else if (event.type === "run.incomplete") {
       turn.status = "incomplete";
+      turn.resumable = event.resumable;
+      turn.timestamp = event.timestamp;
+      turn.error = event.reason;
+      turn.durationMs = event.durationMs;
+      finishReasoning(event.runId, event.timestamp);
+      turn.usage = event.usage;
+      for (const tool of turn.tools) {
+        if (tool.status === "running" || tool.status === "waiting") tool.status = "aborted";
+      }
+    } else if (event.type === "run.cancelled") {
+      turn.status = "cancelled";
+      turn.resumable = undefined;
       turn.timestamp = event.timestamp;
       turn.error = event.reason;
       turn.durationMs = event.durationMs;
@@ -454,6 +504,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       }
     } else if (event.type === "run.aborted") {
       turn.status = "aborted";
+      turn.resumable = undefined;
       turn.timestamp = event.timestamp;
       turn.error = event.reason;
       turn.durationMs = event.durationMs;
@@ -463,6 +514,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       }
     } else if (event.type === "run.failed") {
       turn.status = "failed";
+      turn.resumable = undefined;
       turn.timestamp = event.timestamp;
       turn.error = event.error;
       turn.durationMs = event.durationMs;
@@ -484,6 +536,11 @@ function latestAssistantContent(turn: TimelineTurn): string | undefined {
 
 function emptyTurn(id: string, timestamp?: string): TimelineTurn {
   return { id, user: "", assistant: "", reasoning: "", skills: [], status: "idle", tools: [], steps: [], timestamp };
+}
+
+function historicalTurnStatusSummary(event: Extract<SessionEvent, { type: "turn_status" }>): string {
+  const summary = event.summary ?? `Task ended with status ${event.status} (${event.stopReason}).`;
+  return event.requiredAction ? `${summary}\nRequired action: ${event.requiredAction}` : summary;
 }
 
 function appendHistoricalReasoning(turn: TimelineTurn, content: string | undefined): void {

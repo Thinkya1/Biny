@@ -24,6 +24,7 @@ interface MessageTimelineProps {
   onPreviewFile(path: string): void;
   onOpenExternal(url: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
+  onContinue(): void;
   onRetry(input: string): void;
   onEditUserMessage(input: string, userMessageIndex: number): Promise<void>;
   onCreateBranch(): void;
@@ -31,7 +32,7 @@ interface MessageTimelineProps {
   onDeleteUserMessage(turnId: string): void;
 }
 
-export const MessageTimeline = memo(function MessageTimeline({ projectId, sessionId, turns, onPreviewFile, onOpenExternal, onResolvePermission, onRetry, onEditUserMessage, onCreateBranch, onRollbackFiles, onDeleteUserMessage }: MessageTimelineProps): React.JSX.Element {
+export const MessageTimeline = memo(function MessageTimeline({ projectId, sessionId, turns, onPreviewFile, onOpenExternal, onResolvePermission, onContinue, onRetry, onEditUserMessage, onCreateBranch, onRollbackFiles, onDeleteUserMessage }: MessageTimelineProps): React.JSX.Element {
   const [editing, setEditing] = useState<{ turnId: string; value: string; userMessageIndex: number }>();
 
   const startEditing = (turn: TimelineTurn): void => {
@@ -62,6 +63,7 @@ export const MessageTimeline = memo(function MessageTimeline({ projectId, sessio
           onOpenExternal={onOpenExternal}
           onResolvePermission={onResolvePermission}
           onRollbackFiles={onRollbackFiles}
+          onContinue={onContinue}
           onRetry={onRetry}
           projectId={projectId}
           turn={turn}
@@ -78,6 +80,7 @@ const Turn = memo(function Turn({
   onPreviewFile,
   onOpenExternal,
   onResolvePermission,
+  onContinue,
   onRetry,
   onCancelEdit,
   onChangeEdit,
@@ -93,6 +96,7 @@ const Turn = memo(function Turn({
   onPreviewFile(path: string): void;
   onOpenExternal(url: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
+  onContinue(): void;
   onRetry(input: string): void;
   onCancelEdit(): void;
   onChangeEdit(value: string): void;
@@ -165,7 +169,7 @@ const Turn = memo(function Turn({
         {!running && turn.status !== "idle" && (turn.status !== "completed" || summary || turn.model) ? (
           <footer className={`run-result is-${turn.status}`}>
             {turn.status !== "completed" ? <>
-              <span className="run-result-icon"><Icon name={turn.status === "failed" || turn.status === "incomplete" ? "warning" : "stop"} size={13} /></span>
+              <span className="run-result-icon"><Icon name={turn.status === "failed" || turn.status === "blocked" || turn.status === "incomplete" ? "warning" : "stop"} size={13} /></span>
               <span className="run-result-label">{runStatusLabel(turn.status)}</span>
             </> : null}
             {summary ? <span className="run-result-summary">{summary}</span> : null}
@@ -173,12 +177,19 @@ const Turn = memo(function Turn({
           </footer>
         ) : null}
 
-        {turn.error && (turn.status === "failed" || turn.status === "incomplete" || turn.status === "aborted") ? (
+        {turn.error && (
+          turn.status === "failed"
+          || turn.status === "blocked"
+          || turn.status === "incomplete"
+          || turn.status === "cancelled"
+          || turn.status === "aborted"
+        ) ? (
           <section className="run-error">
-            <button className="run-error-heading" onClick={() => setErrorOpen(!errorOpen)} type="button"><span>{turn.status === "failed" ? "执行失败" : turn.status === "incomplete" ? "任务未完成" : "任务已中止"}</span><Icon name="chevron" size={12} /></button>
+            <button className="run-error-heading" onClick={() => setErrorOpen(!errorOpen)} type="button"><span>{runErrorHeading(turn.status)}</span><Icon name="chevron" size={12} /></button>
             {errorOpen ? <pre><code>{turn.error}</code></pre> : null}
             <div className="run-error-actions">
-              {(turn.status === "failed" || turn.status === "incomplete") && turn.user ? <button onClick={() => onRetry(turn.user)} type="button">重试</button> : null}
+              {turn.resumable === true ? <button onClick={onContinue} type="button">继续</button> : null}
+              {turn.status === "failed" && turn.user ? <button onClick={() => onRetry(turn.user)} type="button">重试</button> : null}
               <button onClick={() => void copyToClipboard(turn.error ?? "")} type="button">复制错误</button>
             </div>
           </section>
@@ -553,10 +564,20 @@ function turnSummary(turn: TimelineTurn): string {
 
 function runStatusLabel(status: TimelineTurn["status"]): string {
   if (status === "completed") return "已完成";
+  if (status === "blocked") return "等待处理";
   if (status === "incomplete") return "未完成";
+  if (status === "cancelled") return "已取消";
   if (status === "aborted") return "已中止";
   if (status === "failed") return "执行失败";
   return "部分完成";
+}
+
+function runErrorHeading(status: TimelineTurn["status"]): string {
+  if (status === "failed") return "执行失败";
+  if (status === "blocked") return "任务被阻塞";
+  if (status === "incomplete") return "任务未完成";
+  if (status === "cancelled") return "任务已取消";
+  return "任务已中止";
 }
 
 function formatDuration(durationMs: number): string {

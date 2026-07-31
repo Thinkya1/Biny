@@ -15,6 +15,7 @@ import type { ModelRuntimeInfo, ThinkingSelection } from "../../../llm/ModelMana
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
 import {
   activeRun,
+  isTerminalRunEvent,
   pendingPermission,
   type AgentHostEvent
 } from "../../../runtime/agentEvents.js";
@@ -236,7 +237,7 @@ export function App(): React.JSX.Element {
       const completedProjects = new Map<string, string>();
       for (const envelope of batch) {
         const event = envelope.event;
-        if (event && (event.type === "run.completed" || event.type === "run.incomplete" || event.type === "run.aborted" || event.type === "run.failed")) {
+        if (isTerminalRunEvent(event)) {
           completedProjects.set(envelope.projectId, event.sessionId);
         }
       }
@@ -390,6 +391,10 @@ export function App(): React.JSX.Element {
     if (!projectId) throw new Error("请先打开一个项目。");
     setSlashResult(await window.biny.runSlashCommand(projectId, selectedRef.current, command));
   }, []);
+
+  const continueInterruptedTurn = useCallback((): void => {
+    void runSlashCommand("/continue").catch((error) => setToast(errorMessage(error)));
+  }, [runSlashCommand]);
 
   const editPrompt = useCallback(async (
     input: string,
@@ -791,6 +796,7 @@ export function App(): React.JSX.Element {
         onRefreshProject={() => { const projectId = projectRef.current; if (projectId) void window.biny.refreshProject(projectId).then(mergeWorkspaceProject).catch((error) => setToast(errorMessage(error))); }}
         onResolvePermission={resolvePermission}
         onRollbackFiles={rollbackFiles}
+        onContinue={continueInterruptedTurn}
         onRetry={(input) => void sendPrompt(input, "chat", []).catch((error) => setToast(errorMessage(error)))}
         project={workspace?.project}
         projectId={workspace?.project.id}
@@ -912,14 +918,21 @@ function applyUpdatesToWorkspace(
     if (session && event.type === "permission.resolved") {
       replaceSession(sessions, { ...session, status: "running", updatedAt: event.timestamp });
     }
-    if (session && (event.type === "run.completed" || event.type === "run.incomplete" || event.type === "run.aborted" || event.type === "run.failed")) {
+    if (session && isTerminalRunEvent(event)) {
       replaceSession(sessions, {
         ...session,
         status: event.type === "run.failed"
           ? "failed"
+          : event.type === "run.blocked"
+            ? "blocked"
           : event.type === "run.incomplete"
             ? "incomplete"
-            : event.type === "run.aborted" ? "aborted" : "completed",
+            : event.type === "run.cancelled"
+              ? "cancelled"
+              : event.type === "run.aborted" ? "aborted" : "completed",
+        resumable: event.type === "run.incomplete" || event.type === "run.blocked"
+          ? event.resumable
+          : undefined,
         updatedAt: event.timestamp
       });
     }
@@ -978,7 +991,8 @@ function syntheticSession(projectId: string, sessionId: string, input: string): 
     createdAt: now,
     updatedAt: now,
     pinned: false,
-    status: "running"
+    status: "running",
+    resumable: undefined
   };
 }
 

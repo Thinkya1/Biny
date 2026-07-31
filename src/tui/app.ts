@@ -28,6 +28,7 @@ import {
 } from "../runtime/InteractiveAgentRuntime.js";
 import type { CommandRuntime } from "../runtime/CommandRuntime.js";
 import {
+  isTerminalRunEvent,
   pendingPermission,
   runtimeIsBusy,
   type InteractiveRuntimeSnapshot
@@ -166,7 +167,7 @@ export class BinyTui {
         this.runtimeSnapshot = update.snapshot;
         if (update.event) this.dispatch(update.event);
         else this.refreshChrome();
-        if (update.event?.type === "run.completed" || update.event?.type === "run.incomplete" || update.event?.type === "run.failed") {
+        if (isTerminalRunEvent(update.event)) {
           void this.refreshContextUsage();
         }
       });

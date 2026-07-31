@@ -16,11 +16,13 @@ import type { AgentConfigStore } from "../../../config/store.js";
 import { listModelChoices, type ModelChoice } from "../../../llm/ModelManager.js";
 import {
   activeRun,
+  isTerminalRunEvent,
   pendingPermission,
   type AgentHostEvent,
   type InteractiveRuntimeSnapshot
 } from "../../../runtime/agentEvents.js";
 import { listSessionSummaries, readStoredSessionEvents } from "../../../session/events.js";
+import type { SessionTurnStatus } from "../../../session/recorder.js";
 import { createSessionFile, deleteSessionFile, duplicateSessionFile, ensureAgentDirs } from "../../../session/store.js";
 import { gitInspectionEnvironment } from "../../../tools/git/environment.js";
 import { resolveWorkspaceDirectory, resolveWorkspacePath, toWorkspaceRelative } from "../../../workspace/resolvePath.js";
@@ -159,7 +161,14 @@ export class DesktopProjectService {
         createdAt: summary.createdAt,
         updatedAt: summary.updatedAt,
         pinned: metadata.pinned ?? false,
-        status: sessionStatus(id, summary.lastAssistantMessage, runtime, liveEvents.get(id))
+        status: sessionStatus(
+          id,
+          summary.lastAssistantMessage,
+          summary.lastTurnStatus?.status,
+          runtime,
+          liveEvents.get(id)
+        ),
+        resumable: sessionResumable(summary.lastTurnStatus?.resumable, liveEvents.get(id))
       } satisfies DesktopSessionSummary;
     });
 
@@ -179,7 +188,8 @@ export class DesktopProjectService {
         createdAt: now,
         updatedAt: now,
         pinned: metadata.pinned ?? false,
-        status: sessionStatus(runtimeInfo.sessionId, "", runtime, liveEvents.get(runtimeInfo.sessionId))
+        status: sessionStatus(runtimeInfo.sessionId, "", undefined, runtime, liveEvents.get(runtimeInfo.sessionId)),
+        resumable: undefined
       });
     }
 
@@ -397,19 +407,32 @@ function sessionTitle(firstUserMessage: string): string {
 function sessionStatus(
   sessionId: string,
   lastAssistantMessage: string,
+  persistedStatus: SessionTurnStatus | undefined,
   runtime: InteractiveRuntimeSnapshot | undefined,
   events: AgentHostEvent[] | undefined
 ): DesktopSessionStatus {
   if (pendingPermission(runtime)?.sessionId === sessionId) return "waiting_permission";
   if (activeRun(runtime)?.sessionId === sessionId) return "running";
-  const finalEvent = events
-    ? [...events].reverse().find((event) => event.type === "run.completed" || event.type === "run.incomplete" || event.type === "run.failed" || event.type === "run.aborted")
-    : undefined;
+  const finalEvent = events ? [...events].reverse().find(isTerminalRunEvent) : undefined;
   if (finalEvent?.type === "run.failed") return "failed";
+  if (finalEvent?.type === "run.blocked") return "blocked";
   if (finalEvent?.type === "run.incomplete") return "incomplete";
+  if (finalEvent?.type === "run.cancelled") return "cancelled";
   if (finalEvent?.type === "run.aborted") return "aborted";
   if (finalEvent?.type === "run.completed") return "completed";
+  if (persistedStatus) return persistedStatus;
   return lastAssistantMessage ? "completed" : "idle";
+}
+
+function sessionResumable(
+  persisted: boolean | undefined,
+  events: AgentHostEvent[] | undefined
+): boolean | undefined {
+  const finalEvent = events ? [...events].reverse().find(isTerminalRunEvent) : undefined;
+  if (!finalEvent) return persisted;
+  return finalEvent.type === "run.blocked" || finalEvent.type === "run.incomplete"
+    ? finalEvent.resumable
+    : undefined;
 }
 
 function createSessionId(): string {

@@ -54,6 +54,33 @@ export function sessionEventsToTranscript(events: SessionEvent[]): TranscriptIte
       continue;
     }
 
+    if (event.type === "turn_status") {
+      const content = turnStatusContent(event);
+      while (pendingTools.length > 0) {
+        const pending = pendingTools.shift();
+        if (pending) {
+          items.push(completeToolItem(
+            pending,
+            { error: content },
+            event.status === "failed" ? "failed" : "skipped",
+            eventTimeMs(event.time) ?? Number.NaN
+          ));
+        }
+      }
+      if (event.status === "completed") continue;
+      // 失败路径通常先写 error 再写结构化终态；历史里只保留后者这一份明确结论。
+      if (items.at(-1)?.kind === "error") items.pop();
+      items.push(event.status === "failed"
+        ? { id: replayId("error", index), kind: "error", content }
+        : {
+            id: replayId("turn-status", index),
+            kind: "notification",
+            content,
+            tone: event.status === "blocked" ? "warning" : "muted"
+          });
+      continue;
+    }
+
     while (pendingTools.length > 0) {
       const pending = pendingTools.shift();
       if (pending) items.push(completeToolItem(pending, { error: event.message }, "failed", eventTimeMs(event.time) ?? Number.NaN));
@@ -65,6 +92,13 @@ export function sessionEventsToTranscript(events: SessionEvent[]): TranscriptIte
     items.push(completeToolItem({ ...pending, startedAtMs: undefined }, { error: "Interrupted before completion." }, "skipped"));
   }
   return items;
+}
+
+function turnStatusContent(event: Extract<SessionEvent, { type: "turn_status" }>): string {
+  const resumable = event.resumable ? "\nThis task can be continued from its saved state." : "";
+  const summary = event.summary ?? `Task ended with status ${event.status} (${event.stopReason}).`;
+  const requiredAction = event.requiredAction ? `\nRequired action: ${event.requiredAction}` : "";
+  return `${summary}${requiredAction}${resumable}`;
 }
 
 function appendReasoning(items: TranscriptItem[], content: string | undefined, index: number): void {

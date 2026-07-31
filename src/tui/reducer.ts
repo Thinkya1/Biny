@@ -75,7 +75,28 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
         transcript
       };
     }
+    case "run.blocked": {
+      const message = event.requiredAction
+        ? `${event.summary}\nRequired action: ${event.requiredAction}`
+        : event.summary;
+      const finalized = finalizeActiveCells(state.transcript, "skipped", message);
+      return {
+        ...state,
+        lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
+        turnStartedAt: undefined,
+        transcript: commitItem(finalized, notificationItem(finalized, message, "warning"))
+      };
+    }
     case "run.incomplete": {
+      const finalized = finalizeActiveCells(state.transcript, "skipped", event.reason);
+      return {
+        ...state,
+        lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
+        turnStartedAt: undefined,
+        transcript: commitItem(finalized, notificationItem(finalized, event.reason))
+      };
+    }
+    case "run.cancelled": {
       const finalized = finalizeActiveCells(state.transcript, "skipped", event.reason);
       return {
         ...state,
@@ -350,8 +371,12 @@ function commitItem(transcript: TranscriptState, item: TranscriptItem): Transcri
   return { ...transcript, committed: [...transcript.committed, item] };
 }
 
-function notificationItem(transcript: TranscriptState, content: string): NotificationTranscriptItem {
-  return { id: nextTranscriptId(transcript, "notification"), kind: "notification", content, tone: "muted" };
+function notificationItem(
+  transcript: TranscriptState,
+  content: string,
+  tone: NotificationTranscriptItem["tone"] = "muted"
+): NotificationTranscriptItem {
+  return { id: nextTranscriptId(transcript, "notification"), kind: "notification", content, tone };
 }
 
 function nextTranscriptId(transcript: TranscriptState, prefix: string): string {

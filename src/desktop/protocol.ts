@@ -91,7 +91,16 @@ export interface DesktopFontPreference {
   family: string;
   size: number;
 }
-export type DesktopSessionStatus = "idle" | "running" | "waiting_permission" | "incomplete" | "aborted" | "failed" | "completed";
+export type DesktopSessionStatus =
+  | "idle"
+  | "running"
+  | "waiting_permission"
+  | "completed"
+  | "blocked"
+  | "incomplete"
+  | "cancelled"
+  | "aborted"
+  | "failed";
 
 /** 侧栏里的一个项目。`missing` 表示目录已不存在但记录仍保留，界面上标灰而不是直接消失。 */
 export interface DesktopProject {
@@ -118,6 +127,7 @@ export interface DesktopSessionSummary {
   updatedAt: string;
   pinned: boolean;
   status: DesktopSessionStatus;
+  resumable?: boolean;
 }
 
 /**

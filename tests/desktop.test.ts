@@ -11,7 +11,7 @@ import type { CommandRuntime } from "../src/runtime/CommandRuntime.js";
 import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.js";
 import { executeRuntimeCommand } from "../src/runtime/commands.js";
 import { SessionLeaseStore } from "../src/runtime/SessionLease.js";
-import { pendingPermission, type AgentHostEvent } from "../src/runtime/agentEvents.js";
+import { isTerminalRunEvent, pendingPermission, type AgentHostEvent } from "../src/runtime/agentEvents.js";
 import { loadConfigFile, saveConfigFile } from "../src/config/loader.js";
 import type { CredentialStore } from "../src/config/credentials.js";
 import { createFileConfigStore } from "../src/config/store.js";
@@ -54,7 +54,9 @@ await testInteractiveRuntimeRedactsRunText();
 await testInteractiveRuntimeStrongConfirmation();
 await testPermissionRequiredToolResultIsFailed();
 await testInteractiveRuntimeAbort();
+await testInteractiveRuntimeTerminalStatuses();
 await testDraftSessionsDoNotReachTheSessionList();
+await testDesktopRestoresPersistedTerminalStatus();
 await testDesktopMessageEditFork();
 await testWorkspaceFilePreview();
 await testWorkspaceDirectoryListing();
@@ -92,6 +94,8 @@ testHistoricalPrefixKeepsUnpersistedDuplicatePrompt();
 testHistoricalEmptyAssistantDoesNotEraseReply();
 testChangedFileProjection();
 testLiveTimelineProjection();
+testLiveBlockedAndCancelledProjection();
+testTerminalRunEventClassification();
 testLiveReasoningAndSkillProjection();
 testReasoningDetailDoesNotUseCompletionStatusAsContent();
 testDesktopNavigationHistory();
@@ -266,7 +270,24 @@ async function testInteractiveRuntimeAbort(): Promise<void> {
   await runStarted;
   runtime.cancelCurrentRun();
   await submitted.completion;
-  assert.equal(events.at(-1)?.type, "run.aborted");
+  assert.equal(events.at(-1)?.type, "run.cancelled");
+  await runtime.close();
+}
+
+async function testInteractiveRuntimeTerminalStatuses(): Promise<void> {
+  const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
+  const events: AgentHostEvent[] = [];
+  subscribeHostEvents(runtime, (event) => events.push(event));
+
+  const blocked = await runtime.submitPrompt("terminal-blocked").completion;
+  assert.equal(blocked.status, "blocked");
+  assert.equal(events.at(-1)?.type, "run.blocked");
+  assert.equal(events.some((event) => event.type === "run.completed" && event.runId === blocked.runId), false);
+
+  const incomplete = await runtime.submitPrompt("terminal-incomplete").completion;
+  assert.equal(incomplete.status, "incomplete");
+  assert.equal(events.at(-1)?.type, "run.incomplete");
+  assert.equal(events.some((event) => event.type === "run.completed" && event.runId === incomplete.runId), false);
   await runtime.close();
 }
 
@@ -289,6 +310,59 @@ async function testDraftSessionsDoNotReachTheSessionList(): Promise<void> {
     assert.deepEqual((await listSessionSummaries(workspaceRoot)).map((session) => session.fileName), ["draft.jsonl"]);
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testDesktopRestoresPersistedTerminalStatus(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-terminal-status-workspace-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-terminal-status-data-"));
+  try {
+    const { projects } = await createDesktopTestServices(desktopRoot);
+    const project = await projects.createProject(workspaceRoot);
+    const dataRoot = await projects.dataRoot(project);
+    await ensureAgentDirs(dataRoot);
+    const recorder = new SessionRecorder(dataRoot, "terminal-status");
+    recorder.record({ type: "user_message", content: "deploy the project" });
+    recorder.record({ type: "assistant_message", content: "I need the target environment." });
+    recorder.record({
+      type: "turn_status",
+      status: "blocked",
+      stopReason: "blocked",
+      steps: 1,
+      summary: "The target environment is unknown.",
+      resumable: true,
+      blockedReason: "missing_user_input",
+      requiredAction: "Choose staging or production.",
+      affectedTodoIds: ["deploy"]
+    });
+    recorder.record({ type: "user_message", content: "Use staging." });
+    recorder.record({ type: "assistant_message", content: "The deployment is not finished." });
+    recorder.record({
+      type: "turn_status",
+      status: "incomplete",
+      stopReason: "hard_step_limit",
+      steps: 96,
+      summary: "The hard step limit was reached.",
+      resumable: true
+    });
+    await recorder.close();
+
+    const sessions = await projects.listSessions(project, undefined, new Map());
+    const restored = sessions.find((session) => session.id === "terminal-status");
+    assert.equal(restored?.status, "incomplete");
+    assert.equal(restored?.resumable, true);
+
+    const document = await projects.openSession(project, "terminal-status", undefined, new Map());
+    const timeline = buildSessionTimeline(document.events, document.liveEvents);
+    assert.equal(timeline[0]?.status, "blocked");
+    assert.equal(timeline[0]?.resumable, true);
+    assert.match(timeline[0]?.error ?? "", /Choose staging or production/u);
+    assert.equal(timeline[1]?.status, "incomplete");
+    assert.equal(timeline[1]?.resumable, true);
+    assert.match(timeline[1]?.error ?? "", /hard step limit/u);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
   }
 }
 
@@ -1322,6 +1396,60 @@ function testLiveTimelineProjection(): void {
   assert.equal(typedFailure[0]?.error, "Step limit reached.");
 }
 
+function testLiveBlockedAndCancelledProjection(): void {
+  const base = { sessionId: "session", timestamp: "2026-01-01T00:00:00.000Z" };
+  const blocked = buildSessionTimeline([], [
+    { ...base, runId: "blocked-run", type: "message.user", messageId: "blocked-message", content: "deploy" },
+    {
+      ...base,
+      runId: "blocked-run",
+      type: "run.blocked",
+      durationMs: 30,
+      reason: "missing_user_input",
+      summary: "The target environment is unknown.",
+      requiredAction: "Choose staging or production."
+    }
+  ]);
+  assert.equal(blocked[0]?.status, "blocked");
+  assert.match(blocked[0]?.error ?? "", /target environment/u);
+  assert.match(blocked[0]?.error ?? "", /Choose staging or production/u);
+
+  const cancelled = buildSessionTimeline([], [
+    { ...base, runId: "cancelled-run", type: "message.user", messageId: "cancelled-message", content: "deploy" },
+    {
+      ...base,
+      runId: "cancelled-run",
+      type: "run.cancelled",
+      durationMs: 10,
+      reason: "Cancelled by user."
+    }
+  ]);
+  assert.equal(cancelled[0]?.status, "cancelled");
+  assert.equal(cancelled[0]?.error, "Cancelled by user.");
+}
+
+function testTerminalRunEventClassification(): void {
+  const base = { sessionId: "session", runId: "run", timestamp: "2026-01-01T00:00:00.000Z" };
+  const terminal: AgentHostEvent[] = [
+    { ...base, type: "run.completed", durationMs: 1 },
+    { ...base, type: "run.blocked", durationMs: 1, reason: "missing_dependency", summary: "Install pnpm." },
+    { ...base, type: "run.incomplete", durationMs: 1, reason: "Hard limit reached.", stopReason: "step_limit", steps: 10 },
+    { ...base, type: "run.cancelled", durationMs: 1, reason: "Cancelled by user." },
+    { ...base, type: "run.aborted", durationMs: 1, reason: "Host closed." },
+    { ...base, type: "run.failed", durationMs: 1, error: "Provider failed." }
+  ];
+  assert.equal(terminal.every(isTerminalRunEvent), true);
+  assert.equal(isTerminalRunEvent({
+    ...base,
+    type: "run.started",
+    messageId: "message",
+    input: "run",
+    mode: "chat",
+    model: { alias: "test", provider: "test", label: "test/model", reasoning: "Off" },
+    skills: []
+  }), false);
+}
+
 function testLiveReasoningAndSkillProjection(): void {
   const live: AgentHostEvent[] = [
     { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:00.000Z", type: "message.user", messageId: "message", content: "explain" },
@@ -1417,6 +1545,40 @@ function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
     switchModel: async () => ({ modelAlias: "test", provider: "test", modelLabel: "test/model", reasoningLabel: "Off", thinking: "off" as const }),
     async *prompt(input: string, options: AgentRunOptions): AsyncGenerator<AgentSessionEvent> {
       yield { type: "status", status: "thinking" };
+      if (input === "terminal-blocked") {
+        yield {
+          type: "done",
+          content: "",
+          outcome: {
+            status: "blocked",
+            stopReason: "blocked",
+            finishReason: "stop",
+            steps: 1,
+            output: "",
+            error: "A deployment target is required.",
+            resumable: true,
+            blockedReason: "missing_user_input",
+            requiredAction: "Choose staging or production."
+          }
+        };
+        return;
+      }
+      if (input === "terminal-incomplete") {
+        yield {
+          type: "done",
+          content: "",
+          outcome: {
+            status: "incomplete",
+            stopReason: "hard_step_limit",
+            finishReason: "tool-calls",
+            steps: 96,
+            output: "",
+            error: "The hard step limit was reached.",
+            resumable: true
+          }
+        };
+        return;
+      }
       if (input === "cancel") {
         if (!options.abortSignal?.aborted) {
           await new Promise<void>((resolve) => options.abortSignal?.addEventListener("abort", () => resolve(), { once: true }));
@@ -1475,7 +1637,7 @@ function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
         content,
         outcome: {
           status: "completed",
-          stopReason: "model_stop",
+          stopReason: "completion_gate",
           finishReason: "stop",
           steps: 1,
           output: content

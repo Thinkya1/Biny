@@ -77,6 +77,8 @@ async function main(): Promise<void> {
   testTranscriptUsesIndependentItemKinds();
   testReasoningStreamingRendersContent();
   testIncompleteSessionStaysDistinctFromCompletion();
+  testBlockedSessionShowsRequiredAction();
+  testCancelledSessionStaysDistinctFromAbort();
   testAbortedSessionStaysDistinctFromCompletion();
   testAssistantStreamingUpdatesOneActiveCell();
   testToolProgressUpdatesOneActiveCell();
@@ -94,6 +96,7 @@ async function main(): Promise<void> {
   testErrorFinalizesActiveCells();
   testSessionReplayUsesToolItems();
   testSessionReplayFinalizesPendingTools();
+  testSessionReplayRestoresTurnStatuses();
   testSlashCommandParity();
   await testSlashAutocompleteInsertsSingleSlash();
   testThemeTokensResolveToAnsi();
@@ -237,6 +240,31 @@ function testIncompleteSessionStaysDistinctFromCompletion(): void {
   });
   assert.equal(state.transcript.committed.at(-1)?.kind, "notification");
   assert.match(state.transcript.committed.at(-1)?.content ?? "", /Step limit/);
+}
+
+function testBlockedSessionShowsRequiredAction(): void {
+  let state = createInitialTuiState("/workspace");
+  state = reduce(state, { type: "message.user", content: "finish the project" });
+  state = reduce(state, {
+    type: "run.blocked",
+    durationMs: 10,
+    reason: "missing_user_input",
+    summary: "The target environment is unknown.",
+    requiredAction: "Choose staging or production."
+  });
+  const notification = state.transcript.committed.at(-1);
+  assert.equal(notification?.kind, "notification");
+  assert.equal(notification?.kind === "notification" ? notification.tone : undefined, "warning");
+  assert.match(notification?.content ?? "", /target environment/u);
+  assert.match(notification?.content ?? "", /Choose staging or production/u);
+}
+
+function testCancelledSessionStaysDistinctFromAbort(): void {
+  let state = createInitialTuiState("/workspace");
+  state = reduce(state, { type: "message.user", content: "run the project" });
+  state = reduce(state, { type: "run.cancelled", durationMs: 10, reason: "Cancelled by user." });
+  assert.equal(state.transcript.committed.at(-1)?.kind, "notification");
+  assert.match(state.transcript.committed.at(-1)?.content ?? "", /cancelled by user/i);
 }
 
 function testAbortedSessionStaysDistinctFromCompletion(): void {
@@ -541,6 +569,54 @@ function testSessionReplayFinalizesPendingTools(): void {
   ] as SessionEvent[]);
   assert.equal((interrupted[0] as ToolTranscriptItem).status, "skipped");
   assert.equal((interrupted[0] as ToolTranscriptItem).title, "Interrupted command");
+}
+
+function testSessionReplayRestoresTurnStatuses(): void {
+  const blocked = sessionEventsToTranscript([
+    { type: "user_message", content: "deploy" },
+    { type: "assistant_message", content: "Need a target." },
+    {
+      type: "turn_status",
+      status: "blocked",
+      stopReason: "blocked",
+      steps: 1,
+      summary: "The target environment is unknown.",
+      resumable: true,
+      blockedReason: "missing_user_input",
+      requiredAction: "Choose staging or production."
+    }
+  ] as SessionEvent[]);
+  const blockedStatus = blocked.at(-1);
+  assert.equal(blockedStatus?.kind, "notification");
+  assert.equal(blockedStatus?.kind === "notification" ? blockedStatus.tone : undefined, "warning");
+  assert.match(blockedStatus?.content ?? "", /Choose staging or production/u);
+  assert.match(blockedStatus?.content ?? "", /continued from its saved state/u);
+
+  const failed = sessionEventsToTranscript([
+    { type: "user_message", content: "run" },
+    { type: "error", message: "provider failed" },
+    {
+      type: "turn_status",
+      status: "failed",
+      stopReason: "provider_error",
+      steps: 1,
+      summary: "The provider failed."
+    }
+  ] as SessionEvent[]);
+  assert.deepEqual(failed.map((item) => item.kind), ["user", "error"]);
+  assert.equal(failed.at(-1)?.content, "The provider failed.");
+
+  const completed = sessionEventsToTranscript([
+    { type: "user_message", content: "answer" },
+    { type: "assistant_message", content: "done" },
+    {
+      type: "turn_status",
+      status: "completed",
+      stopReason: "completion_gate",
+      steps: 1
+    }
+  ] as SessionEvent[]);
+  assert.deepEqual(completed.map((item) => item.kind), ["user", "assistant"]);
 }
 
 function testThemeTokensResolveToAnsi(): void {
