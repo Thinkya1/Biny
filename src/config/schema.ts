@@ -15,11 +15,7 @@ const agentSchema = z.object({
   maxProviderRetries: z.number().int().min(0).max(5).optional(),
   maxCompletionContinuations: z.number().int().min(0).max(32).optional(),
   maxRepeatedActions: z.number().int().min(1).max(32).optional(),
-  maxAttempts: z.number().int().min(1).max(10).default(3),
   maxTaskSteps: z.number().int().min(1).max(1_024).default(96),
-  maxWallTimeMs: z.number().int().min(1_000).max(86_400_000).default(30 * 60_000),
-  maxTotalTokens: z.number().int().min(1).max(10_000_000).default(500_000),
-  maxCostUsd: z.number().positive().max(1_000).optional(),
   maxConcurrentTools: z.number().int().min(1).max(32).default(4),
   maxQueuedToolCalls: z.number().int().min(1).max(1_024).default(64)
 }).default({
@@ -30,11 +26,7 @@ const agentSchema = z.object({
   maxProviderRetries: undefined,
   maxCompletionContinuations: undefined,
   maxRepeatedActions: undefined,
-  maxAttempts: 3,
   maxTaskSteps: 96,
-  maxWallTimeMs: 30 * 60_000,
-  maxTotalTokens: 500_000,
-  maxCostUsd: undefined,
   maxConcurrentTools: 4,
   maxQueuedToolCalls: 64
 });
@@ -500,22 +492,6 @@ const canonicalConfigSchema = z.object({
     });
   }
 
-  if (config.agent.maxCostUsd !== undefined) {
-    const pricing = activeModel?.pricing;
-    if (
-      pricing?.inputPerMillionTokens === undefined
-      || pricing.outputPerMillionTokens === undefined
-      || pricing.cacheReadPerMillionTokens === undefined
-      || pricing.cacheWritePerMillionTokens === undefined
-    ) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["agent", "maxCostUsd"],
-        message: `Agent task cost budgets require input, output, cache-read, and cache-write pricing for model ${config.defaultModel}.`
-      });
-    }
-  }
-
   const memoryAlias = config.context.memory.model;
   if (memoryAlias && !config.models[memoryAlias]) {
     context.addIssue({
@@ -642,11 +618,7 @@ export const defaultConfig: AgentConfig = {
     maxProviderRetries: undefined,
     maxCompletionContinuations: undefined,
     maxRepeatedActions: undefined,
-    maxAttempts: 3,
     maxTaskSteps: 96,
-    maxWallTimeMs: 30 * 60_000,
-    maxTotalTokens: 500_000,
-    maxCostUsd: undefined,
     maxConcurrentTools: 4,
     maxQueuedToolCalls: 64
   },

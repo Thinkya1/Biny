@@ -201,10 +201,7 @@ function testSchedulerConfigDefaultsAndValidation(): void {
   const parsed = configSchema.parse(input);
   assert.deepEqual(parsed.agent, {
     maxSteps: 8,
-    maxAttempts: 3,
     maxTaskSteps: 96,
-    maxWallTimeMs: 30 * 60_000,
-    maxTotalTokens: 500_000,
     maxConcurrentTools: 4,
     maxQueuedToolCalls: 64
   });
@@ -218,10 +215,6 @@ function testSchedulerConfigDefaultsAndValidation(): void {
   ]) {
     assert.throws(() => configSchema.parse({ ...defaultConfig, agent }));
   }
-  assert.throws(
-    () => configSchema.parse({ ...defaultConfig, agent: { ...defaultConfig.agent, maxCostUsd: 1 } }),
-    /cost budgets require.*pricing/iu
-  );
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve(value: T | PromiseLike<T>): void } {

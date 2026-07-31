@@ -102,7 +102,7 @@ async function testVerificationFailureThenPass(): Promise<void> {
   assert.deepEqual(recorded, [failed, passed]);
 }
 
-async function testNoProgressLimit(): Promise<void> {
+async function testStaleTodoWithCompletedFactsStopsAfterNoProgress(): Promise<void> {
   const gate = createGate({
     todos: [{ content: "still pending", status: "pending" }]
   });
@@ -110,9 +110,18 @@ async function testNoProgressLimit(): Promise<void> {
     maxCompletionContinuations: 10,
     maxRepeatedActions: 2
   });
-  assert.equal((await gate.decide(createFacts(), budget)).kind, "continue");
-  assert.equal((await gate.decide(createFacts(), budget)).kind, "continue");
-  const stopped = await gate.decide(createFacts(), budget);
+  const completedFacts = createFacts({
+    actualToolCallCount: 3,
+    changedFiles: ["src/completed.ts"],
+    verificationResults: [{
+      passed: true,
+      summary: "all checks passed",
+      evidence: [{ id: "test", passed: true, summary: "passed" }]
+    }]
+  });
+  assert.equal((await gate.decide(completedFacts, budget)).kind, "continue");
+  assert.equal((await gate.decide(completedFacts, budget)).kind, "continue");
+  const stopped = await gate.decide(completedFacts, budget);
   assert.equal(stopped.kind, "incomplete");
   if (stopped.kind !== "incomplete") throw new Error("stagnant continuation did not stop");
   assert.equal(stopped.reason, "no_progress_after_continuation");
@@ -235,7 +244,7 @@ function testUnrelatedSuccessDoesNotResolveEarlierToolFailure(): void {
   assert.equal(collector.snapshot(false).failedToolCalls.length, 1);
 }
 
-function testMatchingActionSuccessResolvesEarlierToolFailure(): void {
+async function testMatchingActionSuccessResolvesEarlierToolFailure(): Promise<void> {
   const collector = new RunFactsCollector();
   collector.observeToolEvent({
     type: "tool.started",
@@ -263,6 +272,11 @@ function testMatchingActionSuccessResolvesEarlierToolFailure(): void {
     result: { status: "completed", exitCode: 0 }
   });
   assert.equal(collector.snapshot(false).failedToolCalls.length, 0);
+  assert.deepEqual(
+    await createGate().decide(collector.snapshot(false), createBudget()),
+    { kind: "complete" },
+    "a later success for the same action must supersede the old failure at the completion gate"
+  );
 }
 
 function testValidationFailureRequiresSuccessfulSameTool(): void {
@@ -431,14 +445,14 @@ await testPendingApproval();
 await testCancellation();
 await testHardLimit();
 await testVerificationFailureThenPass();
-await testNoProgressLimit();
+await testStaleTodoWithCompletedFactsStopsAfterNoProgress();
 await testContinuationLimit();
 await testToolAndRepeatedActionLimits();
 await testStructuredBlockedState();
 testVerificationFactsDoNotManufactureProgress();
 testWorkspaceMutationFactSurvivesPersistence();
 testUnrelatedSuccessDoesNotResolveEarlierToolFailure();
-testMatchingActionSuccessResolvesEarlierToolFailure();
+await testMatchingActionSuccessResolvesEarlierToolFailure();
 testValidationFailureRequiresSuccessfulSameTool();
 await testPermissionFailureSurvivesUnrelatedSuccess();
 

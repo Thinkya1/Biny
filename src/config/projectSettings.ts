@@ -25,11 +25,7 @@ const agentOverrideSchema = z.preprocess(migrateLegacyAgentBudgetOverrides, z.ob
   maxProviderRetries: z.number().int().min(0).max(5).optional(),
   maxCompletionContinuations: z.number().int().min(0).max(32).optional(),
   maxRepeatedActions: z.number().int().min(1).max(32).optional(),
-  maxAttempts: z.number().int().min(1).max(10).optional(),
   maxTaskSteps: z.number().int().min(1).max(1_024).optional(),
-  maxWallTimeMs: z.number().int().min(1_000).max(86_400_000).optional(),
-  maxTotalTokens: z.number().int().min(1).max(10_000_000).optional(),
-  maxCostUsd: z.number().positive().max(1_000).optional(),
   maxConcurrentTools: z.number().int().min(1).max(32).optional(),
   maxQueuedToolCalls: z.number().int().min(1).max(1_024).optional()
 }).strict());
@@ -126,6 +122,11 @@ function isNotFound(error: unknown): boolean {
 function migrateLegacyAgentBudgetOverrides(value: unknown): unknown {
   if (!isRecord(value)) return value;
   const migrated: Record<string, unknown> = { ...value };
+  // 旧 Durable Task 专属配置已无执行者；迁移时静默丢弃，避免现有项目 settings 直接失效。
+  delete migrated.maxAttempts;
+  delete migrated.maxWallTimeMs;
+  delete migrated.maxTotalTokens;
+  delete migrated.maxCostUsd;
   if (migrated.softStepLimit === undefined && migrated.maxSteps !== undefined) {
     migrated.softStepLimit = migrated.maxSteps;
   }

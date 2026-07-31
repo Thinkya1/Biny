@@ -12,6 +12,7 @@ await testGlobalPathResolution();
 testRunBudgetCompatibility();
 await testProjectOverridesAndGlobalPersistence();
 await testLegacyProjectBudgetOverridesNewGlobalBudget();
+await testRemovedDurableBudgetFieldsAreIgnored();
 await testProjectCredentialFieldsAreRejected();
 await testProjectModelAliasMustBeGlobal();
 await testLegacyProjectConfigIsIgnored();
@@ -160,6 +161,33 @@ async function testLegacyProjectBudgetOverridesNewGlobalBudget(): Promise<void> 
     const explicitEffective = await loadConfig(workspace, { globalDir: globalRoot });
     assert.equal(explicitEffective.agent.softStepLimit, 4);
     assert.equal(explicitEffective.agent.hardStepLimit, 12);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testRemovedDurableBudgetFieldsAreIgnored(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-removed-durable-budget-"));
+  const workspace = path.join(root, "project");
+  await fs.mkdir(path.join(workspace, ".biny"), { recursive: true });
+  try {
+    await fs.writeFile(path.join(workspace, ".biny", "settings.json"), JSON.stringify({
+      agent: {
+        maxSteps: 3,
+        maxAttempts: 7,
+        maxWallTimeMs: 60_000,
+        maxTotalTokens: 500_000,
+        maxCostUsd: 2
+      }
+    }));
+    const effective = await loadConfig(workspace, {
+      globalDir: path.join(root, "global")
+    });
+    assert.equal(effective.agent.maxSteps, 3);
+    assert.equal("maxAttempts" in effective.agent, false);
+    assert.equal("maxWallTimeMs" in effective.agent, false);
+    assert.equal("maxTotalTokens" in effective.agent, false);
+    assert.equal("maxCostUsd" in effective.agent, false);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
