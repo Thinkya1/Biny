@@ -8,9 +8,13 @@
 import { promises as fs } from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { runShellCommand } from "../tools/shell/runCommand.js";
 import { redactSensitiveValue } from "../utils/secrets.js";
-import { resolveWorkspaceDirectory, resolveWorkspacePath } from "../workspace/resolvePath.js";
+import {
+  resolveWorkspaceDirectory,
+  resolveWorkspacePath,
+  toWorkspaceRelative
+} from "../workspace/resolvePath.js";
+import type { AcceptanceCommandExecutor } from "./AcceptanceCommandExecutor.js";
 import { workspaceStateDigest } from "./WorkspaceState.js";
 import type {
   AcceptanceCriterion,
@@ -38,10 +42,19 @@ export interface AcceptanceVerificationResult {
   evidence: AcceptanceEvidence[];
 }
 
+export interface AcceptanceCriteriaVerificationOptions {
+  /** 用户取消或上层硬预算终止时，独立检查必须一起停止。 */
+  signal?: AbortSignal;
+  /** 需要确定性验证时，空条件不能利用 `every([])` 误判为通过。 */
+  requireCriteria?: boolean;
+}
+
 export interface AcceptanceVerifierOptions {
   workspaceRoot: string;
   ignore?: string[];
   managedProcesses?: ManagedProcessInspector;
+  /** 命令条件只能通过宿主注入的受控边界执行；未注入时该条件安全失败。 */
+  commandExecutor?: AcceptanceCommandExecutor;
   defaultProbeTimeoutMs?: number;
   defaultCommandTimeoutMs?: number;
 }
@@ -63,19 +76,21 @@ export class AcceptanceVerifier {
   }
 
   async verify(task: TaskContract, attempt: AgentAttemptExecution): Promise<AcceptanceVerificationResult> {
-    const evidence: AcceptanceEvidence[] = [];
     // Agent 没有正常收尾就没必要跑后面的检查：此时工作区可能停在中间状态，
     // 即使个别条件碰巧通过也不能算验收成功。
-    if (attempt.outcomeStatus !== "completed" || attempt.stopReason !== "model_stop") {
-      evidence.push(this.evidence(
+    if (
+      attempt.outcomeStatus !== "completed"
+      || attempt.stopReason !== "completion_gate" && attempt.stopReason !== "model_stop"
+    ) {
+      const evidence = [this.evidence(
         "agent_outcome",
         false,
-        attempt.error ?? `Agent attempt is ${attempt.outcomeStatus} (${attempt.stopReason}); a terminal model stop is required.`,
+        attempt.error ?? `Agent attempt is ${attempt.outcomeStatus} (${attempt.stopReason}); Completion Gate approval is required.`,
         {
           finishReason: attempt.finishReason,
           runtimeSteps: attempt.runtimeSteps
         }
-      ));
+      )];
       return {
         passed: false,
         summary: evidence[0]?.summary ?? "Agent attempt did not complete.",
@@ -83,10 +98,29 @@ export class AcceptanceVerifier {
       };
     }
 
-    for (const criterion of task.acceptanceCriteria) evidence.push(await this.verifyCriterion(criterion));
-    // 声明了要做确定性验收却没编译出任何可执行条件，说明契约有问题，直接判失败，
-    // 否则「零条件全通过」会变成一条免检通道。
-    if (task.verificationMode === "deterministic" && task.acceptanceCriteria.length === 0) {
+    return await this.verifyCriteria(task.acceptanceCriteria, {
+      requireCriteria: task.verificationMode === "deterministic"
+    });
+  }
+
+  /**
+   * 只验证可执行条件，不依赖 Agent 是否已经被上层标成 completed。
+   *
+   * 普通 Agent Loop 在 `model_yielded` 后调用这个入口；最终 completed / continue 由
+   * Completion Gate 决定。旧 Durable Task 仍可通过 `verify(task, attempt)` 保持兼容。
+   */
+  async verifyCriteria(
+    criteria: readonly AcceptanceCriterion[],
+    options: AcceptanceCriteriaVerificationOptions = {}
+  ): Promise<AcceptanceVerificationResult> {
+    options.signal?.throwIfAborted();
+    const evidence: AcceptanceEvidence[] = [];
+    for (const criterion of criteria) {
+      options.signal?.throwIfAborted();
+      evidence.push(await this.verifyCriterion(criterion, options.signal));
+    }
+    // 声明了要做确定性验收却没有任何可执行条件时直接失败，避免空数组全通过。
+    if (options.requireCriteria === true && criteria.length === 0) {
       evidence.push(this.evidence(
         "deterministic_verification",
         false,
@@ -97,9 +131,9 @@ export class AcceptanceVerifier {
     if (!failures.length) {
       return {
         passed: true,
-        summary: task.acceptanceCriteria.length
-          ? `All ${String(task.acceptanceCriteria.length)} acceptance criteria passed.`
-          : "The agent reached a terminal model stop.",
+        summary: criteria.length
+          ? `All ${String(criteria.length)} acceptance criteria passed.`
+          : "No deterministic verification was required.",
         evidence
       };
     }
@@ -111,15 +145,20 @@ export class AcceptanceVerifier {
   }
 
   /** 单条条件的分发；任何异常都转成「该条不通过」的证据，不让一条检查炸掉整轮验收。 */
-  private async verifyCriterion(criterion: AcceptanceCriterion): Promise<AcceptanceEvidence> {
+  private async verifyCriterion(
+    criterion: AcceptanceCriterion,
+    signal?: AbortSignal
+  ): Promise<AcceptanceEvidence> {
     try {
+      signal?.throwIfAborted();
       if (criterion.kind === "file_exists") return await this.verifyFile(criterion);
       if (criterion.kind === "workspace_changed") return await this.verifyWorkspaceChanged(criterion);
-      if (criterion.kind === "command_succeeded") return await this.verifyCommand(criterion);
-      if (criterion.kind === "http") return await this.verifyHttp(criterion);
-      if (criterion.kind === "tcp") return await this.verifyTcp(criterion);
-      return await this.verifyManagedProcess(criterion);
+      if (criterion.kind === "command_succeeded") return await this.verifyCommand(criterion, signal);
+      if (criterion.kind === "http") return await this.verifyHttp(criterion, signal);
+      if (criterion.kind === "tcp") return await this.verifyTcp(criterion, signal);
+      return await this.verifyManagedProcess(criterion, signal);
     } catch (error) {
+      if (signal?.aborted) throw abortReason(signal);
       return this.evidence(
         criterion.id,
         false,
@@ -168,15 +207,26 @@ export class AcceptanceVerifier {
    * `execution: independent_verifier`），这样「测试通过」是这里跑出来的结论。
    */
   private async verifyCommand(
-    criterion: Extract<AcceptanceCriterion, { kind: "command_succeeded" }>
+    criterion: Extract<AcceptanceCriterion, { kind: "command_succeeded" }>,
+    signal?: AbortSignal
   ): Promise<AcceptanceEvidence> {
     const cwd = resolveWorkspaceDirectory(
       this.options.workspaceRoot,
       criterion.cwd ?? ".",
       this.options.ignore ?? []
     );
-    const result = await runShellCommand(cwd, criterion.command, {
-      timeoutMs: criterion.timeoutMs ?? this.defaultCommandTimeoutMs
+    if (!this.options.commandExecutor) {
+      throw new Error(
+        "A controlled command executor is required for command verification."
+      );
+    }
+    const result = await this.options.commandExecutor.execute({
+      criterionId: criterion.id,
+      command: criterion.command,
+      cwd: toWorkspaceRelative(this.options.workspaceRoot, cwd),
+      timeoutMs: criterion.timeoutMs ?? this.defaultCommandTimeoutMs,
+      signal,
+      description: criterion.description
     });
     const passed = result.status === "completed" && result.exitCode === 0;
     return this.evidence(
@@ -188,22 +238,26 @@ export class AcceptanceVerifier {
       {
         execution: "independent_verifier",
         command: criterion.command,
-        cwd: path.relative(this.options.workspaceRoot, cwd) || ".",
+        cwd: toWorkspaceRelative(this.options.workspaceRoot, cwd),
         status: result.status,
         exitCode: result.exitCode,
+        sandbox: result.sandbox,
         stdout: compactOutput(result.stdout),
         stderr: compactOutput(result.stderr)
       }
     );
   }
 
-  private async verifyHttp(criterion: Extract<AcceptanceCriterion, { kind: "http" }>): Promise<AcceptanceEvidence> {
+  private async verifyHttp(
+    criterion: Extract<AcceptanceCriterion, { kind: "http" }>,
+    signal?: AbortSignal
+  ): Promise<AcceptanceEvidence> {
     const timeoutMs = criterion.timeoutMs ?? this.defaultProbeTimeoutMs;
     const response = await fetch(criterion.url, {
       method: "GET",
       // 不跟随重定向：期望的是这个地址本身的状态码，跟随之后就分不清了。
       redirect: "manual",
-      signal: AbortSignal.timeout(timeoutMs)
+      signal: combinedTimeoutSignal(timeoutMs, signal)
     });
     // 只关心状态码，主动取消响应体，避免占着连接不放。
     await response.body?.cancel();
@@ -219,9 +273,12 @@ export class AcceptanceVerifier {
     );
   }
 
-  private async verifyTcp(criterion: Extract<AcceptanceCriterion, { kind: "tcp" }>): Promise<AcceptanceEvidence> {
+  private async verifyTcp(
+    criterion: Extract<AcceptanceCriterion, { kind: "tcp" }>,
+    signal?: AbortSignal
+  ): Promise<AcceptanceEvidence> {
     const timeoutMs = criterion.timeoutMs ?? this.defaultProbeTimeoutMs;
-    await connectTcp(criterion.host, criterion.port, timeoutMs);
+    await connectTcp(criterion.host, criterion.port, timeoutMs, signal);
     return this.evidence(
       criterion.id,
       true,
@@ -237,12 +294,15 @@ export class AcceptanceVerifier {
    * 即使进程自报 ready，只要有 URL 仍会现场再发一次 HTTP 请求：进程活着不等于服务可用。
    */
   private async verifyManagedProcess(
-    criterion: Extract<AcceptanceCriterion, { kind: "managed_process" }>
+    criterion: Extract<AcceptanceCriterion, { kind: "managed_process" }>,
+    signal?: AbortSignal
   ): Promise<AcceptanceEvidence> {
+    signal?.throwIfAborted();
     if (!this.options.managedProcesses) {
       return this.evidence(criterion.id, false, `${criterion.description ?? criterion.id}: managed process runtime is unavailable.`);
     }
     const processes = await this.options.managedProcesses.listProcesses();
+    signal?.throwIfAborted();
     const matchingProcesses = processes.filter((candidate) => {
       if (criterion.processId !== undefined && candidate.processId !== criterion.processId) return false;
       if (criterion.url !== undefined && candidate.url !== criterion.url) return false;
@@ -273,12 +333,13 @@ export class AcceptanceVerifier {
         const response = await fetch(liveUrl, {
           method: "GET",
           redirect: "manual",
-          signal: AbortSignal.timeout(this.defaultProbeTimeoutMs)
+          signal: combinedTimeoutSignal(this.defaultProbeTimeoutMs, signal)
         });
         liveHttpStatus = response.status;
         await response.body?.cancel();
         passed = response.status === 200;
       } catch {
+        if (signal?.aborted) throw abortReason(signal);
         passed = false;
       }
     }
@@ -310,24 +371,45 @@ export class AcceptanceVerifier {
 }
 
 /** 只探测「端口能不能连上」，连上即断；超时和错误都要清掉定时器与监听器再销毁 socket。 */
-async function connectTcp(host: string, port: number, timeoutMs: number): Promise<void> {
+async function connectTcp(
+  host: string,
+  port: number,
+  timeoutMs: number,
+  signal?: AbortSignal
+): Promise<void> {
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) throw new Error("TCP port must be between 1 and 65535.");
+  signal?.throwIfAborted();
   await new Promise<void>((resolve, reject) => {
     const socket = net.createConnection({ host, port });
     const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new Error(`TCP readiness timed out after ${String(timeoutMs)}ms.`));
+      finish(new Error(`TCP readiness timed out after ${String(timeoutMs)}ms.`));
     }, timeoutMs);
     const finish = (error?: Error): void => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       socket.removeAllListeners();
       socket.destroy();
       if (error) reject(error);
       else resolve();
     };
+    const onAbort = (): void => {
+      const reason = abortReason(signal);
+      finish(reason instanceof Error ? reason : new Error(String(reason)));
+    };
     socket.once("connect", () => finish());
     socket.once("error", (error) => finish(error));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
+}
+
+function combinedTimeoutSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function abortReason(signal: AbortSignal | undefined): unknown {
+  return signal?.reason ?? new DOMException("The operation was aborted.", "AbortError");
 }
 
 function readString(value: unknown, key: string): string | undefined {

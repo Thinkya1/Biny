@@ -4,11 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { loadConfig, loadConfigFile, saveConfig, saveConfigFile } from "../src/config/loader.js";
 import { BINY_AGENT_DIR_ENV, globalAgentDir, globalConfigPath, projectMemoryDir, projectSessionsDir } from "../src/config/paths.js";
-import { defaultConfig } from "../src/config/schema.js";
+import { configSchema, defaultConfig } from "../src/config/schema.js";
 import { BINY_KEYCHAIN_SERVICE, MacKeychainCredentialStore } from "../src/config/credentials.js";
+import { resolveRunBudget } from "../src/agent/runBudget.js";
 
 await testGlobalPathResolution();
+testRunBudgetCompatibility();
 await testProjectOverridesAndGlobalPersistence();
+await testLegacyProjectBudgetOverridesNewGlobalBudget();
 await testProjectCredentialFieldsAreRejected();
 await testProjectModelAliasMustBeGlobal();
 await testLegacyProjectConfigIsIgnored();
@@ -28,6 +31,51 @@ async function testGlobalPathResolution(): Promise<void> {
   assert.equal(path.dirname(memoryA), path.join(configured, "memory"));
   assert.equal(path.basename(memoryA), path.basename(projectA));
   assert.notEqual(memoryA, projectMemoryDir("/tmp/project-b", { env: { [BINY_AGENT_DIR_ENV]: configured } }));
+}
+
+function testRunBudgetCompatibility(): void {
+  assert.deepEqual(resolveRunBudget(defaultConfig.agent), {
+    softStepLimit: 32,
+    hardStepLimit: 96,
+    maxToolCalls: 512,
+    maxProviderRetries: 0,
+    maxCompletionContinuations: 3,
+    maxRepeatedActions: 3
+  });
+
+  const configured = configSchema.parse({
+    ...defaultConfig,
+    agent: {
+      ...defaultConfig.agent,
+      softStepLimit: 12,
+      hardStepLimit: 48,
+      maxToolCalls: 200,
+      maxProviderRetries: 2,
+      maxCompletionContinuations: 4,
+      maxRepeatedActions: 5
+    }
+  });
+  assert.deepEqual(resolveRunBudget(configured.agent), {
+    softStepLimit: 12,
+    hardStepLimit: 48,
+    maxToolCalls: 200,
+    maxProviderRetries: 2,
+    maxCompletionContinuations: 4,
+    maxRepeatedActions: 5
+  });
+
+  const legacyNarrowHardLimit = configSchema.parse({
+    ...defaultConfig,
+    agent: { ...defaultConfig.agent, maxSteps: 16, maxTaskSteps: 8 }
+  });
+  assert.deepEqual(resolveRunBudget(legacyNarrowHardLimit.agent), {
+    softStepLimit: 8,
+    hardStepLimit: 8,
+    maxToolCalls: 512,
+    maxProviderRetries: 0,
+    maxCompletionContinuations: 3,
+    maxRepeatedActions: 3
+  });
 }
 
 async function testProjectOverridesAndGlobalPersistence(): Promise<void> {
@@ -63,6 +111,55 @@ async function testProjectOverridesAndGlobalPersistence(): Promise<void> {
     assert.equal(global.defaultModel, "deepseek-v4-pro");
     assert.equal(global.permission.mode, "ask");
     assert.equal((await loadConfig(workspace, { globalDir: globalRoot })).defaultModel, "deepseek-v4-flash");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testLegacyProjectBudgetOverridesNewGlobalBudget(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-project-budget-"));
+  const globalRoot = path.join(root, "global");
+  const workspace = path.join(root, "project");
+  await fs.mkdir(path.join(workspace, ".biny"), { recursive: true });
+  try {
+    await saveConfigFile(globalRoot, {
+      ...defaultConfig,
+      agent: {
+        ...defaultConfig.agent,
+        softStepLimit: 20,
+        hardStepLimit: 120
+      }
+    });
+    await fs.writeFile(path.join(workspace, ".biny", "settings.json"), JSON.stringify({
+      agent: {
+        maxSteps: 2,
+        maxTaskSteps: 10
+      }
+    }));
+
+    const legacyEffective = await loadConfig(workspace, { globalDir: globalRoot });
+    assert.equal(legacyEffective.agent.softStepLimit, 2);
+    assert.equal(legacyEffective.agent.hardStepLimit, 10);
+    assert.deepEqual(resolveRunBudget(legacyEffective.agent), {
+      softStepLimit: 2,
+      hardStepLimit: 10,
+      maxToolCalls: 512,
+      maxProviderRetries: 0,
+      maxCompletionContinuations: 3,
+      maxRepeatedActions: 3
+    });
+
+    await fs.writeFile(path.join(workspace, ".biny", "settings.json"), JSON.stringify({
+      agent: {
+        maxSteps: 2,
+        softStepLimit: 4,
+        maxTaskSteps: 10,
+        hardStepLimit: 12
+      }
+    }));
+    const explicitEffective = await loadConfig(workspace, { globalDir: globalRoot });
+    assert.equal(explicitEffective.agent.softStepLimit, 4);
+    assert.equal(explicitEffective.agent.hardStepLimit, 12);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

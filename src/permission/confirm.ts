@@ -28,7 +28,10 @@ export async function confirmAction(title: string, details: string, options: Con
   }
 }
 
-export async function confirmPermissionRequest(request: PermissionPrompt): Promise<PermissionResult> {
+export async function confirmPermissionRequest(
+  request: PermissionPrompt,
+  signal?: AbortSignal
+): Promise<PermissionResult> {
   output.write(`\n${request.title}\n`);
   output.write(`Tool: ${request.tool}\n`);
   output.write(`Action: ${request.actionType}\n`);
@@ -53,7 +56,7 @@ export async function confirmPermissionRequest(request: PermissionPrompt): Promi
 
   const rl = createInterface({ input, output });
   try {
-    return permissionResultFromAnswer(await rl.question("> "), request.requireFullYes);
+    return permissionResultFromAnswer(await rl.question("> ", { signal }), request.requireFullYes);
   } finally {
     rl.close();
   }

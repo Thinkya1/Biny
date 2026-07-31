@@ -43,7 +43,16 @@ export interface RunShellCommandOptions {
   killSettleMs?: number;
 }
 
-export function createRunCommandTool(context: ToolContext, sandbox?: SandboxConfig): Tool<RunCommandArgs, RunCommandResult> {
+export interface RunCommandToolOptions {
+  /** 内部调用方可收紧单次命令超时；普通模型工具继续使用 runShellCommand 的默认值。 */
+  timeoutMs?: number;
+}
+
+export function createRunCommandTool(
+  context: ToolContext,
+  sandbox?: SandboxConfig,
+  options: RunCommandToolOptions = {}
+): Tool<RunCommandArgs, RunCommandResult> {
   const sandboxOptions: SandboxOptions = { mode: sandbox?.mode ?? "off", allowNetwork: sandbox?.allowNetwork ?? true };
   return {
     name: "run_command",
@@ -78,7 +87,11 @@ export function createRunCommandTool(context: ToolContext, sandbox?: SandboxConf
             home: homedir(),
             temporaryDirectory: tmpdir()
           });
-          const result = await runShellCommand(cwd, sandboxed.command, { signal, onUpdate });
+          const result = await runShellCommand(cwd, sandboxed.command, {
+            signal,
+            onUpdate,
+            timeoutMs: options.timeoutMs
+          });
           // 如实回报这次到底有没有边界，避免"沙箱模式"这个名字暗示一个不存在的保护。
           return { ...result, sandbox: sandboxed.applied ? describeSandbox(sandboxOptions, process.platform) : `not applied (${sandboxed.reason ?? "unknown"})` };
         }

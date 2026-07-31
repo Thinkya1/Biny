@@ -8,6 +8,13 @@ import { z } from "zod";
 
 const agentSchema = z.object({
   maxSteps: z.number().int().min(1).max(32).default(32),
+  // 新 Loop 的预算字段保持可选，旧配置继续由 maxSteps / maxTaskSteps 提供兼容值。
+  softStepLimit: z.number().int().min(1).max(1_024).optional(),
+  hardStepLimit: z.number().int().min(1).max(1_024).optional(),
+  maxToolCalls: z.number().int().min(1).max(65_536).optional(),
+  maxProviderRetries: z.number().int().min(0).max(5).optional(),
+  maxCompletionContinuations: z.number().int().min(0).max(32).optional(),
+  maxRepeatedActions: z.number().int().min(1).max(32).optional(),
   maxAttempts: z.number().int().min(1).max(10).default(3),
   maxTaskSteps: z.number().int().min(1).max(1_024).default(96),
   maxWallTimeMs: z.number().int().min(1_000).max(86_400_000).default(30 * 60_000),
@@ -17,6 +24,12 @@ const agentSchema = z.object({
   maxQueuedToolCalls: z.number().int().min(1).max(1_024).default(64)
 }).default({
   maxSteps: 32,
+  softStepLimit: undefined,
+  hardStepLimit: undefined,
+  maxToolCalls: undefined,
+  maxProviderRetries: undefined,
+  maxCompletionContinuations: undefined,
+  maxRepeatedActions: undefined,
   maxAttempts: 3,
   maxTaskSteps: 96,
   maxWallTimeMs: 30 * 60_000,
@@ -623,6 +636,12 @@ export const defaultConfig: AgentConfig = {
   thinking: { enabled: false, effort: "high" },
   agent: {
     maxSteps: 32,
+    softStepLimit: undefined,
+    hardStepLimit: undefined,
+    maxToolCalls: undefined,
+    maxProviderRetries: undefined,
+    maxCompletionContinuations: undefined,
+    maxRepeatedActions: undefined,
     maxAttempts: 3,
     maxTaskSteps: 96,
     maxWallTimeMs: 30 * 60_000,
