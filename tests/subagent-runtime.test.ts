@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { ToolExecutionOptions, ToolSet } from "ai";
+import type { AgentTool } from "../src/agent/core/types.js";
 import { AgentSession, type AgentRunOptions, type AgentSessionInfo } from "../src/agent/AgentSession.js";
 import type { ContextStatus } from "../src/agent/context/types.js";
 import type { AgentSessionEvent } from "../src/agent/types.js";
@@ -89,7 +89,7 @@ async function testSubagentConfigDefaultsAndValidation(): Promise<void> {
   const extensions = input.extensions as Record<string, unknown>;
   extensions.subagent = { enabled: true, maxSteps: 4, maxOutputTokens: 4_000 };
   const parsed = configSchema.parse(input);
-  assert.equal(parsed.agent.maxSteps, 32);
+  assert.equal(parsed.agent.softStepLimit, 32);
   assert.equal(parsed.extensions.subagent.maxConcurrentSubagents, 2);
   assert.equal(parsed.extensions.subagent.maxPendingSubagents, 16);
   assert.equal(parsed.extensions.subagent.timeoutMs, 300_000);
@@ -167,8 +167,8 @@ async function testReadOnlyToolBoundary(): Promise<void> {
       "web_search",
       "run_command"
     ]);
-    assert.deepEqual(Object.keys(tools), ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff"]);
-    assert.equal(isSensitiveSubagentPath("agent.config.json"), true);
+    assert.deepEqual(tools.map((tool) => tool.name), ["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff"]);
+    assert.equal(isSensitiveSubagentPath("config.json"), true);
     assert.equal(isSensitiveSubagentPath("nested/.env.production"), true);
     assert.equal(isSensitiveSubagentPath("src/index.ts"), false);
 
@@ -193,7 +193,7 @@ async function testWorkspaceSubagentToolBoundary(): Promise<void> {
   try {
     const registry = createToolRegistry({ workspaceRoot, ignore: [] }, { ...defaultConfig.web.search, enabled: false });
     const tools = createSubagentTools(registry, defaultConfig.extensions.subagent.allowedTools, { accessMode: "workspace" });
-    assert.deepEqual(Object.keys(tools), [
+    assert.deepEqual(tools.map((tool) => tool.name), [
       "read_file",
       "list_files",
       "search_files",
@@ -1311,16 +1311,24 @@ function subscribeHostEvents(
   });
 }
 
-function executableTool(tools: ToolSet, name: string): {
-  execute(input: unknown, options: ToolExecutionOptions<unknown>): Promise<unknown> | unknown;
+function executableTool(tools: AgentTool[], name: string): {
+  execute(input: unknown, options: { toolCallId: string; abortSignal?: AbortSignal }): Promise<unknown> | unknown;
 } {
-  const candidate = tools[name] as { execute?: (input: unknown, options: ToolExecutionOptions<unknown>) => Promise<unknown> | unknown } | undefined;
+  const candidate = tools.find((tool) => tool.name === name);
   if (!candidate?.execute) throw new Error(`Tool is not executable: ${name}`);
-  return { execute: candidate.execute };
+  return {
+    execute: async (input, options) => {
+      const result = await candidate.execute(options.toolCallId, input as Record<string, unknown>, options.abortSignal);
+      if (result.isError) {
+        throw new Error(result.content.map((part) => part.type === "text" ? part.text : "[binary]").join("\n"));
+      }
+      return result.details ?? result;
+    }
+  };
 }
 
-function toolOptions(): ToolExecutionOptions<unknown> {
-  return { toolCallId: "test", messages: [], abortSignal: undefined };
+function toolOptions(): { toolCallId: string; abortSignal?: AbortSignal } {
+  return { toolCallId: "test", abortSignal: undefined };
 }
 
 function deferred<T>(): Deferred<T> {

@@ -1,5 +1,7 @@
-import { generateText, Output, type LanguageModel, type LanguageModelUsage, type ModelMessage, type TelemetryOptions } from "ai";
 import { z } from "zod";
+import type { AgentModel, AgentUsage } from "../core/types.js";
+import type { ModelMessage } from "../core/modelMessage.js";
+import { generateNativeText, nativeJsonMessages, parseNativeJson } from "../../llm/nativeJson.js";
 import { cloneModelMessages, messageReasoning, messageText, messageToolName } from "../modelMessages.js";
 import { formatProjectContext } from "../../project/ProjectContext.js";
 import { formatMemoryMatches, LocalMemory, redactSecrets } from "./LocalMemory.js";
@@ -30,18 +32,15 @@ export class ContextMemory {
   private lastBudget: ContextBudgetStatus;
   private memoryTopics: string[] = [];
   private readonly resolveBudget: () => ModelContextBudget;
-  private readonly getMaxRetries: () => number;
 
   constructor(
-    private readonly getModel: () => LanguageModel,
+    private readonly getModel: () => AgentModel,
     private readonly workspace: WorkspaceContext,
     private readonly localMemory: LocalMemory | undefined,
     private readonly maxTokens: number,
     private readonly instructionMaxBytes: number,
     private readonly onUsage: ModelUsageObserver = () => undefined,
-    private readonly telemetry?: (functionId: string) => TelemetryOptions,
-    getBudgetLimits?: () => ModelContextBudget,
-    getMaxRetries: () => number = () => 0
+    getBudgetLimits?: () => ModelContextBudget
   ) {
     this.resolveBudget = getBudgetLimits ?? (() => ({
       contextWindow: maxTokens,
@@ -49,7 +48,6 @@ export class ContextMemory {
       maxOutputTokens: undefined,
       modelAlias: undefined
     }));
-    this.getMaxRetries = getMaxRetries;
     const budget = this.currentBudget();
     this.lastBudget = {
       maxTokens: budget.maxInputTokens,
@@ -143,7 +141,7 @@ export class ContextMemory {
     return cloneBudget(this.lastBudget);
   }
 
-  recordProviderUsage(usage: LanguageModelUsage): void {
+  recordProviderUsage(usage: AgentUsage): void {
     if (usage.inputTokens === undefined) return;
     this.lastBudget = {
       ...this.lastBudget,
@@ -303,24 +301,14 @@ export class ContextMemory {
     ].filter(Boolean).join("\n\n");
 
     try {
-      const result = await generateText({
-        model: this.getModel(),
-        allowSystemInMessages: true,
-        abortSignal: signal,
-        maxRetries: this.getMaxRetries(),
-        output: Output.object({
-          schema: summarySchema,
-          name: "coding-session-summary",
-          description: "A compact factual handoff summary for a local assistant session."
-        }),
-        telemetry: this.telemetry?.("biny.compaction"),
-        messages: [
-          { role: "system", content: "You create compact, factual coding-session handoff notes." },
-          { role: "user", content: prompt }
-        ]
-      });
-      await this.onUsage(await result.usage, "compaction");
-      const summary = formatStructuredSummary(await result.output);
+      const model = this.getModel();
+      const result = await generateNativeText(model, nativeJsonMessages(
+        "You create compact, factual coding-session handoff notes.",
+        prompt
+      ), { signal, maxOutputTokens: 4_096 });
+      const parsed = summarySchema.safeParse(parseNativeJson(result.text));
+      if (result.usage) await this.onUsage(result.usage, "compaction");
+      const summary = parsed.success ? formatStructuredSummary(parsed.data) : "";
       if (summary) return truncateTextToTokens(redactSecrets(summary), summaryTokens);
     } catch {
       signal?.throwIfAborted();
@@ -682,6 +670,7 @@ type ToolMessage = Extract<ModelMessage, { role: "tool" }>;
 
 function isPrunedToolResult(message: ToolMessage): boolean {
   return message.content.every((part) => part.type === "tool-result"
+    && isRecord(part.output)
     && part.output.type === "text"
     && part.output.value === prunedToolResultMarker);
 }
@@ -703,8 +692,12 @@ function estimateMediaTokens(message: ModelMessage): number {
   if (typeof message.content === "string") return 0;
   return message.content.reduce((total, part) => {
     if (part.type !== "file") return total;
-    if (part.mediaType.startsWith("image/")) return total + 1_024;
-    if (part.mediaType.startsWith("audio/")) return total + 2_048;
+    if (part.mediaType?.startsWith("image/")) return total + 1_024;
+    if (part.mediaType?.startsWith("audio/")) return total + 2_048;
     return total + 512;
   }, 0);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -1,7 +1,7 @@
 /**
  * provider 请求重试。
  *
- * 以「包一层 fetch」的方式实现，这样各 provider SDK 不用各自处理重试，也方便测试注入
+ * 以「包一层 fetch」的方式实现，provider transport 统一复用，也方便测试注入
  * 假 fetch。
  */
 export interface RetryPolicy {

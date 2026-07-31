@@ -15,12 +15,12 @@ import {
 } from "../src/extensions/agents.js";
 import { createMemoryTools } from "../src/extensions/memory.js";
 import { runSubagentTask, type SubagentOptions } from "../src/extensions/subagent.js";
-import { createModelSettings } from "../src/llm/factory.js";
+import { createNativeModelSettings } from "../src/llm/nativeFactory.js";
 import { ensureAgentDirs } from "../src/session/store.js";
 import { ToolRegistry } from "../src/tools/registry.js";
 import type { Tool } from "../src/tools/types.js";
 import { SubagentTaskManager } from "../src/runtime/SubagentTaskManager.js";
-import type { LanguageModel } from "ai";
+import type { AgentModel } from "../src/agent/core/types.js";
 
 async function main(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-named-agents-"));
@@ -195,7 +195,7 @@ async function testSubagentBudgetExhaustionReturnsPartialFindings(): Promise<voi
     const options: SubagentOptions = {
       workspaceRoot,
       config,
-      getModelSettings: () => createModelSettings(config),
+      getNativeModelSettings: () => createNativeModelSettings(config),
       getAccessMode: () => "read-only",
       toolRegistry: registry
     };
@@ -229,8 +229,14 @@ function jsonCompletionResponse(payload: Record<string, unknown>): Response {
   return new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
 }
 
-function unusedModel(): LanguageModel {
-  throw new Error("The model must not be called by explicit memory operations.");
+function unusedModel(): AgentModel {
+  return {
+    provider: "test",
+    modelId: "unused",
+    async stream() {
+      return (async function* () { /* explicit memory operations do not call the model */ })();
+    }
+  };
 }
 
 async function testMemoryTopicLifecycle(): Promise<void> {

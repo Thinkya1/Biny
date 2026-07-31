@@ -67,7 +67,7 @@ const modelConfigurationSchema = z.object({
   supportsVision: z.boolean().optional(),
   supportsAudio: z.boolean().optional(),
   contextWindow: z.number().int().min(4_096).max(2_000_000).optional(),
-  maxOutputTokens: z.number().int().min(1).max(131_072).optional(),
+  maxOutputTokens: z.number().int().min(1).max(384_000).optional(),
   apiBackend: modelApiBackendSchema.optional(),
   thinkingLevelMap: z.record(z.string().min(1), z.string().min(1).nullable()).optional(),
   compatibility: modelCompatibilitySchema.optional(),

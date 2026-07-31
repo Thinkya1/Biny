@@ -8,7 +8,7 @@
  * 恢复出来的历史会直接发回模型，所以宁可丢弃可疑内容（如缺签名的思考块），也不能拼出
  * 服务端会拒绝的消息序列。
  */
-import type { ModelMessage } from "ai";
+import type { ModelMessage } from "../agent/core/modelMessage.js";
 import { readSessionEvents, readStoredSessionEvents } from "./events.js";
 import type { ReasoningBlock, SessionContextState, SessionContextUsage, SessionEvent, SessionUsage } from "./recorder.js";
 

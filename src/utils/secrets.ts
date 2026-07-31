@@ -10,7 +10,7 @@
 import path from "node:path";
 
 const protectedCredentialFiles = new Set([
-  "agent.config.json",
+  "config.json",
   ".envrc",
   ".git-credentials",
   ".npmrc",
@@ -31,7 +31,7 @@ const protectedCredentialDirectories = new Set([
 const protectedGitDirectories = [...protectedCredentialDirectories];
 
 /**
- * 判断是否为受保护的凭据路径。除固定文件名外，还覆盖 `.env` 系列、`agent.config.json.*`
+ * 判断是否为受保护的凭据路径。除固定文件名外，还覆盖 `.env` 系列、`config.json.*`
  * 备份，以及路径中任意一段落在 `.ssh` / `.aws` 等目录里的情况。
  */
 export function isProtectedCredentialPath(value: string): boolean {
@@ -41,7 +41,7 @@ export function isProtectedCredentialPath(value: string): boolean {
   const fileName = path.posix.basename(normalized);
   return fileName === ".env"
     || fileName.startsWith(".env.")
-    || fileName.startsWith("agent.config.json.")
+    || fileName.startsWith("config.json.")
     || segments.some((segment) => protectedCredentialDirectories.has(segment))
     || protectedCredentialFiles.has(fileName);
 }
@@ -121,8 +121,8 @@ export function protectedGitPathspecs(): string[] {
     ]),
     ":(exclude,glob).env.*",
     ":(exclude,glob)**/.env.*",
-    ":(exclude,glob)agent.config.json.*",
-    ":(exclude,glob)**/agent.config.json.*",
+    ":(exclude,glob)config.json.*",
+    ":(exclude,glob)**/config.json.*",
     ...protectedGitDirectories.flatMap((directory) => [
       `:(exclude,glob)${directory}/**`,
       `:(exclude,glob)**/${directory}/**`

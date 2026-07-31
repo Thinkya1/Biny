@@ -6,12 +6,12 @@ import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ModelMessage } from "ai";
+import type { ModelMessage } from "../src/agent/core/modelMessage.js";
 import { z } from "zod";
 import { AgentSession } from "../src/agent/AgentSession.js";
 import type { AgentTurnOutcome } from "../src/agent/types.js";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
-import { createLanguageModelForConfig } from "../src/llm/factory.js";
+import { createNativeModelForConfig } from "../src/llm/nativeFactory.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
 import { SessionRecorder } from "../src/session/recorder.js";
 import { ensureAgentDirs } from "../src/session/store.js";
@@ -366,7 +366,7 @@ async function runAgentWorker(options: WorkerOptions): Promise<void> {
         headers: { "x-test-phase": options.phase }
       }
     },
-    agent: { ...defaultConfig.agent, maxSteps: 6 },
+    agent: { ...defaultConfig.agent, hardStepLimit: 6 },
     permission: { ...defaultConfig.permission, mode: "full-access" },
     context: { ...defaultConfig.context, memory: { enabled: false } }
   });
@@ -379,7 +379,7 @@ async function runAgentWorker(options: WorkerOptions): Promise<void> {
   const agent = new AgentSession({
     workspaceRoot: options.workspaceRoot,
     config,
-    model: createLanguageModelForConfig(config),
+    model: createNativeModelForConfig(config),
     toolRegistry: registry,
     permissionManager: new PermissionManager(config.permission),
     recorder

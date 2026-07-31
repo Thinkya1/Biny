@@ -4,7 +4,7 @@
  * 这些结构会原样写进 session 文件，属于对外的持久化格式，改字段要考虑历史 session 的
  * 兼容性，因此除 `operation` 等必需项外都保持可选。
  */
-import type { LanguageModelUsage } from "ai";
+import type { AgentUsage } from "../agent/core/types.js";
 
 export type UsageOperation = "agent" | "plan" | "compaction" | "memory" | "subagent";
 export type ContextBudgetSource = "estimated" | "provider";
@@ -56,13 +56,13 @@ export interface UsageSummary {
   unpricedCalls: number;
 }
 
-export function usageSnapshot(usage: LanguageModelUsage): Omit<SessionUsage, "operation" | "modelAlias" | "provider" | "model" | "costUsd" | "pricingKnown" | "time"> {
+export function usageSnapshot(usage: AgentUsage): Omit<SessionUsage, "operation" | "modelAlias" | "provider" | "model" | "costUsd" | "pricingKnown" | "time"> {
   return {
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
     totalTokens: usage.totalTokens,
-    reasoningTokens: usage.outputTokenDetails?.reasoningTokens,
-    cacheReadTokens: usage.inputTokenDetails?.cacheReadTokens,
-    cacheWriteTokens: usage.inputTokenDetails?.cacheWriteTokens
+    reasoningTokens: usage.reasoningTokens,
+    cacheReadTokens: usage.cacheReadTokens,
+    cacheWriteTokens: usage.cacheWriteTokens
   };
 }

@@ -12,18 +12,18 @@ export const defaultModelOutputTokens = 8_192;
 
 /**
  * 模型级 canonical map。它表达的是 provider 可接受的参数，而不是模型真实“思考程度”。
- * 旧配置只有 `thinking`/`reasoning` 时，在这里转换为同一份 map，避免上层继续分叉。
+ * `reasoning` 未显式声明时，再按模型能力推导可用档位。
  */
 export function modelThinkingLevelMap(model: ModelAliasConfig): ThinkingLevelMap {
   if (model.thinkingLevelMap) return { ...model.thinkingLevelMap };
-  const reasoning = model.reasoning ?? model.thinking;
+  const reasoning = model.reasoning;
   if (!reasoning) return {};
   const map: ThinkingLevelMap = { off: "none" };
   for (const effort of reasoning.efforts) map[effort] = reasoning.mapping?.[effort] ?? effort;
   return map;
 }
 
-/** `reasoning` 是新字段，`thinking` 是旧配置名；两者都落到 canonical map 上。 */
+/** 从 canonical `reasoning` 配置推导 UI 和 provider 使用的档位。 */
 export function modelReasoningConfig(model: ModelAliasConfig): ModelThinkingConfig | undefined {
   const map = modelThinkingLevelMap(model);
   const efforts = Object.entries(map)
@@ -31,9 +31,9 @@ export function modelReasoningConfig(model: ModelAliasConfig): ModelThinkingConf
     .map(([level]) => level as ReasoningEffort);
   if (!efforts.length) return undefined;
 
-  const legacy = model.reasoning ?? model.thinking;
-  const defaultEffort = legacy?.defaultEffort && efforts.includes(legacy.defaultEffort)
-    ? legacy.defaultEffort
+  const reasoning = model.reasoning;
+  const defaultEffort = reasoning?.defaultEffort && efforts.includes(reasoning.defaultEffort)
+    ? reasoning.defaultEffort
     : efforts.includes("high") ? "high" : efforts[0]!;
   const mapping = Object.fromEntries(
     efforts.map((effort) => [effort, map[effort] ?? effort])
@@ -42,7 +42,7 @@ export function modelReasoningConfig(model: ModelAliasConfig): ModelThinkingConf
     efforts,
     defaultEffort,
     mapping,
-    budgetTokens: legacy?.budgetTokens
+    budgetTokens: reasoning?.budgetTokens
   };
 }
 
@@ -77,23 +77,34 @@ const reasoningModelPatterns: RegExp[] = [
   /(?:^|[-/])(?:thinking|reasoner|reasoning)(?:$|[-.])/iu
 ];
 
+function modelIdentifier(modelId: string): string {
+  const normalized = modelId.trim();
+  return normalized.split("/").pop() ?? normalized;
+}
+
+/** Kimi K3 always reasons and exposes only low/high/max via reasoning_effort. */
+export function isKimiK3Model(modelId: string): boolean {
+  return /^kimi-k3(?:$|[-.])/iu.test(modelIdentifier(modelId));
+}
+
 /**
  * 服务商没有声明推理档位时，按模型 ID 推断。返回空数组表示按不支持处理。
  */
 export function inferReasoningEfforts(modelId: string): ReasoningEffort[] {
-  const normalized = modelId.trim();
-  if (!normalized) return [];
-  // 只看最后一段，避免聚合服务的厂商前缀（如 `openai/gpt-4o-mini`）误伤。
-  const identifier = normalized.split("/").pop() ?? normalized;
-  if (/^deepseek-v4-flash$/iu.test(identifier)) return [];
-  if (/^deepseek-v4-pro$/iu.test(identifier)) return ["low", "medium", "high"];
+  const identifier = modelIdentifier(modelId);
+  if (!identifier) return [];
+  if (/^deepseek-v4-(?:flash|pro)$/iu.test(identifier)) return ["high", "max"];
+  if (isKimiK3Model(identifier)) return ["low", "high", "max"];
   return reasoningModelPatterns.some((pattern) => pattern.test(identifier)) ? ["high", "max"] : [];
 }
 
 /** 把目录/桌面配置里的支持提示转换成模型级 canonical map。 */
 export function thinkingLevelMapForModel(modelId: string, supportsThinking = true): ThinkingLevelMap {
-  if (!supportsThinking || /^deepseek-v4-flash$/iu.test(modelId.trim().split("/").pop() ?? modelId)) {
+  if (!supportsThinking) {
     return { off: "none" };
+  }
+  if (isKimiK3Model(modelId)) {
+    return { low: "low", high: "high", max: "max" };
   }
   const efforts = inferReasoningEfforts(modelId);
   const resolved = efforts.length ? efforts : ["high", "max"] as ReasoningEffort[];

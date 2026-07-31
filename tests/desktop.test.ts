@@ -12,7 +12,6 @@ import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.
 import { executeRuntimeCommand } from "../src/runtime/commands.js";
 import { SessionLeaseStore } from "../src/runtime/SessionLease.js";
 import { isTerminalRunEvent, pendingPermission, type AgentHostEvent } from "../src/runtime/agentEvents.js";
-import { loadConfigFile, saveConfigFile } from "../src/config/loader.js";
 import type { CredentialStore } from "../src/config/credentials.js";
 import { createFileConfigStore } from "../src/config/store.js";
 import { defaultConfig } from "../src/config/schema.js";
@@ -21,7 +20,6 @@ import { DesktopConfigStore } from "../src/desktop/electron/main/DesktopConfigSt
 import { DesktopProjectService } from "../src/desktop/electron/main/DesktopProjectService.js";
 import { DesktopStateStore } from "../src/desktop/electron/main/DesktopStateStore.js";
 import { DesktopUserDataStore } from "../src/desktop/electron/main/DesktopUserDataStore.js";
-import type { DesktopProject } from "../src/desktop/protocol.js";
 import { clampFilePanelWidth, DEFAULT_FILE_PANEL_WIDTH, MAX_FILE_PANEL_WIDTH, MIN_FILE_PANEL_WIDTH } from "../src/desktop/filePanelSizing.js";
 import {
   canNavigateBack,
@@ -78,7 +76,6 @@ await testDesktopRequiresModelConfiguration();
 await testDesktopConnectionMetadata();
 await testWorkspaceSnapshotDoesNotReorderProjects();
 await testDesktopProjectReorder();
-await testLegacyDesktopDataMigration();
 testProviderCatalogResolution();
 testModelChoicesDeduplicateEquivalentAliases();
 testHistoricalAbortProjection();
@@ -551,7 +548,7 @@ function testCommandHighlighting(): void {
 function testWorkspaceFileMarkers(): void {
   assert.deepEqual(workspaceFileMarker("README.md"), { label: "MD", tone: "markdown" });
   assert.deepEqual(workspaceFileMarker("src/App.tsx"), { label: "TSX", tone: "typescript" });
-  assert.deepEqual(workspaceFileMarker("agent.config.json"), { label: "{}", tone: "json" });
+  assert.deepEqual(workspaceFileMarker("config.json"), { label: "{}", tone: "json" });
   assert.deepEqual(workspaceFileMarker("pnpm-lock.yaml"), { label: "YML", tone: "yaml" });
   assert.deepEqual(workspaceFileMarker(".gitignore"), { label: "◆", tone: "git" });
   assert.deepEqual(workspaceFileMarker("preview.png"), { label: "IMG", tone: "image" });
@@ -673,7 +670,7 @@ async function testDesktopModelConfiguration(): Promise<void> {
     await assert.rejects(access(path.join(workspaceRoot, ".biny", "sessions")));
     await access(path.join(workspaceRoot, ".biny", "attachments"));
     await assert.rejects(access(path.join(desktopRoot, "projects", project.id, ".biny", "attachments")));
-    await assert.rejects(access(path.join(workspaceRoot, "agent.config.json")));
+    await assert.rejects(access(path.join(workspaceRoot, "config.json")));
     await agents.closeAll();
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
@@ -753,7 +750,7 @@ async function testDesktopCredentialsAreSeparated(): Promise<void> {
     config.providers.deepseek!.apiKey = "desktop-secret";
     config.web.search.apiKey = "tvly-web-secret";
     await store.save(config);
-    const settings = await readFile(path.join(desktopRoot, "agent.config.json"), "utf8");
+    const settings = await readFile(path.join(desktopRoot, "config.json"), "utf8");
     assert.doesNotMatch(settings, /desktop-secret/);
     // 联网搜索密钥同样只进凭据后端，不落明文设置文件。
     assert.doesNotMatch(settings, /tvly-web-secret/);
@@ -992,76 +989,6 @@ function reorderSectionProjectIdsForTest(
   const sectionMembers = new Set(sectionIds);
   let sectionIndex = 0;
   return fullIds.map((projectId) => sectionMembers.has(projectId) ? nextSection[sectionIndex++]! : projectId);
-}
-
-async function testLegacyDesktopDataMigration(): Promise<void> {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "biny-legacy-project-"));
-  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-data-"));
-  try {
-    const project: DesktopProject = {
-      id: "legacy-project",
-      path: projectRoot,
-      name: "Legacy Project",
-      dirty: false,
-      missing: false,
-      pinned: false,
-      addedAt: "2026-07-18T00:00:00.000Z",
-      lastOpenedAt: "2026-07-18T00:00:00.000Z"
-    };
-    const config = structuredClone(defaultConfig);
-    config.defaultModel = "deepseek-v4-pro";
-    await saveConfigFile(projectRoot, config);
-
-    const storage = new DesktopUserDataStore(desktopRoot);
-    await storage.initialize();
-    const configStore = new DesktopConfigStore(desktopRoot, memoryCredentialStore());
-    const stateProject: DesktopProject = { ...project, id: "state-project", name: "State Project" };
-    const legacyStatePath = path.join(desktopRoot, "legacy-desktop-state.json");
-    const destinationStatePath = path.join(desktopRoot, "desktop-state.json");
-    await writeFile(legacyStatePath, JSON.stringify({
-      version: 1,
-      projects: [project],
-      activeProjectId: project.id,
-      selectedSessionIds: { [project.id]: "legacy-session" },
-      sessionMetadata: { [`${project.id}:legacy-session`]: { title: "Legacy title" } }
-    }));
-    await writeFile(destinationStatePath, JSON.stringify({
-      version: 1,
-      projects: [stateProject],
-      activeProjectId: stateProject.id,
-      selectedSessionIds: { [stateProject.id]: "state-session" },
-      sessionMetadata: { [`${stateProject.id}:state-session`]: { pinned: true } }
-    }));
-    await storage.migrateLegacyState(legacyStatePath, destinationStatePath);
-    const migratedState = JSON.parse(await readFile(destinationStatePath, "utf8")) as {
-      projects: DesktopProject[];
-      activeProjectId?: string;
-      selectedSessionIds: Record<string, string>;
-      sessionMetadata: Record<string, { title?: string; pinned?: boolean }>;
-    };
-    assert.deepEqual(migratedState.projects.map((candidate) => candidate.id).sort(), [project.id, stateProject.id].sort());
-    assert.equal(migratedState.activeProjectId, stateProject.id);
-    assert.equal(migratedState.selectedSessionIds[project.id], "legacy-session");
-    assert.equal(migratedState.selectedSessionIds[stateProject.id], "state-session");
-    assert.equal(migratedState.sessionMetadata[`${project.id}:legacy-session`]?.title, "Legacy title");
-    assert.equal(migratedState.sessionMetadata[`${stateProject.id}:state-session`]?.pinned, true);
-
-    const dataRoot = await storage.ensureProjectData(project);
-    assert.equal(dataRoot, path.resolve(projectRoot));
-    await access(path.dirname(sessionFilePath(projectRoot, "path-probe")));
-    await assert.rejects(access(path.join(projectRoot, ".biny", "sessions")));
-
-    const globalRoot = await storage.ensureGlobalData();
-    assert.equal(globalRoot, path.join(desktopRoot, "global"));
-    await access(path.dirname(sessionFilePath(globalRoot, "path-probe")));
-
-    // 旧项目配置只用于 doctor 提示，启动不会自动迁移或覆盖全局模型配置。
-    assert.equal((await configStore.load()).defaultModel, defaultConfig.defaultModel);
-    assert.equal((await loadConfigFile(projectRoot)).defaultModel, "deepseek-v4-pro");
-  } finally {
-    await rm(projectRoot, { recursive: true, force: true });
-    await rm(desktopRoot, { recursive: true, force: true });
-  }
 }
 
 async function createDesktopTestServices(root: string): Promise<{

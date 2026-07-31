@@ -216,6 +216,7 @@ export const Composer = memo(function Composer({
   const currentThinking = runtimeInfo?.thinking ?? selectedModel?.defaultThinking ?? "off";
   const modelName = activeModel?.displayName ?? runtimeInfo?.modelLabel ?? selectedModel?.displayName ?? "选择模型";
   const thinkingEfforts = selectedModel?.efforts ?? [];
+  const canDisableThinking = selectedModel?.thinkingLevelMap?.off !== undefined;
   const usage = formatContextUsage(contextUsage);
 
   return (
@@ -355,6 +356,7 @@ export const Composer = memo(function Composer({
                   <Icon name="brain" size={13} /><span>{thinkingLabel(currentThinking)}</span>
                 </button>
                 <ThinkingMenu
+                  allowOff={canDisableThinking}
                   current={currentThinking}
                   efforts={thinkingEfforts}
                   open={menu === "thinking"}
@@ -488,11 +490,13 @@ function ModelMenu({
 }
 
 function ThinkingMenu({
+  allowOff,
   current,
   efforts,
   open,
   onChange
 }: {
+  allowOff: boolean;
   current: ThinkingSelection;
   efforts: ThinkingSelection[];
   open: boolean;
@@ -503,7 +507,7 @@ function ThinkingMenu({
   return (
     <div className={`t-dropdown composer-popover thinking-level-menu ${presenceClass(presence.phase)}`} data-origin="bottom-left" role="menu">
       <div className="popover-heading">思考级别</div>
-      {(["off", ...efforts] as ThinkingSelection[]).map((effort) => (
+      {([...(allowOff ? ["off" as const] : []), ...efforts] as ThinkingSelection[]).map((effort) => (
         <button className={`menu-option${effort === current ? " is-selected" : ""}`} key={effort} onClick={() => onChange(effort)} role="menuitemradio" type="button">
           <span className="menu-check">{effort === current ? <Icon name="check" size={14} /> : null}</span>
           <span className="menu-option-copy"><strong>{thinkingLabel(effort)}</strong><small>{thinkingDescription(effort)}</small></span>

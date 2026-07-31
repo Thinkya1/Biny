@@ -6,10 +6,15 @@
  * 新的用户输入。
  */
 import { createHash } from "node:crypto";
-import type { ModelMessage } from "ai";
+import type { ModelMessage } from "./core/modelMessage.js";
 import type { TodoItem } from "../session/todoStore.js";
-import type { AgentLoopToolCall } from "./agentLoop.js";
 import type { AgentToolEvent } from "./types.js";
+
+interface AgentLoopToolCall {
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+}
 
 export type BlockedReason =
   | "missing_user_input"

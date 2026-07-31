@@ -9,10 +9,10 @@ import { BINY_KEYCHAIN_SERVICE, MacKeychainCredentialStore } from "../src/config
 import { resolveRunBudget } from "../src/agent/runBudget.js";
 
 await testGlobalPathResolution();
-testRunBudgetCompatibility();
+testRunBudget();
+testRemovedModelFormatsRequireManualUpdate();
 await testProjectOverridesAndGlobalPersistence();
-await testLegacyProjectBudgetOverridesNewGlobalBudget();
-await testRemovedDurableBudgetFieldsAreIgnored();
+await testRemovedProjectBudgetFieldsAreRejected();
 await testProjectCredentialFieldsAreRejected();
 await testProjectModelAliasMustBeGlobal();
 await testLegacyProjectConfigIsIgnored();
@@ -21,8 +21,9 @@ await testMacKeychainCredentialStore();
 async function testGlobalPathResolution(): Promise<void> {
   const configured = path.join(os.tmpdir(), `biny-agent-${String(process.pid)}`);
   assert.equal(globalAgentDir({ env: { [BINY_AGENT_DIR_ENV]: configured }, homeDir: "/unused" }), configured);
-  assert.equal(globalConfigPath({ env: { [BINY_AGENT_DIR_ENV]: configured }, homeDir: "/unused" }), path.join(configured, "agent.config.json"));
+  assert.equal(globalConfigPath({ env: { [BINY_AGENT_DIR_ENV]: configured }, homeDir: "/unused" }), path.join(configured, "config.json"));
   assert.equal(globalAgentDir({ env: {}, homeDir: "/tmp/biny-home" }), "/tmp/biny-home/.biny/agent");
+  assert.equal(globalConfigPath({ env: {}, homeDir: "/tmp/biny-home" }), "/tmp/biny-home/.biny/config.json");
   const projectA = projectSessionsDir("/tmp/project-a", { env: { [BINY_AGENT_DIR_ENV]: configured } });
   const projectB = projectSessionsDir("/tmp/project-b", { env: { [BINY_AGENT_DIR_ENV]: configured } });
   assert.equal(path.dirname(projectA), path.join(configured, "sessions"));
@@ -34,7 +35,7 @@ async function testGlobalPathResolution(): Promise<void> {
   assert.notEqual(memoryA, projectMemoryDir("/tmp/project-b", { env: { [BINY_AGENT_DIR_ENV]: configured } }));
 }
 
-function testRunBudgetCompatibility(): void {
+function testRunBudget(): void {
   assert.deepEqual(resolveRunBudget(defaultConfig.agent), {
     softStepLimit: 32,
     hardStepLimit: 96,
@@ -65,18 +66,33 @@ function testRunBudgetCompatibility(): void {
     maxRepeatedActions: 5
   });
 
-  const legacyNarrowHardLimit = configSchema.parse({
-    ...defaultConfig,
-    agent: { ...defaultConfig.agent, maxSteps: 16, maxTaskSteps: 8 }
-  });
-  assert.deepEqual(resolveRunBudget(legacyNarrowHardLimit.agent), {
-    softStepLimit: 8,
-    hardStepLimit: 8,
-    maxToolCalls: 512,
-    maxProviderRetries: 0,
-    maxCompletionContinuations: 3,
-    maxRepeatedActions: 3
-  });
+}
+
+function testRemovedModelFormatsRequireManualUpdate(): void {
+  assert.throws(
+    () => configSchema.parse({ ...defaultConfig, model: { provider: "deepseek", model: "deepseek-chat" } }),
+    (error: unknown) => error instanceof Error
+      && /Unsupported model configuration/u.test(error.message)
+      && /no longer auto-migrates/u.test(error.message)
+      && /defaultModel/u.test(error.message)
+      && /biny doctor/u.test(error.message)
+  );
+  assert.throws(
+    () => configSchema.parse({
+      ...defaultConfig,
+      defaultModel: "legacy",
+      models: { ...defaultConfig.models, legacy: { provider: "deepseek", model: "deepseek-reasoner" } }
+    }),
+    /model ID `deepseek-reasoner` was removed/u
+  );
+  assert.throws(
+    () => configSchema.parse({
+      ...defaultConfig,
+      defaultModel: "legacy",
+      models: { ...defaultConfig.models, legacy: { provider: "deepseek", model: "deepseek-v4-flash", thinking: { efforts: ["high"] } } }
+    }),
+    /model-level `thinking` field was removed; use `reasoning`/u
+  );
 }
 
 async function testProjectOverridesAndGlobalPersistence(): Promise<void> {
@@ -90,7 +106,7 @@ async function testProjectOverridesAndGlobalPersistence(): Promise<void> {
     await fs.writeFile(path.join(workspace, ".biny", "settings.json"), JSON.stringify({
       defaultModel: "deepseek-v4-flash",
       thinking: { enabled: false },
-      agent: { maxSteps: 2 },
+      agent: { softStepLimit: 2 },
       permission: { mode: "read-only" },
       context: { memory: { maxRecalled: 1 } },
       sandbox: { mode: "workspace-write" }
@@ -99,7 +115,7 @@ async function testProjectOverridesAndGlobalPersistence(): Promise<void> {
     const effective = await loadConfig(workspace, { globalDir: globalRoot });
     assert.equal(effective.defaultModel, "deepseek-v4-flash");
     assert.equal(effective.thinking.enabled, false);
-    assert.equal(effective.agent.maxSteps, 2);
+    assert.equal(effective.agent.softStepLimit, 2);
     assert.equal(effective.permission.mode, "read-only");
     assert.equal(effective.context.memory.maxRecalled, 1);
     assert.equal(effective.sandbox.mode, "workspace-write");
@@ -117,77 +133,23 @@ async function testProjectOverridesAndGlobalPersistence(): Promise<void> {
   }
 }
 
-async function testLegacyProjectBudgetOverridesNewGlobalBudget(): Promise<void> {
+async function testRemovedProjectBudgetFieldsAreRejected(): Promise<void> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-project-budget-"));
   const globalRoot = path.join(root, "global");
   const workspace = path.join(root, "project");
   await fs.mkdir(path.join(workspace, ".biny"), { recursive: true });
   try {
-    await saveConfigFile(globalRoot, {
-      ...defaultConfig,
-      agent: {
-        ...defaultConfig.agent,
-        softStepLimit: 20,
-        hardStepLimit: 120
-      }
-    });
     await fs.writeFile(path.join(workspace, ".biny", "settings.json"), JSON.stringify({
       agent: {
         maxSteps: 2,
-        maxTaskSteps: 10
-      }
-    }));
-
-    const legacyEffective = await loadConfig(workspace, { globalDir: globalRoot });
-    assert.equal(legacyEffective.agent.softStepLimit, 2);
-    assert.equal(legacyEffective.agent.hardStepLimit, 10);
-    assert.deepEqual(resolveRunBudget(legacyEffective.agent), {
-      softStepLimit: 2,
-      hardStepLimit: 10,
-      maxToolCalls: 512,
-      maxProviderRetries: 0,
-      maxCompletionContinuations: 3,
-      maxRepeatedActions: 3
-    });
-
-    await fs.writeFile(path.join(workspace, ".biny", "settings.json"), JSON.stringify({
-      agent: {
-        maxSteps: 2,
-        softStepLimit: 4,
         maxTaskSteps: 10,
-        hardStepLimit: 12
+        maxAttempts: 7
       }
     }));
-    const explicitEffective = await loadConfig(workspace, { globalDir: globalRoot });
-    assert.equal(explicitEffective.agent.softStepLimit, 4);
-    assert.equal(explicitEffective.agent.hardStepLimit, 12);
-  } finally {
-    await fs.rm(root, { recursive: true, force: true });
-  }
-}
-
-async function testRemovedDurableBudgetFieldsAreIgnored(): Promise<void> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "biny-removed-durable-budget-"));
-  const workspace = path.join(root, "project");
-  await fs.mkdir(path.join(workspace, ".biny"), { recursive: true });
-  try {
-    await fs.writeFile(path.join(workspace, ".biny", "settings.json"), JSON.stringify({
-      agent: {
-        maxSteps: 3,
-        maxAttempts: 7,
-        maxWallTimeMs: 60_000,
-        maxTotalTokens: 500_000,
-        maxCostUsd: 2
-      }
-    }));
-    const effective = await loadConfig(workspace, {
-      globalDir: path.join(root, "global")
-    });
-    assert.equal(effective.agent.maxSteps, 3);
-    assert.equal("maxAttempts" in effective.agent, false);
-    assert.equal("maxWallTimeMs" in effective.agent, false);
-    assert.equal("maxTotalTokens" in effective.agent, false);
-    assert.equal("maxCostUsd" in effective.agent, false);
+    await assert.rejects(
+      loadConfig(workspace, { globalDir: globalRoot }),
+      /Invalid project [\s\S]*Unrecognized key\(s\)/u
+    );
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

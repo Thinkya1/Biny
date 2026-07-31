@@ -17,18 +17,16 @@ const thinkingOverrideSchema = z.object({
   effort: reasoningEffortSchema.optional()
 }).strict();
 
-const agentOverrideSchema = z.preprocess(migrateLegacyAgentBudgetOverrides, z.object({
-  maxSteps: z.number().int().min(1).max(32).optional(),
+const agentOverrideSchema = z.object({
   softStepLimit: z.number().int().min(1).max(1_024).optional(),
   hardStepLimit: z.number().int().min(1).max(1_024).optional(),
   maxToolCalls: z.number().int().min(1).max(65_536).optional(),
   maxProviderRetries: z.number().int().min(0).max(5).optional(),
   maxCompletionContinuations: z.number().int().min(0).max(32).optional(),
   maxRepeatedActions: z.number().int().min(1).max(32).optional(),
-  maxTaskSteps: z.number().int().min(1).max(1_024).optional(),
   maxConcurrentTools: z.number().int().min(1).max(32).optional(),
   maxQueuedToolCalls: z.number().int().min(1).max(1_024).optional()
-}).strict());
+}).strict();
 
 const permissionOverrideSchema = z.object({
   mode: z.enum(["safe", "ask", "read-only", "auto", "full-access"]).optional(),
@@ -113,29 +111,4 @@ export async function loadProjectSettings(workspaceRoot: string): Promise<Projec
 
 function isNotFound(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-}
-
-/**
- * 项目配置的旧字段必须在项目这一层完成映射，否则和全局配置合并后，全局的新字段会错误地
- * 压过项目里的 maxSteps / maxTaskSteps。新旧字段同时存在时，以同层的新字段为准。
- */
-function migrateLegacyAgentBudgetOverrides(value: unknown): unknown {
-  if (!isRecord(value)) return value;
-  const migrated: Record<string, unknown> = { ...value };
-  // 旧 Durable Task 专属配置已无执行者；迁移时静默丢弃，避免现有项目 settings 直接失效。
-  delete migrated.maxAttempts;
-  delete migrated.maxWallTimeMs;
-  delete migrated.maxTotalTokens;
-  delete migrated.maxCostUsd;
-  if (migrated.softStepLimit === undefined && migrated.maxSteps !== undefined) {
-    migrated.softStepLimit = migrated.maxSteps;
-  }
-  if (migrated.hardStepLimit === undefined && migrated.maxTaskSteps !== undefined) {
-    migrated.hardStepLimit = migrated.maxTaskSteps;
-  }
-  return migrated;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

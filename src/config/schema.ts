@@ -2,31 +2,26 @@
  * Runtime configuration schema.
  *
  * Providers own credentials and endpoints, while model aliases own model IDs and
- * capabilities. The legacy single `model` object is migrated at the parse boundary.
+ * capabilities. Only the canonical multi-model format is accepted.
  */
 import { z } from "zod";
 
 const agentSchema = z.object({
-  maxSteps: z.number().int().min(1).max(32).default(32),
-  // 新 Loop 的预算字段保持可选，旧配置继续由 maxSteps / maxTaskSteps 提供兼容值。
-  softStepLimit: z.number().int().min(1).max(1_024).optional(),
-  hardStepLimit: z.number().int().min(1).max(1_024).optional(),
+  softStepLimit: z.number().int().min(1).max(1_024).default(32),
+  hardStepLimit: z.number().int().min(1).max(1_024).default(96),
   maxToolCalls: z.number().int().min(1).max(65_536).optional(),
   maxProviderRetries: z.number().int().min(0).max(5).optional(),
   maxCompletionContinuations: z.number().int().min(0).max(32).optional(),
-  maxRepeatedActions: z.number().int().min(1).max(32).optional(),
-  maxTaskSteps: z.number().int().min(1).max(1_024).default(96),
+  maxRepeatedActions: z.number().int().min(1).max(32).default(3),
   maxConcurrentTools: z.number().int().min(1).max(32).default(4),
   maxQueuedToolCalls: z.number().int().min(1).max(1_024).default(64)
-}).default({
-  maxSteps: 32,
-  softStepLimit: undefined,
-  hardStepLimit: undefined,
+}).strict().default({
+  softStepLimit: 32,
+  hardStepLimit: 96,
   maxToolCalls: undefined,
   maxProviderRetries: undefined,
   maxCompletionContinuations: undefined,
-  maxRepeatedActions: undefined,
-  maxTaskSteps: 96,
+  maxRepeatedActions: 3,
   maxConcurrentTools: 4,
   maxQueuedToolCalls: 64
 });
@@ -401,7 +396,7 @@ const modelAliasSchema = z.object({
     streaming: z.boolean().optional()
   }).optional(),
   contextWindow: z.number().int().min(4_096).max(2_000_000).optional(),
-  maxOutputTokens: z.number().int().min(1).max(131_072).optional(),
+  maxOutputTokens: z.number().int().min(1).max(384_000).optional(),
   /** Model-level API and compatibility override the provider defaults. */
   apiBackend: modelApiBackendSchema.optional(),
   baseUrl: z.string().url().optional(),
@@ -409,7 +404,6 @@ const modelAliasSchema = z.object({
   compatibility: modelCompatibilitySchema.optional(),
   /** Pi-style canonical capability map. Missing/null levels are unsupported. */
   thinkingLevelMap: thinkingLevelMapSchema.optional(),
-  thinking: modelThinkingSchema.optional(),
   reasoning: modelThinkingSchema.optional(),
   pricing: modelPricingSchema.optional()
 });
@@ -456,11 +450,11 @@ const canonicalConfigSchema = z.object({
       });
       continue;
     }
-    // Reasoning is opt-in per model. The provider adapter decides how the
-    // configured effort maps to its native SDK options.
+    // Reasoning is opt-in per model. The native provider transport maps the
+    // configured effort to the provider's request fields.
   }
 
-  const activeReasoning = activeModel ? activeModel.reasoning ?? activeModel.thinking : undefined;
+  const activeReasoning = activeModel?.reasoning;
   const activeThinkingLevels = activeModel?.thinkingLevelMap;
   const activeSupportsReasoning = activeThinkingLevels
     ? Object.entries(activeThinkingLevels).some(([level, native]) => level !== "off" && native !== null)
@@ -537,7 +531,7 @@ const canonicalConfigSchema = z.object({
   }
 });
 
-export const configSchema = z.preprocess(migrateLegacyConfig, canonicalConfigSchema);
+export const configSchema = z.preprocess(rejectLegacyModelConfig, canonicalConfigSchema);
 
 export type AgentConfig = z.infer<typeof canonicalConfigSchema>;
 export type ModelProvider = z.infer<typeof modelProviderSchema>;
@@ -593,9 +587,10 @@ export const defaultConfig: AgentConfig = {
       displayName: "DeepSeek V4 Flash",
       description: "Fast and affordable model for everyday work.",
       supportsTools: true,
-      capabilities: { tools: true, reasoning: false, streaming: true },
-      contextWindow: 128_000,
-      thinkingLevelMap: { off: "none" },
+      capabilities: { tools: true, reasoning: true, streaming: true },
+      contextWindow: 1_000_000,
+      thinkingLevelMap: { off: "none", high: "high", max: "max" },
+      reasoning: { efforts: ["high", "max"], defaultEffort: "high", mapping: { high: "high", max: "max" } }
     },
     "deepseek-v4-pro": {
       provider: "deepseek",
@@ -604,21 +599,19 @@ export const defaultConfig: AgentConfig = {
       description: "Frontier model for complex coding, research, and real-world work.",
       supportsTools: true,
       capabilities: { tools: true, reasoning: true, streaming: true },
-      contextWindow: 128_000,
-      thinkingLevelMap: { off: "none", low: "low", medium: "medium", high: "high" },
-      thinking: { efforts: ["low", "medium", "high"], defaultEffort: "high", mapping: { low: "low", medium: "medium", high: "high" }, budgetTokens: { low: 2_048, medium: 4_096, high: 8_192 } }
+      contextWindow: 1_000_000,
+      thinkingLevelMap: { off: "none", high: "high", max: "max" },
+      reasoning: { efforts: ["high", "max"], defaultEffort: "high", mapping: { high: "high", max: "max" } }
     }
   },
   thinking: { enabled: false, effort: "high" },
   agent: {
-    maxSteps: 32,
-    softStepLimit: undefined,
-    hardStepLimit: undefined,
+    softStepLimit: 32,
+    hardStepLimit: 96,
     maxToolCalls: undefined,
     maxProviderRetries: undefined,
-    maxCompletionContinuations: undefined,
-    maxRepeatedActions: undefined,
-    maxTaskSteps: 96,
+    maxCompletionContinuations: 3,
+    maxRepeatedActions: 3,
     maxConcurrentTools: 4,
     maxQueuedToolCalls: 64
   },
@@ -685,69 +678,75 @@ export const defaultConfig: AgentConfig = {
   }
 };
 
-function migrateLegacyConfig(value: unknown): unknown {
-  if (!isRecord(value) || "defaultModel" in value || !isRecord(value.model)) return value;
-  const legacy = value.model;
-  if (typeof legacy.provider !== "string" || typeof legacy.model !== "string") return value;
+const removedModelIds = new Set(["deepseek-chat", "deepseek-reasoner"]);
 
-  const providerAlias = legacy.provider;
-  const modelAlias = legacy.model;
-  const provider = {
-    type: legacy.provider,
-    baseUrl: typeof legacy.baseUrl === "string" ? legacy.baseUrl : undefined,
-    apiKey: typeof legacy.apiKey === "string" ? legacy.apiKey : undefined,
-    apiKeyEnv: typeof legacy.apiKeyEnv === "string" ? legacy.apiKeyEnv : undefined,
-    timeoutMs: typeof legacy.timeoutMs === "number" ? legacy.timeoutMs : undefined
-  };
-  const thinkingCapability = legacy.provider === "deepseek"
-    ? modelAlias === "deepseek-v4-flash"
-      ? undefined
-      : modelAlias === "deepseek-v4-pro"
-        ? { efforts: ["low", "medium", "high"], defaultEffort: "high" }
-        : { efforts: ["high", "max"], defaultEffort: "high" }
-    : undefined;
-  const models: Record<string, unknown> = {
-    [modelAlias]: {
-      provider: providerAlias,
-      model: modelAlias,
-      supportsTools: true,
-      maxOutputTokens: typeof legacy.maxOutputTokens === "number" ? legacy.maxOutputTokens : undefined,
-      thinking: thinkingCapability
-    }
-  };
+function rejectLegacyModelConfig(value: unknown): unknown {
+  if (!isRecord(value)) return value;
 
-  if (legacy.provider === "deepseek") {
-    models["deepseek-v4-flash"] ??= {
-      provider: providerAlias,
-      model: "deepseek-v4-flash",
-      displayName: "DeepSeek V4 Flash",
-      supportsTools: true,
-      thinking: undefined
-    };
-    models["deepseek-v4-pro"] ??= {
-      provider: providerAlias,
-      model: "deepseek-v4-pro",
-      displayName: "DeepSeek V4 Pro",
-      supportsTools: true,
-      thinking: { efforts: ["low", "medium", "high"], defaultEffort: "high" }
-    };
+  const legacyModel = isRecord(value.model) ? value.model : undefined;
+  if (legacyModel && typeof legacyModel.provider === "string" && typeof legacyModel.model === "string") {
+    throw new Error(formatRemovedModelConfigPrompt({
+      provider: legacyModel.provider,
+      model: legacyModel.model,
+      reason: "the single `model.provider` / `model.model` configuration shape was removed"
+    }));
   }
 
-  const legacyReasoning = isRecord(legacy.reasoning) ? legacy.reasoning : undefined;
-  const thinking = legacy.provider === "deepseek" && thinkingCapability
-    ? {
-      enabled: typeof legacyReasoning?.enabled === "boolean" ? legacyReasoning.enabled : true,
-      effort: legacyReasoning?.effort === "max" ? "max" : "high"
+  const models = isRecord(value.models) ? value.models : {};
+  for (const [alias, candidate] of Object.entries(models)) {
+    if (!isRecord(candidate) || typeof candidate.model !== "string") continue;
+    if (removedModelIds.has(candidate.model.toLowerCase()) || removedModelIds.has(alias.toLowerCase())) {
+      throw new Error(formatRemovedModelConfigPrompt({
+        alias,
+        model: candidate.model,
+        reason: `the model ID \`${candidate.model}\` was removed`
+      }));
     }
-    : { enabled: false, effort: "high" };
-  const { model: _legacyModel, ...rest } = value;
-  return {
-    ...rest,
-    defaultModel: modelAlias,
-    providers: { [providerAlias]: provider },
-    models,
-    thinking
-  };
+    if ("thinking" in candidate) {
+      throw new Error(formatRemovedModelConfigPrompt({
+        alias,
+        model: candidate.model,
+        reason: "the model-level `thinking` field was removed; use `reasoning`"
+      }));
+    }
+  }
+  return value;
+}
+
+function formatRemovedModelConfigPrompt(details: {
+  provider?: string;
+  alias?: string;
+  model: string;
+  reason: string;
+}): string {
+  const detected = [
+    details.provider ? `provider=${JSON.stringify(details.provider)}` : undefined,
+    details.alias ? `alias=${JSON.stringify(details.alias)}` : undefined,
+    `model=${JSON.stringify(details.model)}`
+  ].filter(Boolean).join(", ");
+  return [
+    "Unsupported model configuration.",
+    `Detected: ${detected}.`,
+    `Reason: ${details.reason}.`,
+    "Biny no longer auto-migrates removed model formats. Update the file manually and retry.",
+    "",
+    "Required shape:",
+    JSON.stringify({
+      defaultModel: "coder",
+      providers: {
+        deepseek: { type: "deepseek", apiKeyEnv: "DEEPSEEK_API_KEY" }
+      },
+      models: {
+        coder: {
+          provider: "deepseek",
+          model: "deepseek-v4-flash",
+          reasoning: { efforts: ["high", "max"], defaultEffort: "high" }
+        }
+      }
+    }, null, 2),
+    "",
+    "After editing, run `biny doctor` to validate the configuration."
+  ].join("\n");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

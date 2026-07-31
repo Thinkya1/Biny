@@ -572,7 +572,7 @@ async function testGitInspectionDisablesConfiguredHelpers(workspaceRoot: string)
   await writeFile(path.join(repository, "tracked.txt"), "before\n", "utf8");
   await writeFile(path.join(repository, ".ssh", "id_rsa"), "private-before\n", "utf8");
   await writeFile(path.join(repository, "nested", ".npmrc"), "//registry.example/:_authToken=before\n", "utf8");
-  await writeFile(path.join(repository, "agent.config.json"), "config-before\n", "utf8");
+  await writeFile(path.join(repository, "config.json"), "config-before\n", "utf8");
   await execFileAsync("git", ["add", "."], { cwd: repository });
   await execFileAsync("git", ["-c", "user.name=Biny Test", "-c", "user.email=biny@example.invalid", "commit", "--quiet", "-m", "initial"], { cwd: repository });
   await execFileAsync("git", ["config", "diff.external", helper], { cwd: repository });
@@ -580,7 +580,7 @@ async function testGitInspectionDisablesConfiguredHelpers(workspaceRoot: string)
   await writeFile(path.join(repository, "tracked.txt"), "after\n", "utf8");
   await writeFile(path.join(repository, ".ssh", "id_rsa"), "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n", "utf8");
   await writeFile(path.join(repository, "nested", ".npmrc"), "//registry.example/:_authToken=not-a-real-token\n", "utf8");
-  await writeFile(path.join(repository, "agent.config.json"), "not-a-real-config-secret\n", "utf8");
+  await writeFile(path.join(repository, "config.json"), "not-a-real-config-secret\n", "utf8");
 
   const diff = await runnable(createGitDiffTool({ workspaceRoot: repository, ignore: [] }).resolveExecution({})).execute({ toolCallId: "git-diff" });
   assert.match(diff.output, /tracked\.txt/);

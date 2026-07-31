@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ModelMessage } from "ai";
+import type { ModelMessage } from "../core/modelMessage.js";
 import { messageText } from "../modelMessages.js";
 import { collectProjectContext } from "../../project/ProjectContext.js";
 import { resolveWorkspaceDirectory, resolveWorkspacePath, toWorkspaceRelative } from "../../workspace/resolvePath.js";

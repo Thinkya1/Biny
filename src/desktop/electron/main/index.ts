@@ -17,7 +17,7 @@ import { DesktopProjectService } from "./DesktopProjectService.js";
 import { DesktopStateStore } from "./DesktopStateStore.js";
 import { DesktopTerminalManager } from "./DesktopTerminalManager.js";
 import { DesktopUserDataStore } from "./DesktopUserDataStore.js";
-import { globalAgentDir } from "../../../config/paths.js";
+import { globalConfigDir } from "../../../config/paths.js";
 import { registerDesktopIpc } from "./ipc.js";
 import { installApplicationMenu } from "./menu.js";
 import { createDesktopWindow, type WindowCloseDecision } from "./window.js";
@@ -43,16 +43,15 @@ if (!app.requestSingleInstanceLock()) {
 async function startDesktopApplication(): Promise<void> {
   await app.whenReady();
   setDesktopIcon();
-  const legacyDataRoot = app.getPath("userData");
-  const desktopRoot = path.join(legacyDataRoot, "workspaces", "default");
+  const userDataRoot = app.getPath("userData");
+  const desktopRoot = path.join(userDataRoot, "workspaces", "default");
   const storage = new DesktopUserDataStore(desktopRoot);
   await storage.initialize();
   await storage.ensureGlobalData();
-  await storage.migrateLegacyState(path.join(legacyDataRoot, "desktop-state.json"), path.join(desktopRoot, "desktop-state.json"));
   const state = new DesktopStateStore(path.join(desktopRoot, "desktop-state.json"));
   await state.load();
   // 模型配置与 CLI/TUI 共用全局目录；凭据由 config/credentials.ts 统一接入 macOS Keychain。
-  const configStore = new DesktopConfigStore(globalAgentDir());
+  const configStore = new DesktopConfigStore(globalConfigDir());
   const projects = new DesktopProjectService(state, storage, configStore);
   let mainWindow: BrowserWindow | undefined;
   let preparingQuit = false;

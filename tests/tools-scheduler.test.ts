@@ -197,11 +197,12 @@ async function testSynchronousStartFailureReleasesCapacity(): Promise<void> {
 
 function testSchedulerConfigDefaultsAndValidation(): void {
   const input = structuredClone(defaultConfig) as unknown as Record<string, unknown>;
-  input.agent = { maxSteps: 8 };
+  input.agent = { softStepLimit: 8 };
   const parsed = configSchema.parse(input);
   assert.deepEqual(parsed.agent, {
-    maxSteps: 8,
-    maxTaskSteps: 96,
+    softStepLimit: 8,
+    hardStepLimit: 96,
+    maxRepeatedActions: 3,
     maxConcurrentTools: 4,
     maxQueuedToolCalls: 64
   });

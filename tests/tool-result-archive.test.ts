@@ -2,9 +2,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { LanguageModel, ToolExecutionOptions } from "ai";
 import { z } from "zod";
-import { SdkToolExecutionCoordinator } from "../src/agent/sdkToolExecutionCoordinator.js";
+import { ToolExecutionCoordinator } from "../src/agent/toolExecutionCoordinator.js";
 import { defaultConfig, type AgentConfig } from "../src/config/schema.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
 import { SessionRecorder } from "../src/session/recorder.js";
@@ -15,7 +14,7 @@ import { resolveWorkspacePath } from "../src/workspace/resolvePath.js";
 import type { Tool } from "../src/tools/types.js";
 
 interface ExecutableTool {
-  execute(input: unknown, options: ToolExecutionOptions<unknown>): Promise<unknown>;
+  execute(toolCallId: string, input: Record<string, unknown>): Promise<unknown>;
 }
 
 async function main(): Promise<void> {
@@ -29,17 +28,16 @@ async function main(): Promise<void> {
     registry.register(largeResultTool());
     registry.register(createReadToolResultTool({ workspaceRoot, ignore: config.workspace.ignore }));
     const recorder = new SessionRecorder(workspaceRoot, "archive-test");
-    const coordinator = new SdkToolExecutionCoordinator({
+    const coordinator = new ToolExecutionCoordinator({
       workspaceRoot,
       config,
-      model: {} as LanguageModel,
       recorder,
       toolRegistry: registry
     }, new PermissionManager(config.permission), () => undefined);
-    const tool = coordinator.createTools().large_result as unknown as ExecutableTool;
+    const tool = nativeTool(coordinator, "large_result");
 
-    const first = await tool.execute({}, toolOptions("first"));
-    const second = await tool.execute({}, toolOptions("second")) as Record<string, unknown>;
+    const first = await tool.execute("first", {});
+    const second = await tool.execute("second", {}) as Record<string, unknown>;
     assert.equal(typeof first, "object");
     assert.equal(second.archived, true);
     assert.equal(Number(second.resultBytes) > 768, true);
@@ -53,15 +51,15 @@ async function main(): Promise<void> {
 
     // 归档目录被 workspace ignore 挡在 read_file 之外，模型只能靠 read_tool_result 取回。
     assert.throws(() => resolveWorkspacePath(workspaceRoot, String(second.archivePath), config.workspace.ignore));
-    const reader = coordinator.createTools().read_tool_result as unknown as ExecutableTool;
-    const reread = await reader.execute({ archivePath: second.archivePath }, toolOptions("reread")) as Record<string, unknown>;
+    const reader = nativeTool(coordinator, "read_tool_result");
+    const reread = await reader.execute("reread", { archivePath: second.archivePath }) as Record<string, unknown>;
     assert.equal(reread.tool, "large_result");
     assert.equal(String(reread.content).includes("x".repeat(768)), true);
     assert.equal(reread.hasMore, false);
 
     // 归档引用之外的路径一律拒绝，工具参数不能借它读到任意文件。
     for (const escape of ["../../etc/passwd", ".biny/sessions/archive-test.jsonl", ".biny/tool-results/../sessions/x.jsonl"]) {
-      const denied = await reader.execute({ archivePath: escape }, toolOptions(`escape-${escape}`)) as Record<string, unknown>;
+      const denied = await reader.execute(`escape-${escape}`, { archivePath: escape }) as Record<string, unknown>;
       assert.equal(typeof denied.error, "string", `${escape} should be refused`);
       assert.equal(denied.content, undefined);
     }
@@ -69,7 +67,7 @@ async function main(): Promise<void> {
     // 预算是模型侧的上限：超额后每条结果都塌缩成引用，preview 不会每步再塞一份。
     let inlineBytes = 0;
     for (let index = 0; index < 12; index += 1) {
-      const later = await tool.execute({}, toolOptions(`overflow-${String(index)}`));
+      const later = await tool.execute(`overflow-${String(index)}`, {});
       inlineBytes += Buffer.byteLength(JSON.stringify(later), "utf8");
     }
     assert.equal(inlineBytes < 12 * 768, true, `later results should collapse to references, saw ${String(inlineBytes)} bytes`);
@@ -97,8 +95,15 @@ function largeResultTool(): Tool<Record<string, never>, string> {
   };
 }
 
-function toolOptions(toolCallId: string): ToolExecutionOptions<unknown> {
-  return { toolCallId, abortSignal: undefined } as ToolExecutionOptions<unknown>;
+function nativeTool(coordinator: ToolExecutionCoordinator, name: string): ExecutableTool {
+  const tool = coordinator.createAgentTools().find((candidate) => candidate.name === name);
+  if (!tool) throw new Error(`missing tool ${name}`);
+  return {
+    execute: async (toolCallId, input) => {
+      const result = await tool.execute(toolCallId, input);
+      return result.details ?? result;
+    }
+  };
 }
 
 await main();

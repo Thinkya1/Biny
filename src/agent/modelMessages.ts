@@ -1,10 +1,10 @@
 /**
  * ModelMessage 读取工具。
  *
- * AI SDK 的消息内容既可能是字符串也可能是分片数组，各处都要判一遍很啰嗦，这里统一提供
+ * 模型消息内容既可能是字符串也可能是分片数组，各处都要判一遍很啰嗦，这里统一提供
  * 取文本、取思考内容、取工具名和深拷贝的读法。
  */
-import type { ModelMessage } from "ai";
+import type { ModelMessage } from "./core/modelMessage.js";
 
 /** 拼出消息的纯文本形态；工具调用/结果按 JSON 展开，图片等无文本分片忽略。 */
 export function messageText(message: ModelMessage): string {

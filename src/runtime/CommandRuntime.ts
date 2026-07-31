@@ -25,7 +25,7 @@ import { createSubagentTool, runSubagentTask as executeSubagentTask, type Subage
 import { buildSubagentDefinitionsPrompt, loadSubagentDefinitions, type SubagentDefinition } from "../extensions/agents.js";
 import { createMemoryTools } from "../extensions/memory.js";
 import { createToolCounts, formatExtensionReport, type ExtensionSection, type ExtensionStatus } from "../extensions/report.js";
-import { createModelSettings, type ModelSettings } from "../llm/factory.js";
+import { createNativeModelSettings, type NativeModelSettings } from "../llm/nativeFactory.js";
 import {
   SubagentTaskManager,
   type SubagentTaskRunOptions,
@@ -89,7 +89,7 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   for (const tool of createCompletionStateTools(completionState)) {
     toolRegistry.registerBuiltinTool(tool);
   }
-  const permissionManager = new PermissionManager({ ...config.permission, source: "global agent.config.json + project .biny/settings.json" });
+  const permissionManager = new PermissionManager({ ...config.permission, source: "global config.json + project .biny/settings.json" });
   const mcpHost = new McpToolHost();
   let skills: SkillBundle | undefined;
   let agent: AgentSession | undefined;
@@ -103,7 +103,7 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   const subagentOptions: SubagentOptions = {
     workspaceRoot,
     config,
-    getModelSettings: (modelAlias?: string) => subagentModelSettings(config, modelManager, modelAlias),
+    getNativeModelSettings: (modelAlias?: string) => subagentModelSettings(config, modelManager, modelAlias),
     getAccessMode: () => subagentAccessMode(permissionManager),
     getParentRunId: () => subagentParentRunId,
     loadAgentDefinitions,
@@ -183,7 +183,7 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   });
 
   const startSubagentTask = (task: string, taskOptions?: SubagentTaskRunOptions): SubmittedSubagentTask => {
-    if (!config.extensions.subagent.enabled) throw new Error("Subagent extension is disabled in agent.config.json.");
+    if (!config.extensions.subagent.enabled) throw new Error("Subagent extension is disabled in config.json.");
     if (!subagentTaskManager) throw new Error("Subagent runtime is unavailable.");
     const taskId = taskOptions?.taskId ?? randomUUID();
     agent.recordHostedUserMessage(task);
@@ -258,10 +258,10 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   return runtime;
 }
 
-function subagentModelSettings(config: AgentConfig, modelManager: ModelManager, modelAlias?: string): ModelSettings {
+function subagentModelSettings(config: AgentConfig, modelManager: ModelManager, modelAlias?: string): NativeModelSettings {
   // 具名定义的 model 覆盖优先于全局 subagent model；两者都未配置时沿用当前会话模型。
   const alias = modelAlias ?? config.extensions.subagent.model;
-  if (!alias) return modelManager.getModelSettings();
+  if (!alias) return modelManager.getNativeModelSettings();
   const model = config.models[alias];
   if (!model) throw new Error(`Unknown subagent model alias: ${alias}`);
   if (model.supportsTools === false) throw new Error(`Subagent model ${alias} does not support tools.`);
@@ -273,7 +273,7 @@ function subagentModelSettings(config: AgentConfig, modelManager: ModelManager, 
       ? { enabled: true, effort: reasoning.defaultEffort }
       : { enabled: false, effort: "high" as const }
   };
-  return createModelSettings(modelConfig, alias);
+  return createNativeModelSettings(modelConfig, alias);
 }
 
 export async function withCommandRuntime(workspaceRoot: string, fn: (runtime: CommandRuntime) => Promise<void>): Promise<void> {

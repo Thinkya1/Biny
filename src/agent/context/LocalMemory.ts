@@ -1,8 +1,9 @@
 import { constants, promises as fs } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
-import { generateText, Output, type LanguageModel, type TelemetryOptions } from "ai";
 import { z } from "zod";
+import type { AgentModel } from "../core/types.js";
+import { generateNativeText, nativeJsonMessages, parseNativeJson } from "../../llm/nativeJson.js";
 import { globalAgentDir, projectMemoryDir } from "../../config/paths.js";
 import { redactSecrets } from "../../utils/secrets.js";
 import type { MemoryCompactionTopicResult, MemoryEntry, MemoryEntrySummary, MemoryMatch } from "./types.js";
@@ -39,10 +40,8 @@ export interface MemoryWriteResult {
 export class LocalMemory {
   constructor(
     private readonly workspaceRoot: string,
-    private readonly getModel: () => LanguageModel,
+    private readonly getModel: () => AgentModel,
     private readonly onUsage: ModelUsageObserver = () => undefined,
-    private readonly telemetry?: (functionId: string) => TelemetryOptions,
-    private readonly getMaxRetries: () => number = () => 0,
     /** 每回合自动注入上下文的记忆条数上限，来自 context.memory.maxRecalled。 */
     readonly recallLimit: number = 3
   ) {}
@@ -317,27 +316,16 @@ export class LocalMemory {
       "Current entries (Markdown):",
       content
     ].join("\n\n");
-    const response = await generateText({
-      model: this.getModel(),
-      allowSystemInMessages: true,
-      abortSignal: signal,
-      maxRetries: this.getMaxRetries(),
-      timeout: memoryModelTimeoutMs,
-      output: Output.object({
-        schema: compactedEntriesSchema,
-        name: "biny-memory-compaction",
-        description: "Consolidated entries for one local project memory topic."
-      }),
-      telemetry: this.telemetry?.("biny.memory.compact"),
-      messages: [
-        { role: "system", content: "You consolidate project memory records without losing durable facts." },
-        { role: "user", content: prompt }
-      ]
-    });
-    await this.onUsage(await response.usage, "memory");
+    const model = this.getModel();
+    const response = await generateNativeText(model, nativeJsonMessages(
+      "You consolidate project memory records without losing durable facts.",
+      prompt
+    ), { signal, maxOutputTokens: 4_096, timeoutMs: memoryModelTimeoutMs });
+    if (response.usage) await this.onUsage(response.usage, "memory");
     signal?.throwIfAborted();
-    const output = await response.output;
-    return output.entries
+    const parsed = compactedEntriesSchema.safeParse(parseNativeJson(response.text));
+    if (!parsed.success) throw new Error("Model returned invalid memory compaction JSON.");
+    return parsed.data.entries
       .map((entry) => sanitizeMemoryEntry({ ...entry, topic }))
       .filter((entry) => entry.summary.length >= 20);
   }
@@ -355,27 +343,15 @@ export class LocalMemory {
     ].join("\n\n");
 
     try {
-      const response = await generateText({
-        model: this.getModel(),
-        allowSystemInMessages: true,
-        abortSignal: signal,
-        maxRetries: this.getMaxRetries(),
-        timeout: memoryModelTimeoutMs,
-        output: Output.object({
-          schema: memoryEntrySchema,
-          name: "biny-memory-entry",
-          description: "A durable local project memory entry."
-        }),
-        telemetry: this.telemetry?.("biny.memory"),
-        messages: [
-          { role: "system", content: "You write concise project memory records, not explanations." },
-          { role: "user", content: prompt }
-        ]
-      });
+      const model = this.getModel();
+      const response = await generateNativeText(model, nativeJsonMessages(
+        "You write concise project memory records, not explanations.",
+        prompt
+      ), { signal, maxOutputTokens: 2_048, timeoutMs: memoryModelTimeoutMs });
       signal?.throwIfAborted();
-      await this.onUsage(await response.usage, "memory");
+      if (response.usage) await this.onUsage(response.usage, "memory");
       signal?.throwIfAborted();
-      return parseMemoryEntry(await response.output);
+      return parseMemoryEntry(parseNativeJson(response.text));
     } catch {
       signal?.throwIfAborted();
       return undefined;
@@ -418,15 +394,6 @@ export function normalizeTopic(value: string): string {
   const normalized = value.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
   return normalized || "project";
 }
-
-const memoryEntrySchema = z.object({
-  topic: z.enum(["decisions", "debugging", "workflows", "project"]),
-  title: z.string(),
-  summary: z.string(),
-  decisions: z.array(z.string()).default([]),
-  paths: z.array(z.string()).default([]),
-  keywords: z.array(z.string()).default([])
-});
 
 function parseMemoryEntry(value: unknown): MemoryEntry | undefined {
   try {

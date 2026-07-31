@@ -2,7 +2,7 @@
  * 统一模型凭据存储。
  *
  * macOS 上 CLI、TUI 和 Electron 都通过 `security` 访问同一个 Keychain service/account；其他平台
- * 不落盘，模型凭据只从配置声明的环境变量读取。凭据值不会进入 IPC、session 或 agent.config.json。
+ * 不落盘，模型凭据只从配置声明的环境变量读取。凭据值不会进入 IPC、session 或 config.json。
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";

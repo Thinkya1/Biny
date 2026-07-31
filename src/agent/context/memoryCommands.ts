@@ -9,7 +9,7 @@ import type { LocalMemory } from "./LocalMemory.js";
 export const memoryCommandUsage = "Usage: /memory [list] | show <topic> | add <topic> <note> | forget <topic> | search <query> | compact [topic]";
 
 export async function runMemoryCommand(memory: LocalMemory | undefined, args: string[]): Promise<string> {
-  if (!memory) return "Local memory is disabled (context.memory.enabled = false in agent.config.json).";
+  if (!memory) return "Local memory is disabled (context.memory.enabled = false in config.json).";
   const action = args[0]?.toLowerCase() ?? "list";
 
   if (action === "list" || !action) {

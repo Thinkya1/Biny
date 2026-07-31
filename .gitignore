@@ -17,6 +17,7 @@ ARCHITECTURE.local.md
 # 本地文档不进入仓库，仅发布根目录 README
 *.md
 !/README.md
+AGENTS.md
 
 # Local agent evaluation runs and reports
 /jobs/

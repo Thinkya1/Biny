@@ -2,12 +2,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { LanguageModel, ToolExecutionOptions } from "ai";
 import { z } from "zod";
 import {
-  SdkToolExecutionCoordinator,
+  ToolExecutionCoordinator,
   type ToolExecutionBudget
-} from "../src/agent/sdkToolExecutionCoordinator.js";
+} from "../src/agent/toolExecutionCoordinator.js";
 import type { AgentSessionEvent, AgentToolEvent } from "../src/agent/types.js";
 import { defaultConfig, type AgentConfig } from "../src/config/schema.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
@@ -17,7 +16,7 @@ import { ToolRegistry } from "../src/tools/registry.js";
 import type { Tool } from "../src/tools/types.js";
 
 interface ExecutableTool {
-  execute(input: unknown, options: ToolExecutionOptions<unknown>): Promise<unknown>;
+  execute(toolCallId: string, input: Record<string, unknown>): Promise<unknown>;
 }
 
 type CoordinatorEvent = AgentToolEvent | Extract<AgentSessionEvent, { type: "error" }>;
@@ -29,9 +28,9 @@ async function testBatchCannotExceedToolCallLimit(): Promise<void> {
   });
   try {
     const results = await Promise.all([
-      fixture.tool.execute({ key: "a" }, toolOptions("call-a")),
-      fixture.tool.execute({ key: "b" }, toolOptions("call-b")),
-      fixture.tool.execute({ key: "c" }, toolOptions("call-c"))
+      fixture.tool.execute("call-a", { key: "a" }),
+      fixture.tool.execute("call-b", { key: "b" }),
+      fixture.tool.execute("call-c", { key: "c" })
     ]);
     await fixture.coordinator.waitForIdle();
 
@@ -70,9 +69,9 @@ async function testBatchCannotExceedRepeatedActionLimit(): Promise<void> {
   });
   try {
     const results = await Promise.all([
-      fixture.tool.execute({ key: "same" }, toolOptions("repeat-1")),
-      fixture.tool.execute({ key: "same" }, toolOptions("repeat-2")),
-      fixture.tool.execute({ key: "same" }, toolOptions("repeat-3"))
+      fixture.tool.execute("repeat-1", { key: "same" }),
+      fixture.tool.execute("repeat-2", { key: "same" }),
+      fixture.tool.execute("repeat-3", { key: "same" })
     ]);
     await fixture.coordinator.waitForIdle();
 
@@ -105,7 +104,7 @@ async function testBatchCannotExceedRepeatedActionLimit(): Promise<void> {
 }
 
 async function createFixture(budget: ToolExecutionBudget): Promise<{
-  coordinator: SdkToolExecutionCoordinator;
+  coordinator: ToolExecutionCoordinator;
   tool: ExecutableTool;
   events: CoordinatorEvent[];
   resolveCount(): number;
@@ -144,11 +143,10 @@ async function createFixture(budget: ToolExecutionBudget): Promise<{
   } as Tool);
   const recorder = new SessionRecorder(workspaceRoot, "tool-budget");
   const events: CoordinatorEvent[] = [];
-  const coordinator = new SdkToolExecutionCoordinator(
+  const coordinator = new ToolExecutionCoordinator(
     {
       workspaceRoot,
       config,
-      model: {} as LanguageModel,
       recorder,
       toolRegistry: registry
     },
@@ -160,7 +158,7 @@ async function createFixture(budget: ToolExecutionBudget): Promise<{
   );
   return {
     coordinator,
-    tool: coordinator.createTools().counted_tool as unknown as ExecutableTool,
+    tool: nativeTool(coordinator, "counted_tool"),
     events,
     resolveCount: () => resolved,
     executeCount: () => executed,
@@ -171,8 +169,15 @@ async function createFixture(budget: ToolExecutionBudget): Promise<{
   };
 }
 
-function toolOptions(toolCallId: string): ToolExecutionOptions<unknown> {
-  return { toolCallId, abortSignal: undefined } as ToolExecutionOptions<unknown>;
+function nativeTool(coordinator: ToolExecutionCoordinator, name: string): ExecutableTool {
+  const tool = coordinator.createAgentTools().find((candidate) => candidate.name === name);
+  if (!tool) throw new Error(`missing tool ${name}`);
+  return {
+    execute: async (toolCallId, input) => {
+      const result = await tool.execute(toolCallId, input);
+      return result.details ?? result;
+    }
+  };
 }
 
 function readString(value: unknown, key: string): string | undefined {
@@ -184,4 +189,4 @@ function readString(value: unknown, key: string): string | undefined {
 await testBatchCannotExceedToolCallLimit();
 await testBatchCannotExceedRepeatedActionLimit();
 
-console.log("SDK tool coordinator tests passed");
+console.log("native tool coordinator tests passed");

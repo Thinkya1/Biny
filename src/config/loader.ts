@@ -1,18 +1,18 @@
 /**
  * Configuration loading and persistence.
  *
- * 全局 agent.config.json 可能包含旧版本遗留的 API 凭据，因此每次读写都固定到全局 agent 目录下
- * 的单链接普通文件并强制 0600。新写入由配置存储层先把凭据移出配置文件。
+ * 全局 config.json 可能包含旧版本遗留的 API 凭据，因此每次读写都固定到全局配置目录下的
+ * 单链接普通文件并强制 0600。新写入由配置存储层先把凭据移出配置文件。
  */
 import { randomBytes } from "node:crypto";
 import { constants, promises as fs, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { configSchema, defaultConfig, type AgentConfig } from "./schema.js";
-import { globalAgentDir } from "./paths.js";
+import { globalConfigDir } from "./paths.js";
 import { loadProjectSettings, type ProjectSettings } from "./projectSettings.js";
 
-export const CONFIG_FILE = "agent.config.json";
+export const CONFIG_FILE = "config.json";
 export const maxConfigFileBytes = 1024 * 1024;
 
 interface ConfigLocation {
@@ -42,7 +42,7 @@ export async function loadConfig(workspaceRoot: string, options: ConfigPathOptio
 /** 只读取全局配置，不读取项目覆盖；供保存配置时保持全局字段的原始值。 */
 export async function loadGlobalConfig(options: ConfigPathOptions = {}): Promise<AgentConfig> {
   try {
-    return await loadConfigFile(options.globalDir ?? globalAgentDir());
+    return await loadConfigFile(options.globalDir ?? globalConfigDir());
   } catch (error) {
     if (isNotFound(error)) return configSchema.parse(defaultConfig);
     throw error;
@@ -79,7 +79,7 @@ export async function saveConfig(workspaceRoot: string, config: AgentConfig, opt
     ? await loadGlobalConfigOrDefault(options)
     : configSchema.parse(defaultConfig);
   const toPersist = preserveGlobalValuesForProjectOverrides(globalConfig, parsed, projectSettings);
-  await saveConfigFile(options.globalDir ?? globalAgentDir(), toPersist);
+  await saveConfigFile(options.globalDir ?? globalConfigDir(), toPersist);
 }
 
 /** 保存指定目录下的完整配置文件；凭据字段会被显式清空，不会写入 JSON。 */
@@ -121,7 +121,7 @@ export async function saveConfigFile(root: string, config: AgentConfig): Promise
 
 export async function ensureConfig(workspaceRoot: string, options: ConfigPathOptions = {}): Promise<void> {
   void workspaceRoot;
-  const root = options.globalDir ?? globalAgentDir();
+  const root = options.globalDir ?? globalConfigDir();
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
   const location = await resolveConfigLocation(root);
   let existing: FileHandle | undefined;

@@ -1,7 +1,8 @@
 /**
  * Biny 配置与全局 agent 数据的路径解析。
  *
- * 模型配置、项目会话和项目记忆都脱离工作区存放。BINY_AGENT_DIR 改变这一个全局根目录；
+ * 模型配置、项目会话和项目记忆都脱离工作区存放。配置文件固定在 `~/.biny/config.json`，
+ * session/memory 等 Agent 运行数据在 `~/.biny/agent/`；BINY_AGENT_DIR 只改变后者。
  * 项目 `.biny` 只承载设置、扩展覆盖与尚未迁出的运行产物。
  */
 import { createHash } from "node:crypto";
@@ -11,7 +12,7 @@ import path from "node:path";
 
 export const BINY_AGENT_DIR_ENV = "BINY_AGENT_DIR";
 export const DEFAULT_AGENT_DIR = path.join(".biny", "agent");
-export const GLOBAL_CONFIG_FILE = "agent.config.json";
+export const GLOBAL_CONFIG_FILE = "config.json";
 export const PROJECT_SETTINGS_FILE = "settings.json";
 
 export interface PathEnvironment {
@@ -26,7 +27,13 @@ export function globalAgentDir(options: PathEnvironment = {}): string {
 }
 
 export function globalConfigPath(options: PathEnvironment = {}): string {
-  return path.join(globalAgentDir(options), GLOBAL_CONFIG_FILE);
+  return path.join(globalConfigDir(options), GLOBAL_CONFIG_FILE);
+}
+
+export function globalConfigDir(options: PathEnvironment = {}): string {
+  const configured = (options.env ?? process.env)[BINY_AGENT_DIR_ENV];
+  if (configured?.trim()) return path.resolve(configured.trim());
+  return path.dirname(globalAgentDir(options));
 }
 
 /** 项目会话按规范化绝对路径隔离，避免不同工作区的 latest、id 前缀和锁互相干扰。 */

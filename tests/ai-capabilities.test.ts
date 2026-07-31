@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { inferReasoningEfforts, modelCapabilities, modelContextBudget, modelReasoningConfig, modelThinkingLevelMap, nativeReasoningEffort, reasoningBudgetTokens, thinkingLevelMapForModel } from "../src/ai/capabilities.js";
+import { inferReasoningEfforts, modelCapabilities, modelContextBudget, modelThinkingLevelMap, nativeReasoningEffort, reasoningBudgetTokens, thinkingLevelMapForModel } from "../src/ai/capabilities.js";
 import { parseModelCatalog } from "../src/ai/modelCatalog.js";
 import { createRetryFetch } from "../src/ai/retry.js";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
@@ -37,11 +37,11 @@ assert.equal(modelCapabilities(model).vision, true);
 assert.equal(nativeReasoningEffort(model, "high"), "high");
 assert.equal(reasoningBudgetTokens(model, "high"), 3_072);
 
-assert.deepEqual(modelThinkingLevelMap(defaultConfig.models["deepseek-v4-flash"]!), { off: "none" });
-assert.equal(modelReasoningConfig(defaultConfig.models["deepseek-v4-flash"]!), undefined);
-assert.deepEqual(modelThinkingLevelMap(defaultConfig.models["deepseek-v4-pro"]!), { off: "none", low: "low", medium: "medium", high: "high" });
-assert.deepEqual(thinkingLevelMapForModel("deepseek-v4-pro"), { off: "none", low: "low", medium: "medium", high: "high" });
-assert.deepEqual(thinkingLevelMapForModel("deepseek-v4-flash"), { off: "none" });
+assert.deepEqual(modelThinkingLevelMap(defaultConfig.models["deepseek-v4-flash"]!), { off: "none", high: "high", max: "max" });
+assert.deepEqual(modelThinkingLevelMap(defaultConfig.models["deepseek-v4-pro"]!), { off: "none", high: "high", max: "max" });
+assert.deepEqual(thinkingLevelMapForModel("deepseek-v4-pro"), { off: "none", high: "high", max: "max" });
+assert.deepEqual(thinkingLevelMapForModel("deepseek-v4-flash"), { off: "none", high: "high", max: "max" });
+assert.deepEqual(thinkingLevelMapForModel("kimi-k3"), { low: "low", high: "high", max: "max" });
 
 const registry = new ModelRegistry(structuredClone(defaultConfig));
 registry.registerCatalog("deepseek", [{
@@ -93,8 +93,9 @@ assert.equal(attempts, 2);
 assert.deepEqual(inferReasoningEfforts("grok-4.5"), ["high", "max"]);
 assert.deepEqual(inferReasoningEfforts("gpt-5.4"), ["high", "max"]);
 assert.deepEqual(inferReasoningEfforts("claude-sonnet-4.6"), ["high", "max"]);
-assert.deepEqual(inferReasoningEfforts("deepseek-v4-flash"), []);
-assert.deepEqual(inferReasoningEfforts("deepseek-v4-pro"), ["low", "medium", "high"]);
+assert.deepEqual(inferReasoningEfforts("deepseek-v4-flash"), ["high", "max"]);
+assert.deepEqual(inferReasoningEfforts("deepseek-v4-pro"), ["high", "max"]);
+assert.deepEqual(inferReasoningEfforts("kimi-k3"), ["low", "high", "max"]);
 assert.deepEqual(inferReasoningEfforts("openai/gpt-5.4"), ["high", "max"]); // aggregator vendor prefix
 assert.deepEqual(inferReasoningEfforts("grok-3-mini"), ["high", "max"]);
 assert.deepEqual(inferReasoningEfforts("gpt-4o-mini"), []);

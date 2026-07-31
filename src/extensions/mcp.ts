@@ -131,7 +131,7 @@ export class McpToolHost {
   async reconnectServer(serverName: string): Promise<McpServerStatus> {
     const managed = this.servers.get(serverName);
     if (!managed) throw new Error(`Unknown MCP server: ${serverName}`);
-    if (!managed.status.enabled) throw new Error(`MCP server ${serverName} is disabled in agent.config.json.`);
+    if (!managed.status.enabled) throw new Error(`MCP server ${serverName} is disabled in config.json.`);
     try {
       await this.reconnect(managed);
     } catch (error) {
@@ -234,7 +234,7 @@ export class McpToolHost {
   private requireServer(serverName: string): ManagedMcpServer {
     const managed = this.servers.get(serverName);
     if (!managed) throw new Error(`Unknown MCP server: ${serverName}`);
-    if (!managed.status.enabled) throw new Error(`MCP server ${serverName} is disabled in agent.config.json.`);
+    if (!managed.status.enabled) throw new Error(`MCP server ${serverName} is disabled in config.json.`);
     return managed;
   }
 
@@ -247,7 +247,7 @@ export class McpToolHost {
   /** 串行化的重连：并发调用共享同一次连接尝试。 */
   private async reconnect(managed: ManagedMcpServer): Promise<void> {
     if (this.closing) throw new Error(`MCP host is closing; cannot reconnect ${managed.name}.`);
-    if (!managed.status.enabled) throw new Error(`MCP server ${managed.name} is disabled in agent.config.json.`);
+    if (!managed.status.enabled) throw new Error(`MCP server ${managed.name} is disabled in config.json.`);
     if (managed.connecting) {
       await managed.connecting;
       return;

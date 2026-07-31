@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { LanguageModel, LanguageModelUsage, ModelMessage, TextStreamPart, ToolSet } from "ai";
+import type { ModelMessage } from "./core/modelMessage.js";
 import type { AgentConfig } from "../config/schema.js";
 import { createFileConfigStore, type AgentConfigStore } from "../config/store.js";
 import {
@@ -14,7 +14,7 @@ import {
 import { PermissionManager, type PermissionMode } from "../permission/PermissionManager.js";
 import { runPermissionCommand } from "../permission/commands.js";
 import { listSessionSummaries, parseSessionEvents, type SessionSummary } from "../session/events.js";
-import { SessionRecorder, type ReasoningBlock } from "../session/recorder.js";
+import { SessionRecorder } from "../session/recorder.js";
 import { replaySessionEvents, type SessionReplay } from "../session/replay.js";
 import {
   TurnStore,
@@ -23,8 +23,16 @@ import {
 } from "../session/turnStore.js";
 import { ensureAgentDirs, resolveSessionFile, sessionIdFromFile } from "../session/store.js";
 import type { ToolRegistry } from "../tools/registry.js";
-import { runAgentLoop, type AgentLoopConfig, type AgentLoopResult } from "./agentLoop.js";
-import { SdkToolExecutionCoordinator, type AgentStepContext } from "./sdkToolExecutionCoordinator.js";
+import { agentLoopContinue } from "./core/agentLoop.js";
+import type {
+  AgentAssistantMessage,
+  AgentModel,
+  AgentContext,
+  AgentMessage,
+  AgentUserMessage,
+  AgentUsage
+} from "./core/types.js";
+import { ToolExecutionCoordinator } from "./toolExecutionCoordinator.js";
 import { buildSystemPrompt } from "./prompts.js";
 import type {
   AgentPermissionRequest,
@@ -38,13 +46,13 @@ import { LocalMemory } from "./context/LocalMemory.js";
 import { runMemoryCommand } from "./context/memoryCommands.js";
 import { WorkspaceContext } from "./context/WorkspaceContext.js";
 import type { ContextStatus } from "./context/types.js";
-import { createSdkTelemetry } from "../observability/telemetry.js";
+import { recordNativeTelemetryEnd } from "../observability/telemetry.js";
 import { createSessionUsage, formatUsageSummary, sumSessionUsage, summarizeUsage, type UsageModelInfo } from "../observability/usage.js";
 import type { SessionUsage, UsageSummary } from "../session/metadata.js";
-import { AsyncEventQueue } from "../runtime/AsyncEventQueue.js";
 import { defaultModelContextWindow, modelContextBudget } from "../ai/capabilities.js";
 import { modelCapabilities } from "../ai/capabilities.js";
-import { createLanguageModelForConfig } from "../llm/factory.js";
+import { createNativeModelForConfig } from "../llm/nativeFactory.js";
+import type { NativeModelSettings } from "../llm/nativeFactory.js";
 import { readAttachment, type AgentAttachment } from "../attachments/store.js";
 import type { AttachmentReference } from "../attachments/store.js";
 import { TodoStore } from "../session/todoStore.js";
@@ -69,7 +77,6 @@ import {
 import { AcceptanceVerifier, type ManagedProcessInspector } from "../harness/AcceptanceVerifier.js";
 import {
   createControlledAcceptanceCommandExecutor,
-  type AcceptanceCommandAuditEvent,
   type AcceptanceCommandExecutor
 } from "../harness/AcceptanceCommandExecutor.js";
 import {
@@ -83,7 +90,7 @@ export interface AgentSessionOptions {
   persistenceRoot?: string;
   configStore?: AgentConfigStore;
   config: AgentConfig;
-  model?: LanguageModel;
+  model?: AgentModel;
   toolRegistry: ToolRegistry;
   permissionManager: PermissionManager;
   recorder: SessionRecorder;
@@ -159,6 +166,21 @@ export interface ResumedAgentSession extends SessionReplay {
   sessionId: string;
 }
 
+interface NativeTurnArgs {
+  input: string;
+  messages: ModelMessage[];
+  runOptions: AgentRunOptions & {
+    initialRunFacts?: RunFacts;
+    previousTerminals?: InterruptedTurnTerminal[];
+  };
+  abortSignal: AbortSignal;
+  mode: AgentRunMode;
+  runBudget: RunBudget;
+  completedStepsBeforeRun: number;
+  workspaceBaseline: Promise<WorkspaceStateSnapshot> | undefined;
+  captureWorkspaceBaseline: () => Promise<void>;
+}
+
 /**
  * Stateful core agent for one workspace. Hosts use this public surface instead
  * of reaching into the model, recorder, tools or mutable conversation directly.
@@ -180,24 +202,23 @@ export class AgentSession {
       options.config.workspace.ignore,
       options.config.context.instructionsMaxBytes
     );
-    const getModel = (): LanguageModel => {
-      const model = options.modelManager?.getModel() ?? options.model;
-      if (!model) throw new Error("Vercel AI SDK model is not configured.");
+    const getModel = (): AgentModel => {
+      const model = options.modelManager?.getNativeModel() ?? options.model;
+      if (!model) throw new Error("Agent model is not configured.");
       return model;
     };
-    const onUsage = async (usage: LanguageModelUsage, operation: "agent" | "plan" | "compaction" | "memory" | "subagent"): Promise<void> => {
+    const onUsage = async (usage: AgentUsage, operation: "agent" | "plan" | "compaction" | "memory" | "subagent"): Promise<void> => {
       this.recordModelUsage(usage, operation);
     };
-    const telemetry = (functionId: string) => createSdkTelemetry(options.config, persistenceRoot, functionId);
     const memoryConfig = options.config.context.memory;
     const memoryModelAlias = memoryConfig.model;
     // 记忆抽取/整理可以指定专用小模型；未配置时跟随会话模型。懒创建并缓存，避免每次写记忆都重建 adapter。
-    let memoryModel: LanguageModel | undefined;
+    let memoryModel: AgentModel | undefined;
     const getMemoryModel = memoryModelAlias
-      ? (): LanguageModel => (memoryModel ??= createLanguageModelForConfig(options.config, memoryModelAlias))
+      ? (): AgentModel => (memoryModel ??= createNativeModelForConfig(options.config, memoryModelAlias))
       : getModel;
     this.localMemory = memoryConfig.enabled
-      ? new LocalMemory(persistenceRoot, getMemoryModel, onUsage, telemetry, () => options.modelManager?.getModelSettings().maxRetries ?? 0, memoryConfig.maxRecalled)
+      ? new LocalMemory(persistenceRoot, getMemoryModel, onUsage, memoryConfig.maxRecalled)
       : undefined;
     this.contextMemory = new ContextMemory(
       getModel,
@@ -206,7 +227,6 @@ export class AgentSession {
       options.config.context.maxInputTokens ?? defaultModelContextWindow,
       options.config.context.instructionsMaxBytes,
       onUsage,
-      telemetry,
       () => {
         const activeModel = options.config.models[options.config.defaultModel];
         if (!activeModel) {
@@ -220,8 +240,7 @@ export class AgentSession {
           };
         }
         return modelContextBudget(activeModel, options.config.context.maxInputTokens, options.config.defaultModel);
-      },
-      () => options.modelManager?.getModelSettings().maxRetries ?? 0
+      }
     );
     this.recorder = options.recorder;
     this.turnStore = new TurnStore(this.persistenceRoot(), options.recorder.sessionId);
@@ -322,7 +341,6 @@ export class AgentSession {
     const abortSignal = runOptions.abortSignal
       ? AbortSignal.any([runOptions.abortSignal, turnController.signal])
       : turnController.signal;
-    const effectiveRunOptions: AgentRunOptions = { ...runOptions, abortSignal };
     const continuing = Boolean(runOptions.continueFrom?.length);
     const completedStepsBeforeRun = continuing ? runOptions.completedStepsBeforeRun ?? 0 : 0;
     if (!continuing) this.options.completionState?.reset();
@@ -359,7 +377,6 @@ export class AgentSession {
         preparationUsage: this.usageRecords.slice(usageBeforePreparation)
       });
     };
-    let streamTask: Promise<void> | undefined;
     try {
     // 新根输入明确放弃旧断点；否则它在首个新 step 落盘前崩溃时，/continue 会错误复活上一回合。
     if (!continuing) await this.turnStore.clear().catch(() => undefined);
@@ -391,7 +408,7 @@ export class AgentSession {
     const model = this.options.modelManager?.getModel() ?? this.options.model;
     if (!model) {
       recordUserMessage();
-      const outcome = failedTurn("Vercel AI SDK model is not configured.", completedStepsBeforeRun);
+      const outcome = failedTurn("Native model runtime is not configured.", completedStepsBeforeRun);
       this.recordError(outcome.error);
       this.recordTurnOutcome(outcome);
       yield { type: "error", message: outcome.error ?? "Agent run failed." };
@@ -399,7 +416,6 @@ export class AgentSession {
       yield doneEvent(outcome);
       return;
     }
-    const settings = this.options.modelManager?.getModelSettings();
     const mode = runOptions.mode ?? "chat";
     let messages: ModelMessage[];
     if (runOptions.continueFrom?.length) {
@@ -447,7 +463,6 @@ export class AgentSession {
       yield doneEvent(outcome);
       return;
     }
-    const permissionManager = this.options.permissionManager;
     const configuredBudget = resolveRunBudget(this.options.config.agent);
     const remainingConfiguredSteps = configuredBudget.hardStepLimit - completedStepsBeforeRun;
     const requestedSteps = runOptions.maxSteps ?? remainingConfiguredSteps;
@@ -466,65 +481,92 @@ export class AgentSession {
       softStepLimit: Math.min(configuredBudget.softStepLimit, completedStepsBeforeRun + requestedSteps),
       hardStepLimit: completedStepsBeforeRun + requestedSteps
     };
-    const stepContext: AgentStepContext = { assistantContent: "", reasoningContent: "", reasoningProviderOptions: undefined, reasoningBlocks: [] };
-    const queue = new AsyncEventQueue<AgentSessionEvent>();
+    yield* this.runNativeTurn({
+      input,
+      messages,
+      runOptions,
+      abortSignal,
+      mode,
+      runBudget,
+      completedStepsBeforeRun,
+      workspaceBaseline,
+      captureWorkspaceBaseline
+    });
+    return;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Native Biny runtime path.
+   *
+   * The session boundary uses the same native message protocol as the loop,
+   * provider transport and persisted turn state.
+   */
+  private async *runNativeTurn(args: NativeTurnArgs): AsyncGenerator<AgentSessionEvent> {
+    const {
+      input,
+      messages,
+      runOptions,
+      abortSignal,
+      mode,
+      runBudget,
+      completedStepsBeforeRun,
+      workspaceBaseline,
+      captureWorkspaceBaseline
+    } = args;
+    const nativeModel = this.options.modelManager?.getNativeModel() ?? this.options.model;
+    const nativeSettings: NativeModelSettings | undefined = this.options.modelManager?.getNativeModelSettings()
+      ?? (nativeModel ? { model: nativeModel, maxRetries: 0, contextWindow: undefined } : undefined);
+    if (!nativeSettings) {
+      const outcome = failedTurn("Native model runtime is not configured.", completedStepsBeforeRun);
+      this.recordError(outcome.error);
+      this.recordTurnOutcome(outcome);
+      yield { type: "error", message: outcome.error ?? "Native model runtime is not configured." };
+      yield { type: "status", status: "error" };
+      yield doneEvent(outcome);
+      return;
+    }
+
+    const permissionManager = this.options.permissionManager;
     const facts = new RunFactsCollector(runOptions.initialRunFacts);
     if (runOptions.verificationRequired === true) facts.setUserRequestedVerification(true);
     let pendingApprovalCount = 0;
-    const permissionHandler = effectiveRunOptions.confirmPermission;
-    const confirmPermission = permissionHandler === undefined
+    const confirmPermission = runOptions.confirmPermission === undefined
       ? undefined
       : async (request: AgentPermissionRequest): Promise<AgentPermissionResult> => {
         pendingApprovalCount += 1;
         facts.setPendingApprovals(pendingApprovalCount);
         try {
-          return await permissionHandler(request);
+          return await runOptions.confirmPermission!(request);
         } finally {
           pendingApprovalCount = Math.max(0, pendingApprovalCount - 1);
           facts.setPendingApprovals(pendingApprovalCount);
         }
       };
-    const observeWorkspaceMutation = async (): Promise<void> => {
-      facts.markWorkspaceMutationObserved();
-      await captureWorkspaceBaseline();
-    };
     const runtime = this.runtimeContext(
-      { ...effectiveRunOptions, confirmPermission },
-      observeWorkspaceMutation
+      { ...runOptions, abortSignal, confirmPermission },
+      captureWorkspaceBaseline
     );
     const allowedToolNames = mode === "plan"
       ? new Set(this.options.toolRegistry.list().filter((tool) => tool.risk === "read").map((tool) => tool.name))
       : undefined;
-    let reasoningActive = false;
+    const pendingEvents: AgentSessionEvent[] = [];
     const emitUpdate = (event: AgentSessionEvent): void => {
-      if (
-        reasoningActive
-        && (event.type === "assistant.delta" || event.type === "assistant.completed" || event.type === "tool.started")
-      ) {
-        queue.push({ type: "reasoning.completed" });
-        reasoningActive = false;
-      }
-      if (event.type === "reasoning.started") {
-        if (reasoningActive) return;
-        reasoningActive = true;
-      } else if (event.type === "reasoning.completed") {
-        reasoningActive = false;
-      }
       if (
         event.type === "tool.started"
         || event.type === "tool.progress"
         || event.type === "tool.completed"
         || event.type === "tool.failed"
-      ) {
-        facts.observeToolEvent(event);
-      }
-      queue.push(event);
+      ) facts.observeToolEvent(event);
+      pendingEvents.push(event);
     };
-    const coordinator = new SdkToolExecutionCoordinator(
+    const coordinator = new ToolExecutionCoordinator(
       runtime,
       permissionManager,
       emitUpdate,
-      () => ({ ...stepContext }),
+      undefined,
       allowedToolNames,
       {
         maxToolCalls: runBudget.maxToolCalls,
@@ -533,71 +575,7 @@ export class AgentSession {
         initialMaxRepeatedActionCount: runOptions.initialRunFacts?.maxRepeatedActionCount
       }
     );
-    const sdkTools = coordinator.createTools();
-    const stepUsageRecords: SessionUsage[] = [];
-    const verificationAuditSequences = new Map<string, number>();
-    const recordVerificationCommandAudit = async (
-      event: AcceptanceCommandAuditEvent
-    ): Promise<void> => {
-      const args = { command: event.request.command, cwd: event.request.cwd };
-      if (event.type === "command.started") {
-        const sequence = this.recorder.nextToolCallSequence();
-        verificationAuditSequences.set(event.toolCallId, sequence);
-        this.recorder.record({
-          type: "tool_call",
-          tool: "run_command",
-          args,
-          toolCallId: event.toolCallId,
-          sequence,
-          auditOnly: true
-        });
-        emitUpdate({
-          type: "tool.started",
-          toolCallId: event.toolCallId,
-          tool: "run_command",
-          args,
-          description: event.request.description ?? `Verify ${event.request.criterionId}`
-        });
-        return;
-      }
-      const sequence = verificationAuditSequences.get(event.toolCallId)
-        ?? this.recorder.nextToolCallSequence();
-      verificationAuditSequences.delete(event.toolCallId);
-      const result = event.type === "command.completed"
-        ? event.result
-        : {
-          status: event.failureKind === "permission_required"
-            ? "permission_required"
-            : event.failureKind === "permission_denied" ? "denied" : "failed",
-          approved: event.failureKind === "execution_error" ? undefined : false,
-          error: event.error,
-          verification: true
-        };
-      this.recorder.record({
-        type: "tool_result",
-        tool: "run_command",
-        result,
-        toolCallId: event.toolCallId,
-        sequence,
-        auditOnly: true
-      });
-      if (event.type === "command.completed") {
-        emitUpdate({
-          type: "tool.completed",
-          toolCallId: event.toolCallId,
-          tool: "run_command",
-          result
-        });
-      } else {
-        emitUpdate({
-          type: "tool.failed",
-          toolCallId: event.toolCallId,
-          tool: "run_command",
-          error: event.error,
-          result
-        });
-      }
-    };
+
     const verificationCommandExecutor = createControlledAcceptanceCommandExecutor({
       workspaceRoot: this.options.workspaceRoot,
       ignore: this.options.config.workspace.ignore,
@@ -607,46 +585,8 @@ export class AgentSession {
       confirmPermission,
       maxConcurrency: this.options.config.agent.maxConcurrentTools,
       maxQueuedCommands: this.options.config.agent.maxQueuedToolCalls,
-      beforeCommandExecution: async () => await observeWorkspaceMutation(),
-      onAuditEvent: recordVerificationCommandAudit
+      beforeCommandExecution: async () => await captureWorkspaceBaseline()
     });
-    let verificationResultSequence = 0;
-    const recordVerificationResult = (verification: VerificationFact): void => {
-      facts.recordVerification(verification);
-      verificationResultSequence += 1;
-      const toolCallId = `completion-verifier:${this.recorder.sessionId}:${String(verificationResultSequence)}`;
-      const sequence = this.recorder.nextToolCallSequence();
-      const args = { checks: verification.evidence.map((evidence) => evidence.id) };
-      this.recorder.record({
-        type: "tool_call",
-        tool: "completion_verifier",
-        args,
-        toolCallId,
-        sequence,
-        auditOnly: true
-      });
-      emitUpdate({
-        type: "tool.started",
-        toolCallId,
-        tool: "completion_verifier",
-        args,
-        description: "Evaluate deterministic completion checks"
-      });
-      this.recorder.record({
-        type: "tool_result",
-        tool: "completion_verifier",
-        result: verification,
-        toolCallId,
-        sequence,
-        auditOnly: true
-      });
-      emitUpdate({
-        type: "tool.completed",
-        toolCallId,
-        tool: "completion_verifier",
-        result: verification
-      });
-    };
     const completionGate = new CompletionGate({
       verifier: createCompletionGateVerifier({
         workspaceRoot: this.options.workspaceRoot,
@@ -660,186 +600,58 @@ export class AgentSession {
         ...(this.options.completionState?.listChecks() ?? [])
       ],
       blockedState: () => this.options.completionState?.getBlocked(),
-      onVerification: recordVerificationResult
+      onVerification: (verification) => facts.recordVerification(verification)
     });
 
-    recordUserMessage();
-    yield { type: "status", status: "thinking" };
-
-    let finalLoopResult: AgentLoopResult | undefined;
+    const nativeContext = messagesToAgentContext(messages);
+    nativeContext.tools = nativeSettings.model.supportsTools === false ? [] : coordinator.createAgentTools();
     let completionDecision: CompletionDecision | undefined;
-    let finalMessages = messages;
-    const completedLoopSteps: AgentLoopResult["steps"] = [];
-    let streamError: unknown;
+    let pendingSteering: AgentMessage[] = [];
+    let lastAssistant: AgentAssistantMessage | undefined;
+    let newMessages: AgentMessage[] = [];
     let observedSteps = 0;
-    const invalidToolCalls: Array<{ toolName: string; toolCallId: string; input: unknown }> = [];
-    const invalidToolCallIds = new Set<string>();
-    let handledInvalidToolCalls = 0;
-    let duplicateToolCallError: Error | undefined;
+    let reasoningActive = false;
+    let reasoningOutput = "";
+    const stepUsageRecords: SessionUsage[] = [];
+    let streamFailure: string | undefined;
     let streamFailureReported = false;
-    // 整个回合的 reasoning 展示文本；stepContext.reasoningContent 每步会清空。
-    let turnReasoningContent = "";
-    // 一步里可能有多个 reasoning block，每个各自签名，必须分开保留而不是拼成一段。
-    const reasoningBlockIds = new Map<string, ReasoningBlock>();
-    const reasoningBlock = (id: string): ReasoningBlock => {
-      const existing = reasoningBlockIds.get(id);
-      if (existing) return existing;
-      const created: ReasoningBlock = { text: "" };
-      reasoningBlockIds.set(id, created);
-      (stepContext.reasoningBlocks ??= []).push(created);
-      return created;
-    };
-    function handlePart(part: TextStreamPart<ToolSet>): void {
-      if (part.type === "start-step") {
-        const phase = observedSteps === 0 ? "initial" : "continuing";
-        observedSteps += 1;
-        stepContext.assistantContent = "";
-        stepContext.reasoningContent = "";
-        stepContext.reasoningProviderOptions = undefined;
-        stepContext.reasoningBlocks = [];
-        reasoningBlockIds.clear();
-        emitUpdate({ type: "reasoning.started", phase });
-      } else if (part.type === "text-delta") {
-        stepContext.assistantContent += part.text;
-        emitUpdate({ type: "assistant.delta", content: part.text });
-      } else if (part.type === "reasoning-delta") {
-        stepContext.reasoningContent += part.text;
-        turnReasoningContent += part.text;
-        stepContext.reasoningProviderOptions = part.providerMetadata ?? stepContext.reasoningProviderOptions;
-        const block = reasoningBlock(part.id);
-        block.text += part.text;
-        if (part.providerMetadata) block.providerOptions = part.providerMetadata;
-        emitUpdate({ type: "reasoning.delta", content: part.text });
-      } else if (part.type === "reasoning-start" || part.type === "reasoning-end") {
-        stepContext.reasoningProviderOptions = part.providerMetadata ?? stepContext.reasoningProviderOptions;
-        const block = reasoningBlock(part.id);
-        if (part.providerMetadata) block.providerOptions = part.providerMetadata;
-      } else if (part.type === "error") {
-        streamError = part.error;
-      }
-      if (part.type === "tool-call") {
-        const duplicateMessage = coordinator.observeToolCall(part.toolCallId);
-        if (duplicateMessage && !duplicateToolCallError) {
-          duplicateToolCallError = new Error(duplicateMessage);
-          streamError = duplicateToolCallError;
-          streamFailureReported = true;
-          queue.push({ type: "error", message: duplicateMessage, fatal: true });
-          turnController.abort(duplicateToolCallError);
-        }
-        if (part.invalid) {
-          if (!invalidToolCallIds.has(part.toolCallId)) {
-            invalidToolCallIds.add(part.toolCallId);
-            invalidToolCalls.push({
-              toolName: part.toolName,
-              toolCallId: part.toolCallId,
-              input: part.input
-            });
-          }
-        }
-      }
-    }
-    const handlePendingInvalidToolCalls = async (): Promise<void> => {
-      while (handledInvalidToolCalls < invalidToolCalls.length) {
-        const call = invalidToolCalls[handledInvalidToolCalls];
-        handledInvalidToolCalls += 1;
-        if (!call) continue;
-        await coordinator.handleInvalidToolCall(
-          call.toolName,
-          call.toolCallId,
-          call.input,
-          abortSignal
-        );
-      }
-    };
-    streamTask = (async (): Promise<void> => {
-      try {
-        let softLimitWarningInjected = completedStepsBeforeRun >= runBudget.softStepLimit;
-        while (!completionDecision) {
-          const segmentStepOffset = completedLoopSteps.length;
-          const absoluteCompletedSteps = completedStepsBeforeRun + segmentStepOffset;
-          const remainingSteps = runBudget.hardStepLimit - absoluteCompletedSteps;
-          if (remainingSteps < 1) {
-            completionDecision = {
-              kind: "incomplete",
-              reason: "hard_step_limit",
-              summary: `The run reached its hard limit of ${String(runBudget.hardStepLimit)} provider steps.`,
-              resumable: true
-            };
-            break;
-          }
-          const loopConfig: AgentLoopConfig = {
-            model,
-            tools: sdkTools,
-            maxSteps: remainingSteps,
-            streamOptions: {
-              maxRetries: runBudget.maxProviderRetries,
-              providerOptions: settings?.providerOptions,
-              reasoning: settings?.reasoning,
-              timeout: settings?.timeoutMs,
-              maxOutputTokens: settings?.maxOutputTokens,
-              telemetry: createSdkTelemetry(this.options.config, this.persistenceRoot(), "biny.agent")
-            },
-            // 软限制只提示收敛，不终止；硬限制仍由循环外的 Completion Gate 判定为 incomplete。
-            transformContext: async (stepMessages, info) => {
-              let nextMessages = stepMessages;
-              const absoluteStepIndex = completedStepsBeforeRun + segmentStepOffset + info.index;
-              if (!softLimitWarningInjected && absoluteStepIndex >= runBudget.softStepLimit) {
-                softLimitWarningInjected = true;
-                nextMessages = [
-                  ...nextMessages,
-                  {
-                    role: "system",
-                    content: [
-                      "## Biny run budget",
-                      "",
-                      `The soft limit of ${String(runBudget.softStepLimit)} provider steps has been reached.`,
-                      "Review unfinished work, avoid repeated actions, run the necessary checks, and converge without claiming completion early."
-                    ].join("\n")
-                  }
-                ];
-              }
-              try {
-                return this.contextMemory.pruneToolResultsForStep(nextMessages);
-              } catch {
-                return nextMessages;
-              }
-            },
-            onPart: handlePart,
-            onStepEnd: async (step) => {
-              // SDK 会在 fullStream 里标出 schema-invalid 调用；必须先把结构化失败落盘并交给
-              // RunFacts，再允许下一次 provider 请求或 Completion Gate 判断。
-              if (!duplicateToolCallError) await handlePendingInvalidToolCalls();
-              facts.observeActualToolCalls(step.toolCalls);
-              stepUsageRecords.push(this.recordModelUsage(step.usage, mode === "plan" ? "plan" : "agent"));
-              if (step.usage.inputTokens !== undefined) this.contextMemory.recordProviderUsage(step.usage);
-              const completedSteps = completedStepsBeforeRun + segmentStepOffset + step.index + 1;
-              if (step.toolCalls.length > 0 && completedSteps < runBudget.hardStepLimit) {
-                await this.turnStore.save(
-                  input,
-                  step.messages,
-                  completedSteps,
-                  facts.snapshot(false),
-                  undefined,
-                  runOptions.previousTerminals
-                )
-                  .catch(() => undefined);
-              }
-            },
-            isToolCallValid: (call) => !invalidToolCallIds.has(call.toolCallId),
-            continueAfterToolCalls: () => {
-              const snapshot = facts.snapshot(abortSignal.aborted);
-              return snapshot.actualToolCallCount < runBudget.maxToolCalls
-                && snapshot.maxRepeatedActionCount < runBudget.maxRepeatedActions;
-            }
-          };
-          const segment = await runAgentLoop(finalMessages, loopConfig, abortSignal);
-          finalLoopResult = segment;
-          finalMessages = segment.messages;
-          completedLoopSteps.push(...segment.steps.map((step) => ({
-            ...step,
-            index: segmentStepOffset + step.index
-          })));
+    let softLimitWarningInjected = completedStepsBeforeRun >= runBudget.softStepLimit;
 
+    yield { type: "status", status: "thinking" };
+    try {
+      const loop = agentLoopContinue(nativeContext, {
+        model: nativeSettings.model,
+        tools: nativeContext.tools,
+        modelOptions: {
+          maxOutputTokens: nativeSettings.maxOutputTokens,
+          reasoning: nativeSettings.reasoning,
+          providerOptions: nativeSettings.providerOptions,
+          timeoutMs: nativeSettings.timeoutMs
+        },
+        maxSteps: runBudget.hardStepLimit - completedStepsBeforeRun,
+        transformContext: async (contextMessages) => {
+          const absoluteStep = completedStepsBeforeRun + observedSteps;
+          if (!softLimitWarningInjected && absoluteStep >= runBudget.softStepLimit) {
+            softLimitWarningInjected = true;
+            return [
+              ...contextMessages,
+              {
+                role: "user",
+                content: "## Biny run budget\n\nThe soft limit of provider steps has been reached. Review unfinished work, avoid repeated actions, run the necessary checks, and converge without claiming completion early."
+              }
+            ];
+          }
+          return contextMessages;
+        },
+        getSteeringMessages: async () => {
+          const next = pendingSteering;
+          pendingSteering = [];
+          return next;
+        },
+        shouldStopAfterTurn: async (turn) => {
+          // A tool-producing assistant turn must always be followed by a model
+          // turn so it can consume the structured results and formulate an answer.
+          if (turn.message.content.some((part) => part.type === "toolCall")) return false;
           await coordinator.waitForIdle();
           await refreshRunFacts(
             facts,
@@ -848,108 +660,123 @@ export class AgentSession {
             this.options.config.workspace.ignore,
             this.options.managedProcesses
           );
-
-          if (segment.kind === "fatal_error") throw segment.error ?? new Error("Agent loop failed.");
-          if (segment.kind === "cancelled") {
-            completionDecision = { kind: "cancelled" };
-            break;
-          }
-          if (segment.kind === "output_truncated") {
-            completionDecision = {
-              kind: "incomplete",
-              reason: "model_output_limit",
-              summary: "The model reached its output limit before completing the turn.",
-              resumable: true
-            };
-            break;
-          }
-          if (
-            segment.kind === "model_yielded"
-            && segment.providerFinishReason !== "stop"
-            && segment.providerFinishReason !== "tool-calls"
-          ) {
-            throw new Error(providerStopMessage(segment.providerFinishReason));
-          }
-
-          const snapshot = facts.snapshot(abortSignal.aborted);
-          const decision = await completionGate.decide(snapshot, {
-            steps: completedStepsBeforeRun + completedLoopSteps.length,
+          const decision = await completionGate.decide(facts.snapshot(abortSignal.aborted), {
+            steps: completedStepsBeforeRun + observedSteps,
             softStepLimit: runBudget.softStepLimit,
             hardStepLimit: runBudget.hardStepLimit,
             maxToolCalls: runBudget.maxToolCalls,
             maxCompletionContinuations: runBudget.maxCompletionContinuations,
             maxRepeatedActions: runBudget.maxRepeatedActions
           }, abortSignal);
-          if (decision.kind !== "continue") {
-            completionDecision = decision;
-            break;
+          if (decision.kind === "continue") {
+            pendingSteering.push({ role: "user", content: modelMessageContentText(decision.feedback.content) });
+            return false;
           }
-          finalMessages = [...finalMessages, decision.feedback];
-          await this.turnStore.save(
-            input,
-            finalMessages,
-            completedStepsBeforeRun + completedLoopSteps.length,
-            facts.snapshot(false),
-            undefined,
-            runOptions.previousTerminals
-          ).catch(() => undefined);
+          completionDecision = decision;
+          return true;
         }
-      } catch (error) {
-        // 重复 tool call 这类情况已经推过 fatal error 并主动 abort 了；循环随后抛出的
-        // 中断异常是同一件事的后果，不能再报一次。首个原因也要保留，不被中断异常覆盖。
-        streamError ??= error;
-        if (!streamFailureReported) {
-          streamFailureReported = true;
-          queue.push({ type: "error", message: error instanceof Error ? error.message : String(error) });
+      }, abortSignal);
+
+      for await (const event of loop) {
+        while (pendingEvents.length) {
+          const next = pendingEvents.shift();
+          if (next) yield next;
         }
-      } finally {
-        if (!duplicateToolCallError) await handlePendingInvalidToolCalls();
-        await coordinator.waitForIdle();
-        if (reasoningActive) emitUpdate({ type: "reasoning.completed" });
-        queue.close();
+        if (event.type === "message_update") {
+          if (event.event.type === "text-delta") {
+            yield { type: "assistant.delta", content: event.event.text };
+          } else if (event.event.type === "reasoning-start") {
+            if (!reasoningActive) {
+              reasoningActive = true;
+              yield { type: "reasoning.started", phase: observedSteps === 0 ? "initial" : "continuing" };
+            }
+          } else if (event.event.type === "reasoning-delta") {
+            reasoningOutput += event.event.text;
+            yield { type: "reasoning.delta", content: event.event.text };
+          } else if (event.event.type === "reasoning-end" && reasoningActive) {
+            reasoningActive = false;
+            yield { type: "reasoning.completed" };
+          } else if (event.event.type === "error") {
+            streamFailure = errorMessage(event.event.error);
+            streamFailureReported = true;
+            yield { type: "error", message: streamFailure, fatal: true };
+          }
+        } else if (event.type === "turn_end") {
+          observedSteps += 1;
+          lastAssistant = event.message;
+          const usage = event.message.usage;
+          if (usage) {
+            stepUsageRecords.push(this.recordModelUsage(usage, mode === "plan" ? "plan" : "agent"));
+            this.contextMemory.recordProviderUsage(usage);
+          }
+          // 保存每个已完成的工具步。进程可能在下一次 provider 请求前退出，
+          // 续跑必须从最后一个完整的 assistant + tool result context 开始。
+          if (
+            event.toolResults.length > 0
+            && completedStepsBeforeRun + observedSteps < runBudget.hardStepLimit
+          ) {
+            await this.turnStore.save(
+              input,
+              agentMessagesToModel(event.messages),
+              completedStepsBeforeRun + observedSteps,
+              facts.snapshot(false),
+              undefined,
+              runOptions.previousTerminals
+            ).catch(() => undefined);
+          }
+        } else if (event.type === "agent_end") {
+          newMessages = event.messages;
+        } else if (event.type === "error") {
+          if (event.fatal) {
+            streamFailure ??= event.error;
+            streamFailureReported = true;
+            yield { type: "error", message: event.error, fatal: true };
+          } else {
+            yield { type: "error", message: event.error };
+          }
+        }
       }
-    })();
-
-    for await (const event of queue) {
-      yield event;
-      // Acknowledge after the host asked for the next event, so producers can
-      // distinguish buffered events from facts the host has actually handled.
-      queue.ackConsumed();
-    }
-    await streamTask;
-
-    try {
-      // A provider can surface an error as a fullStream part while still
-      // producing partial output. Do not let a partial answer commit history or
-      // look like a successful turn.
-      if (streamError !== undefined) throw streamError;
-      if (!finalLoopResult && !completionDecision) throw new Error("Agent loop ended without a result.");
-      if (!completionDecision) throw new Error("Completion gate ended without a decision.");
-      if (completionDecision.kind === "continue") {
-        throw new Error("Completion gate returned an unconsumed continuation.");
+      while (pendingEvents.length) {
+        const next = pendingEvents.shift();
+        if (next) yield next;
       }
-      const content = finalLoopResult?.text ?? "";
-      // 循环自己拼 context：每步的 responseMessages 已经按序并入，剪枝后的 messages 也
-      // 在里面，所以直接用循环的最终结果，而不是 [初始 messages + 全部响应]。
+      await coordinator.waitForIdle();
+      if (reasoningActive) yield { type: "reasoning.completed" };
+      if (streamFailure) throw new Error(streamFailure);
+      if (!completionDecision) {
+        completionDecision = {
+          kind: "incomplete",
+          reason: "hard_step_limit",
+          summary: `The run reached its hard limit of ${String(runBudget.hardStepLimit)} provider steps.`,
+          resumable: true
+        };
+      }
+      const finalDecision = completionDecision;
+      if (!finalDecision || finalDecision.kind === "continue") throw new Error("Native completion gate returned an unconsumed continuation.");
+
+      const finalMessages = agentMessagesToModel([...nativeContext.messages, ...newMessages]);
       this.contextMemory.replaceHistory(finalMessages);
-      // 每步的用量已在 onStepEnd 逐条记账；回合级记录用它们的合计，避免重复计费。
-      const usageRecord = sumSessionUsage(stepUsageRecords);
+      const usageRecord = stepUsageRecords.length ? sumSessionUsage(stepUsageRecords) : undefined;
+      const content = lastAssistant ? agentMessageText(lastAssistant) : "";
+      await recordNativeTelemetryEnd(this.options.config, this.options.workspaceRoot, {
+        provider: nativeSettings.model.provider,
+        modelId: nativeSettings.model.modelId,
+        usage: lastAssistant?.usage,
+        text: content
+      });
       this.recorder.record({
         type: "assistant_message",
         content,
-        reasoningContent: turnReasoningContent || undefined,
-        // reasoningContent 是整个回合的展示文本；可回放的部分只有最后一步这些带签名的块。
-        reasoningProviderOptions: stepContext.reasoningProviderOptions,
-        reasoningBlocks: stepContext.reasoningBlocks,
+        reasoningContent: reasoningOutput || undefined,
         usage: usageRecord,
         relatedUsage: this.takeRelatedUsage(),
         contextState: this.contextMemory.snapshot()
       });
       const outcome = completionOutcome(
-        completionDecision,
+        finalDecision,
         content,
-        finalLoopResult?.providerFinishReason,
-        completedStepsBeforeRun + completedLoopSteps.length,
+        lastAssistant?.stopReason,
+        completedStepsBeforeRun + observedSteps,
         usageRecord
       );
       if (content && (outcome.status === "completed" || outcome.status === "incomplete" || outcome.status === "blocked")) {
@@ -965,13 +792,11 @@ export class AgentSession {
       } else if (outcome.status === "cancelled") {
         yield { type: "status", status: "cancelled" };
       } else {
-        this.recordError(outcome.error ?? `Agent stopped with provider finish reason ${outcome.finishReason ?? "unknown"}.`);
-        yield { type: "error", message: outcome.error ?? "Agent run failed." };
+        this.recordError(outcome.error ?? "Native agent run failed.");
+        yield { type: "error", message: outcome.error ?? "Native agent run failed." };
         yield { type: "status", status: "error" };
       }
       if (outcome.status === "blocked" || outcome.status === "incomplete" && outcome.resumable === true) {
-        // 显式 /continue 可以从相同 context 开一个新的预算窗口；原终态保留在
-        // previousTerminals 和 Session JSONL 中，不会被续跑中的新断点覆盖。
         await this.turnStore.save(
           input,
           finalMessages,
@@ -992,25 +817,16 @@ export class AgentSession {
       this.recordTurnOutcome(outcome);
       yield doneEvent(outcome);
     } catch (error) {
-      const failure = streamError ?? error;
-      const message = errorMessage(failure);
-      const outcome = runOptions.abortSignal?.aborted
+      const message = errorMessage(error);
+      const outcome = abortSignal.aborted
         ? cancelledTurn(message || "Current turn cancelled.", completedStepsBeforeRun + observedSteps)
-        : failedTurn(message, completedStepsBeforeRun + observedSteps, isTimeoutFailure(failure) ? "timeout" : "provider_error");
+        : failedTurn(message, completedStepsBeforeRun + observedSteps, isTimeoutFailure(error) ? "timeout" : "provider_error");
       this.recordError(message);
       if (outcome.status === "cancelled") await this.turnStore.clear().catch(() => undefined);
       this.recordTurnOutcome(outcome);
       if (!streamFailureReported) yield { type: "error", message };
       yield { type: "status", status: outcome.status === "cancelled" ? "cancelled" : "error" };
       yield doneEvent(outcome);
-    }
-    } finally {
-      turnController.abort(new Error("Agent turn stream was closed."));
-      try {
-        await streamTask;
-      } finally {
-        release();
-      }
     }
   }
 
@@ -1114,7 +930,7 @@ export class AgentSession {
   }
 
   observeModelUsage(
-    usage: LanguageModelUsage,
+    usage: AgentUsage,
     operation: "agent" | "plan" | "compaction" | "memory" | "subagent",
     modelAlias?: string
   ): void {
@@ -1323,7 +1139,7 @@ export class AgentSession {
   }
 
   private recordModelUsage(
-    usage: LanguageModelUsage,
+    usage: AgentUsage,
     operation: "agent" | "plan" | "compaction" | "memory" | "subagent",
     modelAlias?: string
   ): SessionUsage {
@@ -1354,11 +1170,11 @@ export class AgentSession {
     beforeWorkspaceMutation?: () => Promise<void>
   ): AgentRuntimeContext {
     const model = this.options.modelManager?.getModel() ?? this.options.model;
-    if (!model) throw new Error("Vercel AI SDK model is not configured.");
+    if (!model) throw new Error("Native model runtime is not configured.");
     return {
       workspaceRoot: this.options.workspaceRoot,
       config: this.options.config,
-      model,
+      ...(model ? { model } : {}),
       recorder: this.recorder,
       contextMemory: this.contextMemory,
       toolRegistry: this.options.toolRegistry,
@@ -1443,8 +1259,155 @@ export class AgentSession {
   }
 }
 
-function modelIdentifier(model: LanguageModel): string {
-  return typeof model === "string" ? model : model.modelId;
+function messagesToAgentContext(messages: ModelMessage[]): AgentContext {
+  const systemParts: string[] = [];
+  const contextMessages: AgentMessage[] = [];
+  for (const message of messages) {
+    if (message.role === "system") {
+      systemParts.push(modelMessageContentText(message.content));
+      continue;
+    }
+    if (message.role === "user") {
+      contextMessages.push({ role: "user", content: nativeUserContent(message.content), timestamp: Date.now() });
+      continue;
+    }
+    if (message.role === "assistant") {
+      const content: AgentAssistantMessage["content"] = Array.isArray(message.content)
+        ? message.content.flatMap((part): AgentAssistantMessage["content"] => {
+          if (part.type === "text") return [{ type: "text", text: part.text }];
+          if (part.type === "reasoning") return [{
+            type: "reasoning",
+            text: part.text,
+            providerMetadata: (() => {
+              const reasoning = part as unknown as {
+                providerMetadata?: Record<string, unknown>;
+                providerOptions?: Record<string, unknown>;
+              };
+              return reasoning.providerMetadata ?? reasoning.providerOptions;
+            })()
+          }];
+          if (part.type === "tool-call") return [{
+            type: "toolCall",
+            id: part.toolCallId,
+            name: part.toolName,
+            arguments: isRecord(part.input) ? part.input : parseNativeRecord(part.input)
+          }];
+          return [];
+        })
+        : [{ type: "text" as const, text: message.content }];
+      contextMessages.push({ role: "assistant", content });
+      continue;
+    }
+    const result = Array.isArray(message.content) ? message.content[0] : undefined;
+    if (result?.type === "tool-result") {
+      contextMessages.push({
+        role: "toolResult",
+        toolCallId: result.toolCallId,
+        toolName: result.toolName,
+        content: [{ type: "text", text: stringifyNativeValue(result.output) }],
+        isError: isRecord(result) && result.isError === true
+      });
+    }
+  }
+  return {
+    systemPrompt: systemParts.filter(Boolean).join("\n\n") || undefined,
+    messages: contextMessages,
+    tools: []
+  };
+}
+
+function agentMessagesToModel(messages: AgentMessage[]): ModelMessage[] {
+  return messages.map((message): ModelMessage => {
+    if (message.role === "user") {
+      return { role: "user", content: nativeUserContentToModel(message.content) };
+    }
+    if (message.role === "assistant") {
+      return {
+        role: "assistant",
+        content: message.content.map((part) => {
+          if (part.type === "text") return { type: "text", text: part.text };
+          if (part.type === "reasoning") return { type: "reasoning", text: part.text, providerOptions: part.providerMetadata };
+          return { type: "tool-call", toolCallId: part.id, toolName: part.name, input: part.arguments };
+        })
+      };
+    }
+    return {
+      role: "tool",
+      content: [{
+        type: "tool-result",
+        toolCallId: message.toolCallId,
+        toolName: message.toolName,
+        output: message.details ?? message.content.map((part) => part.type === "text" ? part.text : `[${part.mimeType} image]`).join("\n"),
+        isError: message.isError === true
+      }]
+    };
+  });
+}
+
+function nativeUserContent(
+  content: unknown
+): AgentUserMessage["content"] {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.flatMap((part): Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> => {
+    if (!isRecord(part)) return [];
+    if (part.type === "text" && typeof part.text === "string") return [{ type: "text", text: part.text }];
+    if (part.type !== "file") return [];
+    const data = typeof part.data === "string"
+      ? part.data
+      : isRecord(part.data) && typeof part.data.data === "string"
+        ? part.data.data
+        : undefined;
+    if (!data) return [];
+    const match = /^data:([^;]+);base64,(.*)$/u.exec(data);
+    return [{ type: "image", data: match?.[2] ?? data, mimeType: typeof part.mediaType === "string" ? part.mediaType : "application/octet-stream" }];
+  });
+}
+
+function nativeUserContentToModel(
+  content: string | Array<{ type: "text" | "image"; text?: string; data?: string; mimeType?: string }>
+): ModelMessage["content"] {
+  if (typeof content === "string") return content;
+  return content.map((part) => part.type === "text"
+    ? { type: "text", text: part.text ?? "" }
+    : { type: "file", data: `data:${part.mimeType ?? "application/octet-stream"};base64,${part.data ?? ""}`, mediaType: part.mimeType ?? "application/octet-stream" });
+}
+
+function modelMessageContentText(content: ModelMessage["content"]): string {
+  if (typeof content === "string") return content;
+  return content.map((part) => {
+    if (part.type === "text" || part.type === "reasoning") return part.text;
+    return "";
+  }).join("");
+}
+
+function agentMessageText(message: AgentAssistantMessage): string {
+  return message.content.filter((part): part is Extract<AgentAssistantMessage["content"][number], { type: "text" }> => part.type === "text")
+    .map((part) => part.text)
+    .join("");
+}
+
+function stringifyNativeValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return String(value);
+  }
+}
+
+function parseNativeRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "string") return {};
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function modelIdentifier(model: AgentModel): string {
+  return model.modelId;
 }
 
 function maxToolCallSequence(events: SessionReplay["events"]): number {
@@ -1468,7 +1431,7 @@ function completionOutcome(
   output: string,
   finishReason: string | undefined,
   steps: number,
-  usage: SessionUsage
+  usage?: SessionUsage
 ): AgentTurnOutcome {
   if (decision.kind === "complete") {
     return { status: "completed", stopReason: "completion_gate", finishReason, steps, output, usage };
@@ -1668,13 +1631,6 @@ function processReadinessType(value: unknown): "http" | "tcp" | "log" | undefine
   if (typeof value !== "object" || value === null || !("type" in value)) return undefined;
   const type = value.type;
   return type === "http" || type === "tcp" || type === "log" ? type : undefined;
-}
-
-function providerStopMessage(finishReason: string): string {
-  if (finishReason === "content-filter") {
-    return "The model response was stopped by the provider content filter.";
-  }
-  return `The provider ended the response without a usable model yield (${finishReason || "unknown"}).`;
 }
 
 function restoreCompletionState(

@@ -17,7 +17,7 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   { name: "/help", description: "Show available commands", category: "system", surfaces: terminalOnly },
   { name: "/clear", description: "Clear visible messages", category: "system", surfaces: terminalOnly },
   { name: "/context", description: "Show loaded context and budget", category: "system", surfaces: allInteractive },
-  { name: "/usage", description: "Show SDK token usage and cost", category: "system", surfaces: allInteractive },
+  { name: "/usage", description: "Show model token usage and cost", category: "system", surfaces: allInteractive },
   { name: "/compact", description: "Compact older conversation history", category: "system", acceptsArgs: true, surfaces: allInteractive },
   { name: "/model", description: "Choose a model and its supported thinking effort", category: "system", surfaces: terminalOnly },
   { name: "/status", description: "Show model, permissions and extensions", category: "system", surfaces: allInteractive },

@@ -5,12 +5,8 @@ import {
   type ReasoningEffort
 } from "../config/schema.js";
 import {
-  createModelSettings,
-  resolveModelConfig,
-  validateModelConfiguration,
-  type ModelSettings
-} from "./factory.js";
-import type { LanguageModel } from "ai";
+  resolveModelConfig
+} from "./modelConfig.js";
 import { fetchModelCatalog } from "../ai/modelCatalog.js";
 import { modelContextBudget, modelReasoningConfig, modelThinkingLevelMap } from "../ai/capabilities.js";
 import { providerDefinition } from "../ai/provider.js";
@@ -22,6 +18,8 @@ import {
 } from "./ModelRegistry.js";
 import { ModelResolver } from "./ModelResolver.js";
 import { refreshSubscriptionOAuthTokens } from "./subscriptionAuth.js";
+import type { AgentModel } from "../agent/core/types.js";
+import { createNativeModelSettings, validateModelConfiguration, type NativeModelSettings } from "./nativeFactory.js";
 
 export type ThinkingSelection = "off" | ReasoningEffort;
 export type { ModelChoice } from "./ModelRegistry.js";
@@ -38,9 +36,9 @@ export interface ModelRuntimeInfo {
   maxInputTokens?: number;
 }
 
-/** Keeps one validated AI SDK model while the selected provider changes. */
+/** Keeps one validated native Biny model while the selected provider changes. */
 export class ModelManager {
-  private activeSettings: ModelSettings;
+  private activeSettings: NativeModelSettings;
   private readonly registry: ModelRegistry;
   private observedConfigRevision: number | undefined;
 
@@ -50,7 +48,7 @@ export class ModelManager {
     private readonly configStore: AgentConfigStore = createFileConfigStore(workspaceRoot)
   ) {
     this.registry = new ModelRegistry(config);
-    this.activeSettings = createModelSettings(config);
+    this.activeSettings = createNativeModelSettings(config);
     this.observedConfigRevision = configStore.revision?.();
   }
 
@@ -62,11 +60,16 @@ export class ModelManager {
     return modelRuntimeInfo(this.config);
   }
 
-  getModel(): LanguageModel {
+  getModel(): AgentModel {
     return this.activeSettings.model;
   }
 
-  getModelSettings(): ModelSettings {
+  /** Native Biny model transport. */
+  getNativeModel(): AgentModel {
+    return this.activeSettings.model;
+  }
+
+  getNativeModelSettings(): NativeModelSettings {
     return this.activeSettings;
   }
 
@@ -142,7 +145,7 @@ export class ModelManager {
     const persisted = await this.configStore.load(this.workspaceRoot).catch(() => this.config);
     const persistedRegistry = new ModelRegistry(persisted);
     for (const [providerAlias, entries] of this.registry.catalogsSnapshot()) persistedRegistry.registerCatalog(providerAlias, entries);
-    // 解析允许先找到模型，再由 createModelSettings 给出具体的 endpoint/credential 错误；
+    // 解析允许先找到模型，再由原生模型工厂给出具体的 endpoint/credential 错误；
     // 这样 CLI/TUI 不会把缺少哪个环境变量的信息吞掉。
     const resolved = new ModelResolver(persistedRegistry).resolve(alias);
     const modelAlias = resolved.alias;
@@ -159,7 +162,7 @@ export class ModelManager {
     });
 
     // Validate endpoint and credentials before changing memory or the config file.
-    const nextSettings = createModelSettings(candidate);
+    const nextSettings = createNativeModelSettings(candidate);
     await this.configStore.save(candidate, this.workspaceRoot);
     // 项目覆盖的 defaultModel/thinking 仍然优先；保存后重新读取有效配置，避免内存状态
     // 短暂显示一个实际上被项目覆盖遮住的模型。
@@ -181,7 +184,7 @@ export class ModelManager {
   }
 
   private applyConfig(nextConfig: AgentConfig): void {
-    const nextSettings = createModelSettings(nextConfig);
+    const nextSettings = createNativeModelSettings(nextConfig);
     Object.assign(this.config, nextConfig);
     this.activeSettings = nextSettings;
     this.observedConfigRevision = this.configStore.revision?.();
@@ -203,9 +206,13 @@ export function hasUsableModelConfiguration(config: AgentConfig, alias = config.
 export function modelRuntimeInfo(config: AgentConfig): ModelRuntimeInfo {
   const resolved = resolveModelConfig(config);
   const reasoning = modelReasoningConfig(resolved.model);
-  const thinking: ThinkingSelection = config.thinking.enabled && reasoning?.efforts.includes(config.thinking.effort)
-    ? config.thinking.effort
-    : "off";
+  const levelMap = modelThinkingLevelMap(resolved.model);
+  const canDisableThinking = levelMap.off !== undefined && levelMap.off !== null;
+  const thinking: ThinkingSelection = reasoning && !canDisableThinking
+    ? reasoning.defaultEffort
+    : config.thinking.enabled && reasoning?.efforts.includes(config.thinking.effort)
+      ? config.thinking.effort
+      : "off";
   return {
     modelAlias: resolved.alias,
     provider: resolved.provider.type,

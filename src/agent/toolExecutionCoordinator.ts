@@ -1,12 +1,10 @@
 /**
- * Native Vercel AI SDK tool bridge.
+ * Native tool execution coordinator.
  *
- * The SDK owns tool-call parsing, parallel execution and the model loop. This
- * coordinator only wraps each SDK tool with Biny's permission, scheduling,
- * progress and JSONL session policies.
+ * The model loop owns parsing and turn control. This coordinator wraps each
+ * tool with Biny's permission, scheduling, progress and JSONL policies.
  */
 import { createHash } from "node:crypto";
-import { tool, type ToolExecutionOptions, type ToolSet } from "ai";
 import { ZodError } from "zod";
 import { confirmPermissionRequest } from "../permission/confirm.js";
 import { isFullYesConfirmation } from "../permission/confirmation.js";
@@ -44,6 +42,7 @@ import type {
   AgentSessionEvent,
   AgentToolEvent
 } from "./types.js";
+import type { AgentTool, AgentToolResult } from "./core/types.js";
 
 interface ToolExecutionOutcome {
   result: unknown;
@@ -86,6 +85,11 @@ export interface AgentStepContext {
   reasoningBlocks?: ReasoningBlock[];
 }
 
+interface ToolCallExecutionOptions {
+  toolCallId: string;
+  abortSignal?: AbortSignal;
+}
+
 /**
  * 工具副作用的 admission 预算。
  *
@@ -121,7 +125,7 @@ interface ToolBudgetRejection {
   error: string;
 }
 
-export class SdkToolExecutionCoordinator {
+export class ToolExecutionCoordinator {
   private readonly admissionScheduler: ToolScheduler<unknown>;
   private readonly scheduler: ToolScheduler<ToolExecutionOutcome>;
   private readonly pendingExecutions = new Set<Promise<unknown>>();
@@ -177,17 +181,30 @@ export class SdkToolExecutionCoordinator {
     });
   }
 
-  createTools(): ToolSet {
-    const tools: Record<string, unknown> = {};
-    for (const { tool: registered, source } of this.context.toolRegistry.listEntries()) {
-      if (this.allowedToolNames && !this.allowedToolNames.has(registered.name)) continue;
-      tools[registered.name] = tool({
+  /** Native model-facing tool envelope. */
+  createAgentTools(): AgentTool[] {
+    return this.context.toolRegistry.listEntries()
+      .filter(({ tool: registered }) => !this.allowedToolNames || this.allowedToolNames.has(registered.name))
+      .map(({ tool: registered, source }) => ({
+        name: registered.name,
         description: registered.description,
-        inputSchema: registered.schema,
-        execute: (input: unknown, options: ToolExecutionOptions<unknown>) => this.trackExecution(this.execute(registered, input, options, source))
-      });
-    }
-    return tools as ToolSet;
+        parameters: registered.parameters,
+        executionMode: "parallel" as const,
+        execute: async (toolCallId: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<AgentToolResult> => {
+          const result = await this.trackExecution(this.execute(
+            registered,
+            args,
+            { toolCallId, abortSignal: signal },
+            source
+          ));
+          const error = failedToolResultMessage(result);
+          return {
+            content: [{ type: "text", text: serializeToolResult(result) }],
+            details: result,
+            isError: Boolean(error)
+          };
+        }
+      }));
   }
 
   async waitForIdle(): Promise<void> {
@@ -261,10 +278,10 @@ export class SdkToolExecutionCoordinator {
       );
     }
     const source = this.context.toolRegistry.listEntries().find((entry) => entry.tool.name === toolName)?.source ?? registered.source ?? "builtin";
-    return await this.execute(registered, input, { toolCallId, abortSignal: signal } as ToolExecutionOptions<unknown>, source);
+    return await this.execute(registered, input, { toolCallId, abortSignal: signal }, source);
   }
 
-  private async execute(toolDefinition: Tool, input: unknown, options: ToolExecutionOptions<unknown>, source: ToolSource): Promise<unknown> {
+  private async execute(toolDefinition: Tool, input: unknown, options: ToolCallExecutionOptions, source: ToolSource): Promise<unknown> {
     // Tool calls are observed from fullStream before model-call-end starts the
     // batch. Yield once so every id in the batch can be classified before any
     // side effect is admitted.
@@ -476,8 +493,8 @@ export class SdkToolExecutionCoordinator {
   }
 
   /**
-   * The SDK retains every returned value until the ToolLoopAgent finishes the
-   * turn. Keep the first bounded slice of useful results inline, then preserve
+   * The loop retains every returned value until the turn finishes. Keep the
+   * first bounded slice of useful results inline, then preserve
    * later outputs durably instead of letting ordinary repository inspection
    * overflow the provider context window.
    *

@@ -40,7 +40,7 @@ export class DesktopConfigStore implements AgentConfigStore {
   }
 
   configPath(): string {
-    return path.join(this.root, "agent.config.json");
+    return path.join(this.root, "config.json");
   }
 
   revision(): number {

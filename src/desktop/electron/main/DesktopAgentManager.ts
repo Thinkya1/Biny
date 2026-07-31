@@ -14,14 +14,13 @@
 import type { AgentAttachment, InteractiveAgentRunMode } from "../../../agent/AgentSession.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { generateText } from "ai";
 import { fetchModelCatalog } from "../../../ai/modelCatalog.js";
 import { thinkingLevelMapForModel } from "../../../ai/capabilities.js";
 import { providerDefinition } from "../../../ai/provider.js";
 import { loadProjectSettings } from "../../../config/projectSettings.js";
 import { configSchema, type AgentConfig, type ProviderConfig } from "../../../config/schema.js";
 import type { AgentConfigStore } from "../../../config/store.js";
-import { createModelSettings, validateModelConfiguration } from "../../../llm/factory.js";
+import { createNativeModelSettings, validateModelConfiguration } from "../../../llm/nativeFactory.js";
 import { hasUsableModelConfiguration, listConfiguredModelChoices, type ModelRuntimeInfo, type ThinkingSelection } from "../../../llm/ModelManager.js";
 import { providerProfile } from "../../../llm/profiles.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
@@ -529,14 +528,20 @@ export class DesktopAgentManager {
     }
     const started = Date.now();
     try {
-      const settings = createModelSettings(candidate, alias);
-      await generateText({
-        model: settings.model,
-        prompt: "ping",
+      const settings = createNativeModelSettings(candidate, alias);
+      let providerError: string | undefined;
+      for await (const event of await settings.model.stream({
+        messages: [{ role: "user", content: "ping" }],
+        tools: []
+      }, {
         maxOutputTokens: 16,
-        maxRetries: settings.maxRetries,
-        temperature: 0
-      });
+        reasoning: settings.reasoning,
+        providerOptions: settings.providerOptions,
+        timeoutMs: settings.timeoutMs
+      })) {
+        if (event.type === "error") providerError = event.error instanceof Error ? event.error.message : String(event.error);
+      }
+      if (providerError) throw new Error(providerError);
       const latencyMs = Date.now() - started;
       return {
         ok: true,

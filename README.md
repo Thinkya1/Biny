@@ -41,7 +41,7 @@
 ```bash
 git clone https://github.com/Thinkya1/Biny.git
 cd Biny && pnpm install
-pnpm dev -- init                      # 生成 ~/.biny/agent/agent.config.json
+pnpm dev -- init                      # 生成 ~/.biny/config.json
 export DEEPSEEK_API_KEY="你的 key"
 pnpm dev                              # 打开 TUI
 ```
@@ -52,8 +52,8 @@ pnpm dev                              # 打开 TUI
 
 桌面端在 **设置 → 模型** 里管理连接和默认模型，API key 与 OAuth 凭据由 macOS 系统钥匙串保护。
 
-CLI / TUI / Desktop 共用全局 `~/.biny/agent/agent.config.json` 和项目会话目录。也可以用 `BINY_AGENT_DIR` 指定全局目录。
-项目只在 `<project>/.biny/settings.json` 覆盖运行参数；其中的 `defaultModel` 必须引用全局已有 alias，不能写 `providers`、`models`、API key 或 OAuth 信息。
+CLI / TUI / Desktop 共用全局 `~/.biny/config.json`；项目 session、Memory 等运行数据在 `~/.biny/agent/`。也可以用 `BINY_AGENT_DIR` 指定 Agent 运行数据目录。
+项目只在 `<project>/.biny/settings.json` 覆盖运行参数；其中的 `defaultModel` 必须引用全局已有 alias，不能写 `providers`、`models`、API key 或 OAuth 信息。旧项目配置路径只会被 `biny doctor` 报告，不会读取或迁移。
 
 macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON 不保存凭据；其他平台请使用环境变量。全局配置示例（**只写环境变量名，别把真实 key 写进配置文件**）：
 
@@ -64,7 +64,7 @@ macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON �
     "deepseek": { "type": "deepseek", "apiKeyEnv": "DEEPSEEK_API_KEY" }
   },
   "models": {
-    "coder": { "provider": "deepseek", "model": "deepseek-chat" }
+    "coder": { "provider": "deepseek", "model": "deepseek-v4-flash" }
   }
 }
 ```
@@ -81,15 +81,18 @@ macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON �
       "model": "deepseek-v4-pro",
       "thinkingLevelMap": {
         "off": "none",
-        "low": "low",
-        "medium": "medium",
-        "high": "high"
+        "high": "high",
+        "max": "max"
       }
     },
     "deepseek-v4-flash": {
       "provider": "deepseek",
       "model": "deepseek-v4-flash",
-      "thinkingLevelMap": { "off": "none" }
+      "thinkingLevelMap": {
+        "off": "none",
+        "high": "high",
+        "max": "max"
+      }
     }
   }
 }
@@ -114,11 +117,15 @@ macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON �
 }
 ```
 
-Agent 预算默认软限制为 32 个 provider step、硬限制为 96 个 step。达到软限制只会注入收敛提醒；达到硬限制返回可恢复的 `incomplete`，绝不会发布 `run.completed`。旧配置继续兼容：`maxSteps` 映射软限制，`maxTaskSteps` 映射硬限制；同一配置层里显式的新字段优先。`maxProviderRetries` 默认 0，Provider 的 `finishReason` 仍会记录用于诊断，但实际工具调用才决定 Loop 是否继续。
+Agent 预算默认软限制为 32 个 provider step、硬限制为 96 个 step。达到软限制只会注入收敛提醒；达到硬限制返回可恢复的 `incomplete`，绝不会发布 `run.completed`。`maxProviderRetries` 默认 0，Provider 的 `finishReason` 仍会记录用于诊断，但实际工具调用才决定 Loop 是否继续。
+
+### Agent Runtime
+
+CLI、TUI 和 Desktop 的默认任务入口使用 Biny 自己的 native Agent Runtime：模型请求通过本地 `fetch` transport 归一化为统一的流事件，Agent Loop 自己管理多步请求、工具校验、权限、预算、Session 和 Completion Gate。当前支持 OpenAI Chat Completions、Anthropic Messages，以及配置了 `apiBackend: "responses"` 的 OpenAI Responses；不需要引入 Pi 的 Agent SDK 或各 Provider SDK。模型配置只接受当前的 `defaultModel`、`providers`、`models` 结构，旧格式会直接拒绝并提示手工更新。
 
 当前没有单独的 Durable Task 执行框架。普通问答、代码修改、启动项目和多步工具任务都进入同一个 Agent Loop；验证器只根据文件变化、结构化检查、受管进程等运行事实启动。验证命令的 stdout/stderr 在模型上下文中最多保留 4000 字符摘要，完整结果通过对应的审计 `tool_call` 记录在 Session JSONL 中。
 
-TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 reasoning effort，才会继续打开对应的档位选择器。列表不会把所有模型强行显示成同一套档位：例如 DeepSeek V4 Pro 使用自身声明的三档 `low`、`medium`、`high`，DeepSeek V4 Flash 不显示思考档位。这里的名称是模型/Provider 支持的配置选项，不代表跨模型可比较的真实推理程度。模型目录刷新后，实时模型会进入同一注册表，也可以用 `provider/model-id` 引用；选中的实时模型元数据会写入全局模型配置。
+TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 reasoning effort，才会继续打开对应的档位选择器。当前 DeepSeek V4 Flash/Pro 使用官方支持的 `high`、`max` 两档；Kimi K3 使用 `low`、`high`、`max`，且不能关闭思考。这里的名称是模型/Provider 支持的配置选项，不代表跨模型可比较的真实推理程度。模型目录刷新后，实时模型会进入同一注册表，也可以用 `provider/model-id` 引用；选中的实时模型元数据会写入全局模型配置。
 
 联网搜索启用后默认走 AnySearch（`ANYSEARCH_API_KEY`，也可用匿名额度），另支持 Google、DuckDuckGo、Brave 和 Tavily，在 `web.search` 里切换。桌面端的 **设置 → 联网搜索** 提供独立浏览器和 Cookie-Editor JSON 导入/导出；在其中登录后，Google 搜索与 `web_fetch` 会按域名、路径和 HTTPS 规则使用对应 Cookie。
 
@@ -137,7 +144,7 @@ TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 re
 <project>/.biny/                            settings、runs、turns、todos、logs 等
 ```
 
-全局模型配置、项目 session 和项目 Memory 都在 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）；Session 与 Memory 分别按项目隔离在 `sessions/<project-path-hash>/`、`memory/<project-path-hash>/`。全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表和 UI 状态在 `~/Library/Application Support/Biny/workspaces/default/`，附件、run 等其余项目数据暂时仍在项目 `.biny/`。旧的 `<project>/.biny/sessions/` 和 `<project>/.biny/memory/` 不再读取或复制。
+全局模型配置在 `~/.biny/config.json`；项目 session 和项目 Memory 在 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）。Session 与 Memory 分别按项目隔离在 `sessions/<project-path-hash>/`、`memory/<project-path-hash>/`。全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表和 UI 状态在 `~/Library/Application Support/Biny/workspaces/default/`，附件、run 等其余项目数据暂时仍在项目 `.biny/`。旧的 `<project>/.biny/sessions/` 和 `<project>/.biny/memory/` 不再读取或复制。
 
 项目级 Skill 和 named agent 分别从 `<project>/.biny/skills/`、`<project>/.biny/agents/` 覆盖全局同名定义。旧 `<project>/.agent/` 不再扫描或自动迁移。
 

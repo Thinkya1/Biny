@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import type { ModelMessage } from "ai";
+import type { ModelMessage } from "../src/agent/core/modelMessage.js";
 import { replaySessionEvents, sessionEventsToConversation } from "../src/session/replay.js";
 import type { SessionEvent } from "../src/session/recorder.js";
 

@@ -1,6 +1,6 @@
 /** AgentSession 对外发布的规范化运行事件。 */
 import type { AgentConfig } from "../config/schema.js";
-import type { LanguageModel } from "ai";
+import type { AgentModel } from "./core/types.js";
 import type { SessionRecorder } from "../session/recorder.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { ToolInputDisplay, ToolUpdate } from "../tools/types.js";
@@ -68,7 +68,7 @@ export type AgentToolEvent =
   | { type: "tool.completed"; toolCallId: string; tool: string; result: unknown; durationMs?: number }
   | { type: "tool.failed"; toolCallId: string; tool: string; error: string; result?: unknown; durationMs?: number };
 
-/** Provider 原始分片在 Session 内归一化，宿主不需要理解 AI SDK 协议。 */
+/** Provider 原始分片在 Session 内归一化，宿主不需要理解 provider wire 协议。 */
 export type AgentSessionEvent =
   | { type: "status"; status: AgentStatus }
   | AgentSessionUpdate
@@ -79,8 +79,7 @@ export interface AgentRuntimeContext {
   // Agent loop 的所有外部依赖都由 runtime 注入，方便 CLI 和 TUI 复用同一套执行逻辑。
   workspaceRoot: string;
   config: AgentConfig;
-  /** Canonical Vercel AI SDK model used by ToolLoopAgent and SDK helpers. */
-  model: LanguageModel;
+  model?: AgentModel;
   recorder: SessionRecorder;
   contextMemory?: ContextMemory;
   toolRegistry: ToolRegistry;

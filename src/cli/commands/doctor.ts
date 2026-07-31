@@ -22,7 +22,7 @@ export async function doctorCommand(workspaceRoot: string): Promise<void> {
     ["git", await commandVersion("git", ["--version"])],
     [globalConfigPath(), (await pathExists(globalConfigPath())) ? "found" : "missing"],
     [projectSettingsPath(workspaceRoot), (await pathExists(projectSettingsPath(workspaceRoot))) ? "found" : "missing"],
-    ["legacy project config", await legacyConfigStatus(workspaceRoot)],
+    ["ignored legacy config", await legacyConfigStatus(workspaceRoot)],
     ["credentials", await credentialStatus()],
     [".biny", (await pathExists(path.join(workspaceRoot, ".biny"))) ? "found" : "missing"]
   ];
@@ -48,8 +48,8 @@ async function legacyConfigStatus(workspaceRoot: string): Promise<string> {
   const desktopPath = process.platform === "darwin"
     ? path.join(os.homedir(), "Library", "Application Support", "Biny", "workspaces", "default", CONFIG_FILE)
     : path.join(globalAgentDir(), "..", "workspaces", "default", CONFIG_FILE);
-  if (await pathExists(projectPath)) return `found at ${projectPath}; not migrated automatically`
-  if (await pathExists(desktopPath)) return `found at ${desktopPath}; not migrated automatically`;
+  if (await pathExists(projectPath)) return `found at ${projectPath}; ignored and not loaded`
+  if (await pathExists(desktopPath)) return `found at ${desktopPath}; ignored and not loaded`;
   return "none";
 }
 

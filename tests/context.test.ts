@@ -3,7 +3,8 @@ import { promises as fs } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { LanguageModel, ModelMessage } from "ai";
+import type { AgentModel, ModelStreamContext, ModelStreamEvent } from "../src/agent/core/types.js";
+import type { ModelMessage } from "../src/agent/core/modelMessage.js";
 import { AgentSession } from "../src/agent/AgentSession.js";
 import { ContextMemory, estimateMessageTokens } from "../src/agent/context/ContextMemory.js";
 import { LocalMemory, redactSecrets } from "../src/agent/context/LocalMemory.js";
@@ -14,7 +15,7 @@ import { BINY_AGENT_DIR_ENV, projectMemoryDir } from "../src/config/paths.js";
 import type { AgentConfig } from "../src/config/schema.js";
 import { defaultConfig } from "../src/config/schema.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
-import { createLocalTelemetry } from "../src/observability/telemetry.js";
+import { recordNativeTelemetryEnd } from "../src/observability/telemetry.js";
 import { SessionRecorder, type SessionEvent } from "../src/session/recorder.js";
 import { maxSessionEventLineBytes, maxSessionEvents, maxSessionFileBytes } from "../src/session/limits.js";
 import { replaySession, sessionEventsToConversation } from "../src/session/replay.js";
@@ -35,7 +36,7 @@ import { resolveWorkspacePath } from "../src/workspace/resolvePath.js";
 
 class ContextTestModel {
   readonly requests: ModelMessage[][] = [];
-  readonly model: LanguageModel = createContextTestModel(this);
+  readonly model: AgentModel = createContextTestModel(this);
 
   respond(messages: ModelMessage[]): string {
     this.requests.push(cloneModelMessages(messages));
@@ -75,74 +76,46 @@ class ContextTestModel {
   }
 }
 
-function createContextTestModel(provider: ContextTestModel): LanguageModel {
-  const run = (prompt: unknown): string => provider.respond(promptToModelMessages(prompt));
+function createContextTestModel(provider: ContextTestModel): AgentModel {
   return {
-    specificationVersion: "v3",
     provider: "context-test",
     modelId: "context-test",
-    supportedUrls: {},
-    doGenerate: async ({ prompt }: { prompt: unknown }) => ({
-      content: [{ type: "text", text: run(prompt) }],
-      finishReason: { unified: "stop", raw: "stop" },
-      usage: { inputTokens: 0, outputTokens: 1 },
-      warnings: []
-    }),
-    doStream: async ({ prompt }: { prompt: unknown }) => {
-      const text = run(prompt);
-      const stream = new ReadableStream({
-        start(controller) {
-          controller.enqueue({ type: "stream-start", warnings: [] });
-          controller.enqueue({ type: "text-start", id: "context-text" });
-          controller.enqueue({ type: "text-delta", id: "context-text", delta: text });
-          controller.enqueue({ type: "text-end", id: "context-text" });
-          controller.enqueue({ type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage: { inputTokens: 0, outputTokens: 1 } });
-          controller.close();
-        }
-      });
-      return { stream };
+    async stream(context: ModelStreamContext, options): Promise<AsyncIterable<ModelStreamEvent>> {
+      const text = provider.respond(contextToModelMessages(context));
+      return (async function* () {
+        options?.signal?.throwIfAborted();
+        yield { type: "start" as const };
+        if (text) yield { type: "text-delta" as const, text };
+        yield { type: "finish" as const, reason: "stop" as const, usage: { inputTokens: 0, outputTokens: 1, totalTokens: 1 } };
+      })();
     }
-  } as unknown as LanguageModel;
+  };
 }
 
-function promptToModelMessages(prompt: unknown): ModelMessage[] {
-  if (!Array.isArray(prompt)) return [];
-  return prompt.map((message) => {
-    const item = message as { role?: string; content?: unknown };
-    const parts = Array.isArray(item.content) ? item.content as Array<Record<string, unknown>> : [];
-    const text = typeof item.content === "string" ? item.content : parts
-      .filter((part) => part.type === "text" || part.type === "reasoning")
-      .map((part) => String(part.text ?? ""))
-      .join("");
-    if (item.role === "assistant") {
-      return {
-        role: "assistant",
-        content: [
-          ...(parts.filter((part) => part.type === "reasoning").map((part) => ({ type: "reasoning" as const, text: String(part.text ?? "") }))),
-          ...(text ? [{ type: "text" as const, text }] : []),
-          ...parts.filter((part) => part.type === "tool-call").map((part) => ({
-            type: "tool-call" as const,
-            toolCallId: String(part.toolCallId ?? ""),
-            toolName: String(part.toolName ?? ""),
-            input: part.input
-          }))
-        ]
-      };
-    }
-    if (item.role === "tool") {
-      const result = parts.find((part) => part.type === "tool-result");
-      return {
+function contextToModelMessages(context: ModelStreamContext): ModelMessage[] {
+  const messages: ModelMessage[] = context.systemPrompt ? [{ role: "system", content: context.systemPrompt }] : [];
+  for (const message of context.messages) {
+    if (message.role === "user") messages.push({ role: "user", content: message.content });
+    else if (message.role === "assistant") {
+      messages.push({ role: "assistant", content: message.content.map((part) => {
+        if (part.type === "toolCall") return { type: "tool-call", toolCallId: part.id, toolName: part.name, input: part.arguments };
+        if (part.type === "reasoning") return { type: "reasoning", text: part.text, providerOptions: part.providerMetadata };
+        return { type: "text", text: part.text };
+      }) });
+    } else {
+      messages.push({
         role: "tool",
         content: [{
           type: "tool-result",
-          toolCallId: String(result?.toolCallId ?? ""),
-          toolName: String(result?.toolName ?? "tool"),
-          output: { type: "text", value: JSON.stringify(result?.output ?? "") }
+          toolCallId: message.toolCallId,
+          toolName: message.toolName,
+          output: { type: "text", value: message.content.map((part) => part.type === "text" ? part.text : "[image]").join("\n") },
+          isError: message.isError
         }]
-      };
+      });
     }
-    return { role: item.role === "system" ? "system" : "user", content: text };
-  });
+  }
+  return messages;
 }
 
 async function main(): Promise<void> {
@@ -360,7 +333,9 @@ async function testMidTurnToolResultPruning(): Promise<void> {
 function toolResultValue(message: ModelMessage | undefined): unknown {
   if (!message || message.role !== "tool") return undefined;
   const part = message.content.find((entry) => entry.type === "tool-result");
-  return part && part.output.type === "text" ? part.output.value : undefined;
+  if (!part || typeof part.output !== "object" || part.output === null) return undefined;
+  const output = part.output as { type?: unknown; value?: unknown };
+  return output.type === "text" ? output.value : undefined;
 }
 
 async function testBudgetAndCompaction(): Promise<void> {
@@ -397,21 +372,24 @@ async function testContextPreparationAbortStopsAutoCompaction(): Promise<void> {
   await withTempWorkspace(async (workspaceRoot) => {
     const started = deferred<void>();
     const aborted = deferred<void>();
-    const provider = new ContextTestModel();
-    const model = {
-      ...provider.model,
-      doGenerate: async ({ abortSignal }: { abortSignal?: AbortSignal }) => {
-        started.resolve(undefined);
-        return await new Promise<never>((_resolve, reject) => {
-          const stop = (): void => {
-            aborted.resolve(undefined);
-            reject(abortSignal?.reason ?? new Error("aborted"));
-          };
-          if (abortSignal?.aborted) stop();
-          else abortSignal?.addEventListener("abort", stop, { once: true });
-        });
+    const model: AgentModel = {
+      provider: "context-test-abort",
+      modelId: "context-test-abort",
+      async stream(_context, options) {
+        return (async function* () {
+          started.resolve(undefined);
+          await new Promise<void>((_resolve, reject) => {
+            const stop = (): void => {
+              aborted.resolve(undefined);
+              reject(options?.signal?.reason ?? new Error("aborted"));
+            };
+            if (options?.signal?.aborted) stop();
+            else options?.signal?.addEventListener("abort", stop, { once: true });
+          });
+          yield { type: "start" as const };
+        })();
       }
-    } as unknown as LanguageModel;
+    };
     const memory = new ContextMemory(
       () => model,
       new WorkspaceContext(workspaceRoot, [], 32 * 1024),
@@ -1012,12 +990,12 @@ async function testFailedCurrentSessionResumeKeepsRecorderUsable(): Promise<void
 
 async function testCredentialAndSymlinkBoundaries(): Promise<void> {
   await withTempWorkspace(async (workspaceRoot) => {
-    await fs.writeFile(path.join(workspaceRoot, "agent.config.json"), JSON.stringify({ providers: { demo: { apiKey: "test-secret-value" } } }), "utf8");
-    assert.throws(() => resolveWorkspacePath(workspaceRoot, "agent.config.json", []), /ignored by workspace policy/);
+    await fs.writeFile(path.join(workspaceRoot, "config.json"), JSON.stringify({ providers: { demo: { apiKey: "test-secret-value" } } }), "utf8");
+    assert.throws(() => resolveWorkspacePath(workspaceRoot, "config.json", []), /ignored by workspace policy/);
     assert.throws(() => resolveWorkspacePath(workspaceRoot, ".env.local", []), /ignored by workspace policy/);
     assert.throws(() => resolveWorkspacePath(workspaceRoot, ".envrc", []), /ignored by workspace policy/);
     assert.equal(redactSecrets('{"apiKey":"test-secret-value"}'), '{"apiKey":"[redacted]"}');
-    await fs.symlink(path.join(workspaceRoot, "agent.config.json"), path.join(workspaceRoot, "config-link.json"));
+    await fs.symlink(path.join(workspaceRoot, "config.json"), path.join(workspaceRoot, "config-link.json"));
     assert.throws(() => resolveWorkspacePath(workspaceRoot, "config-link.json", []), /resolves to a location ignored/);
     const criticalWrite = await createToolPermissionRequest({
       id: "critical-write",
@@ -1042,11 +1020,11 @@ async function testCredentialAndSymlinkBoundaries(): Promise<void> {
       const telemetryVictim = path.join(outsideRoot, "telemetry-victim.txt");
       await fs.writeFile(telemetryVictim, "telemetry-victim-unchanged", "utf8");
       await fs.symlink(telemetryVictim, telemetryPath);
-      await createLocalTelemetry(telemetryPath).onError?.(new Error("not written"));
+      await recordNativeTelemetryEnd({ ...defaultConfig, telemetry: { ...defaultConfig.telemetry, enabled: true } }, workspaceRoot, { provider: "test", modelId: "test" });
       assert.equal(await fs.readFile(telemetryVictim, "utf8"), "telemetry-victim-unchanged");
       await fs.rm(telemetryPath);
       await fs.link(telemetryVictim, telemetryPath);
-      await createLocalTelemetry(telemetryPath).onError?.(new Error("not written"));
+      await recordNativeTelemetryEnd({ ...defaultConfig, telemetry: { ...defaultConfig.telemetry, enabled: true } }, workspaceRoot, { provider: "test", modelId: "test" });
       assert.equal(await fs.readFile(telemetryVictim, "utf8"), "telemetry-victim-unchanged");
 
       const historyPath = path.join(workspaceRoot, ".biny", "input-history.jsonl");

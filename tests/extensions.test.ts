@@ -526,12 +526,12 @@ rl.on("line", (line) => {
     const listExecution = await listResources!.resolveExecution({ server: "disabled" });
     assert.equal("isError" in listExecution, false);
     if (!("isError" in listExecution)) {
-      await assert.rejects(listExecution.execute({ toolCallId: "test" }), /disabled in agent\.config\.json/);
+      await assert.rejects(listExecution.execute({ toolCallId: "test" }), /disabled in config\.json/);
     }
     const readExecution = await readResource!.resolveExecution({ server: "disabled", uri: "demo://readme" });
     assert.equal("isError" in readExecution, false);
     if (!("isError" in readExecution)) {
-      await assert.rejects(readExecution.execute({ toolCallId: "test" }), /disabled in agent\.config\.json/);
+      await assert.rejects(readExecution.execute({ toolCallId: "test" }), /disabled in config\.json/);
     }
     assert.equal(disabledHost.listServers().find((server) => server.name === "disabled")?.connected, false);
   } finally {

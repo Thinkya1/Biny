@@ -13,7 +13,7 @@
  */
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { ModelMessage } from "ai";
+import type { ModelMessage } from "../agent/core/modelMessage.js";
 import { agentDir, ensureAgentDirs } from "./store.js";
 
 const turnStateVersion = 1;
