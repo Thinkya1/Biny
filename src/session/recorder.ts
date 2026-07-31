@@ -42,12 +42,34 @@ export interface ReasoningBlock {
   providerOptions?: Record<string, unknown>;
 }
 
+export type SessionTurnStatus = "completed" | "incomplete" | "blocked" | "cancelled" | "failed" | "aborted";
+
+/**
+ * 一个公开 Agent 回合的稳定终态。
+ *
+ * Provider 消息和工具事件负责恢复模型上下文；这个事件只保存宿主需要恢复的完成语义，
+ * 不参与模型消息重放。
+ */
+export interface SessionTurnStatusEvent {
+  type: "turn_status";
+  status: SessionTurnStatus;
+  stopReason: string;
+  steps: number;
+  summary?: string;
+  resumable?: boolean;
+  blockedReason?: string;
+  requiredAction?: string;
+  affectedTodoIds?: string[];
+  time?: string;
+}
+
 export type SessionEvent =
   // session 事件类型要保持稳定；resume、未来上下文压缩和记忆功能都会依赖这几个基础类型。
   | { type: "user_message"; content: string; attachments?: AttachmentReference[]; skills?: string[]; contextUsage?: SessionContextUsage; contextState?: SessionContextState; preparationUsage?: SessionUsage[]; auditOnly?: boolean; time?: string }
   | { type: "assistant_message"; content: string; reasoningContent?: string; reasoningProviderOptions?: Record<string, unknown>; reasoningBlocks?: ReasoningBlock[]; usage?: SessionUsage; relatedUsage?: SessionUsage[]; contextState?: SessionContextState; auditOnly?: boolean; time?: string }
   | { type: "tool_call"; tool: string; args: unknown; toolCallId?: string; sequence?: number; assistantContent?: string; reasoningContent?: string; reasoningProviderOptions?: Record<string, unknown>; reasoningBlocks?: ReasoningBlock[]; auditOnly?: boolean; time?: string }
   | { type: "tool_result"; tool: string; result: unknown; toolCallId?: string; sequence?: number; relatedUsage?: SessionUsage[]; auditOnly?: boolean; time?: string }
+  | SessionTurnStatusEvent
   | { type: "error"; message: string; detail?: unknown; relatedUsage?: SessionUsage[]; time?: string };
 
 export class SessionRecorder {
@@ -229,6 +251,14 @@ function redactSessionEvent(event: SessionEvent): SessionEvent {
   }
   if (event.type === "tool_result") {
     return { ...event, result: redactSensitiveValue(event.result) };
+  }
+  if (event.type === "turn_status") {
+    return {
+      ...event,
+      summary: event.summary === undefined ? undefined : redactSecrets(event.summary),
+      requiredAction: event.requiredAction === undefined ? undefined : redactSecrets(event.requiredAction),
+      affectedTodoIds: event.affectedTodoIds?.map((todoId) => redactSecrets(todoId))
+    };
   }
   return {
     ...event,

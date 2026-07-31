@@ -26,10 +26,23 @@ export class TodoStore {
   private items: TodoItem[] = [];
   private loaded = false;
 
-  constructor(private readonly workspaceRoot: string, private readonly sessionId: string) {}
+  constructor(private readonly workspaceRoot: string, private sessionId: string) {}
 
   async initialize(): Promise<void> {
     if (this.loaded) return;
+    await this.loadCurrentSession();
+  }
+
+  /** Session resume 后切换真值源，避免继续读写创建 runtime 时的旧 session 清单。 */
+  async useSession(sessionId: string): Promise<void> {
+    if (this.loaded && this.sessionId === sessionId) return;
+    this.sessionId = sessionId;
+    this.loaded = false;
+    this.items = [];
+    await this.loadCurrentSession();
+  }
+
+  private async loadCurrentSession(): Promise<void> {
     this.loaded = true;
     try {
       const raw = await fs.readFile(this.filePath(), "utf8");

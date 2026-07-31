@@ -14,7 +14,7 @@ import {
   readBoundedSessionHandle
 } from "./limits.js";
 import { listSessionFiles, readSessionSnapshot } from "./store.js";
-import type { SessionEvent } from "./recorder.js";
+import type { SessionEvent, SessionTurnStatusEvent } from "./recorder.js";
 import { publicUserMessage } from "./publicMessage.js";
 
 const sessionListReadConcurrency = 8;
@@ -78,6 +78,18 @@ const sessionEventSchema = z.discriminatedUnion("type", [
     time: z.string().optional()
   }).passthrough(),
   z.object({
+    type: z.literal("turn_status"),
+    status: z.enum(["completed", "incomplete", "blocked", "cancelled", "failed", "aborted"]),
+    stopReason: z.string(),
+    steps: z.number().int().nonnegative(),
+    summary: z.string().optional(),
+    resumable: z.boolean().optional(),
+    blockedReason: z.string().optional(),
+    requiredAction: z.string().optional(),
+    affectedTodoIds: z.array(z.string()).optional(),
+    time: z.string().optional()
+  }).passthrough(),
+  z.object({
     type: z.literal("error"),
     message: z.string(),
     detail: z.unknown().optional(),
@@ -90,6 +102,7 @@ export interface SessionSummary {
   fileName: string;
   firstUserMessage: string;
   lastAssistantMessage: string;
+  lastTurnStatus?: SessionTurnStatusEvent;
   eventCount: number;
   createdAt: string;
   updatedAt: string;
@@ -216,12 +229,14 @@ export async function listSessionSummaries(workspaceRoot: string): Promise<Sessi
         const firstUserMessage = publicUserMessage(events.find((event) => event.type === "user_message")?.content ?? "");
         const lastAssistant = [...events].reverse().find((event): event is Extract<SessionEvent, { type: "assistant_message" }> => event.type === "assistant_message" && Boolean(event.content));
         const lastAssistantMessage = lastAssistant?.content ?? "";
+        const lastTurnStatus = [...events].reverse().find((event): event is SessionTurnStatusEvent => event.type === "turn_status");
         const firstTime = events.find((event) => typeof event.time === "string")?.time;
         const lastTime = [...events].reverse().find((event) => typeof event.time === "string")?.time;
         summaries[index] = {
           fileName,
           firstUserMessage,
           lastAssistantMessage,
+          lastTurnStatus,
           eventCount: events.length,
           createdAt: firstTime ?? snapshot.stat.birthtime.toISOString(),
           updatedAt: lastTime ?? snapshot.stat.mtime.toISOString()
