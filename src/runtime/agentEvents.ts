@@ -1,10 +1,21 @@
 import type { AgentRunMode, AgentSessionInfo } from "../agent/AgentSession.js";
+import type { BlockedReason } from "../agent/completionGate.js";
 import type { AgentSessionUpdate, AgentTurnStopReason } from "../agent/types.js";
 import type { ContextStatus } from "../agent/context/types.js";
 import type { PermissionGrantScope, PermissionMode } from "../permission/PermissionManager.js";
 import type { SessionUsage } from "../session/metadata.js";
 
-export type AgentRunStatus = "thinking" | "running" | "waiting_permission" | "completed" | "incomplete" | "aborted" | "failed";
+export type AgentRunStatus =
+  | "thinking"
+  | "running"
+  | "waiting_permission"
+  | "completed"
+  | "blocked"
+  | "incomplete"
+  | "cancelled"
+  | "aborted"
+  | "failed";
+export type AgentBlockedReason = BlockedReason;
 export type RuntimeOperation =
   | "resume"
   | "compact"
@@ -48,10 +59,44 @@ export type AgentHostEvent =
   | (AgentEventBase & { type: "context.updated"; context: ContextStatus })
   | (AgentEventBase & { type: "compact.started"; hint?: string })
   | (AgentEventBase & { type: "compact.completed"; summary: string; context: ContextStatus })
-  | (AgentEventBase & { type: "run.completed"; durationMs: number; stopReason?: "model_stop"; finishReason?: string; steps?: number; usage?: SessionUsage })
-  | (AgentEventBase & { type: "run.incomplete"; durationMs: number; reason: string; stopReason: AgentTurnStopReason; finishReason?: string; steps: number; usage?: SessionUsage })
+  | (AgentEventBase & { type: "run.completed"; durationMs: number; stopReason?: AgentTurnStopReason; finishReason?: string; steps?: number; usage?: SessionUsage })
+  | (AgentEventBase & {
+      type: "run.blocked";
+      durationMs: number;
+      reason: AgentBlockedReason;
+      summary: string;
+      requiredAction?: string;
+      affectedTodoIds?: string[];
+      resumable?: boolean;
+      stopReason?: AgentTurnStopReason;
+      finishReason?: string;
+      steps?: number;
+      usage?: SessionUsage;
+    })
+  | (AgentEventBase & { type: "run.incomplete"; durationMs: number; reason: string; resumable?: boolean; stopReason: AgentTurnStopReason; finishReason?: string; steps: number; usage?: SessionUsage })
+  | (AgentEventBase & { type: "run.cancelled"; durationMs: number; reason: string; stopReason?: AgentTurnStopReason; finishReason?: string; steps?: number; usage?: SessionUsage })
+  /** 旧宿主仍可能发布 aborted；新用户取消应优先发布 run.cancelled。 */
   | (AgentEventBase & { type: "run.aborted"; durationMs: number; reason: string; stopReason?: AgentTurnStopReason; finishReason?: string; steps?: number })
   | (AgentEventBase & { type: "run.failed"; durationMs: number; error: string; stopReason?: AgentTurnStopReason; finishReason?: string; steps?: number });
+
+export type TerminalRunEvent = Extract<AgentHostEvent, {
+  type:
+    | "run.completed"
+    | "run.blocked"
+    | "run.incomplete"
+    | "run.cancelled"
+    | "run.aborted"
+    | "run.failed";
+}>;
+
+export function isTerminalRunEvent(event: AgentHostEvent | undefined): event is TerminalRunEvent {
+  return event?.type === "run.completed"
+    || event?.type === "run.blocked"
+    || event?.type === "run.incomplete"
+    || event?.type === "run.cancelled"
+    || event?.type === "run.aborted"
+    || event?.type === "run.failed";
+}
 
 export interface AgentPermissionEventRequest {
   toolCallId: string;
@@ -173,12 +218,7 @@ export function reduceInteractiveRunState(
     if (currentRuns.pendingPermission?.requestId !== event.requestId) return state;
     return { ...updateActiveRunStatus(currentRuns, event.runId, "running"), pendingPermission: undefined };
   }
-  if (
-    event.type === "run.completed"
-    || event.type === "run.incomplete"
-    || event.type === "run.aborted"
-    || event.type === "run.failed"
-  ) {
+  if (isTerminalRunEvent(event)) {
     return currentRuns.activeRun.runId === event.runId ? { kind: "idle" } : state;
   }
   return state;

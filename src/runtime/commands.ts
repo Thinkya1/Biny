@@ -82,7 +82,7 @@ export async function executeRuntimeCommand(
       return result(
         command,
         "Continue",
-        "No interrupted turn to continue. Step-limit results require a new user message."
+        "No interrupted, blocked, or resumable incomplete turn is available."
       );
     }
     const content = outcome.status === "completed"

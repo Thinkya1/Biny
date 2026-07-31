@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AgentAttachment, AgentRunMode, AgentSessionInfo, ResumedAgentSession } from "../agent/AgentSession.js";
+import type { BlockedReason } from "../agent/completionGate.js";
 import type { AgentPermissionResult, AgentSessionEvent, AgentTurnOutcome } from "../agent/types.js";
 import { isFullYesConfirmation } from "../permission/confirmation.js";
 import type { PermissionResult } from "../permission/PermissionManager.js";
@@ -488,7 +489,7 @@ export class InteractiveAgentRuntime {
       }
       // 非协作嵌入方可能在 AbortSignal 后仍吐出一个“完成”事件；取消优先，不能把晚到的
       // 结果写成成功回合。
-      if (signal.aborted) throw new Error("Current turn interrupted.");
+      if (signal.aborted && turn?.status !== "cancelled") throw new Error("Current turn cancelled.");
       if (terminalEvents !== 1 || !turn) {
         throw new Error(terminalEvents > 1
           ? "Agent stream emitted multiple terminal results."
@@ -498,17 +499,29 @@ export class InteractiveAgentRuntime {
       const context = await agent.contextStatus();
       this.emit({ ...this.eventBase(run), type: "context.updated", context });
       if (turn.status === "completed") {
+        if (turn.stopReason !== "completion_gate") {
+          return this.failRun(
+            run,
+            durationMs,
+            `Completed outcome bypassed the Completion Gate (${turn.stopReason}).`,
+            turn
+          );
+        }
         return this.completeRun(run, durationMs, turn);
       }
       if (turn.status === "incomplete") return this.incompleteRun(run, durationMs, turn);
+      if (turn.status === "blocked") return this.blockRun(run, durationMs, turn);
+      if (turn.status === "cancelled") {
+        return this.cancelledRun(run, durationMs, turn.error ?? "Current turn cancelled.", turn);
+      }
       if (turn.status === "aborted") return this.abortRun(run, durationMs, turn.error ?? "Current turn interrupted.", turn);
       return this.failRun(run, durationMs, turn.error ?? "Task verification failed.", turn);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const durationMs = Date.now() - startedAtMs;
       if (signal.aborted) {
-        const reason = "Current turn interrupted.";
-        return this.abortRun(run, durationMs, reason);
+        const reason = "Current turn cancelled.";
+        return this.cancelledRun(run, durationMs, reason);
       }
       agent.recordError(error);
       return this.failRun(run, durationMs, message);
@@ -525,7 +538,7 @@ export class InteractiveAgentRuntime {
       ...this.eventBase(run),
       type: "run.completed",
       durationMs,
-      stopReason: "model_stop",
+      stopReason: turn.stopReason,
       finishReason: turn.finishReason,
       steps: turn.steps,
       usage: turn.usage
@@ -541,12 +554,71 @@ export class InteractiveAgentRuntime {
       type: "run.incomplete",
       durationMs,
       reason: redactSecrets(reason),
+      resumable: turn.resumable,
       stopReason: turn.stopReason,
       finishReason: turn.finishReason,
       steps: turn.steps,
       usage: turn.usage
     });
     return { runId: run.runId, durationMs, ...turn, error: turn.error ?? redactSecrets(reason) };
+  }
+
+  private blockRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): AgentRunOutcome {
+    const summary = redactSecrets(turn.error ?? "The current task is blocked.");
+    const requiredAction = turn.requiredAction === undefined ? undefined : redactSecrets(turn.requiredAction);
+    run.status = "blocked";
+    this.emit({
+      ...this.eventBase(run),
+      type: "run.blocked",
+      durationMs,
+      reason: normalizeBlockedReason(turn.blockedReason),
+      summary,
+      requiredAction,
+      affectedTodoIds: turn.affectedTodoIds,
+      resumable: turn.resumable,
+      stopReason: turn.stopReason,
+      finishReason: turn.finishReason,
+      steps: turn.steps,
+      usage: turn.usage
+    });
+    return {
+      runId: run.runId,
+      durationMs,
+      ...turn,
+      error: summary,
+      requiredAction
+    };
+  }
+
+  private cancelledRun(
+    run: ActiveRunSnapshot,
+    durationMs: number,
+    reason: string,
+    turn?: AgentTurnOutcome
+  ): AgentRunOutcome {
+    const publicReason = redactSecrets(reason);
+    run.status = "cancelled";
+    this.emit({
+      ...this.eventBase(run),
+      type: "run.cancelled",
+      durationMs,
+      reason: publicReason,
+      stopReason: turn?.stopReason ?? "cancelled",
+      finishReason: turn?.finishReason,
+      steps: turn?.steps ?? 0,
+      usage: turn?.usage
+    });
+    return {
+      runId: run.runId,
+      status: "cancelled",
+      stopReason: "cancelled",
+      finishReason: turn?.finishReason,
+      steps: turn?.steps ?? 0,
+      output: turn?.output ?? "",
+      durationMs,
+      usage: turn?.usage,
+      error: publicReason
+    };
   }
 
   private abortRun(
@@ -886,6 +958,19 @@ function readNumber(value: unknown, key: string): number | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const field = (value as Record<string, unknown>)[key];
   return typeof field === "number" ? field : undefined;
+}
+
+function normalizeBlockedReason(reason: string | undefined): BlockedReason {
+  if (
+    reason === "missing_user_input"
+    || reason === "waiting_for_approval"
+    || reason === "permission_denied"
+    || reason === "missing_dependency"
+    || reason === "environment_unavailable"
+    || reason === "external_service_failure"
+    || reason === "unsafe_action_required"
+  ) return reason;
+  return "environment_unavailable";
 }
 
 function incompleteReason(outcome: AgentTurnOutcome): string {

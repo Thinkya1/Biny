@@ -109,7 +109,12 @@ export class AgentAttemptExecutor {
       output: outcome.output,
       runtimeSteps: outcome.steps,
       usage: outcome.usage,
-      outcomeStatus: outcome.status,
+      // Durable Attempt 的持久化枚举保持兼容；普通 Loop 的新终态在跨入旧 harness 时降级。
+      outcomeStatus: outcome.status === "cancelled"
+        ? "aborted"
+        : outcome.status === "blocked"
+          ? "incomplete"
+          : outcome.status,
       stopReason: outcome.stopReason,
       finishReason: outcome.finishReason,
       error: outcome.error,

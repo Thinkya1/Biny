@@ -24,7 +24,8 @@ export function printSessionSummaries(sessions: Awaited<ReturnType<typeof listSe
     // 摘要压成单行，避免长对话内容把 session 列表冲散。
     const firstMessage = session.firstUserMessage.replace(/\s+/g, " ").slice(0, 80) || "(no user_message)";
     const lastAssistant = session.lastAssistantMessage.replace(/\s+/g, " ").slice(0, 80) || "(no assistant_message)";
-    console.log(`${session.fileName}\t${session.createdAt}\t${relativeTime(session.updatedAt)}\t${session.eventCount} events`);
+    const terminalStatus = session.lastTurnStatus ? `\t${session.lastTurnStatus.status}` : "";
+    console.log(`${session.fileName}\t${session.createdAt}\t${relativeTime(session.updatedAt)}\t${session.eventCount} events${terminalStatus}`);
     console.log(`  user: ${firstMessage}`);
     console.log(`  biny: ${lastAssistant}`);
   }

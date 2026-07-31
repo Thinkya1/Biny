@@ -39,5 +39,10 @@ function printEvent(event: SessionEvent): void {
     return;
   }
 
+  if (event.type === "turn_status") {
+    console.log(`${prefix}: ${event.status} (${event.stopReason}, ${String(event.steps)} steps)${event.summary ? ` ${event.summary}` : ""}`);
+    return;
+  }
+
   console.log(`${prefix}: ${event.message}`);
 }

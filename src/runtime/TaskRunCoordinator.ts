@@ -1,5 +1,7 @@
 import type { AgentAttachment } from "../agent/AgentSession.js";
+import { resolveRunBudget } from "../agent/runBudget.js";
 import type { AgentPermissionRequest, AgentPermissionResult, AgentTurnOutcome } from "../agent/types.js";
+import { createControlledAcceptanceCommandExecutor } from "../harness/AcceptanceCommandExecutor.js";
 import { AcceptanceVerifier } from "../harness/AcceptanceVerifier.js";
 import { AgentAttemptExecutor } from "../harness/AgentAttemptExecutor.js";
 import { cleanupTask } from "../harness/TaskCleanup.js";
@@ -10,6 +12,7 @@ import { createTaskContract } from "../harness/TaskContractFactory.js";
 import type { TaskRunStore } from "../harness/TaskRunStore.js";
 import type { AgentAttemptExecution, TaskCleanupResult, TaskContract, TaskToolEvidence } from "../harness/types.js";
 import type { SessionUsage } from "../session/metadata.js";
+import { PermissionManager } from "../permission/PermissionManager.js";
 import type { CommandRuntime } from "./CommandRuntime.js";
 
 export interface TaskRunCoordinatorOptions {
@@ -87,8 +90,22 @@ export class TaskRunCoordinator {
       const verifier = new AcceptanceVerifier({
         workspaceRoot: this.runtime.workspaceRoot,
         ignore: this.runtime.config.workspace.ignore,
-        managedProcesses: this.runtime.managedProcesses
+        managedProcesses: this.runtime.managedProcesses,
+        commandExecutor: createControlledAcceptanceCommandExecutor({
+          workspaceRoot: this.runtime.workspaceRoot,
+          ignore: this.runtime.config.workspace.ignore,
+          sandbox: this.runtime.config.sandbox,
+          permissionManager: new PermissionManager({
+            ...this.runtime.config.permission,
+            source: "durable task verification"
+          }),
+          sessionId: options.sessionId,
+          confirmPermission: options.confirmPermission,
+          maxConcurrency: this.runtime.config.agent.maxConcurrentTools,
+          maxQueuedCommands: this.runtime.config.agent.maxQueuedToolCalls
+        })
       });
+      const runBudget = resolveRunBudget(this.runtime.config.agent);
       const executor = new AgentAttemptExecutor({
         agent: this.runtime.agent,
         initialEvidence: resolved.priorToolEvidence,
@@ -97,8 +114,12 @@ export class TaskRunCoordinator {
           confirmPermission: options.confirmPermission,
           attachments: options.attachments,
           maxSteps: context.remainingRuntimeSteps === undefined
-            ? undefined
-            : Math.min(this.runtime.config.agent.maxSteps, context.remainingRuntimeSteps),
+            ? Math.min(this.runtime.config.agent.maxSteps, runBudget.hardStepLimit)
+            : Math.min(
+                this.runtime.config.agent.maxSteps,
+                runBudget.hardStepLimit,
+                context.remainingRuntimeSteps
+              ),
           deferSuccessfulMemory: true,
           sessionUserMessage: options.input,
           recordSessionUserMessage: context.attemptNumber === 1
@@ -297,7 +318,7 @@ function harnessTurnOutcome(
     output: latest?.output ?? "",
     usage
   };
-  if (harness.status === "passed") return { status: "completed", stopReason: "model_stop", ...common };
+  if (harness.status === "passed") return { status: "completed", stopReason: "completion_gate", ...common };
   if (harness.status === "budget_exhausted") {
     return { status: "incomplete", stopReason: "budget_exhausted", ...common, error: latest?.error ?? harness.terminalReason };
   }

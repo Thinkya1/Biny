@@ -1,18 +1,14 @@
 /**
- * 自主执行能力入口。
+ * 普通单次执行入口。
  *
- * 普通 Chat/Plan 不创建任务契约、验收器或 durable task store；只有 `biny run`
- * 显式进入本服务。
+ * `biny run` 与 Chat、Desktop、TUI 共用 InteractiveAgentRuntime / AgentSession。
+ * 这里不推断任务类型，也不创建 TaskContract 或 durable attempt。
  */
-import { randomUUID } from "node:crypto";
 import type { AgentAttachment, AgentSessionInfo } from "../agent/AgentSession.js";
-import type { AgentPermissionRequest, AgentPermissionResult } from "../agent/types.js";
-import { TaskRunStore } from "../harness/TaskRunStore.js";
+import type { AgentPermissionRequest, AgentPermissionResult, AgentTurnOutcome } from "../agent/types.js";
+import { confirmPermissionRequest } from "../permission/confirm.js";
 import type { CommandRuntime } from "./CommandRuntime.js";
-import {
-  TaskRunCoordinator,
-  type TaskRunCoordinatorResult
-} from "./TaskRunCoordinator.js";
+import { InteractiveAgentRuntime } from "./InteractiveAgentRuntime.js";
 
 export interface ExecutionOptions {
   input: string;
@@ -21,39 +17,100 @@ export interface ExecutionOptions {
   confirmPermission?(request: AgentPermissionRequest): Promise<AgentPermissionResult>;
 }
 
-export interface ExecutionResult extends TaskRunCoordinatorResult {
+export interface ExecutionResult {
   runId: string;
   session: AgentSessionInfo;
+  turn: AgentTurnOutcome;
 }
 
 export class ExecutionService {
-  private readonly coordinator: TaskRunCoordinator;
+  private readonly interactive: InteractiveAgentRuntime;
 
-  constructor(
-    private readonly runtime: CommandRuntime,
-    taskRuns: TaskRunStore
-  ) {
-    this.coordinator = new TaskRunCoordinator({ runtime, taskRunStore: taskRuns });
+  constructor(private readonly runtime: CommandRuntime) {
+    this.interactive = new InteractiveAgentRuntime(runtime);
   }
 
   static async create(runtime: CommandRuntime): Promise<ExecutionService> {
-    return new ExecutionService(runtime, await TaskRunStore.open(runtime.persistenceRoot));
+    return new ExecutionService(runtime);
   }
 
   async execute(options: ExecutionOptions): Promise<ExecutionResult> {
-    const runId = randomUUID();
     const session = this.runtime.agent.getInfo();
-    const result = await this.coordinator.execute({
-      runId,
-      sessionId: session.sessionId,
-      input: options.input,
-      attachments: options.attachments,
-      signal: options.signal,
-      confirmPermission: options.confirmPermission
+    let permissionFailure: unknown;
+    const answerPermission = (requestId: string, result: AgentPermissionResult): void => {
+      try {
+        this.interactive.answerPermission(requestId, result);
+      } catch (error) {
+        if (!options.signal.aborted) permissionFailure ??= error;
+      }
+    };
+    const unsubscribe = this.interactive.subscribe((update) => {
+      if (update.event?.type !== "permission.requested") return;
+      const event = update.event;
+      void (async () => {
+        try {
+          const request: AgentPermissionRequest = {
+            ...event.request,
+            toolName: event.request.tool,
+            sessionId: event.sessionId,
+            projectRoot: this.runtime.workspaceRoot,
+            actionType: permissionActionType(event.request.actionType),
+            riskLevel: permissionRiskLevel(event.request.riskLevel)
+          };
+          const result = options.confirmPermission
+            ? await options.confirmPermission(request)
+            : await confirmPermissionRequest(request, options.signal);
+          answerPermission(event.requestId, result);
+        } catch (error) {
+          if (options.signal.aborted) return;
+          permissionFailure ??= error;
+          answerPermission(event.requestId, {
+            approved: false,
+            scope: "once",
+            message: errorMessage(error)
+          });
+        }
+      })();
     });
-    if (result.turn.status === "completed") {
-      this.runtime.agent.rememberSuccessfulTask(options.input, result.turn.output);
+
+    try {
+      const submitted = this.interactive.submitPrompt(options.input, "chat", options.attachments ?? []);
+      const abort = (): void => {
+        this.interactive.cancelRun(submitted.runId);
+      };
+      options.signal.addEventListener("abort", abort, { once: true });
+      if (options.signal.aborted) abort();
+      try {
+        const turn = await submitted.completion;
+        if (permissionFailure !== undefined) throw permissionFailure;
+        return { runId: submitted.runId, session, turn };
+      } finally {
+        options.signal.removeEventListener("abort", abort);
+      }
+    } finally {
+      unsubscribe();
     }
-    return { ...result, runId, session };
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function permissionActionType(value: string): AgentPermissionRequest["actionType"] {
+  if (
+    value === "read"
+    || value === "write"
+    || value === "delete"
+    || value === "shell"
+    || value === "network"
+    || value === "git"
+    || value === "install"
+  ) return value;
+  return "unknown";
+}
+
+function permissionRiskLevel(value: string): AgentPermissionRequest["riskLevel"] {
+  if (value === "low" || value === "medium" || value === "high" || value === "critical") return value;
+  return "high";
 }

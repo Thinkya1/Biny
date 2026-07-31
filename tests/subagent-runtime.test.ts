@@ -601,7 +601,7 @@ async function testRuntimeCloseDefersCleanupForNonCooperativeRun(): Promise<void
   assert.equal(closedWhileWriting, false);
 
   release.resolve();
-  assert.equal((await submitted.completion).status, "aborted");
+  assert.equal((await submitted.completion).status, "cancelled");
   await waitUntil(() => closeCalls === 1);
   assert.equal(closedWhileWriting, false);
 }
@@ -776,8 +776,8 @@ async function testContinueCommandKeepsStepLimitSeparate(): Promise<void> {
   const commands = fakeCommandRuntime();
   const runtime = new InteractiveAgentRuntime(commands);
   const result = await executeRuntimeCommand(runtime, commands, "/continue", "tui");
-  assert.match(result?.content ?? "", /No interrupted turn/u);
-  assert.match(result?.content ?? "", /Step-limit.*new user message/u);
+  assert.match(result?.content ?? "", /No interrupted.*turn/u);
+  assert.doesNotMatch(result?.content ?? "", /Step-limit/u);
   await runtime.close();
 }
 
@@ -878,7 +878,7 @@ async function testIncompleteTurnDoesNotEmitRunCompleted(): Promise<void> {
 async function testCliRejectsIncompleteAndFailedOutcomes(): Promise<void> {
   assert.doesNotThrow(() => assertCompletedCliRun({
     status: "completed",
-    stopReason: "model_stop",
+    stopReason: "completion_gate",
     finishReason: "stop",
     steps: 1,
     output: "done"
@@ -1294,7 +1294,7 @@ function completed(content: string): Extract<AgentSessionEvent, { type: "done" }
     content,
     outcome: {
       status: "completed",
-      stopReason: "model_stop",
+      stopReason: "completion_gate",
       finishReason: "stop",
       steps: 1,
       output: content

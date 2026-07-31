@@ -55,8 +55,9 @@ export function attachCleanupLineage(evidence: TaskEvidence[], parentEvidenceIds
 }
 
 function agentOutcomeEvidence(attempt: AttemptEvidenceSource): TaskEvidence {
-  // 只有「跑完 + 模型自己停下来」才算通过：跑到步数上限或被打断都不能当作正常收尾。
-  const passed = attempt.status === "completed" && attempt.stopReason === "model_stop";
+  // 新运行必须经过 Completion Gate；model_stop 仅供旧 TaskRun 记录兼容。
+  const passed = attempt.status === "completed"
+    && (attempt.stopReason === "completion_gate" || attempt.stopReason === "model_stop");
   return {
     id: `attempt:${attempt.attemptId}:agent:outcome`,
     kind: "agent",
@@ -64,7 +65,7 @@ function agentOutcomeEvidence(attempt: AttemptEvidenceSource): TaskEvidence {
     parentEvidenceIds: [],
     passed,
     summary: passed
-      ? "Agent reached a terminal model stop."
+      ? "Agent reached an approved terminal state."
       : `Agent attempt ended as ${attempt.status} (${attempt.stopReason ?? "unknown"}).`,
     observedAt: attempt.endedAt ?? new Date().toISOString(),
     details: {

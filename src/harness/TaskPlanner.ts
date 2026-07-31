@@ -100,7 +100,8 @@ export function advanceTaskPlan(plan: TaskPlanItem[], progress: TaskPlanProgress
     ? successfulToolEvidence.filter((item) => item.tool === "start_process").map((item) => toolEvidenceId(progress.attemptId, item))
     : progress.taskType === "code_change"
       ? successfulToolEvidence.filter((item) => mutationTools.has(item.tool)).map((item) => toolEvidenceId(progress.attemptId, item))
-      : progress.execution?.outcomeStatus === "completed" && progress.execution.stopReason === "model_stop"
+      : progress.execution?.outcomeStatus === "completed"
+        && (progress.execution.stopReason === "completion_gate" || progress.execution.stopReason === "model_stop")
         ? [agentOutcomeEvidenceId(progress.attemptId)]
         : [];
   const verificationEvidence = progress.verificationEvidence ?? [];

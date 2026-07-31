@@ -5,16 +5,12 @@
  * session 文件位置。它适合脚本化调用或不需要持续对话的任务。
  */
 import type { AgentTurnOutcome } from "../../agent/types.js";
-import type { CommandRuntime } from "../../runtime/CommandRuntime.js";
-import type { SessionLease, SessionLeaseStore } from "../../runtime/SessionLease.js";
+import { createCommandRuntime, type CommandRuntime } from "../../runtime/CommandRuntime.js";
+import { ExecutionService } from "../../runtime/ExecutionService.js";
+import { SessionLeaseStore, type SessionLease } from "../../runtime/SessionLease.js";
 import { withCliAbortSignal } from "../sigint.js";
 
 export async function runCommand(workspaceRoot: string, input: string): Promise<void> {
-  const [{ createCommandRuntime }, { ExecutionService }, { SessionLeaseStore }] = await Promise.all([
-    import("../../runtime/CommandRuntime.js"),
-    import("../../runtime/ExecutionService.js"),
-    import("../../runtime/SessionLease.js")
-  ]);
   let runtime: CommandRuntime | undefined;
   let leases: SessionLeaseStore | undefined;
   let lease: SessionLease | undefined;
@@ -42,7 +38,7 @@ export async function runCommand(workspaceRoot: string, input: string): Promise<
 
 /** Throwing here lets the CLI composition root set a non-zero exit status. */
 export function assertCompletedCliRun(outcome: AgentTurnOutcome): void {
-  if (outcome.status === "completed" && outcome.stopReason === "model_stop") return;
+  if (outcome.status === "completed") return;
   const detail = outcome.error ?? `Agent task stopped with ${outcome.stopReason} after ${String(outcome.steps)} steps.`;
   throw new Error(`Agent task ${outcome.status}: ${detail}`);
 }
