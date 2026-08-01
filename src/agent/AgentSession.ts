@@ -95,10 +95,10 @@ export interface AgentSessionOptions {
   permissionManager: PermissionManager;
   recorder: SessionRecorder;
   modelManager?: ModelManager;
-  skillPrompt?: string;
+  skillPrompt?: string | (() => string);
   /** 具名子代理定义元数据段（delegate_task 可用的 agent 列表）。 */
   subagentPrompt?: string;
-  skillPaths?: string[];
+  skillPaths?: string[] | (() => string[]);
   /** MCP 服务器 initialize 返回的 instructions 汇总；重连后会变化，因此每回合实时读取。 */
   mcpPrompt?: () => string;
   /** 模型自己维护的计划清单；每回合实时读取，历史压缩不会让它丢失。 */
@@ -276,12 +276,21 @@ export class AgentSession {
   /** 技能元数据、具名子代理清单与 MCP instructions 共同构成 system prompt 的扩展段。 */
   private extensionPrompt(): string | undefined {
     const sections = [
-      this.options.skillPrompt?.trim(),
+      this.skillPrompt()?.trim(),
       this.options.subagentPrompt?.trim(),
       this.options.mcpPrompt?.().trim(),
       (this.options.todoStore?.promptSection() ?? this.options.todoPrompt?.())?.trim()
     ].filter(Boolean);
     return sections.length ? sections.join("\n\n") : undefined;
+  }
+
+  private skillPrompt(): string | undefined {
+    return typeof this.options.skillPrompt === "function" ? this.options.skillPrompt() : this.options.skillPrompt;
+  }
+
+  private skillPaths(): string[] {
+    const paths = typeof this.options.skillPaths === "function" ? this.options.skillPaths() : this.options.skillPaths;
+    return [...(paths ?? [])];
   }
 
   /** 上次被打断、尚未收尾的回合；没有则为 undefined。 */
@@ -435,7 +444,7 @@ export class AgentSession {
         type: "user_message",
         content: input,
         attachments: sessionAttachments(runOptions.attachments),
-        skills: this.options.skillPaths,
+        skills: this.skillPaths(),
         contextUsage: this.contextMemory.getBudget(),
         contextState: this.contextMemory.persistedState(),
         preparationUsage: this.usageRecords.slice(usageBeforePreparation)
@@ -1207,7 +1216,7 @@ export class AgentSession {
       sessionId: this.recorder.sessionId,
       sessionFile: this.recorder.filePath,
       ...model,
-      skills: this.options.skillPaths
+      skills: this.skillPaths()
     };
   }
 
@@ -1280,7 +1289,7 @@ export class AgentSession {
     this.recorder.record({
       type: "user_message",
       content,
-      skills: this.options.skillPaths,
+      skills: this.skillPaths(),
       auditOnly: true
     });
   }
@@ -1322,7 +1331,7 @@ export class AgentSession {
         type: "user_message",
         content: item.input,
         attachments: sessionAttachments(item.attachments),
-        skills: this.options.skillPaths,
+        skills: this.skillPaths(),
         contextUsage: this.contextMemory.getBudget(),
         contextState: this.contextMemory.persistedState()
       });

@@ -256,6 +256,7 @@ function fakeRuntime(
       close: async () => []
     },
     extensionReport: () => "",
+    refreshSkills: async () => undefined,
     setSubagentParentRunId: () => undefined,
     cancelSubagentTasks: () => undefined,
     close: async () => undefined

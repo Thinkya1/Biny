@@ -198,7 +198,7 @@ const subagentToolNameSchema = z.enum(defaultSubagentAllowedTools);
 
 const extensionsSchema = z.object({
   mcp: z.record(mcpServerSchema).default({}),
-  skills: z.array(z.string().trim().min(1)).max(32).default([".biny/skills"]),
+  skills: z.array(z.string().trim().min(1)).max(32).default([".agents/skills", ".biny/skills"]),
   plugins: z.array(z.string().trim().min(1)).max(32).default([]),
   subagent: z.object({
     enabled: z.boolean().default(false),
@@ -226,7 +226,7 @@ const extensionsSchema = z.object({
   })
 }).default({
   mcp: {},
-  skills: [".biny/skills"],
+  skills: [".agents/skills", ".biny/skills"],
   plugins: [],
   subagent: {
     enabled: false,
@@ -651,7 +651,7 @@ export const defaultConfig: AgentConfig = {
   telemetry: { enabled: false, recordInputs: false, recordOutputs: false },
   extensions: {
     mcp: {},
-    skills: [".biny/skills"],
+    skills: [".agents/skills", ".biny/skills"],
     plugins: [],
     subagent: {
       enabled: false,

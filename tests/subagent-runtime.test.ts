@@ -1305,6 +1305,7 @@ function fakeCommandRuntime(options: FakeRuntimeOptions = {}): CommandRuntime {
       cancelTask: options.cancelSubagentTask ?? (() => false),
       cancelParent: () => undefined
     },
+    refreshSkills: async () => undefined,
     setSubagentParentRunId: () => undefined,
     close: options.close ?? (async () => undefined)
   } as unknown as CommandRuntime;

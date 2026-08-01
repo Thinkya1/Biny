@@ -1,22 +1,26 @@
 /**
- * 技能扩展模块（渐进式披露）。
+ * Agent Skills 扩展模块（渐进式披露）。
  *
- * 会话启动时只扫描技能元数据（frontmatter 的 name/description）拼进 system prompt，
- * 完整指令由 invoke_skill 工具在被调用时按需读取。技能可以放在项目内配置的目录
- * （默认 .biny/skills）或全局 ~/.biny/skills，项目级同名技能覆盖全局。
+ * 新根回合开始前只扫描 YAML frontmatter 的 name/description 并按总预算拼进 system prompt；
+ * 完整指令与 references/scripts/assets 分别由 invoke_skill、read_skill_resource 按需读取。
+ * 默认同时发现官方 .agents/skills、~/.agents/skills 与 Biny 旧目录。
  */
 import { constants, promises as fs, type BigIntStats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { parseDocument } from "yaml";
 import { z } from "zod";
 import { ToolAccesses } from "../tools/access.js";
 import type { Tool } from "../tools/types.js";
 
-const maxSkillCount = 32;
-const maxSkillMetadataBytes = 8 * 1024;
-const maxSkillInstructionBytes = 64 * 1024;
-const maxSkillDescriptionChars = 300;
+const maxDiscoveredSkillCount = 256;
+const maxSkillMetadataBytes = 64 * 1024;
+const maxSkillInstructionBytes = 512 * 1024;
+const maxSkillResourceBytes = 512 * 1024;
+const maxSkillDescriptionChars = 1024;
+const maxInitialSkillPromptChars = 8_000;
+const maxListedSkillResources = 100;
 
 export type SkillScope = "project" | "global";
 
@@ -36,13 +40,14 @@ export interface SkillBundle {
   skills: SkillDefinition[];
   paths: string[];
   prompt: string;
+  warnings: string[];
 }
 
 export interface LoadSkillsOptions {
   workspaceRoot: string;
   /** Workspace-relative paths from extensions.skills. */
   projectPaths: string[];
-  /** Global skill directory; defaults to ~/.biny/skills. */
+  /** Isolated global skill directory; omitted means official, legacy, and admin roots. */
   globalRoot?: string;
 }
 
@@ -64,75 +69,146 @@ interface SkillFileCandidate {
 export async function loadSkills(options: LoadSkillsOptions): Promise<SkillBundle> {
   const canonicalWorkspace = await fs.realpath(path.resolve(options.workspaceRoot));
   const skills: SkillDefinition[] = [];
-  const usedNames = new Set<string>();
+  const warnings: string[] = [];
   const seen = new Set<string>();
-  // 逐个配置目录收集并按名字去重：先配置的目录（默认 .biny/skills）同名优先。
+  // 配置目录按顺序扫描。同名 Skill 不合并，由调用时的 path 消歧。
   for (const configuredPath of options.projectPaths) {
-    if (skills.length >= maxSkillCount) break;
+    if (skills.length >= maxDiscoveredSkillCount) break;
+    if (isOfficialProjectSkillPath(configuredPath)) {
+      const repositoryRoot = await findRepositoryRoot(canonicalWorkspace);
+      for (const target of officialProjectSkillTargets(canonicalWorkspace, repositoryRoot)) {
+        const relative = path.relative(repositoryRoot, target);
+        const absolutePath = await resolveRootedSkillPath(repositoryRoot, relative);
+        if (!absolutePath) continue;
+        const files: SkillFileCandidate[] = [];
+        await collectSkillFiles(repositoryRoot, absolutePath, files, seen);
+        await appendSkillDefinitions(skills, warnings, repositoryRoot, files, "project");
+      }
+      continue;
+    }
     const absolutePath = await resolveRootedSkillPath(canonicalWorkspace, configuredPath);
     if (!absolutePath) continue;
     const files: SkillFileCandidate[] = [];
     await collectSkillFiles(canonicalWorkspace, absolutePath, files, seen);
-    await appendSkillDefinitions(skills, usedNames, canonicalWorkspace, files, "project");
+    await appendSkillDefinitions(skills, warnings, canonicalWorkspace, files, "project");
   }
 
-  // 全局技能在项目技能之后加载，同名时项目级优先。
-  const globalRoot = options.globalRoot ?? path.join(os.homedir(), ".biny", "skills");
-  try {
-    const canonicalGlobalRoot = await resolveGlobalSkillRoot(globalRoot);
-    if (canonicalGlobalRoot) {
-      const globalFiles: SkillFileCandidate[] = [];
-      await collectSkillFiles(canonicalGlobalRoot, canonicalGlobalRoot, globalFiles, new Set());
-      await appendSkillDefinitions(skills, usedNames, canonicalGlobalRoot, globalFiles, "global");
+  // 显式传 globalRoot 时只扫描该目录（测试和嵌入方可隔离）；默认兼容官方与 Biny 旧目录。
+  const globalRoots = options.globalRoot
+    ? [options.globalRoot]
+    : [path.join(os.homedir(), ".agents", "skills"), path.join(os.homedir(), ".biny", "skills"), "/etc/codex/skills"];
+  for (const globalRoot of globalRoots) {
+    if (skills.length >= maxDiscoveredSkillCount) break;
+    try {
+      const canonicalGlobalRoot = await resolveGlobalSkillRoot(globalRoot);
+      if (canonicalGlobalRoot) {
+        const globalFiles: SkillFileCandidate[] = [];
+        await collectSkillFiles(canonicalGlobalRoot, canonicalGlobalRoot, globalFiles, new Set());
+        await appendSkillDefinitions(skills, warnings, canonicalGlobalRoot, globalFiles, "global");
+      }
+    } catch (error) {
+      warnings.push(`Skipped skill root ${globalRoot}: ${errorMessage(error)}`);
     }
-  } catch {
-    // 全局目录里的软链/硬链/权限问题只放弃全局技能：拒绝加载已达到防御目的，
-    // 不能让一个共享目录的异常阻止所有工作区启动。项目内路径仍保持硬失败。
   }
 
+  if (skills.length >= maxDiscoveredSkillCount) {
+    warnings.push(`Only the first ${String(maxDiscoveredSkillCount)} skills were discovered.`);
+  }
   return {
     skills,
     paths: skills.map((skill) => skill.path),
-    prompt: buildSkillPrompt(skills)
+    prompt: buildSkillPrompt(skills),
+    warnings
   };
+}
+
+function isOfficialProjectSkillPath(configuredPath: string): boolean {
+  return path.normalize(configuredPath) === path.join(".agents", "skills");
+}
+
+/** Codex 从 CWD 逐层扫描到当前仓库根目录；非 Git 目录只扫描当前目录。 */
+async function findRepositoryRoot(workspaceRoot: string): Promise<string> {
+  let current = workspaceRoot;
+  while (true) {
+    try {
+      await fs.lstat(path.join(current, ".git"));
+      return current;
+    } catch (error) {
+      if (!isNotFound(error)) throw error;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return workspaceRoot;
+    current = parent;
+  }
+}
+
+function officialProjectSkillTargets(workspaceRoot: string, repositoryRoot: string): string[] {
+  const targets: string[] = [];
+  let current = workspaceRoot;
+  while (true) {
+    targets.push(path.join(current, ".agents", "skills"));
+    if (current === repositoryRoot) return targets;
+    const parent = path.dirname(current);
+    if (parent === current) return targets;
+    current = parent;
+  }
 }
 
 async function appendSkillDefinitions(
   skills: SkillDefinition[],
-  usedNames: Set<string>,
+  warnings: string[],
   rootPath: string,
   files: SkillFileCandidate[],
   scope: SkillScope
 ): Promise<void> {
   for (const candidate of files.sort((left, right) => left.path.localeCompare(right.path))) {
-    if (skills.length >= maxSkillCount) break;
-    const definition = await readSkillMetadata(rootPath, candidate, scope);
-    if (!definition || usedNames.has(definition.name)) continue;
-    usedNames.add(definition.name);
-    skills.push(definition);
+    if (skills.length >= maxDiscoveredSkillCount) break;
+    try {
+      skills.push(await readSkillMetadata(rootPath, candidate, scope));
+    } catch (error) {
+      warnings.push(`Skipped ${candidate.path}: ${errorMessage(error)}`);
+    }
   }
 }
 
 function buildSkillPrompt(skills: SkillDefinition[]): string {
   if (!skills.length) return "";
-  const lines = [
-    "Available skills (metadata only; full instructions are not loaded yet):",
-    ...skills.map((skill) => `- ${skill.name} (${skill.scope}): ${skill.description}`),
-    "Before doing a task that matches a skill, call the invoke_skill tool with that skill name and follow the returned instructions."
-  ];
-  return lines.join("\n");
+  const header = "Available skills (metadata only; full instructions are not loaded yet):";
+  const footer = "Before doing a task that matches a skill, call invoke_skill with its name. A $skill-name mention is an explicit invocation and must be honored. When names are duplicated, also pass the listed path.";
+  const render = (descriptionLimit: number, limit = skills.length): string => {
+    const lines = skills.slice(0, limit).map((skill) => {
+      const description = truncateChars(skill.description, descriptionLimit);
+      return `- ${skill.name} (${skill.scope}) [${skill.path}]: ${description}`;
+    });
+    const omitted = skills.length - limit;
+    if (omitted > 0) lines.push(`Warning: ${String(omitted)} additional skills were omitted from the initial list. Use /skills to inspect all skills.`);
+    return [header, ...lines, footer].join("\n");
+  };
+  for (const descriptionLimit of [maxSkillDescriptionChars, 300, 160, 80]) {
+    const prompt = render(descriptionLimit);
+    if (prompt.length <= maxInitialSkillPromptChars) return prompt;
+  }
+  let visible = skills.length;
+  while (visible > 0 && render(80, visible).length > maxInitialSkillPromptChars) visible -= 1;
+  return render(80, visible);
 }
 
-const invokeSkillArgsSchema = z.object({ skill: z.string().trim().min(1) });
+const invokeSkillArgsSchema = z.object({
+  skill: z.string().trim().min(1),
+  path: z.string().trim().min(1).optional()
+});
 
-export function createSkillTool(bundle: SkillBundle): Tool {
+type SkillBundleSource = SkillBundle | (() => SkillBundle);
+
+export function createSkillTool(source: SkillBundleSource): Tool {
   return {
     name: "invoke_skill",
     description: "Load the full instructions of an available skill by name. Call this before performing a task that a listed skill covers, then follow the returned instructions.",
     parameters: {
       type: "object",
       properties: {
-        skill: { type: "string", description: "Skill name exactly as listed in the available skills." }
+        skill: { type: "string", description: "Skill name exactly as listed in the available skills." },
+        path: { type: "string", description: "Listed skill path. Required only when multiple skills have the same name." }
       },
       required: ["skill"],
       additionalProperties: false
@@ -147,13 +223,13 @@ export function createSkillTool(bundle: SkillBundle): Tool {
         return { isError: true as const, result: "invoke_skill requires a skill name.", errorMessage: "invoke_skill requires a skill name." };
       }
       const requested = parsed.data.skill;
-      const definition = bundle.skills.find((skill) => skill.name === requested)
-        ?? bundle.skills.find((skill) => skill.name.toLowerCase() === requested.toLowerCase());
-      if (!definition) {
-        const known = bundle.skills.map((skill) => skill.name).join(", ") || "none";
-        const message = `Unknown skill: ${requested}. Available skills: ${known}.`;
+      const bundle = currentBundle(source);
+      const resolved = resolveSkill(bundle, requested, parsed.data.path);
+      if (typeof resolved === "string") {
+        const message = resolved;
         return { isError: true as const, result: message, errorMessage: message };
       }
+      const definition = resolved;
       return {
         accesses: ToolAccesses.readFile(definition.filePath),
         display: { kind: "generic" as const, summary: `Skill ${definition.name}`, detail: { path: definition.path } },
@@ -161,19 +237,24 @@ export function createSkillTool(bundle: SkillBundle): Tool {
         approvalRule: `invoke_skill:${definition.name}`,
         async execute(): Promise<unknown> {
           const content = await readSkillFileFresh(definition.rootPath, definition.filePath, maxSkillInstructionBytes);
-          const { body } = splitFrontmatter(content);
-          const files = await listSkillSiblingFiles(definition.filePath);
+          let body = content;
+          try {
+            const parsed = splitFrontmatter(content);
+            if (path.basename(definition.filePath) === "SKILL.md" || parsed.frontmatter.name || parsed.frontmatter.description) {
+              body = parsed.body;
+            }
+          } catch (error) {
+            if (path.basename(definition.filePath) === "SKILL.md") throw error;
+          }
+          const resources = await listSkillResources(definition.filePath);
           const result: Record<string, unknown> = {
             skill: definition.name,
             scope: definition.scope,
             path: definition.path,
             instructions: body.trim() || content.trim(),
-            files
+            resourceRoot: path.dirname(definition.filePath),
+            resources
           };
-          // 全局技能位于工作区外，read_file 够不到附属文件，直接内联小体积文本内容。
-          if (definition.scope === "global" && files.length) {
-            result.bundledFiles = await readGlobalSiblingFiles(path.dirname(definition.filePath), files);
-          }
           return result;
         }
       };
@@ -181,22 +262,109 @@ export function createSkillTool(bundle: SkillBundle): Tool {
   };
 }
 
-async function readSkillMetadata(rootPath: string, candidate: SkillFileCandidate, scope: SkillScope): Promise<SkillDefinition | undefined> {
-  let content: string;
-  try {
-    content = await readBoundedSkillFile(rootPath, candidate, maxSkillMetadataBytes);
-  } catch {
-    // A missing or unreadable optional skill should not stop the runtime.
-    return undefined;
+const readSkillResourceArgsSchema = z.object({
+  skill: z.string().trim().min(1),
+  path: z.string().trim().min(1),
+  skillPath: z.string().trim().min(1).optional()
+});
+
+/** 第三级渐进式披露：只在 SKILL.md 明确需要时读取 references/scripts/assets。 */
+export function createSkillResourceTool(source: SkillBundleSource): Tool {
+  return {
+    name: "read_skill_resource",
+    description: "Read a text resource from an activated skill. Use a relative path listed by invoke_skill.",
+    parameters: {
+      type: "object",
+      properties: {
+        skill: { type: "string", description: "Activated skill name." },
+        path: { type: "string", description: "Resource path relative to the skill directory." },
+        skillPath: { type: "string", description: "Listed skill path when the name is ambiguous." }
+      },
+      required: ["skill", "path"],
+      additionalProperties: false
+    },
+    schema: readSkillResourceArgsSchema,
+    source: "skill",
+    capability: "skills",
+    risk: "read",
+    async resolveExecution(args: unknown) {
+      const parsed = readSkillResourceArgsSchema.safeParse(args);
+      if (!parsed.success) {
+        const message = "read_skill_resource requires a skill name and relative resource path.";
+        return { isError: true as const, result: message, errorMessage: message };
+      }
+      const resolved = resolveSkill(currentBundle(source), parsed.data.skill, parsed.data.skillPath);
+      if (typeof resolved === "string") return { isError: true as const, result: resolved, errorMessage: resolved };
+      let resourcePath: string;
+      try {
+        resourcePath = resolveSkillResourcePath(resolved, parsed.data.path);
+        await assertReadableSkillResource(resolved, resourcePath);
+      } catch (error) {
+        const message = errorMessage(error);
+        return { isError: true as const, result: message, errorMessage: message };
+      }
+      return {
+        accesses: ToolAccesses.readFile(resourcePath),
+        display: { kind: "file_io" as const, operation: "read" as const, path: parsed.data.path },
+        description: `Read ${parsed.data.path} from skill ${resolved.name}`,
+        approvalRule: `read_skill_resource:${resolved.name}:${parsed.data.path}`,
+        async execute(): Promise<unknown> {
+          return {
+            skill: resolved.name,
+            skillPath: resolved.path,
+            path: parsed.data.path,
+            content: await readSkillResourceFresh(resolved, resourcePath)
+          };
+        }
+      };
+    }
+  };
+}
+
+function currentBundle(source: SkillBundleSource): SkillBundle {
+  return typeof source === "function" ? source() : source;
+}
+
+function resolveSkill(bundle: SkillBundle, requested: string, requestedPath?: string): SkillDefinition | string {
+  const matches = bundle.skills.filter((skill) => skill.name.toLowerCase() === requested.toLowerCase());
+  const selected = requestedPath ? matches.find((skill) => skill.path === requestedPath) : matches[0];
+  if (!matches.length || !selected) {
+    const known = bundle.skills.map((skill) => `${skill.name} [${skill.path}]`).join(", ") || "none";
+    return `Unknown skill: ${requested}${requestedPath ? ` at ${requestedPath}` : ""}. Available skills: ${known}.`;
   }
-  const { frontmatter, body } = splitFrontmatter(content);
+  if (!requestedPath && matches.length > 1) {
+    return `Skill name is ambiguous: ${requested}. Pass one of these paths: ${matches.map((skill) => skill.path).join(", ")}.`;
+  }
+  return selected;
+}
+
+async function readSkillMetadata(rootPath: string, candidate: SkillFileCandidate, scope: SkillScope): Promise<SkillDefinition> {
+  const content = await readBoundedSkillFile(rootPath, candidate, maxSkillMetadataBytes);
+  const standardSkill = path.basename(candidate.path) === "SKILL.md";
+  let frontmatter: SkillFrontmatter = {};
+  let body = content;
+  try {
+    ({ frontmatter, body } = splitFrontmatter(content));
+    if (!standardSkill && !frontmatter.name && !frontmatter.description) body = content;
+  } catch (error) {
+    if (standardSkill) throw error;
+  }
   const fallbackName = deriveSkillName(candidate.path);
-  const name = normalizeSkillName(frontmatter.name ?? fallbackName);
-  if (!name) return undefined;
-  const description = truncateChars(
-    (frontmatter.description ?? firstDescriptiveLine(body) ?? "No description provided.").trim(),
-    maxSkillDescriptionChars
-  );
+  const name = frontmatter.name ?? (standardSkill ? undefined : fallbackName);
+  if (!name) throw new Error("SKILL.md frontmatter must include name.");
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name) || name.length > 64) {
+    throw new Error(`Invalid skill name: ${name}. Use 1-64 lowercase letters, numbers, and single hyphens.`);
+  }
+  if (standardSkill && path.basename(path.dirname(candidate.path)) !== name) {
+    throw new Error(`Skill name ${name} must match its directory name.`);
+  }
+  if (standardSkill && !frontmatter.description) throw new Error("SKILL.md frontmatter must include description.");
+  const rawDescription = (frontmatter.description ?? firstDescriptiveLine(body) ?? "No description provided.").trim();
+  if (standardSkill && rawDescription.length > maxSkillDescriptionChars) {
+    throw new Error(`Skill description exceeds ${String(maxSkillDescriptionChars)} characters.`);
+  }
+  const description = truncateChars(rawDescription, maxSkillDescriptionChars);
+  if (!description) throw new Error("Skill description cannot be empty.");
   const relative = path.relative(rootPath, candidate.path);
   return {
     name,
@@ -218,12 +386,8 @@ function globalDisplayPath(rootPath: string, relative: string): string {
 /** SKILL.md 用上级目录名作为技能名，普通 .md 用文件名主干。 */
 function deriveSkillName(filePath: string): string {
   const stem = path.basename(filePath, path.extname(filePath));
-  if (stem.toLowerCase() === "skill") return path.basename(path.dirname(filePath));
+  if (path.basename(filePath) === "SKILL.md") return path.basename(path.dirname(filePath));
   return stem;
-}
-
-function normalizeSkillName(value: string): string {
-  return value.trim().replace(/\s+/g, "-").slice(0, 64);
 }
 
 interface SkillFrontmatter {
@@ -232,37 +396,31 @@ interface SkillFrontmatter {
 }
 
 function splitFrontmatter(content: string): { frontmatter: SkillFrontmatter; body: string } {
-  if (!content.startsWith("---")) return { frontmatter: {}, body: content };
-  const firstLineEnd = content.indexOf("\n");
-  if (firstLineEnd === -1 || content.slice(0, firstLineEnd).trim() !== "---") return { frontmatter: {}, body: content };
-  const closing = content.indexOf("\n---", firstLineEnd);
-  if (closing === -1) return { frontmatter: {}, body: content };
-  const closingLineEnd = content.indexOf("\n", closing + 1);
-  const raw = content.slice(firstLineEnd + 1, closing);
-  const lines = raw.split("\n");
-  // 只有 fence 之间全部是 "key: value" 形式才当 frontmatter 解析，
-  // 避免把以水平分割线开头的正文误判成元数据而丢掉内容。
-  if (!lines.every((line) => !line.trim() || /^\s*[A-Za-z0-9_-]+\s*:/.test(line))) {
-    return { frontmatter: {}, body: content };
-  }
-  const body = closingLineEnd === -1 ? "" : content.slice(closingLineEnd + 1);
-  const frontmatter: SkillFrontmatter = {};
-  for (const line of lines) {
-    const separator = line.indexOf(":");
-    if (separator === -1) continue;
-    const key = line.slice(0, separator).trim().toLowerCase();
-    if (key !== "name" && key !== "description") continue;
-    const value = stripQuotes(line.slice(separator + 1).trim());
-    if (value) frontmatter[key] = value;
-  }
-  return { frontmatter, body };
+  const opening = /^---[ \t]*\r?\n/.exec(content);
+  if (!opening) return { frontmatter: {}, body: content };
+  const closingPattern = /^---[ \t]*\r?$/gm;
+  closingPattern.lastIndex = opening[0].length;
+  const closing = closingPattern.exec(content);
+  if (!closing) return { frontmatter: {}, body: content };
+  const raw = content.slice(opening[0].length, closing.index);
+  const document = parseDocument(raw, { uniqueKeys: true });
+  if (document.errors.length) throw new Error(`Invalid SKILL.md YAML: ${document.errors[0]?.message ?? "unknown error"}`);
+  const value = document.toJS({ maxAliasCount: 0 });
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("SKILL.md frontmatter must be a YAML mapping.");
+  const record = value as Record<string, unknown>;
+  const name = stringMetadata(record.name, "name");
+  const description = stringMetadata(record.description, "description");
+  let bodyStart = closing.index + closing[0].length;
+  if (content.startsWith("\r\n", bodyStart)) bodyStart += 2;
+  else if (content.startsWith("\n", bodyStart)) bodyStart += 1;
+  return { frontmatter: { name, description }, body: content.slice(bodyStart) };
 }
 
-function stripQuotes(value: string): string {
-  if (value.length >= 2 && ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'")))) {
-    return value.slice(1, -1);
-  }
-  return value;
+function stringMetadata(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw new Error(`SKILL.md ${field} must be a string.`);
+  const trimmed = value.trim();
+  return trimmed || undefined;
 }
 
 function firstDescriptiveLine(body: string): string | undefined {
@@ -278,48 +436,86 @@ function truncateChars(value: string, maxChars: number): string {
   return value.length <= maxChars ? value : `${value.slice(0, maxChars - 1)}…`;
 }
 
-const maxBundledFileBytes = 8 * 1024;
-const maxBundledTotalBytes = 24 * 1024;
-const bundledTextExtensions = new Set([".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".sh", ".py", ".js", ".ts"]);
-
-/** 内联全局技能的文本附属文件（软链/硬链跳过，单文件与总量都设上限）。 */
-async function readGlobalSiblingFiles(directory: string, names: string[]): Promise<Array<{ name: string; content: string }>> {
-  const bundled: Array<{ name: string; content: string }> = [];
-  let usedBytes = 0;
-  for (const name of names) {
-    if (usedBytes >= maxBundledTotalBytes) break;
-    if (!bundledTextExtensions.has(path.extname(name).toLowerCase())) continue;
-    const filePath = path.join(directory, name);
-    try {
-      const stat = await fs.lstat(filePath, { bigint: true });
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) continue;
-      const content = await readBoundedSkillFile(
-        directory,
-        { path: filePath, snapshot: skillSnapshot(stat) },
-        Math.min(maxBundledFileBytes, maxBundledTotalBytes - usedBytes)
-      );
-      usedBytes += Buffer.byteLength(content, "utf8");
-      bundled.push({ name, content });
-    } catch {
-      // 附属文件读取失败不影响技能本体。
-    }
-  }
-  return bundled;
+interface SkillResourceEntry {
+  path: string;
+  kind: "script" | "reference" | "asset" | "file";
+  size: number;
 }
 
-async function listSkillSiblingFiles(skillFilePath: string): Promise<string[]> {
-  // 目录式技能可以携带模板、脚本等附属文件；这里只列文件名供模型继续用读取工具查看。
-  if (path.basename(skillFilePath).toLowerCase() !== "skill.md") return [];
-  try {
-    const entries = await fs.readdir(path.dirname(skillFilePath), { withFileTypes: true });
-    return entries
-      .filter((entry) => entry.isFile() && entry.name.toLowerCase() !== "skill.md")
-      .map((entry) => entry.name)
-      .sort((left, right) => left.localeCompare(right))
-      .slice(0, 20);
-  } catch {
-    return [];
+/** 枚举标准资源目录，内容仍由 read_skill_resource 第三级按需读取。 */
+async function listSkillResources(skillFilePath: string): Promise<SkillResourceEntry[]> {
+  if (path.basename(skillFilePath) !== "SKILL.md") return [];
+  const skillRoot = path.dirname(skillFilePath);
+  const resources: SkillResourceEntry[] = [];
+  const visit = async (directory: string): Promise<void> => {
+    if (resources.length >= maxListedSkillResources) return;
+    let entries;
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (resources.length >= maxListedSkillResources) return;
+      const target = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        await visit(target);
+        continue;
+      }
+      if (!entry.isFile() || target === skillFilePath) continue;
+      try {
+        const stat = await fs.lstat(target, { bigint: true });
+        if (!stat.isFile() || stat.nlink !== 1n || await escapesRoot(skillRoot, target)) continue;
+        const relative = path.relative(skillRoot, target);
+        const top = relative.split(path.sep, 1)[0]?.toLowerCase();
+        resources.push({
+          path: relative,
+          kind: top === "scripts" ? "script" : top === "references" ? "reference" : top === "assets" ? "asset" : "file",
+          size: Number(stat.size)
+        });
+      } catch {
+        // 单个资源异常不影响 Skill 正文。
+      }
+    }
+  };
+  await visit(skillRoot);
+  return resources;
+}
+
+function resolveSkillResourcePath(skill: SkillDefinition, resource: string): string {
+  if (path.isAbsolute(resource)) throw new Error("Skill resource path must be relative.");
+  const skillRoot = path.dirname(skill.filePath);
+  const target = path.resolve(skillRoot, resource);
+  const relative = path.relative(skillRoot, target);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Skill resource escapes its skill directory: ${resource}`);
   }
+  return target;
+}
+
+async function assertReadableSkillResource(skill: SkillDefinition, resourcePath: string): Promise<void> {
+  const stat = await fs.lstat(resourcePath, { bigint: true });
+  if (stat.isSymbolicLink()) throw new Error(`Skill resource cannot be a symbolic link: ${resourcePath}`);
+  if (!stat.isFile()) throw new Error(`Skill resource is not a file: ${resourcePath}`);
+  if (stat.nlink !== 1n) throw new Error(`Skill resources cannot be hardlinks: ${resourcePath}`);
+  if (await escapesRoot(path.dirname(skill.filePath), resourcePath)) throw new Error(`Skill resource escapes its skill directory: ${resourcePath}`);
+  if (stat.size > BigInt(maxSkillResourceBytes)) {
+    throw new Error(`Skill resource exceeds ${String(maxSkillResourceBytes)} bytes: ${resourcePath}`);
+  }
+}
+
+async function readSkillResourceFresh(skill: SkillDefinition, resourcePath: string): Promise<string> {
+  await assertReadableSkillResource(skill, resourcePath);
+  const stat = await fs.lstat(resourcePath, { bigint: true });
+  const content = await readBoundedSkillFile(
+    path.dirname(skill.filePath),
+    { path: resourcePath, snapshot: skillSnapshot(stat) },
+    maxSkillResourceBytes,
+    true
+  );
+  if (content.includes("\0")) throw new Error(`Skill resource is binary and cannot be read as text: ${resourcePath}`);
+  return content;
 }
 
 /** invoke 时重新校验并读取，允许文件在会话期间被正常编辑，但保持符号链接/硬链接/越界防御。 */
@@ -329,11 +525,11 @@ async function readSkillFileFresh(rootPath: string, filePath: string, maxBytes: 
   if (!stat.isFile()) throw new Error(`Skill path is not a file: ${filePath}`);
   if (stat.nlink !== 1n) throw new Error(`Skill files cannot be hardlinks: ${filePath}`);
   if (await escapesRoot(rootPath, filePath)) throw new Error(`Skill file escapes its root: ${filePath}`);
-  return await readBoundedSkillFile(rootPath, { path: filePath, snapshot: skillSnapshot(stat) }, maxBytes);
+  return await readBoundedSkillFile(rootPath, { path: filePath, snapshot: skillSnapshot(stat) }, maxBytes, true);
 }
 
 async function collectSkillFiles(rootPath: string, target: string, files: SkillFileCandidate[], seen: Set<string>): Promise<void> {
-  if (files.length >= maxSkillCount) return;
+  if (files.length >= maxDiscoveredSkillCount) return;
   let stat;
   try {
     stat = await fs.lstat(target, { bigint: true });
@@ -367,7 +563,7 @@ async function collectSkillFiles(rootPath: string, target: string, files: SkillF
   for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
     if (entry.name === "node_modules" || entry.name === ".git") continue;
     await collectSkillFiles(rootPath, path.join(target, entry.name), files, seen);
-    if (files.length >= maxSkillCount) return;
+    if (files.length >= maxDiscoveredSkillCount) return;
   }
 }
 
@@ -411,7 +607,12 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return value.slice(0, end);
 }
 
-async function readBoundedSkillFile(rootPath: string, candidate: SkillFileCandidate, maxBytes: number): Promise<string> {
+async function readBoundedSkillFile(
+  rootPath: string,
+  candidate: SkillFileCandidate,
+  maxBytes: number,
+  rejectOverflow = false
+): Promise<string> {
   let handle: FileHandle;
   try {
     handle = await fs.open(candidate.path, constants.O_RDONLY | noFollowFlag());
@@ -434,6 +635,9 @@ async function readBoundedSkillFile(rootPath: string, candidate: SkillFileCandid
     }
     const current = await assertSkillFileBinding(rootPath, candidate, handle);
     if (!sameSkillSnapshot(initial, current)) throw new Error(`Skill file changed while it was being read: ${candidate.path}`);
+    if (rejectOverflow && bytesRead > maxBytes) {
+      throw new Error(`Skill file exceeds ${String(maxBytes)} bytes: ${candidate.path}`);
+    }
     return truncateUtf8(Buffer.concat(chunks, bytesRead).toString("utf8"), maxBytes);
   } finally {
     await handle.close();
@@ -507,4 +711,8 @@ function noFollowFlag(): number {
 
 function isSymbolicLinkError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error.code === "ELOOP" || error.code === "EMLINK");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

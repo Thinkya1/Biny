@@ -466,6 +466,7 @@ export class InteractiveAgentRuntime {
   private async executeRun(run: AgentRun, signal: AbortSignal): Promise<AgentRunOutcome> {
     const agent = this.commandRuntime.agent;
     const startedAtMs = Date.now();
+    await this.commandRuntime.refreshSkills();
     const info = this.getInfo();
     run.sessionId = info.sessionId;
     run.status = "thinking";

@@ -185,8 +185,8 @@ export function analyzePermissionRequest(input: AnalyzePermissionInput): Permiss
     };
   }
 
-  if (input.toolName === "invoke_skill") {
-    // 技能文件在启动时已通过路径/软链/硬链校验，按内置只读工具放行。
+  if (input.toolName === "invoke_skill" || input.toolName === "read_skill_resource") {
+    // Skill 正文与资源都会在实际读取前重新校验路径、软链和硬链，按内置只读工具放行。
     return {
       ...base(input),
       actionType: "read",

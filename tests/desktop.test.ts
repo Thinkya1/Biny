@@ -1665,6 +1665,7 @@ function fakeCommandRuntime(requireFullYes = false, statusGate?: Promise<void>):
       return { taskId: "desktop-test-subagent", completion };
     },
     subagents: undefined,
+    refreshSkills: async () => undefined,
     setSubagentParentRunId: () => undefined,
     close: async () => undefined
   } as unknown as CommandRuntime;

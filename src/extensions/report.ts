@@ -12,6 +12,7 @@ import type { ToolSource } from "../tools/types.js";
 export interface ExtensionStatus {
   mcp: McpServerStatus[];
   skills: SkillDefinition[];
+  skillWarnings: string[];
   plugins: string[];
   subagent: {
     enabled: boolean;
@@ -48,7 +49,7 @@ export function createToolCounts(entries: Array<{ source: ToolSource }>): Record
 
 export function formatExtensionReport(status: ExtensionStatus, section: ExtensionSection = "all"): string {
   if (section === "mcp") return formatMcpReport(status.mcp);
-  if (section === "skills") return formatSkillReport(status.skills);
+  if (section === "skills") return formatSkillReport(status.skills, status.skillWarnings);
   if (section === "plugins") return formatPathReport("Plugins", status.plugins, "No plugins loaded.");
 
   const counts = status.toolCounts;
@@ -57,7 +58,7 @@ export function formatExtensionReport(status: ExtensionStatus, section: Extensio
     "",
     formatMcpReport(status.mcp),
     "",
-    formatSkillReport(status.skills),
+    formatSkillReport(status.skills, status.skillWarnings),
     "",
     formatPathReport("Plugins", status.plugins, "No plugins loaded."),
     "",
@@ -119,13 +120,14 @@ function formatSubagentAgents(agents: SubagentDefinition[]): string[] {
   return lines;
 }
 
-function formatSkillReport(skills: SkillDefinition[]): string {
-  if (!skills.length) return "Skills\n  No skills loaded.";
+function formatSkillReport(skills: SkillDefinition[], warnings: string[]): string {
+  if (!skills.length && !warnings.length) return "Skills\n  No skills loaded.";
   const lines = ["Skills"];
   for (const skill of skills) {
     lines.push(`  ${skill.name} · ${skill.scope} · ${skill.path}`);
     lines.push(`    ${skill.description}`);
   }
+  for (const warning of warnings) lines.push(`  ! ${warning}`);
   return lines.join("\n");
 }
 

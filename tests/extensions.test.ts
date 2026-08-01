@@ -6,7 +6,7 @@ import path from "node:path";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
 import { createMcpResourceTools, expandEnvTemplate, McpToolHost } from "../src/extensions/mcp.js";
 import { loadPlugins } from "../src/extensions/plugins.js";
-import { createSkillTool, loadSkills } from "../src/extensions/skills.js";
+import { createSkillResourceTool, createSkillTool, loadSkills } from "../src/extensions/skills.js";
 import { calculateUsageCost, summarizeUsage } from "../src/observability/usage.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
 import { analyzePermissionRequest } from "../src/permission/policy.js";
@@ -108,7 +108,7 @@ function testUsageCostAccounting(): void {
 
 async function testSkillsAndPlugins(workspaceRoot: string): Promise<void> {
   const extensionDefaults = configSchema.parse({ ...defaultConfig, extensions: {} }).extensions;
-  assert.deepEqual(extensionDefaults.skills, [".biny/skills"]);
+  assert.deepEqual(extensionDefaults.skills, [".agents/skills", ".biny/skills"]);
   assert.deepEqual(extensionDefaults.plugins, []);
   assert.throws(
     () => configSchema.parse({ ...defaultConfig, extensions: { ...defaultConfig.extensions, plugins: [" "] } }),
@@ -237,6 +237,8 @@ async function testProgressiveSkills(workspaceRoot: string): Promise<void> {
       "Always run pnpm test from the workspace root."
     ].join("\n"), "utf8");
     await writeFile(path.join(projectSkillDir, "notes.md"), "Extra notes bundled with the skill.", "utf8");
+    await mkdir(path.join(projectSkillDir, "references"));
+    await writeFile(path.join(projectSkillDir, "references", "details.md"), "Nested project reference.", "utf8");
 
     // 与项目技能同名的全局技能应被项目级覆盖；另一个全局技能正常加载。
     const globalOverride = path.join(globalRoot, "test-runner");
@@ -245,30 +247,42 @@ async function testProgressiveSkills(workspaceRoot: string): Promise<void> {
     await mkdir(globalOnly, { recursive: true });
     await writeFile(path.join(globalOverride, "SKILL.md"), "---\nname: test-runner\ndescription: Global variant must lose\n---\nGlobal body.", "utf8");
     await writeFile(path.join(globalOnly, "SKILL.md"), "---\nname: release-notes\ndescription: Draft release notes from git history\n---\nGlobal release instructions.", "utf8");
+    await mkdir(path.join(globalOnly, "references"));
+    await writeFile(path.join(globalOnly, "references", "format.md"), "Nested global reference.", "utf8");
 
     const bundle = await loadSkills({ workspaceRoot, projectPaths: [".biny/skills"], globalRoot });
     assert.deepEqual(bundle.skills.map((skill) => [skill.name, skill.scope]), [
       ["test-runner", "project"],
-      ["release-notes", "global"]
+      ["release-notes", "global"],
+      ["test-runner", "global"]
     ]);
     // 渐进式披露：prompt 只含元数据与 invoke_skill 指引，不含技能正文。
-    assert.match(bundle.prompt, /test-runner \(project\): Run the repository test suite/);
-    assert.match(bundle.prompt, /release-notes \(global\): Draft release notes/);
+    assert.match(bundle.prompt, /test-runner \(project\).*Run the repository test suite/);
+    assert.match(bundle.prompt, /release-notes \(global\).*Draft release notes/);
+    assert.ok(bundle.prompt.length <= 8_000);
     assert.match(bundle.prompt, /invoke_skill/);
     assert.equal(bundle.prompt.includes("Always run pnpm test"), false);
-    assert.equal(bundle.prompt.includes("Global variant must lose"), false);
+    assert.equal(bundle.prompt.includes("Global variant must lose"), true);
 
     const tool = createSkillTool(bundle);
     assert.equal(tool.name, "invoke_skill");
     assert.equal(tool.risk, "read");
-    const execution = await tool.resolveExecution({ skill: "test-runner" });
+    const ambiguous = await tool.resolveExecution({ skill: "test-runner" });
+    assert.equal("isError" in ambiguous && ambiguous.isError, true);
+    if ("isError" in ambiguous) assert.match(ambiguous.errorMessage, /ambiguous/);
+    const projectSkill = bundle.skills.find((skill) => skill.name === "test-runner" && skill.scope === "project");
+    assert.ok(projectSkill);
+    const execution = await tool.resolveExecution({ skill: "test-runner", path: projectSkill.path });
     assert.equal("isError" in execution, false);
     if (!("isError" in execution)) {
-      const result = await execution.execute({ toolCallId: "test" }) as { skill: string; scope: string; instructions: string; files: string[] };
+      const result = await execution.execute({ toolCallId: "test" }) as { skill: string; scope: string; instructions: string; resources: Array<{ path: string; kind: string }> };
       assert.equal(result.skill, "test-runner");
       assert.equal(result.scope, "project");
       assert.match(result.instructions, /Always run pnpm test/);
-      assert.deepEqual(result.files, ["notes.md"]);
+      assert.deepEqual(result.resources.map((resource) => [resource.path, resource.kind]), [
+        ["notes.md", "file"],
+        [path.join("references", "details.md"), "reference"]
+      ]);
     }
     const globalExecution = await tool.resolveExecution({ skill: "release-notes" });
     assert.equal("isError" in globalExecution, false);
@@ -276,6 +290,13 @@ async function testProgressiveSkills(workspaceRoot: string): Promise<void> {
       const result = await globalExecution.execute({ toolCallId: "test" }) as { instructions: string; scope: string };
       assert.equal(result.scope, "global");
       assert.match(result.instructions, /Global release instructions/);
+    }
+    const resourceTool = createSkillResourceTool(bundle);
+    const globalResource = await resourceTool.resolveExecution({ skill: "release-notes", path: "references/format.md" });
+    assert.equal("isError" in globalResource, false);
+    if (!("isError" in globalResource)) {
+      const result = await globalResource.execute({ toolCallId: "resource" }) as { content: string };
+      assert.equal(result.content, "Nested global reference.");
     }
     const unknown = await tool.resolveExecution({ skill: "missing" });
     assert.equal("isError" in unknown && unknown.isError, true);
@@ -296,6 +317,62 @@ async function testProgressiveSkills(workspaceRoot: string): Promise<void> {
       globalRoot: path.join(workspaceRoot, "no-global")
     });
     assert.equal(horizontalRule.skills[0]?.description, "Step one: build.");
+
+    // 标准 YAML 的折叠多行 description 可以用于隐式匹配。
+    const yamlSkillDir = path.join(workspaceRoot, ".biny", "skills", "yaml-skill");
+    await mkdir(yamlSkillDir);
+    await writeFile(path.join(yamlSkillDir, "SKILL.md"), "---\nname: yaml-skill\ndescription: >-\n  Review YAML metadata\n  without losing continuation lines.\nmetadata:\n  author: test\n---\nFollow the YAML workflow.", "utf8");
+    const yamlBundle = await loadSkills({ workspaceRoot, projectPaths: [path.join(".biny", "skills", "yaml-skill")], globalRoot: path.join(workspaceRoot, "no-global") });
+    assert.equal(yamlBundle.skills[0]?.description, "Review YAML metadata without losing continuation lines.");
+
+    // 不合规 Skill 会出现在 /skills 可见警告里，而不是以错误元数据参与匹配。
+    const invalidSkillDir = path.join(workspaceRoot, ".biny", "skills", "invalid-skill");
+    await mkdir(invalidSkillDir);
+    await writeFile(path.join(invalidSkillDir, "SKILL.md"), "---\nname: another-name\ndescription: Invalid directory binding\n---\nBody.", "utf8");
+    const invalidBundle = await loadSkills({ workspaceRoot, projectPaths: [path.join(".biny", "skills", "invalid-skill")], globalRoot: path.join(workspaceRoot, "no-global") });
+    assert.deepEqual(invalidBundle.skills, []);
+    assert.match(invalidBundle.warnings[0] ?? "", /must match its directory name/);
+
+    // 超大正文必须明确失败，不能把末尾约束静默截断后继续执行。
+    const largeSkillDir = path.join(workspaceRoot, ".biny", "skills", "large-skill");
+    await mkdir(largeSkillDir);
+    await writeFile(path.join(largeSkillDir, "SKILL.md"), `---\nname: large-skill\ndescription: Oversized instructions\n---\n${"x".repeat(520 * 1024)}`, "utf8");
+    const largeBundle = await loadSkills({ workspaceRoot, projectPaths: [path.join(".biny", "skills", "large-skill")], globalRoot: path.join(workspaceRoot, "no-global") });
+    const largeExecution = await createSkillTool(largeBundle).resolveExecution({ skill: "large-skill" });
+    assert.equal("isError" in largeExecution, false);
+    if (!("isError" in largeExecution)) await assert.rejects(largeExecution.execute({ toolCallId: "large" }), /exceeds/);
+
+    const escapedResource = await resourceTool.resolveExecution({ skill: "release-notes", path: "../SKILL.md" });
+    assert.equal("isError" in escapedResource && escapedResource.isError, true);
+    if ("isError" in escapedResource) assert.match(escapedResource.errorMessage, /escapes its skill directory/);
+
+    // 官方项目目录从当前工作目录逐层扫描到 Git 仓库根目录。
+    const nestedWorkspace = path.join(workspaceRoot, "service");
+    const rootOfficialSkill = path.join(workspaceRoot, ".agents", "skills", "root-skill");
+    const nestedOfficialSkill = path.join(nestedWorkspace, ".agents", "skills", "nested-skill");
+    await mkdir(path.join(workspaceRoot, ".git"));
+    await mkdir(rootOfficialSkill, { recursive: true });
+    await mkdir(nestedOfficialSkill, { recursive: true });
+    await writeFile(path.join(rootOfficialSkill, "SKILL.md"), "---\nname: root-skill\ndescription: Root workflow\n---\nRoot body.", "utf8");
+    await writeFile(path.join(nestedOfficialSkill, "SKILL.md"), "---\nname: nested-skill\ndescription: Nested workflow\n---\nNested body.", "utf8");
+    const officialBundle = await loadSkills({ workspaceRoot: nestedWorkspace, projectPaths: [path.join(".agents", "skills")], globalRoot: path.join(workspaceRoot, "no-global") });
+    assert.deepEqual(officialBundle.skills.map((skill) => skill.name), ["nested-skill", "root-skill"]);
+    assert.deepEqual(officialBundle.paths, [
+      path.join("service", ".agents", "skills", "nested-skill", "SKILL.md"),
+      path.join(".agents", "skills", "root-skill", "SKILL.md")
+    ]);
+
+    // 初始清单使用整体字符预算：先缩短描述，再省略尾部 Skill 并给出警告。
+    const budgetRoot = path.join(workspaceRoot, ".biny", "budget-skills");
+    await Promise.all(Array.from({ length: 100 }, async (_, index) => {
+      const name = `budget-${String(index).padStart(2, "0")}`;
+      const directory = path.join(budgetRoot, name);
+      await mkdir(directory, { recursive: true });
+      await writeFile(path.join(directory, "SKILL.md"), `---\nname: ${name}\ndescription: ${"d".repeat(1024)}\n---\nBody.`, "utf8");
+    }));
+    const budgetBundle = await loadSkills({ workspaceRoot, projectPaths: [path.join(".biny", "budget-skills")], globalRoot: path.join(workspaceRoot, "no-global") });
+    assert.ok(budgetBundle.prompt.length <= 8_000);
+    assert.match(budgetBundle.prompt, /additional skills were omitted/);
 
     // 全局目录里的符号链接只导致放弃全局技能，不能阻断加载/启动。
     const poisonedGlobal = await mkdtemp(path.join(os.tmpdir(), "biny-global-poison-"));

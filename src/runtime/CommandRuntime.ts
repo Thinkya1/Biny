@@ -18,7 +18,7 @@ import { CompletionStateStore } from "../agent/completionState.js";
 import { createCompletionStateTools } from "../tools/completion.js";
 import { CheckpointStore } from "../session/checkpointStore.js";
 import { PermissionManager } from "../permission/PermissionManager.js";
-import { createSkillTool, loadSkills, type SkillBundle } from "../extensions/skills.js";
+import { createSkillResourceTool, createSkillTool, loadSkills, type SkillBundle } from "../extensions/skills.js";
 import { loadPlugins } from "../extensions/plugins.js";
 import { createMcpResourceTools, McpToolHost } from "../extensions/mcp.js";
 import { createSubagentTool, runSubagentTask as executeSubagentTask, type SubagentOptions } from "../extensions/subagent.js";
@@ -48,6 +48,8 @@ export interface CommandRuntime {
   mcp: McpToolHost;
   subagents: SubagentTaskManager | undefined;
   extensionReport(section?: ExtensionSection): string;
+  /** 每个新根回合前重新扫描 Skill，使新增和元数据修改无需重启即可生效。 */
+  refreshSkills(): Promise<void>;
   /** 实时重新扫描具名子代理定义（会话期间可编辑生效）。 */
   listSubagentAgents(): Promise<SubagentDefinition[]>;
   startSubagentTask(task: string, options?: SubagentTaskRunOptions): SubmittedSubagentTask;
@@ -124,7 +126,8 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   try {
     // 技能扫描可能因项目内配置路径的软链/硬链问题抛错，放在清理保护内执行。
     skills = await loadSkills({ workspaceRoot, projectPaths: config.extensions.skills });
-    if (skills.skills.length) toolRegistry.registerUserTool(createSkillTool(skills));
+    toolRegistry.registerUserTool(createSkillTool(() => requireSkillBundle(skills)));
+    toolRegistry.registerUserTool(createSkillResourceTool(() => requireSkillBundle(skills)));
     // 先注册通用资源工具。若服务器工具归一化后撞名，connectConfiguredServers 中的
     // 按工具隔离会跳过它，而不会让整个 runtime 在之后重复注册时失败。
     if (Object.values(config.extensions.mcp).some((server) => server.enabled)) {
@@ -152,9 +155,9 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
       toolRegistry,
       permissionManager,
       recorder,
-      skillPrompt: skills.prompt,
+      skillPrompt: () => requireSkillBundle(skills).prompt,
       subagentPrompt: buildSubagentDefinitionsPrompt(subagentDefinitions),
-      skillPaths: skills.paths,
+      skillPaths: () => requireSkillBundle(skills).paths,
       mcpPrompt: () => mcpHost.instructionsPrompt(),
       todoStore: todos,
       completionState,
@@ -172,11 +175,11 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   }
   if (!agent || !skills) throw new Error("Failed to initialize Biny agent runtime.");
 
-  const loadedSkills = skills;
   // MCP 连接状态与工具集合在运行期会变（断线、重连、list_changed），报告每次实时取。
   const extensionStatus = (): ExtensionStatus => ({
     mcp: mcpHost.listServers(),
-    skills: [...loadedSkills.skills],
+    skills: [...requireSkillBundle(skills).skills],
+    skillWarnings: [...requireSkillBundle(skills).warnings],
     plugins: [...loadedPlugins],
     subagent: { ...config.extensions.subagent, agents: [...subagentDefinitions] },
     toolScheduling: {
@@ -238,6 +241,9 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     mcp: mcpHost,
     subagents: subagentTaskManager,
     extensionReport: (section?: ExtensionSection): string => formatExtensionReport(extensionStatus(), section),
+    refreshSkills: async (): Promise<void> => {
+      skills = await loadSkills({ workspaceRoot, projectPaths: config.extensions.skills });
+    },
     listSubagentAgents: async (): Promise<SubagentDefinition[]> => {
       subagentDefinitions = await loadAgentDefinitions();
       return [...subagentDefinitions];
@@ -283,6 +289,11 @@ function subagentModelSettings(config: AgentConfig, modelManager: ModelManager, 
 function requireModelManager(modelManager: ModelManager | undefined): ModelManager {
   if (!modelManager) throw new Error("Model runtime is not initialized.");
   return modelManager;
+}
+
+function requireSkillBundle(skills: SkillBundle | undefined): SkillBundle {
+  if (!skills) throw new Error("Skill runtime is not initialized.");
+  return skills;
 }
 
 export async function withCommandRuntime(workspaceRoot: string, fn: (runtime: CommandRuntime) => Promise<void>): Promise<void> {
