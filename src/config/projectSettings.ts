@@ -21,7 +21,6 @@ const agentOverrideSchema = z.object({
   softStepLimit: z.number().int().min(1).max(1_024).optional(),
   hardStepLimit: z.number().int().min(1).max(1_024).optional(),
   maxToolCalls: z.number().int().min(1).max(65_536).optional(),
-  maxProviderRetries: z.number().int().min(0).max(5).optional(),
   maxCompletionContinuations: z.number().int().min(0).max(32).optional(),
   maxRepeatedActions: z.number().int().min(1).max(32).optional(),
   maxConcurrentTools: z.number().int().min(1).max(32).optional(),

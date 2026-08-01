@@ -12,23 +12,41 @@ import { agentDir } from "../session/store.js";
 import { redactSecrets } from "../utils/secrets.js";
 import type { AgentUsage } from "../agent/core/types.js";
 
-/** Record one native model turn without depending on a provider callback contract. */
-export async function recordNativeTelemetryEnd(
+export type NativeTelemetryEvent =
+  | { type: "start"; provider: string; modelId: string; input?: unknown }
+  | { type: "step"; provider: string; modelId: string; step: number; finishReason?: string; usage?: AgentUsage; output?: unknown }
+  | { type: "end"; provider: string; modelId: string; steps: number; usage?: AgentUsage; output?: unknown }
+  | { type: "error"; provider: string; modelId: string; step: number; error: unknown };
+
+/** 记录一次模型运行事件，不依赖 provider 回调协议。 */
+export async function recordNativeTelemetry(
   config: AgentConfig,
   workspaceRoot: string,
-  details: { provider: string; modelId: string; usage?: AgentUsage; text?: string }
+  event: NativeTelemetryEvent
 ): Promise<void> {
   if (!config.telemetry.enabled) return;
+  const common = { type: event.type, provider: event.provider, modelId: event.modelId, time: new Date().toISOString() };
+  const payload = event.type === "start"
+    ? { ...common, input: config.telemetry.recordInputs ? safePayload(event.input) : undefined }
+    : event.type === "step"
+      ? {
+        ...common,
+        step: event.step,
+        finishReason: event.finishReason,
+        usage: sanitizeUsage(event.usage),
+        output: config.telemetry.recordOutputs ? safePayload(event.output) : undefined
+      }
+      : event.type === "end"
+        ? {
+          ...common,
+          steps: event.steps,
+          usage: sanitizeUsage(event.usage),
+          output: config.telemetry.recordOutputs ? safePayload(event.output) : undefined
+        }
+        : { ...common, step: event.step, error: safePayload(event.error) };
   await appendSecureTelemetry(
     path.join(agentDir(workspaceRoot), "telemetry.jsonl"),
-    `${JSON.stringify({
-      type: "end",
-      provider: details.provider,
-      modelId: details.modelId,
-      usage: sanitizeUsage(details.usage),
-      outputs: config.telemetry.recordOutputs ? safePayload(details.text) : undefined,
-      time: new Date().toISOString()
-    })}\n`
+    `${JSON.stringify(payload)}\n`
   ).catch(() => undefined);
 }
 

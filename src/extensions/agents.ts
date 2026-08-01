@@ -1,5 +1,5 @@
 /**
- * 具名子代理定义模块（参考 pi 的 agents 设计）。
+ * 具名子代理定义模块。
  *
  * 每个定义是一个带 YAML frontmatter 的 markdown 文件：frontmatter 提供
  * name/description/tools/model 元数据，正文即该子代理的附加 system prompt。
@@ -101,7 +101,7 @@ async function collectDefinitions(
   } catch {
     return;
   }
-  // 与 pi 一致：只认目录下第一层的 *.md，不递归，避免把附属文档误当定义。
+  // 只认目录下第一层的 *.md，不递归，避免把附属文档误当定义。
   const files = entries
     .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"))
     .map((entry) => entry.name)
@@ -127,7 +127,7 @@ async function readDefinition(rootPath: string, filePath: string, scope: Subagen
   const name = normalizeAgentName(frontmatter.name ?? path.basename(filePath, path.extname(filePath)));
   const description = (frontmatter.description ?? "").trim();
   const prompt = body.trim();
-  // 与 pi 相同：没有 description 或正文的定义视为无效。
+  // 没有 description 或正文的定义视为无效。
   if (!name || !description || !prompt) return undefined;
   const relative = path.relative(rootPath, filePath);
   return {

@@ -55,6 +55,8 @@ export interface AgentTurnOutcome {
 }
 
 export type AgentSessionUpdate =
+  | { type: "message.user"; messageId: string; content: string; delivery: "steer" | "followUp" }
+  | { type: "context.retrying"; reason: "context_overflow"; attempt: number; compactedMessages: number }
   | { type: "assistant.delta"; content: string }
   | { type: "assistant.completed"; content: string }
   | { type: "reasoning.started"; phase: "initial" | "continuing" }

@@ -8,6 +8,9 @@
  * 三层叠加的防线，不能只靠其中一层。
  */
 import path from "node:path";
+import { redactSecrets } from "./redaction.js";
+
+export { redactSecrets } from "./redaction.js";
 
 const protectedCredentialFiles = new Set([
   "config.json",
@@ -44,20 +47,6 @@ export function isProtectedCredentialPath(value: string): boolean {
     || fileName.startsWith("config.json.")
     || segments.some((segment) => protectedCredentialDirectories.has(segment))
     || protectedCredentialFiles.has(fileName);
-}
-
-/**
- * 文本打码。按「私钥块 → 已知前缀的 key → Bearer → key=value → JSON 字段」的顺序逐条替换，
- * 匹配不到的自定义格式仍可能漏过，因此调用方不能把它当作唯一防线。
- */
-export function redactSecrets(value: string): string {
-  return value
-    .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]*PRIVATE KEY-----/g, "[redacted private key]")
-    .replace(/\b(?:sk|rk|pk|ghp|github_pat|AIza|AKIA)[-_A-Za-z0-9]{8,}\b/g, "[redacted]")
-    .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
-    .replace(/((?:aws_secret_access_key|_authToken)\s*[:=]\s*)([^\s,;]+)/gi, "$1[redacted]")
-    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)\s*[:=]\s*)([^\s,;]+)/gi, "$1[redacted]")
-    .replace(/(["'](?:apiKey|api_key|accessToken|access_token|refreshToken|refresh_token|token|secret|password)["']\s*:\s*["'])([^"']*)(["'])/gi, "$1[redacted]$3");
 }
 
 /**

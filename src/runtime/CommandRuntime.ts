@@ -35,6 +35,7 @@ import { ManagedProcessService } from "./ManagedProcessService.js";
 import { subagentAccessMode } from "./subagentAccess.js";
 import { modelReasoningConfig } from "../ai/capabilities.js";
 import { attachmentRoot, ensureAttachmentRoot } from "../attachments/store.js";
+import { AiRegistry } from "../llm/AiRegistry.js";
 
 export interface CommandRuntime {
   workspaceRoot: string;
@@ -66,7 +67,7 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   const projectAttachmentRoot = options.attachmentRoot ?? attachmentRoot(persistenceRoot);
   const configStore = options.configStore ?? createFileConfigStore(persistenceRoot);
   const config = await configStore.load(workspaceRoot);
-  const modelManager = new ModelManager(workspaceRoot, config, configStore);
+  const ai = new AiRegistry();
   await ensureAgentDirs(persistenceRoot);
   await ensureAttachmentRoot(persistenceRoot);
   const recorder = new SessionRecorder(persistenceRoot);
@@ -93,6 +94,7 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   const mcpHost = new McpToolHost();
   let skills: SkillBundle | undefined;
   let agent: AgentSession | undefined;
+  let modelManager: ModelManager | undefined;
   let subagentParentRunId: string | undefined;
   let subagentDefinitions: SubagentDefinition[] = [];
   // 具名子代理定义每次委派时重新读取（会话期间可编辑生效）；启动时读一次用于 prompt 与报告。
@@ -103,7 +105,7 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   const subagentOptions: SubagentOptions = {
     workspaceRoot,
     config,
-    getNativeModelSettings: (modelAlias?: string) => subagentModelSettings(config, modelManager, modelAlias),
+    getModelSettings: (modelAlias?: string) => subagentModelSettings(config, requireModelManager(modelManager), modelAlias),
     getAccessMode: () => subagentAccessMode(permissionManager),
     getParentRunId: () => subagentParentRunId,
     loadAgentDefinitions,
@@ -129,7 +131,9 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
       for (const tool of createMcpResourceTools(mcpHost)) toolRegistry.registerMcpTool(tool);
     }
     await mcpHost.connectConfiguredServers(workspaceRoot, config, toolRegistry);
-    loadedPlugins = await loadPlugins(workspaceRoot, config.extensions.plugins, config, toolRegistry);
+    loadedPlugins = await loadPlugins(workspaceRoot, config.extensions.plugins, config, toolRegistry, ai);
+    // 插件必须先完成 Provider/API 注册，默认模型才能使用插件提供的新类型。
+    modelManager = await ModelManager.create(workspaceRoot, config, configStore, ai);
     if (config.extensions.subagent.enabled) {
       toolRegistry.registerSubagentTool(createSubagentTool(subagentOptions, subagentTaskManager!));
       subagentDefinitions = await loadAgentDefinitions();
@@ -261,7 +265,7 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
 function subagentModelSettings(config: AgentConfig, modelManager: ModelManager, modelAlias?: string): NativeModelSettings {
   // 具名定义的 model 覆盖优先于全局 subagent model；两者都未配置时沿用当前会话模型。
   const alias = modelAlias ?? config.extensions.subagent.model;
-  if (!alias) return modelManager.getNativeModelSettings();
+  if (!alias) return modelManager.getModelSettings();
   const model = config.models[alias];
   if (!model) throw new Error(`Unknown subagent model alias: ${alias}`);
   if (model.supportsTools === false) throw new Error(`Subagent model ${alias} does not support tools.`);
@@ -274,6 +278,11 @@ function subagentModelSettings(config: AgentConfig, modelManager: ModelManager, 
       : { enabled: false, effort: "high" as const }
   };
   return createNativeModelSettings(modelConfig, alias);
+}
+
+function requireModelManager(modelManager: ModelManager | undefined): ModelManager {
+  if (!modelManager) throw new Error("Model runtime is not initialized.");
+  return modelManager;
 }
 
 export async function withCommandRuntime(workspaceRoot: string, fn: (runtime: CommandRuntime) => Promise<void>): Promise<void> {

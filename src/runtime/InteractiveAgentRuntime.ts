@@ -28,6 +28,12 @@ export interface SubmittedAgentRun {
   completion: Promise<AgentRunOutcome>;
 }
 
+export interface QueuedAgentMessage {
+  runId: string;
+  messageId: string;
+  delivery: "steer" | "followUp";
+}
+
 export interface AgentRunOutcome extends AgentTurnOutcome {
   runId: string;
   durationMs: number;
@@ -111,6 +117,29 @@ export class InteractiveAgentRuntime {
 
   submitPrompt(input: string, mode: AgentRunMode = "chat", attachments: AgentAttachment[] = []): SubmittedAgentRun {
     return this.startRun(input, mode, attachments, false);
+  }
+
+  steer(input: string, attachments: AgentAttachment[] = []): QueuedAgentMessage {
+    return this.queueMessage(input, attachments, "steer");
+  }
+
+  followUp(input: string, attachments: AgentAttachment[] = []): QueuedAgentMessage {
+    return this.queueMessage(input, attachments, "followUp");
+  }
+
+  private queueMessage(
+    input: string,
+    attachments: AgentAttachment[],
+    delivery: "steer" | "followUp"
+  ): QueuedAgentMessage {
+    if (this.closed) throw new Error("Agent runtime is closed.");
+    const run = this.activeRun;
+    if (!run || this.state.kind !== "runs") throw new Error("There is no active run to receive a queued message.");
+    if (!input.trim() && !attachments.length) throw new Error("Queued message cannot be empty.");
+    const messageId = randomUUID();
+    if (delivery === "steer") this.commandRuntime.agent.queueSteering(messageId, input, attachments);
+    else this.commandRuntime.agent.queueFollowUp(messageId, input, attachments);
+    return { runId: run.runId, messageId, delivery };
   }
 
   async continueInterruptedTurn(): Promise<AgentRunOutcome | undefined> {
@@ -693,7 +722,27 @@ export class InteractiveAgentRuntime {
           : event.status === "error"
             ? "failed"
             : event.status;
+      // AgentSession 的 status 事件没有对应的 host event，但它仍然是前台状态的事实来源。
+      // 收尾阶段可能还要清理断点或写入终态；如果这里不发布快照，UI 会一直停在上一个
+      // reasoning/tool 状态，直到后续的 run.completed 才有机会重新同步。
+      this.syncActiveRunStatus(run);
       return event.status === "error" ? "Agent run failed." : undefined;
+    }
+
+    if (event.type === "message.user") {
+      this.emit({
+        ...this.eventBase(run),
+        type: event.type,
+        messageId: event.messageId,
+        content: redactSecrets(event.content),
+        delivery: event.delivery
+      });
+      return undefined;
+    }
+
+    if (event.type === "context.retrying") {
+      this.emit({ ...this.eventBase(run), ...event });
+      return undefined;
     }
 
     if (event.type === "assistant.delta" || event.type === "assistant.completed") {
@@ -851,6 +900,19 @@ export class InteractiveAgentRuntime {
 
   private setState(state: InteractiveRunState): void {
     this.state = state;
+    this.publishSnapshot();
+  }
+
+  private syncActiveRunStatus(run: ActiveRunSnapshot): void {
+    if (this.state.kind !== "runs" || this.state.activeRun.runId !== run.runId) return;
+    this.state = {
+      ...this.state,
+      activeRun: { ...this.state.activeRun, status: run.status }
+    };
+    this.publishSnapshot();
+  }
+
+  private publishSnapshot(): void {
     this.revision += 1;
     this.updates.emit({ snapshot: this.getSnapshot() });
   }

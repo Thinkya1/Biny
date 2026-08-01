@@ -15,8 +15,29 @@ import type { CatalogProviderRequest, ModelCatalogEntry } from "./types.js";
 
 const catalogTimeoutMs = 15_000;
 
+export interface ModelCatalogValidators {
+  etag?: string;
+  lastModified?: number;
+}
+
+export interface ModelCatalogFetchResult {
+  models?: ModelCatalogEntry[];
+  notModified: boolean;
+  etag?: string;
+  lastModified?: number;
+}
+
 /** 拉取服务商的实时模型列表；只读，不写入任何凭据或配置。 */
-export async function fetchModelCatalog(request: CatalogProviderRequest): Promise<ModelCatalogEntry[]> {
+export async function fetchModelCatalog(request: CatalogProviderRequest, signal?: AbortSignal): Promise<ModelCatalogEntry[]> {
+  return (await fetchModelCatalogSnapshot(request, signal)).models ?? [];
+}
+
+/** 带 HTTP 校验信息拉取目录，Provider Runtime 用它实现跨进程缓存复用。 */
+export async function fetchModelCatalogSnapshot(
+  request: CatalogProviderRequest,
+  signal?: AbortSignal,
+  validators: ModelCatalogValidators = {}
+): Promise<ModelCatalogFetchResult> {
   const protocol = providerProtocol(request.config, request.definition);
   const endpoint = request.config.modelsEndpoint ?? defaultModelsEndpoint(request.config.baseUrl ?? request.definition.baseUrl, protocol);
   if (!endpoint) throw new Error(`No model catalog endpoint configured for provider ${request.alias}.`);
@@ -33,14 +54,23 @@ export async function fetchModelCatalog(request: CatalogProviderRequest): Promis
     ? { "x-api-key": apiKey ?? "", "anthropic-version": "2023-06-01" }
     : { Authorization: apiKey ? `Bearer ${apiKey}` : "" };
   if (protocol === "anthropic" && authMode === "oauth-bearer") headers["anthropic-version"] = "2023-06-01";
+  Object.assign(headers, request.config.headers);
+  if (validators.etag) headers["If-None-Match"] = validators.etag;
+  if (validators.lastModified) headers["If-Modified-Since"] = new Date(validators.lastModified).toUTCString();
   const retry = request.config.retry ?? { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0 };
+  const timeoutSignal = AbortSignal.timeout(catalogTimeoutMs);
   const response = await createRetryFetch(retry)(endpoint, {
     headers,
-    signal: AbortSignal.timeout(catalogTimeoutMs)
+    signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
   });
+  const responseValidators = {
+    etag: response.headers.get("etag") ?? validators.etag,
+    lastModified: httpTimestamp(response.headers.get("last-modified")) ?? validators.lastModified
+  };
+  if (response.status === 304) return { notModified: true, ...responseValidators };
   if (!response.ok) throw new Error(`Model catalog request failed (${String(response.status)}).`);
   const body = await response.json() as unknown;
-  return parseModelCatalog(body, request.alias, protocol);
+  return { models: parseModelCatalog(body, request.alias, protocol), notModified: false, ...responseValidators };
 }
 
 /**
@@ -52,10 +82,18 @@ export function parseModelCatalog(
   provider: string,
   protocol: "anthropic" | "openai-compatible"
 ): ModelCatalogEntry[] {
-  if (!isRecord(value) || !Array.isArray(value.data)) return [];
+  const items = Array.isArray(value)
+    ? value
+    : isRecord(value) && Array.isArray(value.data)
+      ? value.data
+      : isRecord(value) && Array.isArray(value.models)
+        ? value.models
+        : [];
   // 用 flatMap 而不是 map+filter：无效条目直接返回空数组丢弃。
-  return value.data.flatMap((item) => {
-    if (!isRecord(item) || typeof item.id !== "string" || !item.id) return [];
+  return items.flatMap((item) => {
+    if (!isRecord(item)) return [];
+    const id = stringValue(item.id) ?? stringValue(item.model) ?? stringValue(item.name);
+    if (!id) return [];
     const contextWindow = numberValue(item.context_window)
       ?? numberValue(item.contextWindow)
       ?? numberValue(item.context_length)
@@ -76,11 +114,11 @@ export function parseModelCatalog(
       : protocol === "anthropic" ? ["high", "max"] as ReasoningEffort[]
       // OpenAI 兼容端点基本不返回推理档位字段，只能按模型 ID 兜底推断，
       // 否则 grok-4.5 / GPT-5 这类模型在界面上只剩一个「默认」档。
-      : inferReasoningEfforts(item.id);
+      : inferReasoningEfforts(id);
     const modalities = Array.isArray(item.modalities) ? item.modalities : [];
     const entry: ModelCatalogEntry = {
-      id: item.id,
-      displayName: stringValue(item.display_name) ?? stringValue(item.name) ?? item.id,
+      id,
+      displayName: stringValue(item.display_name) ?? stringValue(item.displayName) ?? stringValue(item.name) ?? id,
       provider,
       contextWindow,
       maxOutputTokens,
@@ -145,10 +183,9 @@ function parseThinkingLevelMap(value: unknown): ThinkingLevelMap | undefined {
 }
 
 function parseApiBackend(value: unknown): ModelApiBackend | undefined {
-  if (value === "chat_completions" || value === "responses" || value === "anthropic_messages") return value;
   if (value === "openai-responses") return "responses";
   if (value === "anthropic-messages") return "anthropic_messages";
-  return undefined;
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value) ? value : undefined;
 }
 
 function stringRecord(value: unknown): Record<string, string> | undefined {
@@ -182,4 +219,10 @@ function modalityCapability(modalities: unknown[], modality: string): boolean | 
 
 function isReasoningEffort(value: unknown): value is ReasoningEffort {
   return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max";
+}
+
+function httpTimestamp(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
 }

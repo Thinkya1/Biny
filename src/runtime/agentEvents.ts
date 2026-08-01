@@ -52,7 +52,7 @@ export interface AgentRunModel {
 
 export type AgentHostEvent =
   | RunStartedEvent
-  | (AgentEventBase & { type: "message.user"; messageId: string; content: string })
+  | (AgentEventBase & { type: "message.user"; messageId: string; content: string; delivery?: "steer" | "followUp" })
   | (AgentEventBase & AgentSessionUpdate)
   | (AgentEventBase & { type: "permission.requested"; requestId: string; toolCallId: string; request: AgentPermissionEventRequest })
   | (AgentEventBase & { type: "permission.resolved"; requestId: string; toolCallId: string; tool: string; approved: boolean; scope?: PermissionGrantScope; message?: string })

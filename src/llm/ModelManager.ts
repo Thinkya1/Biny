@@ -7,24 +7,20 @@ import {
 import {
   resolveModelConfig
 } from "./modelConfig.js";
-import { fetchModelCatalog } from "../ai/modelCatalog.js";
 import { modelContextBudget, modelReasoningConfig, modelThinkingLevelMap } from "../ai/capabilities.js";
-import { providerDefinition } from "../ai/provider.js";
 import type { ModelCatalogEntry } from "../ai/types.js";
 import {
   hasUsableModelConfiguration as hasUsableRegisteredModel,
-  ModelRegistry,
   type ModelChoice
 } from "./ModelRegistry.js";
-import { ModelResolver } from "./ModelResolver.js";
-import { refreshSubscriptionOAuthTokens } from "./subscriptionAuth.js";
 import type { AgentModel } from "../agent/core/types.js";
-import { createNativeModelSettings, validateModelConfiguration, type NativeModelSettings } from "./nativeFactory.js";
+import { ModelRuntime } from "./ModelRuntime.js";
+import type { NativeModelSettings } from "./ProviderRuntime.js";
+import { AiRegistry } from "./AiRegistry.js";
+import { FileModelsStore, restoreProviderCatalogs, type ModelsStore } from "./ModelsStore.js";
 
 export type ThinkingSelection = "off" | ReasoningEffort;
 export type { ModelChoice } from "./ModelRegistry.js";
-
-const OAUTH_REFRESH_WINDOW_MS = 5 * 60 * 1_000;
 
 export interface ModelRuntimeInfo {
   modelAlias: string;
@@ -39,21 +35,35 @@ export interface ModelRuntimeInfo {
 /** Keeps one validated native Biny model while the selected provider changes. */
 export class ModelManager {
   private activeSettings: NativeModelSettings;
-  private readonly registry: ModelRegistry;
+  private runtime: ModelRuntime;
   private observedConfigRevision: number | undefined;
 
   constructor(
     private readonly workspaceRoot: string,
     private readonly config: AgentConfig,
-    private readonly configStore: AgentConfigStore = createFileConfigStore(workspaceRoot)
+    private readonly configStore: AgentConfigStore = createFileConfigStore(workspaceRoot),
+    private readonly ai: AiRegistry = new AiRegistry(),
+    private readonly modelsStore?: ModelsStore,
+    catalogs: readonly [string, ModelCatalogEntry[]][] = []
   ) {
-    this.registry = new ModelRegistry(config);
-    this.activeSettings = createNativeModelSettings(config);
+    this.runtime = new ModelRuntime(config, catalogs, ai, modelsStore);
+    this.activeSettings = this.runtime.createModelSettings();
     this.observedConfigRevision = configStore.revision?.();
   }
 
+  static async create(
+    workspaceRoot: string,
+    config: AgentConfig,
+    configStore: AgentConfigStore = createFileConfigStore(workspaceRoot),
+    ai: AiRegistry = new AiRegistry(),
+    modelsStore: ModelsStore = new FileModelsStore()
+  ): Promise<ModelManager> {
+    const catalogs = await restoreProviderCatalogs(Object.keys(config.providers), modelsStore);
+    return new ModelManager(workspaceRoot, config, configStore, ai, modelsStore, catalogs);
+  }
+
   listModels(): ModelChoice[] {
-    return this.registry.listModels();
+    return this.runtime.listModels();
   }
 
   getInfo(): ModelRuntimeInfo {
@@ -64,12 +74,7 @@ export class ModelManager {
     return this.activeSettings.model;
   }
 
-  /** Native Biny model transport. */
-  getNativeModel(): AgentModel {
-    return this.activeSettings.model;
-  }
-
-  getNativeModelSettings(): NativeModelSettings {
+  getModelSettings(): NativeModelSettings {
     return this.activeSettings;
   }
 
@@ -89,33 +94,14 @@ export class ModelManager {
       await this.refreshFromDisk();
     }
 
-    const resolved = resolveModelConfig(this.config);
-    const oauth = resolved.provider.oauth;
-    if (
-      resolved.provider.authMode === "oauth-bearer"
-      && oauth?.refreshToken
-      && oauth.expiresAt - Date.now() <= OAUTH_REFRESH_WINDOW_MS
-    ) {
-      const refreshed = await refreshSubscriptionOAuthTokens(oauth.provider, {
-        accessToken: resolved.provider.apiKey ?? "",
-        refreshToken: oauth.refreshToken,
-        expiresAt: oauth.expiresAt,
-        accountId: oauth.accountId
-      }, signal);
+    const refreshed = await this.runtime.refreshActiveCredential(signal);
+    if (refreshed) {
+      const resolved = resolveModelConfig(this.config);
       const nextConfig = configSchema.parse({
         ...this.config,
         providers: {
           ...this.config.providers,
-          [resolved.providerAlias]: {
-            ...resolved.provider,
-            apiKey: refreshed.accessToken,
-            oauth: {
-              provider: oauth.provider,
-              refreshToken: refreshed.refreshToken,
-              expiresAt: refreshed.expiresAt,
-              accountId: refreshed.accountId
-            }
-          }
+          [resolved.providerAlias]: refreshed
         }
       });
       await this.configStore.save(nextConfig, this.workspaceRoot);
@@ -123,19 +109,11 @@ export class ModelManager {
       this.applyConfig(effective);
     }
 
-    validateModelConfiguration(this.config);
+    this.runtime.validate();
   }
 
   async refreshModelCatalog(providerAlias = resolveModelConfig(this.config).providerAlias): Promise<ModelCatalogEntry[]> {
-    const provider = this.config.providers[providerAlias];
-    if (!provider) throw new Error(`Unknown provider alias: ${providerAlias}`);
-    const entries = await fetchModelCatalog({
-      alias: providerAlias,
-      config: provider,
-      definition: providerDefinition(provider.type)
-    });
-    this.registry.registerCatalog(providerAlias, entries);
-    return entries;
+    return await this.runtime.refreshModels(providerAlias);
   }
 
   async switchModel(alias: string, thinking?: ThinkingSelection): Promise<ModelRuntimeInfo> {
@@ -143,11 +121,11 @@ export class ModelManager {
     // （桌面端多项目共用配置、权限模式变更、OAuth token 刷新等），整份写回内存快照会把那些
     // 改动覆盖掉。读不到就退回内存快照，行为与以前一致。
     const persisted = await this.configStore.load(this.workspaceRoot).catch(() => this.config);
-    const persistedRegistry = new ModelRegistry(persisted);
-    for (const [providerAlias, entries] of this.registry.catalogsSnapshot()) persistedRegistry.registerCatalog(providerAlias, entries);
+    const catalogs = this.runtime.catalogsSnapshot();
+    const persistedRuntime = new ModelRuntime(persisted, catalogs, this.ai, this.modelsStore);
     // 解析允许先找到模型，再由原生模型工厂给出具体的 endpoint/credential 错误；
     // 这样 CLI/TUI 不会把缺少哪个环境变量的信息吞掉。
-    const resolved = new ModelResolver(persistedRegistry).resolve(alias);
+    const resolved = persistedRuntime.resolve(alias);
     const modelAlias = resolved.alias;
     const model = resolved.model;
     const selection = resolveThinkingSelection({ ...persisted, models: { ...persisted.models, [modelAlias]: model } }, modelAlias, thinking);
@@ -162,13 +140,15 @@ export class ModelManager {
     });
 
     // Validate endpoint and credentials before changing memory or the config file.
-    const nextSettings = createNativeModelSettings(candidate);
+    const nextRuntime = new ModelRuntime(candidate, catalogs, this.ai, this.modelsStore);
+    const nextSettings = nextRuntime.createModelSettings();
     await this.configStore.save(candidate, this.workspaceRoot);
     // 项目覆盖的 defaultModel/thinking 仍然优先；保存后重新读取有效配置，避免内存状态
     // 短暂显示一个实际上被项目覆盖遮住的模型。
     const effective = await this.configStore.load(this.workspaceRoot).catch(() => candidate);
     if (effective === candidate) {
       Object.assign(this.config, effective);
+      this.runtime = nextRuntime;
       this.activeSettings = nextSettings;
       this.observedConfigRevision = this.configStore.revision?.();
     } else {
@@ -184,15 +164,17 @@ export class ModelManager {
   }
 
   private applyConfig(nextConfig: AgentConfig): void {
-    const nextSettings = createNativeModelSettings(nextConfig);
+    const nextRuntime = new ModelRuntime(nextConfig, this.runtime.catalogsSnapshot(), this.ai, this.modelsStore);
+    const nextSettings = nextRuntime.createModelSettings();
     Object.assign(this.config, nextConfig);
+    this.runtime = nextRuntime;
     this.activeSettings = nextSettings;
     this.observedConfigRevision = this.configStore.revision?.();
   }
 }
 
 export function listModelChoices(config: AgentConfig): ModelChoice[] {
-  return new ModelRegistry(config).listModels();
+  return new ModelRuntime(config).listModels();
 }
 
 export function listConfiguredModelChoices(config: AgentConfig): ModelChoice[] {

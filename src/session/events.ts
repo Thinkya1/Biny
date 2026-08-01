@@ -30,6 +30,39 @@ const attachmentReferenceSchema = z.object({
   path: z.string(),
   size: z.number().int().nonnegative().optional()
 });
+const agentTextContentSchema = z.object({ type: z.literal("text"), text: z.string() }).passthrough();
+const agentImageContentSchema = z.object({ type: z.literal("image"), data: z.string(), mimeType: z.string() }).passthrough();
+const agentReasoningContentSchema = z.object({
+  type: z.literal("reasoning"),
+  text: z.string(),
+  providerMetadata: z.record(z.unknown()).optional()
+}).passthrough();
+const agentToolCallContentSchema = z.object({
+  type: z.literal("toolCall"),
+  id: z.string(),
+  name: z.string(),
+  arguments: z.record(z.unknown()),
+  invalid: z.boolean().optional()
+}).passthrough();
+const persistedAgentMessageSchema = z.discriminatedUnion("role", [
+  z.object({
+    role: z.literal("assistant"),
+    content: z.array(z.discriminatedUnion("type", [agentTextContentSchema, agentReasoningContentSchema, agentToolCallContentSchema])),
+    stopReason: z.enum(["stop", "tool-calls", "length", "error", "aborted", "other"]).optional(),
+    usage: sessionUsageSchema.optional(),
+    errorMessage: z.string().optional(),
+    timestamp: z.number().finite().optional()
+  }).passthrough(),
+  z.object({
+    role: z.literal("toolResult"),
+    toolCallId: z.string(),
+    toolName: z.string(),
+    content: z.array(z.discriminatedUnion("type", [agentTextContentSchema, agentImageContentSchema])),
+    details: z.unknown().optional(),
+    isError: z.boolean().optional(),
+    timestamp: z.number().finite().optional()
+  }).passthrough()
+]);
 const sessionEventSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("user_message"),
@@ -39,6 +72,8 @@ const sessionEventSchema = z.discriminatedUnion("type", [
     contextUsage: sessionContextSchema.optional(),
     contextState: sessionContextSchema.optional(),
     preparationUsage: z.array(sessionUsageSchema).optional(),
+    messageId: z.string().optional(),
+    parentMessageId: z.string().optional(),
     auditOnly: z.boolean().optional(),
     time: z.string().optional()
   }).passthrough(),
@@ -75,6 +110,13 @@ const sessionEventSchema = z.discriminatedUnion("type", [
     sequence: z.number().finite().optional(),
     relatedUsage: z.array(sessionUsageSchema).optional(),
     auditOnly: z.boolean().optional(),
+    time: z.string().optional()
+  }).passthrough(),
+  z.object({
+    type: z.literal("agent_message"),
+    message: persistedAgentMessageSchema,
+    messageId: z.string().optional(),
+    parentMessageId: z.string().optional(),
     time: z.string().optional()
   }).passthrough(),
   z.object({

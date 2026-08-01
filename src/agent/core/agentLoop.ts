@@ -1,5 +1,5 @@
 /**
- * Biny 自有的 Pi 风格 Agent Loop。
+ * Biny 自有的 Agent Loop。
  *
  * Provider 只负责输出归一化的 ModelStreamEvent；工具由 Loop 显式校验和执行，
  * 不再把多步控制权交给模型 SDK。这样权限、预算、审计和 Completion Gate 都有
@@ -84,12 +84,15 @@ async function* runLoop(
       }
       pendingMessages = [];
 
-      const assistantEvents: AgentEvent[] = [];
-      const assistant = await streamAssistant(context, config, signal, (event) => {
-        assistantEvents.push(event);
-        return Promise.resolve(event);
-      });
-      yield* assistantEvents;
+      const assistantStream = streamAssistant(context, config, signal);
+      let assistantNext = await assistantStream.next();
+      while (!assistantNext.done) {
+        // Provider 的每个分片在这里立即交给宿主；不能等完整 assistant
+        // message 结束后再批量 yield，否则上层只能看到“伪流式”输出。
+        yield assistantNext.value;
+        assistantNext = await assistantStream.next();
+      }
+      const assistant = assistantNext.value;
       context.messages.push(assistant);
       newMessages.push(assistant);
       steps += 1;
@@ -116,7 +119,19 @@ async function* runLoop(
 
       yield { type: "turn_end", message: assistant, toolResults, messages: [...context.messages] };
       const turnContext: AgentLoopTurnContext = { message: assistant, toolResults, context, newMessages };
-      if (await config.shouldStopAfterTurn?.(turnContext)) return;
+      const nextTurn = await config.prepareNextTurn?.(turnContext);
+      if (nextTurn) {
+        context = nextTurn.context ?? context;
+        if (nextTurn.tools) context.tools = [...nextTurn.tools];
+        config = {
+          ...config,
+          model: nextTurn.model ?? config.model,
+          modelOptions: nextTurn.modelOptions ?? config.modelOptions,
+          tools: nextTurn.tools ?? config.tools
+        };
+      }
+      const effectiveTurnContext: AgentLoopTurnContext = { ...turnContext, context };
+      if (await config.shouldStopAfterTurn?.(effectiveTurnContext)) return;
       pendingMessages = await config.getSteeringMessages?.() ?? [];
     }
 
@@ -126,53 +141,62 @@ async function* runLoop(
   }
 }
 
-async function streamAssistant(
+async function* streamAssistant(
   context: AgentContext,
   config: AgentLoopConfig,
   signal: AbortSignal | undefined,
-  emit: (event: AgentEvent) => Promise<AgentEvent>
-): Promise<AgentAssistantMessage> {
+): AsyncGenerator<AgentEvent, AgentAssistantMessage, void> {
   let text = "";
   const reasoning = new Map<string, { text: string; providerMetadata?: Record<string, unknown> }>();
   const toolCalls: AgentToolCallContent[] = [];
   let stopReason: AgentAssistantMessage["stopReason"] = "stop";
   let usage: AgentAssistantMessage["usage"];
   const assistant: AgentAssistantMessage = { role: "assistant", content: [] };
-  await emit({ type: "message_start", message: assistant });
-  try {
-    const messages = config.transformContext
-      ? await config.transformContext(context.messages, signal)
-      : context.messages;
-    const stream = await config.model.stream({ ...context, messages, tools: context.tools }, { ...config.modelOptions, signal });
-    for await (const event of stream) {
-      signal?.throwIfAborted();
-      if (event.type === "text-delta") {
-        text += event.text;
-      } else if (event.type === "reasoning-start") {
-        reasoning.set(event.id, { text: "", providerMetadata: event.providerMetadata });
-      } else if (event.type === "reasoning-delta") {
-        const block = reasoning.get(event.id) ?? { text: "" };
-        block.text += event.text;
-        block.providerMetadata = event.providerMetadata ?? block.providerMetadata;
-        reasoning.set(event.id, block);
-      } else if (event.type === "tool-call") {
-        toolCalls.push({ type: "toolCall", id: event.id, name: event.name, arguments: event.arguments, invalid: event.invalid });
-      } else if (event.type === "finish") {
-        stopReason = event.reason;
-        usage = event.usage;
-      } else if (event.type === "error") {
-        stopReason = "error";
-        assistant.errorMessage = errorMessage(event.error);
-        await emit({ type: "error", error: assistant.errorMessage, fatal: true });
+  yield { type: "message_start", message: assistant };
+  while (true) {
+    try {
+      const messages = config.transformContext
+        ? await config.transformContext(context.messages, signal)
+        : context.messages;
+      const streamModel = config.model.streamSimple?.bind(config.model) ?? config.model.stream.bind(config.model);
+      const stream = await streamModel({ ...context, messages, tools: context.tools }, { ...config.modelOptions, signal });
+      for await (const event of stream) {
+        signal?.throwIfAborted();
+        if (event.type === "text-delta") {
+          text += event.text;
+        } else if (event.type === "reasoning-start") {
+          reasoning.set(event.id, { text: "", providerMetadata: event.providerMetadata });
+        } else if (event.type === "reasoning-delta") {
+          const block = reasoning.get(event.id) ?? { text: "" };
+          block.text += event.text;
+          block.providerMetadata = event.providerMetadata ?? block.providerMetadata;
+          reasoning.set(event.id, block);
+        } else if (event.type === "tool-call") {
+          toolCalls.push({ type: "toolCall", id: event.id, name: event.name, arguments: event.arguments, invalid: event.invalid });
+        } else if (event.type === "finish") {
+          stopReason = event.reason;
+          usage = event.usage;
+        } else if (event.type === "error") {
+          throw event.error;
+        }
+        if (event.type !== "start" && event.type !== "finish") {
+          yield { type: "message_update", message: snapshotAssistant(text, reasoning, toolCalls, assistant), event };
+        }
       }
-      if (event.type !== "start" && event.type !== "finish") {
-        await emit({ type: "message_update", message: snapshotAssistant(text, reasoning, toolCalls, assistant), event });
+      break;
+    } catch (error) {
+      const message = errorMessage(error);
+      const canRecover = !signal?.aborted && !text && reasoning.size === 0 && toolCalls.length === 0;
+      const recovery = canRecover ? await config.recoverFromModelError?.(message, context, signal) : undefined;
+      if (recovery) {
+        yield { type: "model_retry", ...recovery };
+        continue;
       }
+      stopReason = signal?.aborted ? "aborted" : "error";
+      assistant.errorMessage = message;
+      yield { type: "error", error: message, fatal: !signal?.aborted };
+      break;
     }
-  } catch (error) {
-    stopReason = signal?.aborted ? "aborted" : "error";
-    assistant.errorMessage = errorMessage(error);
-    await emit({ type: "error", error: assistant.errorMessage, fatal: !signal?.aborted });
   }
 
   const duplicateToolCallIds = new Set<string>();
@@ -185,8 +209,8 @@ async function streamAssistant(
     const message = `Duplicate tool call id received from the model: ${[...duplicateToolCallIds].join(", ")}. The turn was stopped before tool execution.`;
     assistant.stopReason = "error";
     assistant.errorMessage = message;
-    await emit({ type: "error", error: message, fatal: true });
-    await emit({ type: "message_end", message: assistant });
+    yield { type: "error", error: message, fatal: true };
+    yield { type: "message_end", message: assistant };
     return assistant;
   }
 
@@ -197,7 +221,7 @@ async function streamAssistant(
   assistant.content.push(...toolCalls);
   assistant.stopReason = stopReason;
   assistant.usage = usage;
-  await emit({ type: "message_end", message: assistant });
+  yield { type: "message_end", message: assistant };
   return assistant;
 }
 

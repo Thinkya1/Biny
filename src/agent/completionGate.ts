@@ -6,7 +6,7 @@
  * 新的用户输入。
  */
 import { createHash } from "node:crypto";
-import type { ModelMessage } from "./core/modelMessage.js";
+import type { AgentUserMessage } from "./core/types.js";
 import type { TodoItem } from "../session/todoStore.js";
 import type { AgentToolEvent } from "./types.js";
 
@@ -129,7 +129,7 @@ export type IncompleteReason =
 
 export type CompletionDecision =
   | { kind: "complete" }
-  | { kind: "continue"; feedback: ModelMessage }
+  | { kind: "continue"; feedback: AgentUserMessage }
   | {
       kind: "blocked";
       reason: BlockedReason;
@@ -446,6 +446,8 @@ export class CompletionGate {
         this.options.onVerification?.(verification);
       }
       if (!verification.passed) {
+        const verificationBlocked = blockedFromVerification(verification);
+        if (verificationBlocked) return { kind: "blocked", ...verificationBlocked };
         return this.continueOrStop(
           verificationFailureFeedback(verification),
           facts,
@@ -496,7 +498,7 @@ export class CompletionGate {
     return {
       kind: "continue",
       feedback: {
-        role: "system",
+        role: "user",
         content: [
           "## Biny completion gate",
           "",
@@ -518,6 +520,28 @@ function verificationFailureFeedback(verification: VerificationFact): string {
     `Independent verification failed: ${verification.summary}`,
     ...(evidence.length ? ["Evidence:", ...evidence] : [])
   ].join("\n");
+}
+
+function blockedFromVerification(verification: VerificationFact): BlockedState | undefined {
+  const failures = verification.evidence.filter((evidence) => !evidence.passed);
+  if (!failures.length || !failures.every(verificationEvidenceLooksUnavailable)) return undefined;
+  return {
+    reason: "environment_unavailable",
+    summary: `Independent verification is blocked by an unavailable environment: ${failures.map((failure) => failure.summary).join("; ")}`,
+    requiredAction: "Start the required service or repair the test environment, then rerun verification."
+  };
+}
+
+function verificationEvidenceLooksUnavailable(evidence: VerificationEvidenceFact): boolean {
+  const diagnostic = `${evidence.summary} ${stableValue(evidence.details ?? {})}`.toLowerCase();
+  return diagnostic.includes("connection refused")
+    || diagnostic.includes("econnrefused")
+    || diagnostic.includes("connectexception")
+    || diagnostic.includes("could not connect")
+    || diagnostic.includes("connection timed out")
+    || diagnostic.includes("no route to host")
+    || diagnostic.includes("network is unreachable")
+    || diagnostic.includes("service unavailable");
 }
 
 function blockedFromFailures(failures: readonly ToolFailureFact[]): BlockedState | undefined {

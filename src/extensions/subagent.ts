@@ -47,10 +47,10 @@ export interface SubagentOptions {
   workspaceRoot: string;
   config: AgentConfig;
   /** 不带别名时返回 subagent 默认模型设置；带别名时返回该模型别名的设置。 */
-  getNativeModelSettings: (modelAlias?: string) => NativeModelSettings;
+  getModelSettings: (modelAlias?: string) => NativeModelSettings;
   getAccessMode: () => SubagentAccessMode;
   getParentRunId?: () => string | undefined;
-  /** 每次委派时重新读取具名定义，允许会话期间编辑生效（对齐 pi）。 */
+  /** 每次委派时重新读取具名定义，允许会话期间编辑生效。 */
   loadAgentDefinitions?: () => Promise<SubagentDefinition[]>;
   toolRegistry: ToolRegistry;
   onUsage?: ModelUsageObserver;
@@ -98,7 +98,7 @@ export async function runSubagentTask(
 ): Promise<string> {
   const settings = options.config.extensions.subagent;
   const definition = await resolveSubagentDefinition(options, agentName);
-  const modelSettings = options.getNativeModelSettings(definition?.model);
+  const modelSettings = options.getModelSettings(definition?.model);
   const modelAlias = definition?.model ?? settings.model ?? options.config.defaultModel;
   // 具名定义的 tools 只做收窄：始终与全局 allowedTools 求交集，不能放宽安全边界。
   const allowedTools = definition?.tools

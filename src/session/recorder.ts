@@ -29,6 +29,7 @@ import { sessionFilePath } from "./store.js";
 import { projectSessionsDir } from "../config/paths.js";
 import type { SessionContextState, SessionContextUsage, SessionUsage } from "./metadata.js";
 import type { AttachmentReference } from "../attachments/store.js";
+import type { AgentMessage } from "../agent/core/types.js";
 
 export type { SessionContextState, SessionContextUsage, SessionUsage, UsageOperation } from "./metadata.js";
 
@@ -65,10 +66,11 @@ export interface SessionTurnStatusEvent {
 
 export type SessionEvent =
   // session 事件类型要保持稳定；resume、未来上下文压缩和记忆功能都会依赖这几个基础类型。
-  | { type: "user_message"; content: string; attachments?: AttachmentReference[]; skills?: string[]; contextUsage?: SessionContextUsage; contextState?: SessionContextState; preparationUsage?: SessionUsage[]; auditOnly?: boolean; time?: string }
+  | { type: "user_message"; content: string; attachments?: AttachmentReference[]; skills?: string[]; contextUsage?: SessionContextUsage; contextState?: SessionContextState; preparationUsage?: SessionUsage[]; messageId?: string; parentMessageId?: string; auditOnly?: boolean; time?: string }
   | { type: "assistant_message"; content: string; reasoningContent?: string; reasoningProviderOptions?: Record<string, unknown>; reasoningBlocks?: ReasoningBlock[]; usage?: SessionUsage; relatedUsage?: SessionUsage[]; contextState?: SessionContextState; auditOnly?: boolean; time?: string }
   | { type: "tool_call"; tool: string; args: unknown; toolCallId?: string; sequence?: number; assistantContent?: string; reasoningContent?: string; reasoningProviderOptions?: Record<string, unknown>; reasoningBlocks?: ReasoningBlock[]; auditOnly?: boolean; time?: string }
   | { type: "tool_result"; tool: string; result: unknown; toolCallId?: string; sequence?: number; relatedUsage?: SessionUsage[]; auditOnly?: boolean; time?: string }
+  | { type: "agent_message"; message: Exclude<AgentMessage, { role: "user" }>; messageId?: string; parentMessageId?: string; time?: string }
   | SessionTurnStatusEvent
   | { type: "error"; message: string; detail?: unknown; relatedUsage?: SessionUsage[]; time?: string };
 
@@ -84,6 +86,7 @@ export class SessionRecorder {
   private toolCallSequence = 0;
   private recordedEvents = 0;
   private readonly existedAtCreation: boolean;
+  private lastMessageId: string | undefined;
 
   constructor(workspaceRoot: string, sessionId = createSessionId(), resolvedFilePath = sessionFilePath(workspaceRoot, sessionId)) {
     // sessionId 默认按时间和随机后缀生成，便于人工排序也避免同秒冲突。
@@ -108,7 +111,7 @@ export class SessionRecorder {
   record(event: SessionEvent): void {
     // 每个事件一行 JSON，便于追加写入，也方便后续按行读取和压缩。
     if (this.closed) throw new Error(`Session recorder is already closed: ${this.sessionId}`);
-    const safeEvent = redactSessionEvent(event);
+    const safeEvent = redactSessionEvent(this.linkCanonicalMessage(event));
     const line = JSON.stringify({ ...safeEvent, time: event.time ?? new Date().toISOString() });
     if (!this.stream) {
       const descriptor = this.descriptor;
@@ -139,6 +142,10 @@ export class SessionRecorder {
     this.toolCallSequence = Math.max(this.toolCallSequence, sequence);
   }
 
+  restoreMessageParent(messageId: string | undefined): void {
+    this.lastMessageId = messageId;
+  }
+
   isUnrecordedDraft(): boolean {
     return !this.existedAtCreation && this.recordedEvents === 0;
   }
@@ -148,16 +155,28 @@ export class SessionRecorder {
     const stat = validateSessionDescriptor(descriptor, this.filePath);
     assertSessionFileSize(stat.size, this.filePath);
     if (stat.size === 0) return;
-    const raw = readDescriptor(descriptor, stat.size);
-    if (raw.at(-1) === 0x0a) return;
-    const lastNewline = raw.lastIndexOf(0x0a);
-    const tail = raw.subarray(lastNewline + 1).toString("utf8");
-    try {
-      JSON.parse(tail);
-      writeSync(descriptor, "\n");
-    } catch {
-      ftruncateSync(descriptor, lastNewline + 1);
+    let raw = readDescriptor(descriptor, stat.size);
+    if (raw.at(-1) !== 0x0a) {
+      const lastNewline = raw.lastIndexOf(0x0a);
+      const tail = raw.subarray(lastNewline + 1).toString("utf8");
+      try {
+        JSON.parse(tail);
+        writeSync(descriptor, "\n");
+        raw = Buffer.concat([raw, Buffer.from("\n")]);
+      } catch {
+        ftruncateSync(descriptor, lastNewline + 1);
+        raw = raw.subarray(0, lastNewline + 1);
+      }
     }
+    this.lastMessageId = lastPersistedMessageId(raw);
+  }
+
+  private linkCanonicalMessage(event: SessionEvent): SessionEvent {
+    if (event.type !== "agent_message" && (event.type !== "user_message" || event.auditOnly)) return event;
+    const messageId = event.messageId ?? createMessageId();
+    const linked = { ...event, messageId, parentMessageId: event.parentMessageId ?? this.lastMessageId };
+    this.lastMessageId = messageId;
+    return linked;
   }
 
   readText(): string {
@@ -252,6 +271,9 @@ function redactSessionEvent(event: SessionEvent): SessionEvent {
   if (event.type === "tool_result") {
     return { ...event, result: redactSensitiveValue(event.result) };
   }
+  if (event.type === "agent_message") {
+    return { ...event, message: redactAgentMessage(event.message) };
+  }
   if (event.type === "turn_status") {
     return {
       ...event,
@@ -264,6 +286,35 @@ function redactSessionEvent(event: SessionEvent): SessionEvent {
     ...event,
     message: redactSecrets(event.message),
     detail: event.detail === undefined ? undefined : redactSensitiveValue(event.detail)
+  };
+}
+
+function redactAgentMessage(message: Exclude<AgentMessage, { role: "user" }>): Exclude<AgentMessage, { role: "user" }> {
+  if (message.role === "toolResult") {
+    return {
+      ...message,
+      content: message.content.map((part) => part.type === "text"
+        ? { ...part, text: redactSecrets(part.text) }
+        : { ...part, data: redactSecrets(part.data) }),
+      details: message.details === undefined ? undefined : redactSensitiveValue(message.details)
+    };
+  }
+  return {
+    ...message,
+    content: message.content.map((part) => {
+      if (part.type === "text") return { ...part, text: redactSecrets(part.text) };
+      if (part.type === "toolCall") {
+        return { ...part, arguments: redactSensitiveValue(part.arguments) as Record<string, unknown> };
+      }
+      const text = redactSecrets(part.text);
+      return {
+        ...part,
+        text,
+        providerMetadata: text === part.text && part.providerMetadata !== undefined
+          ? redactSensitiveValue(part.providerMetadata) as Record<string, unknown>
+          : undefined
+      };
+    })
   };
 }
 
@@ -332,6 +383,28 @@ function removeDraftFile(filePath: string, identity: Pick<Stats, "dev" | "ino">)
   } catch {
     // A missing or replaced draft must never cause cleanup to touch another file.
   }
+}
+
+function createMessageId(): string {
+  return `msg_${randomBytes(12).toString("hex")}`;
+}
+
+function lastPersistedMessageId(raw: Buffer): string | undefined {
+  const lines = raw.toString("utf8").trimEnd().split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (!line) continue;
+    try {
+      const event = JSON.parse(line) as { type?: unknown; messageId?: unknown; auditOnly?: unknown };
+      if (
+        typeof event.messageId === "string"
+        && (event.type === "agent_message" || (event.type === "user_message" && event.auditOnly !== true))
+      ) return event.messageId;
+    } catch {
+      // JSONL 中间损坏由严格解析负责报错；这里仅尽力恢复追加节点的父链。
+    }
+  }
+  return undefined;
 }
 
 export function createSessionId(): string {

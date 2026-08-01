@@ -48,14 +48,53 @@ Respond in Chinese unless the task explicitly asks for another language.
 
 export type PromptMode = keyof typeof MODE_PROMPTS;
 
+const dynamicPromptStart = "<!-- biny-runtime-context:start -->";
+const dynamicPromptEnd = "<!-- biny-runtime-context:end -->";
+const activeRunSummaryStart = "<!-- biny-active-run-summary:start -->";
+const activeRunSummaryEnd = "<!-- biny-active-run-summary:end -->";
+
 export function buildSystemPrompt(mode: PromptMode, skillPrompt?: string, availableTools: readonly string[] = []): string {
   // 全局规则始终在前，mode 只补充当前任务的输出约束。
   return [
     GLOBAL_SYSTEM_PROMPT.trim(),
     MODE_PROMPTS[mode].trim(),
+    dynamicRuntimePrompt(skillPrompt, availableTools)
+  ].filter(Boolean).join("\n\n");
+}
+
+export function refreshRuntimeSystemPrompt(
+  systemPrompt: string | undefined,
+  skillPrompt: string | undefined,
+  availableTools: readonly string[]
+): string | undefined {
+  if (!systemPrompt) return systemPrompt;
+  const start = systemPrompt.indexOf(dynamicPromptStart);
+  const end = systemPrompt.indexOf(dynamicPromptEnd, start + dynamicPromptStart.length);
+  if (start === -1 || end === -1) return systemPrompt;
+  return `${systemPrompt.slice(0, start)}${dynamicRuntimePrompt(skillPrompt, availableTools)}${systemPrompt.slice(end + dynamicPromptEnd.length)}`;
+}
+
+export function withActiveRunCompactionSummary(systemPrompt: string | undefined, summary: string): string {
+  const block = [
+    activeRunSummaryStart,
+    "Active run handoff summary after context compaction:",
+    summary.trim(),
+    activeRunSummaryEnd
+  ].join("\n\n");
+  if (!systemPrompt) return block;
+  const start = systemPrompt.indexOf(activeRunSummaryStart);
+  const end = systemPrompt.indexOf(activeRunSummaryEnd, start + activeRunSummaryStart.length);
+  if (start === -1 || end === -1) return `${systemPrompt}\n\n${block}`;
+  return `${systemPrompt.slice(0, start)}${block}${systemPrompt.slice(end + activeRunSummaryEnd.length)}`;
+}
+
+function dynamicRuntimePrompt(skillPrompt: string | undefined, availableTools: readonly string[]): string {
+  return [
+    dynamicPromptStart,
     toolGuidance(availableTools),
-    // skillPrompt 自带说明头（渐进式披露：仅元数据 + invoke_skill 指引）。
-    skillPrompt?.trim() ?? ""
+    // 扩展段可能随 MCP、具名代理和 Todo 状态变化，每个模型步骤前都会整体替换。
+    skillPrompt?.trim() ?? "",
+    dynamicPromptEnd
   ].filter(Boolean).join("\n\n");
 }
 

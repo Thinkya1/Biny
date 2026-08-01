@@ -15,7 +15,8 @@ import type {
   ReasoningEffort,
   ThinkingLevelMap
 } from "../config/schema.js";
-import { providerProfile } from "./profiles.js";
+import { providerDefinition } from "../ai/provider.js";
+import { ProviderRegistry } from "./ProviderRuntime.js";
 
 export type ModelSource = "configured" | "catalog";
 
@@ -55,7 +56,10 @@ export function catalogModelAlias(providerAlias: string, modelId: string): strin
 export class ModelRegistry {
   private readonly catalogs = new Map<string, ModelCatalogEntry[]>();
 
-  constructor(private readonly config: AgentConfig) {}
+  constructor(
+    private readonly config: AgentConfig,
+    private readonly providers: ProviderRegistry = new ProviderRegistry(config)
+  ) {}
 
   registerCatalog(providerAlias: string, entries: ModelCatalogEntry[]): void {
     this.catalogs.set(providerAlias, entries.map((entry) => ({ ...entry, provider: providerAlias })));
@@ -100,7 +104,7 @@ export class ModelRegistry {
   }
 
   isAvailable(resolved: RegisteredModel): boolean {
-    return hasUsableModelConfiguration(this.config, resolved.alias, resolved.model);
+    return this.providers.get(resolved.providerAlias)?.isConfigured(resolved.model) ?? false;
   }
 
   resolve(aliasOrReference: string): RegisteredModel | undefined {
@@ -140,6 +144,7 @@ export class ModelRegistry {
 
   private toChoice(alias: string, model: ModelAliasConfig, source: ModelSource): ModelChoice {
     const provider = this.config.providers[model.provider];
+    const providerRuntime = this.providers.get(model.provider);
     const capabilities = modelCapabilities(model);
     const reasoning = modelReasoningConfig(model);
     const thinkingLevelMap = modelThinkingLevelMap(model);
@@ -159,9 +164,9 @@ export class ModelRegistry {
       defaultThinking: reasoning?.defaultEffort ?? "off",
       thinkingLevelMap,
       apiBackend: model.apiBackend,
-      baseUrl: model.baseUrl ?? provider?.baseUrl ?? (provider ? providerProfile(provider.type).baseUrl : undefined),
+      baseUrl: model.baseUrl ?? provider?.baseUrl ?? providerRuntime?.definition.baseUrl ?? (provider ? providerDefinition(provider.type).baseUrl : undefined),
       compatibility: model.compatibility ?? provider?.compatibility,
-      available: hasUsableModelConfiguration(this.config, alias, model),
+      available: providerRuntime?.isConfigured(model) ?? false,
       source
     };
   }
@@ -173,14 +178,8 @@ export function modelKey(providerAlias: string, modelId: string): string {
 
 export function hasUsableModelConfiguration(config: AgentConfig, alias: string, modelOverride?: ModelAliasConfig): boolean {
   const model = modelOverride ?? config.models[alias];
-  const provider = model ? config.providers[model.provider] : undefined;
-  if (!provider) return false;
-  const profile = providerProfile(provider.type);
-  const endpoint = model?.baseUrl ?? provider.baseUrl ?? profile.baseUrl;
-  if (!endpoint || !isHttpEndpoint(endpoint)) return false;
-  if (!(provider.requiresApiKey ?? profile.requiresApiKey)) return true;
-  const envName = provider.apiKeyEnv ?? profile.apiKeyEnv;
-  return Boolean(provider.apiKey || (envName && process.env[envName]));
+  if (!model) return false;
+  return new ProviderRegistry(config).get(model.provider)?.isConfigured(model) ?? false;
 }
 
 function catalogEntryToModel(entry: ModelCatalogEntry): ModelAliasConfig {
@@ -204,13 +203,4 @@ function reasoningEffortsToMap(efforts: ReasoningEffort[]): ThinkingLevelMap {
   const map: ThinkingLevelMap = { off: "none" };
   for (const effort of efforts) map[effort] = effort;
   return map;
-}
-
-function isHttpEndpoint(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
 }

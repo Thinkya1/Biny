@@ -1,8 +1,7 @@
 import { z } from "zod";
-import type { AgentModel, AgentUsage } from "../core/types.js";
-import type { ModelMessage } from "../core/modelMessage.js";
+import type { AgentMessage, AgentModel, AgentToolResultMessage, AgentUsage } from "../core/types.js";
 import { generateNativeText, nativeJsonMessages, parseNativeJson } from "../../llm/nativeJson.js";
-import { cloneModelMessages, messageReasoning, messageText, messageToolName } from "../modelMessages.js";
+import { cloneAgentMessages, messageReasoning, messageText, messageToolName } from "../modelMessages.js";
 import { formatProjectContext } from "../../project/ProjectContext.js";
 import { formatMemoryMatches, LocalMemory, redactSecrets } from "./LocalMemory.js";
 import { formatRepoMapCandidates, WorkspaceContext } from "./WorkspaceContext.js";
@@ -22,7 +21,7 @@ const memoryAbortDrainMs = 500;
  * compaction and prompt assembly; workspace discovery stays in WorkspaceContext.
  */
 export class ContextMemory {
-  private readonly history: ModelMessage[] = [];
+  private readonly history: AgentMessage[] = [];
   private memoryTail: Promise<void> = Promise.resolve();
   private readonly memoryControllers = new Set<AbortController>();
   private memoryClosed = false;
@@ -66,7 +65,7 @@ export class ContextMemory {
     await this.workspace.initialize();
   }
 
-  async prepareTurn(input: string, systemPrompt: string, signal?: AbortSignal, attachments: AgentAttachment[] = []): Promise<ModelMessage[]> {
+  async prepareTurn(input: string, systemPrompt: string, signal?: AbortSignal, attachments: AgentAttachment[] = []): Promise<PreparedAgentContext> {
     signal?.throwIfAborted();
     await this.flush(signal);
     signal?.throwIfAborted();
@@ -95,11 +94,11 @@ export class ContextMemory {
       maxOutputTokens: budget.maxOutputTokens,
       modelAlias: budget.modelAlias
     };
-    return assembly.messages;
+    return { systemPrompt: assembly.systemPrompt, messages: assembly.messages };
   }
 
-  replaceHistory(messages: ModelMessage[]): void {
-    this.history.splice(0, this.history.length, ...messages.filter((message) => message.role !== "system"));
+  replaceHistory(messages: AgentMessage[]): void {
+    this.history.splice(0, this.history.length, ...messages);
   }
 
   /**
@@ -113,21 +112,21 @@ export class ContextMemory {
    *
    * 保留 `keepRecentToolResults` 条最近的结果不动：模型当下正要用的就是它们。
    */
-  pruneToolResultsForStep(messages: ModelMessage[], keepRecentToolResults = 2): ModelMessage[] {
+  pruneToolResultsForStep(messages: AgentMessage[], keepRecentToolResults = 2): AgentMessage[] {
     const limit = Math.floor(this.inputBudget() * midTurnPruneThreshold);
     if (estimateMessageTokens(messages) <= limit) return messages;
 
     const prunableIndexes = messages.reduce<number[]>((indexes, message, index) => {
-      if (message.role === "tool" && !isPrunedToolResult(message)) indexes.push(index);
+      if (message.role === "toolResult" && !isPrunedToolResult(message)) indexes.push(index);
       return indexes;
-    }, []).slice(0, Math.max(0, messages.length - keepRecentToolResults));
+    }, []);
     if (!prunableIndexes.length) return messages;
 
     const pruned = [...messages];
     let total = estimateMessageTokens(pruned);
     for (const index of prunableIndexes.slice(0, Math.max(0, prunableIndexes.length - keepRecentToolResults))) {
       const original = pruned[index];
-      if (!original || original.role !== "tool") continue;
+      if (!original || original.role !== "toolResult") continue;
       const replacement = prunedToolResultMessage(original);
       total -= messageTokenCost(original) - messageTokenCost(replacement);
       pruned[index] = replacement;
@@ -166,8 +165,8 @@ export class ContextMemory {
     return state.summary !== undefined || state.compactedMessages > 0 ? state : undefined;
   }
 
-  getHistory(): ModelMessage[] {
-    return cloneModelMessages(this.history);
+  getHistory(): AgentMessage[] {
+    return cloneAgentMessages(this.history);
   }
 
   observeToolResult(tool: string, args: unknown, result: unknown): void {
@@ -196,7 +195,35 @@ export class ContextMemory {
     return { compacted: true, compactedMessageCount: compacted.length, summary: this.summary };
   }
 
-  restore(messages: ModelMessage[], state?: ContextBudgetStatus | SessionContextState): void {
+  /**
+   * Provider 在长回合中拒绝上下文时，只压缩已经闭合的消息前缀。
+   * 保留段按 assistant + tool-result 批次切分，不能把工具调用和结果从中间拆开。
+   */
+  async compactRunContext(messages: AgentMessage[], signal?: AbortSignal): Promise<RunContextCompaction | undefined> {
+    signal?.throwIfAborted();
+    if (messages.length < 2) return undefined;
+    const retainBudget = Math.min(retainedHistoryTokens, Math.max(1_000, Math.floor(this.inputBudget() * 0.25)));
+    let retained = takeRecentRunMessages(messages, retainBudget);
+    let compacted = messages.slice(0, messages.length - retained.length);
+    if (!compacted.length) {
+      compacted = [...messages];
+      retained = [];
+    }
+    const nextSummary = await this.createSummary(compacted, "Recover from a provider context overflow during the active run.", signal);
+    signal?.throwIfAborted();
+    this.summary = mergeSummaries(this.summary, nextSummary);
+    this.compactedMessages += compacted.length;
+    this.lastCompactedAt = new Date().toISOString();
+    this.replaceHistory(retained);
+    this.refreshEstimatedBudget();
+    return {
+      messages: cloneAgentMessages(retained),
+      summary: this.summary,
+      compactedMessageCount: compacted.length
+    };
+  }
+
+  restore(messages: AgentMessage[], state?: ContextBudgetStatus | SessionContextState): void {
     this.replaceHistory(messages);
     const contextState = isContextState(state) ? state : undefined;
     const budget: ContextBudgetStatus | undefined = contextState?.budget ?? (isContextState(state) ? undefined : state);
@@ -215,7 +242,7 @@ export class ContextMemory {
     const pending = this.memoryTail.then(async () => {
       await this.localMemory?.rememberSuccessfulTask(task, answer, controller.signal);
     }).catch(() => {
-      // Persistent memory is best effort and must not turn a successful turn into an error.
+      // 持久记忆是尽力写入，失败不能把已经成功的回合改成错误。
     }).finally(() => this.memoryControllers.delete(controller));
     this.memoryTail = pending;
   }
@@ -286,9 +313,9 @@ export class ContextMemory {
     return await this.compact(undefined, signal);
   }
 
-  private async createSummary(messages: ModelMessage[], hint?: string, signal?: AbortSignal): Promise<string> {
+  private async createSummary(messages: AgentMessage[], hint?: string, signal?: AbortSignal): Promise<string> {
     const transcript = messages.map((message) => {
-      const label = message.role === "tool" ? `tool ${messageToolName(message)}` : message.role;
+      const label = message.role === "toolResult" ? `tool ${messageToolName(message)}` : message.role;
       return `${label}: ${truncateTextToTokens(messageText(message), 700)}`;
     }).join("\n\n");
     const prompt = [
@@ -469,7 +496,7 @@ function normalizeRestoredBudget(budget: ContextBudgetStatus, limits: ModelConte
   };
 }
 
-function estimateRestoredBudget(history: ModelMessage[], limits: ModelContextBudget): ContextBudgetStatus {
+function estimateRestoredBudget(history: AgentMessage[], limits: ModelContextBudget): ContextBudgetStatus {
   const estimatedTokens = estimateMessageTokens(history);
   return {
     maxTokens: limits.maxInputTokens,
@@ -485,14 +512,26 @@ function estimateRestoredBudget(history: ModelMessage[], limits: ModelContextBud
 }
 
 interface ContextAssembly {
-  messages: ModelMessage[];
+  systemPrompt?: string;
+  messages: AgentMessage[];
   budget: ContextBudgetStatus;
+}
+
+export interface PreparedAgentContext {
+  systemPrompt?: string;
+  messages: AgentMessage[];
+}
+
+export interface RunContextCompaction {
+  messages: AgentMessage[];
+  summary: string;
+  compactedMessageCount: number;
 }
 
 function assembleContext(
   systemPrompt: string,
   input: string,
-  history: ModelMessage[],
+  history: AgentMessage[],
   workspace: WorkspaceTurnData,
   summary: string | undefined,
   memoryMatches: MemoryMatch[],
@@ -505,7 +544,7 @@ function assembleContext(
   const taskBudget = Math.max(1, Math.min(estimateTokens(task), Math.floor(maxTokens * 0.35)));
   const taskContent = truncateTextToTokens(task, taskBudget);
   let remaining = Math.max(0, maxTokens - estimateTokens(taskContent) - 4);
-  const systemMessages: ModelMessage[] = [];
+  const systemParts: string[] = [];
   const addSystem = (id: string, content: string, required: boolean): void => {
     if (!content) return;
     const available = Math.max(0, remaining - 4);
@@ -520,7 +559,7 @@ function assembleContext(
     }
     const selected = required ? truncateTextToTokens(content, available) : content;
     if (selected !== content) omitted.push(`${id} (trimmed)`);
-    systemMessages.push({ role: "system", content: selected });
+    systemParts.push(selected);
     remaining -= estimateTokens(selected) + 4;
   };
 
@@ -539,24 +578,32 @@ function assembleContext(
 
   const selectedHistory = selectHistory(history, remaining);
   remaining -= estimateMessageTokens(selectedHistory);
-  if (selectedHistory.length < history.filter((message) => message.role !== "system").length) omitted.push("older conversation messages");
+  if (selectedHistory.length < history.length) omitted.push("older conversation messages");
 
   addSystem("RepoMap candidates", `RepoMap candidates:\n${formatRepoMapCandidates(workspace.repoMapCandidates)}`, false);
   const userContent = attachments.length
     ? [
       { type: "text" as const, text: taskContent },
       ...attachments.map((attachment) => ({
-        type: "file" as const,
-        data: { type: "data" as const, data: attachment.data },
-        mediaType: attachment.mimeType,
-        filename: attachment.name
+        type: attachment.mimeType.startsWith("audio/") ? "audio" as const : "image" as const,
+        data: attachment.data,
+        mimeType: attachment.mimeType
       }))
     ]
     : taskContent;
-  const messages = [...systemMessages, ...selectedHistory, { role: "user" as const, content: userContent }];
+  const messages: AgentMessage[] = [...selectedHistory, { role: "user", content: userContent }];
+  const assembledSystemPrompt = systemParts.join("\n\n") || undefined;
   return {
+    systemPrompt: assembledSystemPrompt,
     messages,
-    budget: { maxTokens, usedTokens: estimateMessageTokens(messages), omitted, autoCompacted, source: "estimated", measuredAt: undefined }
+    budget: {
+      maxTokens,
+      usedTokens: estimateMessageTokens(messages) + estimateTokens(assembledSystemPrompt ?? ""),
+      omitted,
+      autoCompacted,
+      source: "estimated",
+      measuredAt: undefined
+    }
   };
 }
 
@@ -577,16 +624,15 @@ function formatRecentActivity(activity: RecentWorkspaceActivity): string {
   ].join("\n");
 }
 
-function selectHistory(history: ModelMessage[], maxTokens: number): ModelMessage[] {
-  const candidates = history.filter((message) => message.role !== "system");
-  if (!maxTokens || !candidates.length) return [];
-  return takeRecentMessages(candidates, maxTokens);
+function selectHistory(history: AgentMessage[], maxTokens: number): AgentMessage[] {
+  if (!maxTokens || !history.length) return [];
+  return takeRecentMessages(history, maxTokens);
 }
 
-function deterministicSummary(messages: ModelMessage[]): string {
+function deterministicSummary(messages: AgentMessage[]): string {
   const userMessages = messages.filter((message) => message.role === "user").map(messageText);
   const assistantMessages = messages.filter((message) => message.role === "assistant").map(messageText);
-  const toolMessages = messages.filter((message) => message.role === "tool").map((message) => `${messageToolName(message)}: ${messageText(message)}`);
+  const toolMessages = messages.filter((message) => message.role === "toolResult").map((message) => `${messageToolName(message)}: ${messageText(message)}`);
   const paths = [...new Set(messages.flatMap((message) => messageText(message).match(/[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json|md|yml|yaml|css|html)/g) ?? []))].slice(0, 12);
   return truncateTextToTokens(redactSecrets([
     "Goal",
@@ -617,7 +663,7 @@ export function estimateTokens(value: string): number {
   return Math.ceil(Buffer.byteLength(value, "utf8") / 3);
 }
 
-export function estimateMessageTokens(messages: ModelMessage[]): number {
+export function estimateMessageTokens(messages: AgentMessage[]): number {
   return messages.reduce((total, message) => total + messageTokenCost(message), 0);
 }
 
@@ -638,9 +684,9 @@ export function truncateTextToTokens(value: string, maxTokens: number): string {
   return `${value.slice(0, low)}${suffix}`;
 }
 
-function takeRecentMessages(messages: ModelMessage[], maxTokens: number): ModelMessage[] {
+function takeRecentMessages(messages: AgentMessage[], maxTokens: number): AgentMessage[] {
   const turns = groupConversationTurns(messages);
-  const selected: ModelMessage[][] = [];
+  const selected: AgentMessage[][] = [];
   let used = 0;
   for (let index = turns.length - 1; index >= 0; index -= 1) {
     const turn = turns[index];
@@ -653,8 +699,27 @@ function takeRecentMessages(messages: ModelMessage[], maxTokens: number): ModelM
   return selected.flat();
 }
 
-function groupConversationTurns(messages: ModelMessage[]): ModelMessage[][] {
-  const turns: ModelMessage[][] = [];
+function takeRecentRunMessages(messages: AgentMessage[], maxTokens: number): AgentMessage[] {
+  const segments: AgentMessage[][] = [];
+  for (const message of messages) {
+    if (message.role === "user" || message.role === "assistant" || segments.length === 0) segments.push([]);
+    segments.at(-1)?.push(message);
+  }
+  const selected: AgentMessage[][] = [];
+  let used = 0;
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const segment = segments[index];
+    if (!segment) continue;
+    const cost = estimateMessageTokens(segment);
+    if (used + cost > maxTokens) break;
+    selected.unshift(segment);
+    used += cost;
+  }
+  return selected.flat();
+}
+
+function groupConversationTurns(messages: AgentMessage[]): AgentMessage[][] {
+  const turns: AgentMessage[][] = [];
   for (const message of messages) {
     if (message.role === "user" || turns.length === 0) turns.push([]);
     turns.at(-1)?.push(message);
@@ -666,38 +731,29 @@ function groupConversationTurns(messages: ModelMessage[]): ModelMessage[][] {
 const midTurnPruneThreshold = 0.7;
 const prunedToolResultMarker = "[earlier tool result elided to fit the context window; the full result is in the session log]";
 
-type ToolMessage = Extract<ModelMessage, { role: "tool" }>;
+type ToolMessage = AgentToolResultMessage;
 
 function isPrunedToolResult(message: ToolMessage): boolean {
-  return message.content.every((part) => part.type === "tool-result"
-    && isRecord(part.output)
-    && part.output.type === "text"
-    && part.output.value === prunedToolResultMarker);
+  return message.content.every((part) => part.type === "text" && part.text === prunedToolResultMarker);
 }
 
 function prunedToolResultMessage(message: ToolMessage): ToolMessage {
   return {
     ...message,
-    content: message.content.map((part) => part.type === "tool-result"
-      ? { ...part, output: { type: "text" as const, value: prunedToolResultMarker } }
-      : part)
+    content: [{ type: "text", text: prunedToolResultMarker }]
   };
 }
 
-function messageTokenCost(message: ModelMessage): number {
+function messageTokenCost(message: AgentMessage): number {
   return estimateTokens(messageText(message)) + estimateTokens(messageReasoning(message)) + estimateMediaTokens(message) + 4;
 }
 
-function estimateMediaTokens(message: ModelMessage): number {
-  if (typeof message.content === "string") return 0;
+function estimateMediaTokens(message: AgentMessage): number {
+  if (message.role === "assistant" || typeof message.content === "string") return 0;
   return message.content.reduce((total, part) => {
-    if (part.type !== "file") return total;
-    if (part.mediaType?.startsWith("image/")) return total + 1_024;
-    if (part.mediaType?.startsWith("audio/")) return total + 2_048;
+    if (part.type !== "image" && part.type !== "audio") return total;
+    if (part.mimeType.startsWith("image/")) return total + 1_024;
+    if (part.mimeType.startsWith("audio/")) return total + 2_048;
     return total + 512;
   }, 0);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

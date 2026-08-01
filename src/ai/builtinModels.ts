@@ -1,0 +1,71 @@
+/**
+ * 内置模型基线。
+ *
+ * 这份目录只提供离线可见的常用模型；实时 `/models` 结果和插件目录会在运行时覆盖同 ID
+ * 条目，用户配置的模型别名拥有最高优先级。
+ */
+import { inferReasoningEfforts } from "./capabilities.js";
+import type { ModelCatalogEntry } from "./types.js";
+
+type BuiltinModelOptions = Partial<Omit<ModelCatalogEntry, "id" | "displayName" | "provider" | "reasoningEfforts">>;
+
+function model(id: string, displayName = id, options: BuiltinModelOptions = {}): ModelCatalogEntry {
+  return {
+    id,
+    displayName,
+    provider: "",
+    contextWindow: options.contextWindow,
+    maxOutputTokens: options.maxOutputTokens,
+    capabilities: { streaming: true, ...options.capabilities },
+    reasoningEfforts: inferReasoningEfforts(id),
+    thinkingLevelMap: options.thinkingLevelMap,
+    apiBackend: options.apiBackend,
+    baseUrl: options.baseUrl,
+    headers: options.headers,
+    compatibility: options.compatibility
+  };
+}
+
+export const builtinProviderModels: Record<string, ModelCatalogEntry[]> = {
+  deepseek: [model("deepseek-chat", "DeepSeek Chat"), model("deepseek-reasoner", "DeepSeek Reasoner")],
+  openai: [
+    model("gpt-5.2", "GPT-5.2", { capabilities: { tools: true, reasoning: true, vision: true } }),
+    model("gpt-5-mini", "GPT-5 Mini", { capabilities: { tools: true, reasoning: true, vision: true } }),
+    model("gpt-4.1", "GPT-4.1", { capabilities: { tools: true, vision: true } })
+  ],
+  anthropic: [
+    model("claude-opus-4-6", "Claude Opus 4.6", { capabilities: { tools: true, reasoning: true, vision: true } }),
+    model("claude-sonnet-4-5", "Claude Sonnet 4.5", { capabilities: { tools: true, reasoning: true, vision: true } }),
+    model("claude-haiku-4-5", "Claude Haiku 4.5", { capabilities: { tools: true, reasoning: true, vision: true } })
+  ],
+  gemini: [
+    model("gemini-3.5-pro", "Gemini 3.5 Pro", { capabilities: { tools: true, reasoning: true, vision: true, audio: true } }),
+    model("gemini-3.5-flash", "Gemini 3.5 Flash", { capabilities: { tools: true, vision: true, audio: true } })
+  ],
+  "google-native": [
+    model("gemini-3.5-pro", "Gemini 3.5 Pro", { apiBackend: "google_generative_ai", capabilities: { tools: true, reasoning: true, vision: true, audio: true } }),
+    model("gemini-3.5-flash", "Gemini 3.5 Flash", { apiBackend: "google_generative_ai", capabilities: { tools: true, vision: true, audio: true } })
+  ],
+  kimi: [model("kimi-k3", "Kimi K3"), model("kimi-k2.5", "Kimi K2.5")],
+  qwen: [model("qwen3.5-plus", "Qwen 3.5 Plus"), model("qwen3-coder-plus", "Qwen 3 Coder Plus")],
+  xai: [model("grok-4.5", "Grok 4.5"), model("grok-4", "Grok 4")],
+  mistral: [model("mistral-large-latest", "Mistral Large"), model("codestral-latest", "Codestral")],
+  groq: [model("openai/gpt-oss-120b", "GPT OSS 120B"), model("llama-3.3-70b-versatile", "Llama 3.3 70B")],
+  openrouter: [],
+  cerebras: [model("gpt-oss-120b", "GPT OSS 120B"), model("llama3.1-8b", "Llama 3.1 8B")],
+  togetherai: [model("meta-llama/Llama-3.3-70B-Instruct-Turbo", "Llama 3.3 70B")],
+  "fireworks-ai": [model("accounts/fireworks/models/kimi-k2p5", "Kimi K2.5")],
+  nvidia: [model("nvidia/nemotron-3-super-120b-a12b", "NVIDIA Nemotron")],
+  deepinfra: [model("meta-llama/Llama-3.3-70B-Instruct", "Llama 3.3 70B")],
+  siliconflow: [model("deepseek-ai/DeepSeek-V3", "DeepSeek V3"), model("Qwen/Qwen3-Coder-480B-A35B-Instruct", "Qwen3 Coder")],
+  zai: [model("glm-5", "GLM-5"), model("glm-4.7", "GLM-4.7")],
+  minimax: [model("MiniMax-M2.5", "MiniMax M2.5")],
+  "minimax-cn": [model("MiniMax-M2.5", "MiniMax M2.5")],
+  stepfun: [model("step-3.5-flash", "Step 3.5 Flash")],
+  volcengine: [],
+  cohere: [model("command-a-03-2025", "Command A")],
+  huggingface: [],
+  ollama: [model("llama3.2", "Llama 3.2"), model("qwen3", "Qwen 3")],
+  "lm-studio": [],
+  localai: []
+};

@@ -4,11 +4,19 @@ import { pathToFileURL } from "node:url";
 import type { AgentConfig } from "../config/schema.js";
 import type { Tool } from "../tools/types.js";
 import type { ToolRegistry } from "../tools/registry.js";
+import type { ModelCatalogEntry, ProviderDefinition } from "../ai/types.js";
+import type { ApiAdapter } from "../llm/ApiAdapterRegistry.js";
+import { AiRegistry } from "../llm/AiRegistry.js";
+import type { CredentialRefreshHandler } from "../llm/AiRegistry.js";
 
 export interface BinyPluginContext {
   workspaceRoot: string;
   config: AgentConfig;
   registerTool(tool: Tool): void;
+  registerProvider(definition: ProviderDefinition, models?: readonly ModelCatalogEntry[]): void;
+  registerModels(providerType: string, models: readonly ModelCatalogEntry[]): void;
+  registerApiAdapter(adapter: ApiAdapter): void;
+  registerCredentialHandler(id: string, handler: CredentialRefreshHandler): void;
 }
 
 interface BinyPluginModule {
@@ -21,7 +29,8 @@ export async function loadPlugins(
   workspaceRoot: string,
   configuredPaths: string[],
   config: AgentConfig,
-  registry: ToolRegistry
+  registry: ToolRegistry,
+  ai: AiRegistry = new AiRegistry()
 ): Promise<string[]> {
   const canonicalWorkspace = await fs.realpath(path.resolve(workspaceRoot));
   const files: string[] = [];
@@ -39,7 +48,11 @@ export async function loadPlugins(
     const context: BinyPluginContext = {
       workspaceRoot: canonicalWorkspace,
       config: pluginConfig,
-      registerTool: (tool) => registry.registerPluginTool(tool)
+      registerTool: (tool) => registry.registerPluginTool(tool),
+      registerProvider: (definition, models) => ai.registerProvider(definition, models),
+      registerModels: (providerType, models) => ai.registerModels(providerType, models),
+      registerApiAdapter: (adapter) => ai.registerApiAdapter(adapter),
+      registerCredentialHandler: (id, handler) => ai.registerCredentialHandler(id, handler)
     };
     if (typeof imported.default === "function") await imported.default(context);
     if (typeof imported.register === "function") await imported.register(context);

@@ -13,19 +13,20 @@
  */
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { ModelMessage } from "../agent/core/modelMessage.js";
+import type { AgentMessage } from "../agent/core/types.js";
 import { agentDir, ensureAgentDirs } from "./store.js";
 
-const turnStateVersion = 1;
+const turnStateVersion = 2;
 
 export interface InterruptedTurn {
   sessionId: string;
   /** 触发这个回合的用户输入，用于向用户描述要续跑的是什么。 */
   prompt: string;
   /** 最后一个完成的步结束时的完整 context。 */
-  messages: ModelMessage[];
+  systemPrompt?: string;
+  messages: AgentMessage[];
   completedSteps: number;
-  /** Completion Gate 的结构化事实；旧断点没有该字段时按空事实兼容。 */
+  /** Completion Gate 的结构化事实。 */
   facts?: unknown;
   /** blocked / incomplete 终态的恢复边界；普通工具步断点没有该字段。 */
   terminal?: InterruptedTurnTerminal;
@@ -47,7 +48,8 @@ export class TurnStore {
 
   async save(
     prompt: string,
-    messages: readonly ModelMessage[],
+    systemPrompt: string | undefined,
+    messages: readonly AgentMessage[],
     completedSteps: number,
     facts?: unknown,
     terminal?: InterruptedTurnTerminal,
@@ -57,6 +59,7 @@ export class TurnStore {
     const payload: InterruptedTurn = {
       sessionId: this.sessionId,
       prompt,
+      systemPrompt,
       messages: [...messages],
       completedSteps,
       facts,
@@ -72,6 +75,7 @@ export class TurnStore {
   async load(): Promise<InterruptedTurn | undefined> {
     try {
       const parsed: unknown = JSON.parse(await fs.readFile(this.filePath(), "utf8"));
+      if ((parsed as { version?: unknown }).version !== turnStateVersion) return undefined;
       const turn = (parsed as { turn?: unknown }).turn;
       return isInterruptedTurn(turn) ? turn : undefined;
     } catch {
@@ -93,8 +97,10 @@ function isInterruptedTurn(value: unknown): value is InterruptedTurn {
   const candidate = value as Partial<InterruptedTurn>;
   return typeof candidate.sessionId === "string"
     && typeof candidate.prompt === "string"
+    && (candidate.systemPrompt === undefined || typeof candidate.systemPrompt === "string")
     && Array.isArray(candidate.messages)
     && candidate.messages.length > 0
+    && candidate.messages.every(isAgentMessage)
     && Number.isSafeInteger(candidate.completedSteps)
     && (candidate.completedSteps ?? -1) >= 0
     && (candidate.terminal === undefined || isInterruptedTurnTerminal(candidate.terminal))
@@ -102,6 +108,51 @@ function isInterruptedTurn(value: unknown): value is InterruptedTurn {
       || Array.isArray(candidate.previousTerminals)
       && candidate.previousTerminals.every(isInterruptedTurnTerminal))
     && typeof candidate.updatedAt === "string";
+}
+
+function isAgentMessage(value: unknown): value is AgentMessage {
+  if (typeof value !== "object" || value === null) return false;
+  const message = value as Record<string, unknown>;
+  if (message.role === "user") {
+    return typeof message.content === "string"
+      || Array.isArray(message.content) && message.content.every(isUserContent);
+  }
+  if (message.role === "assistant") {
+    return Array.isArray(message.content) && message.content.every((part) => {
+      if (typeof part !== "object" || part === null) return false;
+      const content = part as Record<string, unknown>;
+      if (content.type === "text" || content.type === "reasoning") return typeof content.text === "string";
+      return content.type === "toolCall"
+        && typeof content.id === "string"
+        && typeof content.name === "string"
+        && typeof content.arguments === "object"
+        && content.arguments !== null
+        && !Array.isArray(content.arguments);
+    });
+  }
+  return message.role === "toolResult"
+    && typeof message.toolCallId === "string"
+    && typeof message.toolName === "string"
+    && Array.isArray(message.content)
+    && message.content.every(isToolResultContent);
+}
+
+function isUserContent(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const content = value as Record<string, unknown>;
+  if (content.type === "text") return typeof content.text === "string";
+  return (content.type === "image" || content.type === "audio")
+    && typeof content.data === "string"
+    && typeof content.mimeType === "string";
+}
+
+function isToolResultContent(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const content = value as Record<string, unknown>;
+  if (content.type === "text") return typeof content.text === "string";
+  return content.type === "image"
+    && typeof content.data === "string"
+    && typeof content.mimeType === "string";
 }
 
 function isInterruptedTurnTerminal(value: unknown): value is InterruptedTurnTerminal {

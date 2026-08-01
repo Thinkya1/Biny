@@ -1,30 +1,34 @@
 /**
  * Session 回放：事件流 → 模型对话历史。
  *
- * session 里记的是扁平事件（user_message / assistant_message / tool_call / tool_result），
- * 而模型需要的是「assistant 消息里带 tool-call 分片、紧跟 tool 角色消息」的嵌套结构，
- * 这里负责把前者重新组装成后者，同时补齐被中断的工具调用、抽出最近的上下文状态和用量。
+ * 新 session 同时记录可直接重放的 canonical AgentMessage 和用于界面/审计的扁平投影；旧 session
+ * 只有扁平事件。这里优先读取 canonical 消息，并为旧格式重组 assistant/tool-call/tool-result，
+ * 同时补齐被中断的工具调用、抽出消息树、最近上下文状态和用量。
  *
  * 恢复出来的历史会直接发回模型，所以宁可丢弃可疑内容（如缺签名的思考块），也不能拼出
  * 服务端会拒绝的消息序列。
  */
-import type { ModelMessage } from "../agent/core/modelMessage.js";
+import type { AgentMessage, AgentReasoningContent } from "../agent/core/types.js";
 import { readSessionEvents, readStoredSessionEvents } from "./events.js";
 import type { ReasoningBlock, SessionContextState, SessionContextUsage, SessionEvent, SessionUsage } from "./recorder.js";
-
-type AssistantContent = Extract<ModelMessage, { role: "assistant" }>["content"];
-type AssistantPart = Exclude<AssistantContent, string>[number];
-type ReplayReasoningPart = Extract<AssistantPart, { type: "reasoning" }>;
 
 export interface SessionReplay {
   events: SessionEvent[];
   /** 会话超过大小上限、只回放了最近部分时为 true。 */
   truncated?: boolean;
-  messages: ModelMessage[];
+  messages: AgentMessage[];
   contextUsage?: SessionContextUsage;
   contextState?: SessionContextState;
   usage: SessionUsage[];
   recoveredToolResults: Array<Extract<SessionEvent, { type: "tool_result" }>>;
+  messageTree: SessionMessageNode[];
+}
+
+export interface SessionMessageNode {
+  id: string;
+  parentId?: string;
+  eventIndex: number;
+  message: AgentMessage;
 }
 
 export async function replaySession(filePath: string): Promise<SessionReplay> {
@@ -45,8 +49,29 @@ export function replaySessionEvents(recordedEvents: SessionEvent[]): SessionRepl
     contextUsage: latestContextUsage(events),
     contextState: latestContextState(events),
     usage: sessionUsage(events),
-    recoveredToolResults
+    recoveredToolResults,
+    messageTree: sessionMessageTree(events)
   };
+}
+
+/** 新格式直接保留 canonical 消息的父子关系；旧事件没有 ID 时仍按原重放路径兼容。 */
+export function sessionMessageTree(events: SessionEvent[]): SessionMessageNode[] {
+  return events.flatMap((event, eventIndex): SessionMessageNode[] => {
+    if (event.type === "user_message" && !event.auditOnly) {
+      if (!event.messageId) return [];
+      return [{
+        id: event.messageId,
+        parentId: event.parentMessageId,
+        eventIndex,
+        message: { role: "user", content: event.content }
+      }];
+    }
+    if (event.type === "agent_message") {
+      if (!event.messageId) return [];
+      return [{ id: event.messageId, parentId: event.parentMessageId, eventIndex, message: event.message }];
+    }
+    return [];
+  });
 }
 
 /**
@@ -128,8 +153,8 @@ function sessionUsage(events: SessionEvent[]): SessionUsage[] {
  * 同一批调用合并进一条 assistant 消息。因此这里维护一组 pending 状态，遇到 tool_result 或
  * 新的对话消息时才 flush 出去；`callsFlushed` 防止同一批调用被写入两次。
  */
-export function sessionEventsToConversation(events: SessionEvent[]): ModelMessage[] {
-  const messages: ModelMessage[] = [];
+export function sessionEventsToConversation(events: SessionEvent[]): AgentMessage[] {
+  const messages: AgentMessage[] = [];
   const pendingCalls: Array<{ id: string; name: string; args: unknown }> = [];
   const openCalls = new Map<string, { id: string; name: string; args: unknown }>();
   let pendingAssistantContent = "";
@@ -137,6 +162,7 @@ export function sessionEventsToConversation(events: SessionEvent[]): ModelMessag
   let pendingReasoningProviderOptions: Record<string, unknown> | undefined;
   let pendingReasoningBlocks: ReasoningBlock[] | undefined;
   let callsFlushed = false;
+  let canonicalTurn = false;
 
   const flushPendingCalls = (): void => {
     if (!pendingCalls.length || callsFlushed) return;
@@ -145,7 +171,12 @@ export function sessionEventsToConversation(events: SessionEvent[]): ModelMessag
       content: [
         ...replayReasoningParts(pendingReasoningBlocks, pendingReasoningContent, pendingReasoningProviderOptions),
         ...(pendingAssistantContent ? [{ type: "text" as const, text: pendingAssistantContent }] : []),
-        ...pendingCalls.map((call) => ({ type: "tool-call" as const, toolCallId: call.id, toolName: call.name, input: call.args }))
+        ...pendingCalls.map((call) => ({
+          type: "toolCall" as const,
+          id: call.id,
+          name: call.name,
+          arguments: normalizeToolArguments(call.args)
+        }))
       ]
     });
     callsFlushed = true;
@@ -174,10 +205,20 @@ export function sessionEventsToConversation(events: SessionEvent[]): ModelMessag
       flushPendingCalls();
       resetPendingCalls();
       messages.push({ role: "user", content: event.content });
+      canonicalTurn = false;
+      continue;
+    }
+
+    if (event.type === "agent_message") {
+      flushPendingCalls();
+      resetPendingCalls();
+      messages.push(event.message);
+      canonicalTurn = true;
       continue;
     }
 
     if (event.type === "assistant_message") {
+      if (canonicalTurn) continue;
       flushPendingCalls();
       resetPendingCalls();
       if (!event.content && !event.reasoningContent) continue;
@@ -192,6 +233,7 @@ export function sessionEventsToConversation(events: SessionEvent[]): ModelMessag
     }
 
     if (event.type === "tool_call") {
+      if (canonicalTurn) continue;
       // 上一批调用已经 flush 且全部收到结果，说明这是新一批调用，重新开始累积。
       if (callsFlushed && openCalls.size === 0) resetPendingCalls();
       const toolCall = {
@@ -211,11 +253,15 @@ export function sessionEventsToConversation(events: SessionEvent[]): ModelMessag
     }
 
     if (event.type === "tool_result") {
+      if (canonicalTurn) continue;
       const toolCallId = event.toolCallId ?? findToolCallId(openCalls, event.tool) ?? `session-tool-${String(event.sequence ?? index + 1)}`;
       flushPendingCalls();
       messages.push({
-        role: "tool",
-        content: [{ type: "tool-result", toolCallId, toolName: event.tool, output: { type: "text", value: stringifyResult(event.result) } }]
+        role: "toolResult",
+        toolCallId,
+        toolName: event.tool,
+        content: [{ type: "text", text: stringifyResult(event.result) }],
+        details: event.result
       });
       openCalls.delete(toolCallId);
       continue;
@@ -240,18 +286,24 @@ function replayReasoningParts(
   blocks: ReasoningBlock[] | undefined,
   content: string | undefined,
   providerOptions: Record<string, unknown> | undefined
-): ReplayReasoningPart[] {
+): AgentReasoningContent[] {
   if (blocks?.length) {
     return blocks
       .filter((block) => block.text && block.providerOptions)
       .map((block) => ({
         type: "reasoning" as const,
         text: block.text,
-        providerOptions: block.providerOptions as ReplayReasoningPart["providerOptions"]
+        providerMetadata: block.providerOptions
       }));
   }
   if (!content || !providerOptions) return [];
-  return [{ type: "reasoning", text: content, providerOptions: providerOptions as ReplayReasoningPart["providerOptions"] }];
+  return [{ type: "reasoning", text: content, providerMetadata: providerOptions }];
+}
+
+function normalizeToolArguments(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : { value };
 }
 
 function findToolCallId(calls: Map<string, { id: string; name: string; args: unknown }>, toolName: string): string | undefined {

@@ -49,7 +49,7 @@ export async function loadGlobalConfig(options: ConfigPathOptions = {}): Promise
   }
 }
 
-/** 读取指定目录下的旧式配置文件，供桌面测试兼容层和 doctor 诊断使用。 */
+/** 从指定的全局配置目录读取当前格式，测试和桌面端可显式传入隔离目录。 */
 export async function loadConfigFile(root: string): Promise<AgentConfig> {
   let location: ConfigLocation;
   try {

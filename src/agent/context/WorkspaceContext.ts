@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ModelMessage } from "../core/modelMessage.js";
+import type { AgentMessage } from "../core/types.js";
 import { messageText } from "../modelMessages.js";
 import { collectProjectContext } from "../../project/ProjectContext.js";
 import { resolveWorkspaceDirectory, resolveWorkspacePath, toWorkspaceRelative } from "../../workspace/resolvePath.js";
@@ -43,7 +43,7 @@ export class WorkspaceContext {
     private readonly workspaceRoot: string,
     private readonly ignore: string[],
     private readonly instructionMaxBytes: number,
-    /** 全局指令文件（参考 pi 的全局 AGENTS.md）；传 undefined 关闭，默认 ~/.biny/AGENTS.md。 */
+    /** 全局指令文件；传 undefined 关闭，默认 ~/.biny/AGENTS.md。 */
     private readonly globalInstructionFile: string | undefined = path.join(os.homedir(), ".biny", "AGENTS.md")
   ) {
     this.canonicalWorkspaceRoot = resolveWorkspaceDirectory(workspaceRoot, ".", []);
@@ -96,7 +96,7 @@ export class WorkspaceContext {
     }
   }
 
-  restoreFromHistory(messages: ModelMessage[]): void {
+  restoreFromHistory(messages: AgentMessage[]): void {
     this.activePaths.splice(0, this.activePaths.length);
     this.recentSummaries.splice(0, this.recentSummaries.length);
     for (const message of messages) {

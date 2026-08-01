@@ -166,6 +166,8 @@ async function searchWithGoogle(
   recency: SearchRecency | undefined,
   signal: AbortSignal | undefined
 ): Promise<WebSearchResult[]> {
+  // TODO: 桌面端可复用本机 Electron/Chromium 的持久浏览器 session，在隐藏的 BrowserWindow 中
+  // 打开 Google 结果页并从渲染后的 DOM 提取结果；CLI 等无 Electron 环境继续保留当前 HTTP 路径。
   const url = new URL("https://www.google.com/search");
   url.searchParams.set("q", query);
   // 结果页里混着广告、"People also ask" 等非自然结果，多要一些再截断。

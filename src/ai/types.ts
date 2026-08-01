@@ -30,12 +30,23 @@ export interface ModelContextBudget {
  */
 export interface ProviderDefinition {
   type: ModelProvider;
+  name?: string;
   protocol: AiProtocol;
+  api?: ModelApiBackend;
   baseUrl?: string;
   apiKeyEnv?: string;
   requiresApiKey: boolean;
   authModes: AiAuthMode[];
   reasoningProtocol?: "deepseek" | "openai" | "anthropic" | "alibaba" | "moonshotai";
+  fetchModels?: (context: {
+    providerAlias: string;
+    config: ProviderConfig;
+    signal?: AbortSignal;
+  }) => Promise<readonly ModelCatalogEntry[]>;
+  filterModels?: (
+    models: readonly ModelCatalogEntry[],
+    context: { configured: boolean; authMode: AiAuthMode | undefined }
+  ) => readonly ModelCatalogEntry[];
 }
 
 export interface ModelCatalogEntry {

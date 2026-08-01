@@ -21,18 +21,31 @@ export function createRetryFetch(policy: RetryPolicy, baseFetch: typeof fetch = 
   const maxDelayMs = Math.max(initialDelayMs, policy.maxDelayMs);
   return async (input, init) => {
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let responseDelayMs: number | undefined;
       try {
         const response = await baseFetch(input, init);
         if (!retryableStatuses.has(response.status) || attempt === maxAttempts) return response;
+        responseDelayMs = retryDelayMs(response);
       } catch (error) {
         if (attempt === maxAttempts) throw error;
       }
       // 退避前先检查取消，避免用户已中断还白等一轮。
       init?.signal?.throwIfAborted();
-      await delay(Math.min(maxDelayMs, initialDelayMs * 2 ** (attempt - 1)), init?.signal ?? undefined);
+      await delay(Math.min(maxDelayMs, responseDelayMs ?? initialDelayMs * 2 ** (attempt - 1)), init?.signal ?? undefined);
     }
     throw new Error("Provider request retry loop ended unexpectedly.");
   };
+}
+
+function retryDelayMs(response: Response): number | undefined {
+  const milliseconds = Number(response.headers.get("retry-after-ms"));
+  if (Number.isFinite(milliseconds) && milliseconds >= 0) return milliseconds;
+  const retryAfter = response.headers.get("retry-after");
+  if (!retryAfter) return undefined;
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const date = Date.parse(retryAfter);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
 }
 
 /** 可被取消的等待：定时器和 abort 监听互相清理，不留悬挂的 timer 或监听器。 */

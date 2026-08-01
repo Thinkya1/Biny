@@ -4,7 +4,7 @@ export interface NativeTextGenerationOptions {
   signal?: AbortSignal;
   maxOutputTokens?: number;
   providerOptions?: Record<string, unknown>;
-  reasoning?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  reasoning?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   timeoutMs?: number;
 }
 
@@ -21,7 +21,8 @@ export async function generateNativeText(
 ): Promise<NativeTextGenerationResult> {
   let text = "";
   let usage: AgentUsage | undefined;
-  for await (const event of await model.stream({ messages, tools: [] }, options)) {
+  const streamModel = model.streamSimple?.bind(model) ?? model.stream.bind(model);
+  for await (const event of await streamModel({ messages, tools: [] }, options)) {
     options.signal?.throwIfAborted();
     if (event.type === "text-delta") text += event.text;
     else if (event.type === "finish") usage = event.usage;

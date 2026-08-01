@@ -1,0 +1,164 @@
+/**
+ * Google Generative AI 原生协议 Adapter。
+ *
+ * Gemini 的 parts、functionCall 和 usageMetadata 在这里归一化，上层只接收 Biny 的统一事件。
+ */
+import type {
+  AgentMessage,
+  AgentTool,
+  AgentUserMessage,
+  ModelStreamContext,
+  ModelStreamEvent,
+  ModelStreamOptions
+} from "../../agent/core/types.js";
+import type { ApiAdapter, ApiAdapterRequest } from "../ApiAdapterRegistry.js";
+import {
+  isRecord,
+  parseJson,
+  providerHttpError,
+  randomToolCallId,
+  readNumber,
+  readSse,
+  readString,
+  removeUndefined
+} from "./shared.js";
+
+export const googleGenerativeAiAdapter: ApiAdapter = {
+  id: "google_generative_ai",
+  stream: (request, context, options) => streamGoogle(request, context, options)
+};
+
+async function* streamGoogle(
+  request: ApiAdapterRequest,
+  context: ModelStreamContext,
+  options: ModelStreamOptions = {}
+): AsyncGenerator<ModelStreamEvent, void, void> {
+  const body: Record<string, unknown> = {
+    systemInstruction: context.systemPrompt ? { parts: [{ text: context.systemPrompt }] } : undefined,
+    contents: context.messages.map(googleMessage),
+    tools: context.tools.length ? [{ functionDeclarations: context.tools.map(googleTool) }] : undefined,
+    generationConfig: {
+      maxOutputTokens: options.maxOutputTokens,
+      thinkingConfig: googleThinking(options.reasoning)
+    }
+  };
+  const baseUrl = request.baseUrl.replace(/\/+$/u, "");
+  const endpoint = `${baseUrl}/models/${encodeURIComponent(request.modelId)}:streamGenerateContent?alt=sse`;
+  const response = await request.fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      ...(request.apiKey ? { "x-goog-api-key": request.apiKey } : {}),
+      ...request.headers
+    },
+    body: JSON.stringify(removeUndefined(body)),
+    signal: requestSignal(options)
+  });
+  if (!response.ok) throw await providerHttpError(response, "Google Generative AI provider");
+  if (!response.body) throw new Error("Google Generative AI provider returned an empty response body.");
+
+  yield { type: "start" };
+  if (!response.headers.get("content-type")?.includes("text/event-stream")) {
+    const payload = await response.json() as unknown;
+    for (const item of Array.isArray(payload) ? payload : [payload]) yield* googlePayloadEvents(item);
+    return;
+  }
+  for await (const event of readSse(response.body)) {
+    yield* googlePayloadEvents(parseJson(event.data, "Google Generative AI stream event"));
+  }
+}
+
+function* googlePayloadEvents(value: unknown): Generator<ModelStreamEvent, void, void> {
+  if (!isRecord(value)) return;
+  if (isRecord(value.error)) throw new Error(`Google Generative AI provider returned an error: ${readString(value.error.message) ?? "unknown error"}`);
+  const candidate = Array.isArray(value.candidates) && isRecord(value.candidates[0]) ? value.candidates[0] : undefined;
+  const content = candidate && isRecord(candidate.content) ? candidate.content : undefined;
+  const parts = content && Array.isArray(content.parts) ? content.parts : [];
+  for (const part of parts) {
+    if (!isRecord(part)) continue;
+    const text = readString(part.text);
+    if (text) {
+      yield part.thought === true
+        ? { type: "reasoning-delta", id: "reasoning-0", text }
+        : { type: "text-delta", text };
+    }
+    if (isRecord(part.functionCall)) {
+      yield {
+        type: "tool-call",
+        id: readString(part.functionCall.id) ?? randomToolCallId(),
+        name: readString(part.functionCall.name) ?? "unknown",
+        arguments: isRecord(part.functionCall.args) ? part.functionCall.args : {},
+        invalid: !isRecord(part.functionCall.args)
+      };
+    }
+  }
+  const finishReason = readString(candidate?.finishReason);
+  const usage = isRecord(value.usageMetadata) ? value.usageMetadata : undefined;
+  if (finishReason || usage) {
+    yield {
+      type: "finish",
+      reason: mapGoogleStopReason(finishReason),
+      usage: usage ? {
+        inputTokens: readNumber(usage.promptTokenCount),
+        outputTokens: readNumber(usage.candidatesTokenCount),
+        totalTokens: readNumber(usage.totalTokenCount),
+        cacheReadTokens: readNumber(usage.cachedContentTokenCount)
+      } : undefined
+    };
+  }
+}
+
+function googleMessage(message: AgentMessage): unknown {
+  if (message.role === "user") return { role: "user", parts: googleUserParts(message.content) };
+  if (message.role === "assistant") {
+    return {
+      role: "model",
+      parts: message.content.flatMap((part): unknown[] => {
+        if (part.type === "text") return [{ text: part.text }];
+        if (part.type === "reasoning") return [{ text: part.text, thought: true }];
+        return [{ functionCall: { id: part.id, name: part.name, args: part.arguments } }];
+      })
+    };
+  }
+  return {
+    role: "user",
+    parts: [{
+      functionResponse: {
+        id: message.toolCallId,
+        name: message.toolName,
+        response: { output: message.content.map((part) => part.type === "text" ? part.text : `[${part.mimeType} image]`).join("\n"), isError: message.isError }
+      }
+    }]
+  };
+}
+
+function googleUserParts(content: AgentUserMessage["content"]): unknown[] {
+  if (typeof content === "string") return [{ text: content }];
+  return content.map((part) => part.type === "text"
+    ? { text: part.text }
+    : { inlineData: { mimeType: part.mimeType, data: part.data } });
+}
+
+function googleTool(tool: AgentTool): unknown {
+  return { name: tool.name, description: tool.description, parameters: tool.parameters };
+}
+
+function googleThinking(reasoning: ModelStreamOptions["reasoning"]): Record<string, unknown> | undefined {
+  if (reasoning === undefined) return undefined;
+  if (reasoning === "off") return { thinkingBudget: 0 };
+  const budgets = { minimal: 512, low: 1_024, medium: 4_096, high: 8_192, xhigh: 16_384, max: 24_576 };
+  return { thinkingBudget: budgets[reasoning], includeThoughts: true };
+}
+
+function mapGoogleStopReason(reason: string | undefined): "stop" | "tool-calls" | "length" | "error" | "other" {
+  if (!reason || reason === "STOP") return "stop";
+  if (reason === "MAX_TOKENS") return "length";
+  if (reason === "MALFORMED_FUNCTION_CALL" || reason === "SAFETY" || reason === "RECITATION") return "error";
+  return "other";
+}
+
+function requestSignal(options: ModelStreamOptions): AbortSignal | undefined {
+  const timeout = options.timeoutMs ? AbortSignal.timeout(options.timeoutMs) : undefined;
+  return options.signal && timeout ? AbortSignal.any([options.signal, timeout]) : options.signal ?? timeout;
+}

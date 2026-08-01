@@ -5,9 +5,11 @@
  * `ModelStreamEvent`，Agent Loop 就可以独立处理消息、工具和事件生命周期。
  */
 import type { JsonSchema } from "../../tools/schema.js";
+import type { ReasoningEffort } from "../../config/schema.js";
 
 export type AgentTextContent = { type: "text"; text: string };
 export type AgentImageContent = { type: "image"; data: string; mimeType: string };
+export type AgentAudioContent = { type: "audio"; data: string; mimeType: string };
 export type AgentReasoningContent = {
   type: "reasoning";
   text: string;
@@ -29,7 +31,7 @@ export type AgentMessage =
 
 export interface AgentUserMessage {
   role: "user";
-  content: string | Array<AgentTextContent | AgentImageContent>;
+  content: string | Array<AgentTextContent | AgentImageContent | AgentAudioContent>;
   timestamp?: number;
 }
 
@@ -103,7 +105,7 @@ export interface ModelStreamContext {
 export interface ModelStreamOptions {
   signal?: AbortSignal;
   maxOutputTokens?: number;
-  reasoning?: string;
+  reasoning?: "off" | ReasoningEffort;
   providerOptions?: Record<string, unknown>;
   timeoutMs?: number;
 }
@@ -113,6 +115,11 @@ export interface AgentModel {
   modelId: string;
   supportsTools?: boolean;
   stream(
+    context: ModelStreamContext,
+    options?: ModelStreamOptions
+  ): Promise<AsyncIterable<ModelStreamEvent>>;
+  /** 将通用推理档位转换成当前 Provider 的请求参数后再流式调用。 */
+  streamSimple?(
     context: ModelStreamContext,
     options?: ModelStreamOptions
   ): Promise<AsyncIterable<ModelStreamEvent>>;
@@ -139,6 +146,7 @@ export type AgentEvent =
   | { type: "tool_execution_start"; toolCallId: string; toolName: string; args: Record<string, unknown> }
   | { type: "tool_execution_update"; toolCallId: string; toolName: string; update: AgentToolResult }
   | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: AgentToolResult }
+  | { type: "model_retry"; reason: string; attempt: number; compactedMessages: number }
   | { type: "error"; error: string; fatal: boolean };
 
 export interface AgentLoopTurnContext {
@@ -146,6 +154,13 @@ export interface AgentLoopTurnContext {
   toolResults: AgentToolResultMessage[];
   context: AgentContext;
   newMessages: AgentMessage[];
+}
+
+export interface AgentLoopNextTurnSnapshot {
+  context?: AgentContext;
+  model?: AgentModel;
+  modelOptions?: ModelStreamOptions;
+  tools?: AgentTool[];
 }
 
 export interface AgentLoopConfig {
@@ -157,6 +172,12 @@ export interface AgentLoopConfig {
   getSteeringMessages?: () => Promise<AgentMessage[]>;
   getFollowUpMessages?: () => Promise<AgentMessage[]>;
   shouldStopAfterTurn?: (context: AgentLoopTurnContext) => boolean | Promise<boolean>;
+  prepareNextTurn?: (context: AgentLoopTurnContext) => Promise<AgentLoopNextTurnSnapshot | undefined>;
+  recoverFromModelError?: (
+    error: string,
+    context: AgentContext,
+    signal?: AbortSignal
+  ) => Promise<{ reason: string; attempt: number; compactedMessages: number } | undefined>;
   beforeToolCall?: (context: {
     assistantMessage: AgentAssistantMessage;
     toolCall: AgentToolCallContent;

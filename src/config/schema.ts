@@ -10,7 +10,6 @@ const agentSchema = z.object({
   softStepLimit: z.number().int().min(1).max(1_024).default(32),
   hardStepLimit: z.number().int().min(1).max(1_024).default(96),
   maxToolCalls: z.number().int().min(1).max(65_536).optional(),
-  maxProviderRetries: z.number().int().min(0).max(5).optional(),
   maxCompletionContinuations: z.number().int().min(0).max(32).optional(),
   maxRepeatedActions: z.number().int().min(1).max(32).default(3),
   maxConcurrentTools: z.number().int().min(1).max(32).default(4),
@@ -19,7 +18,6 @@ const agentSchema = z.object({
   softStepLimit: 32,
   hardStepLimit: 96,
   maxToolCalls: undefined,
-  maxProviderRetries: undefined,
   maxCompletionContinuations: undefined,
   maxRepeatedActions: 3,
   maxConcurrentTools: 4,
@@ -62,23 +60,15 @@ const contextSchema = z.object({
   memory: { enabled: false, autoRemember: false, maxRecalled: 3, model: undefined }
 });
 
-export const modelProviderSchema = z.enum([
-  "deepseek",
-  "openai",
-  "anthropic",
-  "claude-subscription",
-  "openai-codex",
-  "gemini",
-  "kimi",
-  "qwen",
-  "ollama",
-  "openai-compatible"
-]);
+const extensionIdSchema = z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/u);
+
+/** Provider 与 API ID 是扩展点，内置值只提供默认实现，不限制插件注册的新类型。 */
+export const modelProviderSchema = extensionIdSchema;
 
 export const providerProtocolSchema = z.enum(["anthropic", "openai-compatible"]);
 export const reasoningEffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]);
 export const thinkingLevelSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-export const modelApiBackendSchema = z.enum(["chat_completions", "responses", "anthropic_messages"]);
+export const modelApiBackendSchema = extensionIdSchema;
 
 export const modelCompatibilitySchema = z.object({
   supportsDeveloperRole: z.boolean().optional(),
@@ -113,7 +103,7 @@ const providerConfigSchema = z.object({
   requiresApiKey: z.boolean().optional(),
   authMode: z.enum(["api-key", "oauth-bearer"]).optional(),
   oauth: z.object({
-    provider: z.enum(["claude-code", "openai-codex"]),
+    provider: extensionIdSchema,
     refreshToken: z.string().min(1).optional(),
     expiresAt: z.number().int().positive(),
     accountId: z.string().min(1).optional()
@@ -125,7 +115,8 @@ const providerConfigSchema = z.object({
     maxDelayMs: z.number().int().min(0).max(120_000).default(4_000)
   }).optional(),
   modelsEndpoint: z.string().url().optional(),
-  apiBackend: z.enum(["chat_completions", "responses"]).optional(),
+  headers: z.record(z.string()).optional(),
+  apiBackend: modelApiBackendSchema.optional(),
   compatibility: modelCompatibilitySchema.optional()
 }).superRefine((provider, context) => {
   if (provider.type === "openai-compatible" && !provider.baseUrl) {
@@ -402,7 +393,7 @@ const modelAliasSchema = z.object({
   baseUrl: z.string().url().optional(),
   headers: z.record(z.string()).optional(),
   compatibility: modelCompatibilitySchema.optional(),
-  /** Pi-style canonical capability map. Missing/null levels are unsupported. */
+  /** Canonical capability map. Missing/null levels are unsupported. */
   thinkingLevelMap: thinkingLevelMapSchema.optional(),
   reasoning: modelThinkingSchema.optional(),
   pricing: modelPricingSchema.optional()
@@ -609,7 +600,6 @@ export const defaultConfig: AgentConfig = {
     softStepLimit: 32,
     hardStepLimit: 96,
     maxToolCalls: undefined,
-    maxProviderRetries: undefined,
     maxCompletionContinuations: 3,
     maxRepeatedActions: 3,
     maxConcurrentTools: 4,

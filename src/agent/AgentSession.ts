@@ -1,6 +1,5 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { ModelMessage } from "./core/modelMessage.js";
 import type { AgentConfig } from "../config/schema.js";
 import { createFileConfigStore, type AgentConfigStore } from "../config/store.js";
 import {
@@ -14,7 +13,7 @@ import {
 import { PermissionManager, type PermissionMode } from "../permission/PermissionManager.js";
 import { runPermissionCommand } from "../permission/commands.js";
 import { listSessionSummaries, parseSessionEvents, type SessionSummary } from "../session/events.js";
-import { SessionRecorder } from "../session/recorder.js";
+import { SessionRecorder, type ReasoningBlock } from "../session/recorder.js";
 import { replaySessionEvents, type SessionReplay } from "../session/replay.js";
 import {
   TurnStore,
@@ -33,7 +32,7 @@ import type {
   AgentUsage
 } from "./core/types.js";
 import { ToolExecutionCoordinator } from "./toolExecutionCoordinator.js";
-import { buildSystemPrompt } from "./prompts.js";
+import { buildSystemPrompt, refreshRuntimeSystemPrompt, withActiveRunCompactionSummary } from "./prompts.js";
 import type {
   AgentPermissionRequest,
   AgentPermissionResult,
@@ -46,13 +45,14 @@ import { LocalMemory } from "./context/LocalMemory.js";
 import { runMemoryCommand } from "./context/memoryCommands.js";
 import { WorkspaceContext } from "./context/WorkspaceContext.js";
 import type { ContextStatus } from "./context/types.js";
-import { recordNativeTelemetryEnd } from "../observability/telemetry.js";
+import { recordNativeTelemetry } from "../observability/telemetry.js";
 import { createSessionUsage, formatUsageSummary, sumSessionUsage, summarizeUsage, type UsageModelInfo } from "../observability/usage.js";
 import type { SessionUsage, UsageSummary } from "../session/metadata.js";
 import { defaultModelContextWindow, modelContextBudget } from "../ai/capabilities.js";
 import { modelCapabilities } from "../ai/capabilities.js";
 import { createNativeModelForConfig } from "../llm/nativeFactory.js";
 import type { NativeModelSettings } from "../llm/nativeFactory.js";
+import { isModelContextOverflowError } from "../llm/nativeModel.js";
 import { readAttachment, type AgentAttachment } from "../attachments/store.js";
 import type { AttachmentReference } from "../attachments/store.js";
 import { TodoStore } from "../session/todoStore.js";
@@ -123,9 +123,11 @@ export interface AgentRunOptions {
   maxSteps?: number;
   /**
    * 从已有 context 直接续跑，跳过上下文组装，也不再记一条用户消息。
-   * 对齐 pi 的 `agentLoopContinue`：续跑的是同一个回合，不是新的一轮对话。
+   * 续跑的是同一个回合，不是新的一轮对话。
    */
-  continueFrom?: ModelMessage[];
+  continueFrom?: AgentMessage[];
+  /** 与 continueFrom 对应的系统提示词；普通根回合由 ContextMemory 生成。 */
+  continueSystemPrompt?: string;
   /** 续跑同一 Turn 时不重复追加公开用户消息。 */
   recordSessionUserMessage?: boolean;
   /** 宿主显式要求 Completion Gate 执行确定性验证；不从用户文本关键词推断。 */
@@ -168,7 +170,8 @@ export interface ResumedAgentSession extends SessionReplay {
 
 interface NativeTurnArgs {
   input: string;
-  messages: ModelMessage[];
+  systemPrompt?: string;
+  messages: AgentMessage[];
   runOptions: AgentRunOptions & {
     initialRunFacts?: RunFacts;
     previousTerminals?: InterruptedTurnTerminal[];
@@ -179,7 +182,26 @@ interface NativeTurnArgs {
   completedStepsBeforeRun: number;
   workspaceBaseline: Promise<WorkspaceStateSnapshot> | undefined;
   captureWorkspaceBaseline: () => Promise<void>;
+  messageQueues: ActiveRunMessageQueues;
 }
+
+interface QueuedRunMessage {
+  messageId: string;
+  input: string;
+  attachments: AgentAttachment[];
+  message: AgentUserMessage;
+  delivery: "steer" | "followUp";
+}
+
+interface ActiveRunMessageQueues {
+  steering: QueuedRunMessage[];
+  followUps: QueuedRunMessage[];
+  delivered: WeakMap<AgentUserMessage, QueuedRunMessage>;
+  projectedAssistants: WeakSet<AgentAssistantMessage>;
+  accepting: boolean;
+}
+
+const maxQueuedRunMessages = 100;
 
 /**
  * Stateful core agent for one workspace. Hosts use this public surface instead
@@ -193,6 +215,7 @@ export class AgentSession {
   private recorder: SessionRecorder;
   private turnStore: TurnStore;
   private activeOperation: string | undefined;
+  private activeRunMessageQueues: ActiveRunMessageQueues | undefined;
   private readonly lingeringExternalTools = new Map<Promise<unknown>, { tool: string; toolCallId: string }>();
 
   constructor(private readonly options: AgentSessionOptions) {
@@ -203,7 +226,7 @@ export class AgentSession {
       options.config.context.instructionsMaxBytes
     );
     const getModel = (): AgentModel => {
-      const model = options.modelManager?.getNativeModel() ?? options.model;
+      const model = options.modelManager?.getModel() ?? options.model;
       if (!model) throw new Error("Agent model is not configured.");
       return model;
     };
@@ -307,6 +330,7 @@ export class AgentSession {
       ...runOptions,
       maxSteps: remainingSteps,
       continueFrom: continuationMessages,
+      continueSystemPrompt: turn.systemPrompt,
       recordSessionUserMessage: false,
       completedStepsBeforeRun: turn.completedSteps,
       initialRunFacts: restartRunFactsBudget(readRunFacts(turn.facts), turn.completedSteps === 0),
@@ -328,6 +352,38 @@ export class AgentSession {
     yield* this.runTurn(input, options);
   }
 
+  queueSteering(messageId: string, input: string, attachments: AgentAttachment[] = []): void {
+    this.queueRunMessage(messageId, input, attachments, "steer");
+  }
+
+  queueFollowUp(messageId: string, input: string, attachments: AgentAttachment[] = []): void {
+    this.queueRunMessage(messageId, input, attachments, "followUp");
+  }
+
+  private queueRunMessage(
+    messageId: string,
+    input: string,
+    attachments: AgentAttachment[],
+    delivery: "steer" | "followUp"
+  ): void {
+    const queues = this.activeRunMessageQueues;
+    if (!queues?.accepting) throw new Error("The active run is no longer accepting queued messages.");
+    if (!input.trim() && !attachments.length) throw new Error("Queued message cannot be empty.");
+    this.assertAttachmentsSupported(attachments);
+    if (queues.steering.length + queues.followUps.length >= maxQueuedRunMessages) {
+      throw new Error(`The active run already has ${String(maxQueuedRunMessages)} queued messages.`);
+    }
+    const clonedAttachments = attachments.map((attachment) => ({ ...attachment }));
+    const item: QueuedRunMessage = {
+      messageId,
+      input,
+      attachments: clonedAttachments,
+      message: queuedUserMessage(input, clonedAttachments),
+      delivery
+    };
+    (delivery === "steer" ? queues.steering : queues.followUps).push(item);
+  }
+
   private async *runTurn(
     input: string,
     runOptions: AgentRunOptions & {
@@ -337,6 +393,14 @@ export class AgentSession {
     } = {}
   ): AsyncGenerator<AgentSessionEvent> {
     const release = this.beginOperation("agent turn");
+    const messageQueues: ActiveRunMessageQueues = {
+      steering: [],
+      followUps: [],
+      delivered: new WeakMap(),
+      projectedAssistants: new WeakSet(),
+      accepting: true
+    };
+    this.activeRunMessageQueues = messageQueues;
     const turnController = new AbortController();
     const abortSignal = runOptions.abortSignal
       ? AbortSignal.any([runOptions.abortSignal, turnController.signal])
@@ -417,27 +481,31 @@ export class AgentSession {
       return;
     }
     const mode = runOptions.mode ?? "chat";
-    let messages: ModelMessage[];
+    let systemPrompt: string | undefined;
+    let messages: AgentMessage[];
     if (runOptions.continueFrom?.length) {
       // 续跑用的是被打断那一刻的 context，重新组装会丢掉已完成步骤的工具结果。
       messages = [...runOptions.continueFrom];
+      systemPrompt = runOptions.continueSystemPrompt;
       userMessageRecorded = true;
     } else {
     // 先把用户原始输入（以及附件引用）写进 JSONL，再组装上下文或检查模型能力。
     // 这样即使模型不支持图片、上下文构建失败或进程随后中断，恢复会话时仍能看到这次输入。
     recordUserMessage();
     try {
-      const systemPrompt = buildSystemPrompt(
+      const baseSystemPrompt = buildSystemPrompt(
         mode === "plan" ? "plan" : "qa",
         this.extensionPrompt(),
         this.options.toolRegistry.list().map((tool) => tool.name)
       );
-      messages = await this.contextMemory.prepareTurn(
+      const prepared = await this.contextMemory.prepareTurn(
         input,
-        systemPrompt,
+        baseSystemPrompt,
         abortSignal,
         this.supportedAttachments(runOptions.attachments)
       );
+      systemPrompt = prepared.systemPrompt;
+      messages = prepared.messages;
     } catch (error) {
       recordUserMessage();
       const outcome = abortSignal.aborted
@@ -483,6 +551,7 @@ export class AgentSession {
     };
     yield* this.runNativeTurn({
       input,
+      systemPrompt,
       messages,
       runOptions,
       abortSignal,
@@ -490,10 +559,13 @@ export class AgentSession {
       runBudget,
       completedStepsBeforeRun,
       workspaceBaseline,
-      captureWorkspaceBaseline
+      captureWorkspaceBaseline,
+      messageQueues
     });
     return;
     } finally {
+      messageQueues.accepting = false;
+      if (this.activeRunMessageQueues === messageQueues) this.activeRunMessageQueues = undefined;
       release();
     }
   }
@@ -507,6 +579,7 @@ export class AgentSession {
   private async *runNativeTurn(args: NativeTurnArgs): AsyncGenerator<AgentSessionEvent> {
     const {
       input,
+      systemPrompt,
       messages,
       runOptions,
       abortSignal,
@@ -514,11 +587,12 @@ export class AgentSession {
       runBudget,
       completedStepsBeforeRun,
       workspaceBaseline,
-      captureWorkspaceBaseline
+      captureWorkspaceBaseline,
+      messageQueues
     } = args;
-    const nativeModel = this.options.modelManager?.getNativeModel() ?? this.options.model;
-    const nativeSettings: NativeModelSettings | undefined = this.options.modelManager?.getNativeModelSettings()
-      ?? (nativeModel ? { model: nativeModel, maxRetries: 0, contextWindow: undefined } : undefined);
+    const nativeModel = this.options.modelManager?.getModel() ?? this.options.model;
+    const nativeSettings: NativeModelSettings | undefined = this.options.modelManager?.getModelSettings()
+      ?? (nativeModel ? { model: nativeModel, contextWindow: undefined } : undefined);
     if (!nativeSettings) {
       const outcome = failedTurn("Native model runtime is not configured.", completedStepsBeforeRun);
       this.recordError(outcome.error);
@@ -528,6 +602,7 @@ export class AgentSession {
       yield doneEvent(outcome);
       return;
     }
+    let activeModelSettings = nativeSettings;
 
     const permissionManager = this.options.permissionManager;
     const facts = new RunFactsCollector(runOptions.initialRunFacts);
@@ -552,6 +627,9 @@ export class AgentSession {
     const allowedToolNames = mode === "plan"
       ? new Set(this.options.toolRegistry.list().filter((tool) => tool.risk === "read").map((tool) => tool.name))
       : undefined;
+    let stepAssistantContent = "";
+    let stepReasoningOutput = "";
+    let stepReasoningBlocks: ReasoningBlock[] | undefined;
     const pendingEvents: AgentSessionEvent[] = [];
     const emitUpdate = (event: AgentSessionEvent): void => {
       if (
@@ -566,7 +644,13 @@ export class AgentSession {
       runtime,
       permissionManager,
       emitUpdate,
-      undefined,
+      () => ({
+        // 工具审计必须绑定到发起它的模型 step，不能等整个 run 结束后再取累计 reasoning。
+        assistantContent: stepAssistantContent || undefined,
+        reasoningContent: stepReasoningOutput || undefined,
+        reasoningProviderOptions: stepReasoningBlocks?.length === 1 ? stepReasoningBlocks[0]?.providerOptions : undefined,
+        reasoningBlocks: stepReasoningBlocks
+      }),
       allowedToolNames,
       {
         maxToolCalls: runBudget.maxToolCalls,
@@ -603,32 +687,80 @@ export class AgentSession {
       onVerification: (verification) => facts.recordVerification(verification)
     });
 
-    const nativeContext = messagesToAgentContext(messages);
-    nativeContext.tools = nativeSettings.model.supportsTools === false ? [] : coordinator.createAgentTools();
+    const nativeContext: AgentContext = { systemPrompt, messages: [...messages], tools: [] };
+    nativeContext.tools = activeModelSettings.model.supportsTools === false ? [] : coordinator.createAgentTools();
     let completionDecision: CompletionDecision | undefined;
     let pendingSteering: AgentMessage[] = [];
     let lastAssistant: AgentAssistantMessage | undefined;
     let newMessages: AgentMessage[] = [];
     let observedSteps = 0;
     let reasoningActive = false;
-    let reasoningOutput = "";
+    let lastStepReasoningOutput = "";
     const stepUsageRecords: SessionUsage[] = [];
     let streamFailure: string | undefined;
     let streamFailureReported = false;
     let softLimitWarningInjected = completedStepsBeforeRun >= runBudget.softStepLimit;
+    let contextRecoveryAttempts = 0;
 
     yield { type: "status", status: "thinking" };
+    await recordNativeTelemetry(this.options.config, this.options.workspaceRoot, {
+      type: "start",
+      provider: activeModelSettings.model.provider,
+      modelId: activeModelSettings.model.modelId,
+      input: { systemPrompt, messages }
+    });
     try {
       const loop = agentLoopContinue(nativeContext, {
-        model: nativeSettings.model,
+        model: activeModelSettings.model,
         tools: nativeContext.tools,
         modelOptions: {
-          maxOutputTokens: nativeSettings.maxOutputTokens,
-          reasoning: nativeSettings.reasoning,
-          providerOptions: nativeSettings.providerOptions,
-          timeoutMs: nativeSettings.timeoutMs
+          maxOutputTokens: activeModelSettings.maxOutputTokens,
+          reasoning: activeModelSettings.reasoning,
+          providerOptions: activeModelSettings.providerOptions,
+          timeoutMs: activeModelSettings.timeoutMs
         },
         maxSteps: runBudget.hardStepLimit - completedStepsBeforeRun,
+        prepareNextTurn: async ({ context }) => {
+          await this.options.modelManager?.preparePrompt(abortSignal);
+          const settings = this.options.modelManager?.getModelSettings() ?? activeModelSettings;
+          activeModelSettings = settings;
+          const tools = settings.model.supportsTools === false ? [] : coordinator.createAgentTools();
+          context.systemPrompt = refreshRuntimeSystemPrompt(
+            context.systemPrompt,
+            this.extensionPrompt(),
+            tools.map((tool) => tool.name)
+          );
+          return {
+            context,
+            model: settings.model,
+            tools,
+            modelOptions: {
+              maxOutputTokens: settings.maxOutputTokens,
+              reasoning: settings.reasoning,
+              providerOptions: settings.providerOptions,
+              timeoutMs: settings.timeoutMs
+            }
+          };
+        },
+        recoverFromModelError: async (error, context, signal) => {
+          if (!isModelContextOverflowError(error) || contextRecoveryAttempts >= 2) return undefined;
+          const compacted = await this.contextMemory.compactRunContext(context.messages, signal);
+          if (!compacted) return undefined;
+          contextRecoveryAttempts += 1;
+          context.messages.splice(0, context.messages.length, ...compacted.messages);
+          // 基于当前提示词替换摘要，保留前一步刚刷新的工具和扩展能力信息。
+          context.systemPrompt = withActiveRunCompactionSummary(context.systemPrompt, compacted.summary);
+          this.recorder.record({
+            type: "assistant_message",
+            content: "",
+            contextState: this.contextMemory.snapshot()
+          });
+          return {
+            reason: "context_overflow",
+            attempt: contextRecoveryAttempts,
+            compactedMessages: compacted.compactedMessageCount
+          };
+        },
         transformContext: async (contextMessages) => {
           const absoluteStep = completedStepsBeforeRun + observedSteps;
           if (!softLimitWarningInjected && absoluteStep >= runBudget.softStepLimit) {
@@ -644,13 +776,20 @@ export class AgentSession {
           return contextMessages;
         },
         getSteeringMessages: async () => {
-          const next = pendingSteering;
+          const next = [
+            ...pendingSteering,
+            ...this.takeQueuedRunMessages(messageQueues, "steer", lastAssistant)
+          ];
           pendingSteering = [];
           return next;
         },
+        getFollowUpMessages: async () => {
+          const next = this.takeQueuedRunMessages(messageQueues, "followUp", lastAssistant);
+          if (!next.length) messageQueues.accepting = false;
+          return next;
+        },
         shouldStopAfterTurn: async (turn) => {
-          // A tool-producing assistant turn must always be followed by a model
-          // turn so it can consume the structured results and formulate an answer.
+          // 含工具调用的 assistant 后必须继续一步，让模型消费结构化结果并形成答复。
           if (turn.message.content.some((part) => part.type === "toolCall")) return false;
           await coordinator.waitForIdle();
           await refreshRunFacts(
@@ -669,11 +808,12 @@ export class AgentSession {
             maxRepeatedActions: runBudget.maxRepeatedActions
           }, abortSignal);
           if (decision.kind === "continue") {
-            pendingSteering.push({ role: "user", content: modelMessageContentText(decision.feedback.content) });
+            pendingSteering.push(decision.feedback);
             return false;
           }
           completionDecision = decision;
-          return true;
+          // Loop 自然退出前还要检查 follow-up 队列；没有排队消息时才真正结束。
+          return false;
         }
       }, abortSignal);
 
@@ -683,6 +823,7 @@ export class AgentSession {
           if (next) yield next;
         }
         if (event.type === "message_update") {
+          stepAssistantContent = agentMessageText(event.message);
           if (event.event.type === "text-delta") {
             yield { type: "assistant.delta", content: event.event.text };
           } else if (event.event.type === "reasoning-start") {
@@ -691,7 +832,7 @@ export class AgentSession {
               yield { type: "reasoning.started", phase: observedSteps === 0 ? "initial" : "continuing" };
             }
           } else if (event.event.type === "reasoning-delta") {
-            reasoningOutput += event.event.text;
+            stepReasoningOutput += event.event.text;
             yield { type: "reasoning.delta", content: event.event.text };
           } else if (event.event.type === "reasoning-end" && reasoningActive) {
             reasoningActive = false;
@@ -701,14 +842,50 @@ export class AgentSession {
             streamFailureReported = true;
             yield { type: "error", message: streamFailure, fatal: true };
           }
+        } else if (event.type === "turn_start") {
+          // 每个 provider step 都重新开始计数，后续 tool_call 才能携带对应的 Thought。
+          stepAssistantContent = "";
+          stepReasoningOutput = "";
+          stepReasoningBlocks = undefined;
+        } else if (event.type === "message_end") {
+          if (event.message.role === "assistant") {
+            stepAssistantContent = agentMessageText(event.message);
+            stepReasoningBlocks = reasoningBlocks(event.message);
+            if (event.message.stopReason !== "error" && event.message.stopReason !== "aborted") {
+              this.recorder.record({ type: "agent_message", message: event.message });
+            }
+          } else if (event.message.role === "user") {
+            const queued = messageQueues.delivered.get(event.message);
+            if (queued) {
+              yield {
+                type: "message.user",
+                messageId: queued.messageId,
+                content: queued.input,
+                delivery: queued.delivery
+              };
+            }
+          }
         } else if (event.type === "turn_end") {
+          for (const toolResult of event.toolResults) {
+            this.recorder.record({ type: "agent_message", message: toolResult });
+          }
           observedSteps += 1;
+          lastStepReasoningOutput = stepReasoningOutput;
           lastAssistant = event.message;
           const usage = event.message.usage;
           if (usage) {
             stepUsageRecords.push(this.recordModelUsage(usage, mode === "plan" ? "plan" : "agent"));
             this.contextMemory.recordProviderUsage(usage);
           }
+          await recordNativeTelemetry(this.options.config, this.options.workspaceRoot, {
+            type: "step",
+            provider: activeModelSettings.model.provider,
+            modelId: activeModelSettings.model.modelId,
+            step: completedStepsBeforeRun + observedSteps,
+            finishReason: event.message.stopReason,
+            usage,
+            output: agentMessageText(event.message)
+          });
           // 保存每个已完成的工具步。进程可能在下一次 provider 请求前退出，
           // 续跑必须从最后一个完整的 assistant + tool result context 开始。
           if (
@@ -717,7 +894,8 @@ export class AgentSession {
           ) {
             await this.turnStore.save(
               input,
-              agentMessagesToModel(event.messages),
+              systemPrompt,
+              event.messages,
               completedStepsBeforeRun + observedSteps,
               facts.snapshot(false),
               undefined,
@@ -726,6 +904,13 @@ export class AgentSession {
           }
         } else if (event.type === "agent_end") {
           newMessages = event.messages;
+        } else if (event.type === "model_retry") {
+          yield {
+            type: "context.retrying",
+            reason: "context_overflow",
+            attempt: event.attempt,
+            compactedMessages: event.compactedMessages
+          };
         } else if (event.type === "error") {
           if (event.fatal) {
             streamFailure ??= event.error;
@@ -754,20 +939,24 @@ export class AgentSession {
       const finalDecision = completionDecision;
       if (!finalDecision || finalDecision.kind === "continue") throw new Error("Native completion gate returned an unconsumed continuation.");
 
-      const finalMessages = agentMessagesToModel([...nativeContext.messages, ...newMessages]);
+      const finalMessages = [...nativeContext.messages, ...newMessages];
       this.contextMemory.replaceHistory(finalMessages);
       const usageRecord = stepUsageRecords.length ? sumSessionUsage(stepUsageRecords) : undefined;
       const content = lastAssistant ? agentMessageText(lastAssistant) : "";
-      await recordNativeTelemetryEnd(this.options.config, this.options.workspaceRoot, {
-        provider: nativeSettings.model.provider,
-        modelId: nativeSettings.model.modelId,
+      await recordNativeTelemetry(this.options.config, this.options.workspaceRoot, {
+        type: "end",
+        provider: activeModelSettings.model.provider,
+        modelId: activeModelSettings.model.modelId,
+        steps: completedStepsBeforeRun + observedSteps,
         usage: lastAssistant?.usage,
-        text: content
+        output: content
       });
       this.recorder.record({
         type: "assistant_message",
         content,
-        reasoningContent: reasoningOutput || undefined,
+        reasoningContent: lastStepReasoningOutput || undefined,
+        reasoningProviderOptions: stepReasoningBlocks?.length === 1 ? stepReasoningBlocks[0]?.providerOptions : undefined,
+        reasoningBlocks: stepReasoningBlocks,
         usage: usageRecord,
         relatedUsage: this.takeRelatedUsage(),
         contextState: this.contextMemory.snapshot()
@@ -799,6 +988,7 @@ export class AgentSession {
       if (outcome.status === "blocked" || outcome.status === "incomplete" && outcome.resumable === true) {
         await this.turnStore.save(
           input,
+          systemPrompt,
           finalMessages,
           0,
           facts.snapshot(false),
@@ -818,6 +1008,13 @@ export class AgentSession {
       yield doneEvent(outcome);
     } catch (error) {
       const message = errorMessage(error);
+      await recordNativeTelemetry(this.options.config, this.options.workspaceRoot, {
+        type: "error",
+        provider: activeModelSettings.model.provider,
+        modelId: activeModelSettings.model.modelId,
+        step: completedStepsBeforeRun + observedSteps,
+        error: message
+      });
       const outcome = abortSignal.aborted
         ? cancelledTurn(message || "Current turn cancelled.", completedStepsBeforeRun + observedSteps)
         : failedTurn(message, completedStepsBeforeRun + observedSteps, isTimeoutFailure(error) ? "timeout" : "provider_error");
@@ -863,6 +1060,7 @@ export class AgentSession {
       replacementRecorder.repairTailForAppend();
       const replay = replaySessionEvents(parseSessionEvents(replacementRecorder.readText()));
       replacementRecorder.restoreToolCallSequence(maxToolCallSequence(replay.events));
+      replacementRecorder.restoreMessageParent(replay.messageTree.at(-1)?.id);
 
       if (!resumingCurrent) {
         previousClosed = true;
@@ -915,6 +1113,8 @@ export class AgentSession {
   /** 当前激活模型不支持媒体时返回明确错误；输入本身已先写入会话，方便恢复和切换模型后重试。 */
   assertAttachmentsSupported(attachments: AgentAttachment[]): void {
     if (!attachments.length) return;
+    const unsupported = attachments.find((attachment) => !attachment.mimeType.startsWith("image/") && !attachment.mimeType.startsWith("audio/"));
+    if (unsupported) throw new Error(`不支持的附件类型：${unsupported.mimeType}。当前只接受图片和 MP3/WAV 音频。`);
     const modelAlias = this.options.modelManager?.getInfo().modelAlias ?? this.options.config.defaultModel;
     const model = this.options.config.models[modelAlias];
     if (!model) throw new Error(`当前模型配置不存在：${modelAlias}`);
@@ -926,6 +1126,9 @@ export class AgentSession {
     const audio = attachments.find((attachment) => attachment.mimeType.startsWith("audio/"));
     if (audio && !capabilities.audio) {
       throw new Error(`当前模型 ${modelAlias} 未声明 audio 能力，无法发送音频附件。请切换到支持音频的模型，或在模型配置中明确启用 capabilities.audio。`);
+    }
+    if (audio && !["audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav"].includes(audio.mimeType)) {
+      throw new Error(`不支持的音频类型：${audio.mimeType}。当前只接受 MP3 或 WAV。`);
     }
   }
 
@@ -1105,6 +1308,45 @@ export class AgentSession {
     });
   }
 
+  private takeQueuedRunMessages(
+    queues: ActiveRunMessageQueues,
+    delivery: "steer" | "followUp",
+    previousAssistant: AgentAssistantMessage | undefined
+  ): AgentUserMessage[] {
+    const pending = delivery === "steer" ? queues.steering : queues.followUps;
+    if (!pending.length) return [];
+    this.recordIntermediateAssistant(queues, previousAssistant);
+    const items = pending.splice(0, pending.length);
+    for (const item of items) {
+      this.recorder.record({
+        type: "user_message",
+        content: item.input,
+        attachments: sessionAttachments(item.attachments),
+        skills: this.options.skillPaths,
+        contextUsage: this.contextMemory.getBudget(),
+        contextState: this.contextMemory.persistedState()
+      });
+      queues.delivered.set(item.message, item);
+    }
+    return items.map((item) => item.message);
+  }
+
+  private recordIntermediateAssistant(
+    queues: ActiveRunMessageQueues,
+    message: AgentAssistantMessage | undefined
+  ): void {
+    if (!message || queues.projectedAssistants.has(message)) return;
+    queues.projectedAssistants.add(message);
+    const blocks = reasoningBlocks(message);
+    this.recorder.record({
+      type: "assistant_message",
+      content: agentMessageText(message),
+      reasoningContent: blocks?.map((block) => block.text).join("") || undefined,
+      reasoningProviderOptions: blocks?.length === 1 ? blocks[0]?.providerOptions : undefined,
+      reasoningBlocks: blocks
+    });
+  }
+
   async close(): Promise<void> {
     await this.contextMemory.shutdownMemory();
     const relatedUsage = this.takeRelatedUsage();
@@ -1174,7 +1416,7 @@ export class AgentSession {
     return {
       workspaceRoot: this.options.workspaceRoot,
       config: this.options.config,
-      ...(model ? { model } : {}),
+      model,
       recorder: this.recorder,
       contextMemory: this.contextMemory,
       toolRegistry: this.options.toolRegistry,
@@ -1223,11 +1465,11 @@ export class AgentSession {
     return native;
   }
 
-  private async rehydrateSessionAttachments(messages: ModelMessage[], events: SessionReplay["events"]): Promise<ModelMessage[]> {
+  private async rehydrateSessionAttachments(messages: AgentMessage[], events: SessionReplay["events"]): Promise<AgentMessage[]> {
     if (!this.options.attachmentRoot) return messages;
     const userEvents = events.filter((event): event is Extract<typeof event, { type: "user_message" }> => event.type === "user_message" && !event.auditOnly);
     let userIndex = 0;
-    const hydrated: ModelMessage[] = [];
+    const hydrated: AgentMessage[] = [];
     for (const message of messages) {
       if (message.role !== "user") {
         hydrated.push(message);
@@ -1247,10 +1489,9 @@ export class AgentSession {
         content: [
           { type: "text", text: message.content },
           ...files.map((attachment) => ({
-            type: "file" as const,
-            data: { type: "data" as const, data: attachment.data },
-            mediaType: attachment.mimeType,
-            filename: attachment.name
+            type: attachment.mimeType.startsWith("audio/") ? "audio" as const : "image" as const,
+            data: attachment.data,
+            mimeType: attachment.mimeType
           }))
         ]
       });
@@ -1259,151 +1500,32 @@ export class AgentSession {
   }
 }
 
-function messagesToAgentContext(messages: ModelMessage[]): AgentContext {
-  const systemParts: string[] = [];
-  const contextMessages: AgentMessage[] = [];
-  for (const message of messages) {
-    if (message.role === "system") {
-      systemParts.push(modelMessageContentText(message.content));
-      continue;
-    }
-    if (message.role === "user") {
-      contextMessages.push({ role: "user", content: nativeUserContent(message.content), timestamp: Date.now() });
-      continue;
-    }
-    if (message.role === "assistant") {
-      const content: AgentAssistantMessage["content"] = Array.isArray(message.content)
-        ? message.content.flatMap((part): AgentAssistantMessage["content"] => {
-          if (part.type === "text") return [{ type: "text", text: part.text }];
-          if (part.type === "reasoning") return [{
-            type: "reasoning",
-            text: part.text,
-            providerMetadata: (() => {
-              const reasoning = part as unknown as {
-                providerMetadata?: Record<string, unknown>;
-                providerOptions?: Record<string, unknown>;
-              };
-              return reasoning.providerMetadata ?? reasoning.providerOptions;
-            })()
-          }];
-          if (part.type === "tool-call") return [{
-            type: "toolCall",
-            id: part.toolCallId,
-            name: part.toolName,
-            arguments: isRecord(part.input) ? part.input : parseNativeRecord(part.input)
-          }];
-          return [];
-        })
-        : [{ type: "text" as const, text: message.content }];
-      contextMessages.push({ role: "assistant", content });
-      continue;
-    }
-    const result = Array.isArray(message.content) ? message.content[0] : undefined;
-    if (result?.type === "tool-result") {
-      contextMessages.push({
-        role: "toolResult",
-        toolCallId: result.toolCallId,
-        toolName: result.toolName,
-        content: [{ type: "text", text: stringifyNativeValue(result.output) }],
-        isError: isRecord(result) && result.isError === true
-      });
-    }
-  }
-  return {
-    systemPrompt: systemParts.filter(Boolean).join("\n\n") || undefined,
-    messages: contextMessages,
-    tools: []
-  };
-}
-
-function agentMessagesToModel(messages: AgentMessage[]): ModelMessage[] {
-  return messages.map((message): ModelMessage => {
-    if (message.role === "user") {
-      return { role: "user", content: nativeUserContentToModel(message.content) };
-    }
-    if (message.role === "assistant") {
-      return {
-        role: "assistant",
-        content: message.content.map((part) => {
-          if (part.type === "text") return { type: "text", text: part.text };
-          if (part.type === "reasoning") return { type: "reasoning", text: part.text, providerOptions: part.providerMetadata };
-          return { type: "tool-call", toolCallId: part.id, toolName: part.name, input: part.arguments };
-        })
-      };
-    }
-    return {
-      role: "tool",
-      content: [{
-        type: "tool-result",
-        toolCallId: message.toolCallId,
-        toolName: message.toolName,
-        output: message.details ?? message.content.map((part) => part.type === "text" ? part.text : `[${part.mimeType} image]`).join("\n"),
-        isError: message.isError === true
-      }]
-    };
-  });
-}
-
-function nativeUserContent(
-  content: unknown
-): AgentUserMessage["content"] {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content.flatMap((part): Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> => {
-    if (!isRecord(part)) return [];
-    if (part.type === "text" && typeof part.text === "string") return [{ type: "text", text: part.text }];
-    if (part.type !== "file") return [];
-    const data = typeof part.data === "string"
-      ? part.data
-      : isRecord(part.data) && typeof part.data.data === "string"
-        ? part.data.data
-        : undefined;
-    if (!data) return [];
-    const match = /^data:([^;]+);base64,(.*)$/u.exec(data);
-    return [{ type: "image", data: match?.[2] ?? data, mimeType: typeof part.mediaType === "string" ? part.mediaType : "application/octet-stream" }];
-  });
-}
-
-function nativeUserContentToModel(
-  content: string | Array<{ type: "text" | "image"; text?: string; data?: string; mimeType?: string }>
-): ModelMessage["content"] {
-  if (typeof content === "string") return content;
-  return content.map((part) => part.type === "text"
-    ? { type: "text", text: part.text ?? "" }
-    : { type: "file", data: `data:${part.mimeType ?? "application/octet-stream"};base64,${part.data ?? ""}`, mediaType: part.mimeType ?? "application/octet-stream" });
-}
-
-function modelMessageContentText(content: ModelMessage["content"]): string {
-  if (typeof content === "string") return content;
-  return content.map((part) => {
-    if (part.type === "text" || part.type === "reasoning") return part.text;
-    return "";
-  }).join("");
-}
-
 function agentMessageText(message: AgentAssistantMessage): string {
   return message.content.filter((part): part is Extract<AgentAssistantMessage["content"][number], { type: "text" }> => part.type === "text")
     .map((part) => part.text)
     .join("");
 }
 
-function stringifyNativeValue(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value) ?? "";
-  } catch {
-    return String(value);
-  }
+function queuedUserMessage(input: string, attachments: AgentAttachment[]): AgentUserMessage {
+  if (!attachments.length) return { role: "user", content: input };
+  return {
+    role: "user",
+    content: [
+      { type: "text", text: input },
+      ...attachments.map((attachment) => ({
+        type: attachment.mimeType.startsWith("audio/") ? "audio" as const : "image" as const,
+        data: attachment.data,
+        mimeType: attachment.mimeType
+      }))
+    ]
+  };
 }
 
-function parseNativeRecord(value: unknown): Record<string, unknown> {
-  if (typeof value !== "string") return {};
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return isRecord(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
+function reasoningBlocks(message: AgentAssistantMessage): ReasoningBlock[] | undefined {
+  const blocks = message.content
+    .filter((part): part is Extract<AgentAssistantMessage["content"][number], { type: "reasoning" }> => part.type === "reasoning")
+    .map((part) => ({ text: part.text, providerOptions: part.providerMetadata }));
+  return blocks.length ? blocks : undefined;
 }
 
 function modelIdentifier(model: AgentModel): string {
@@ -1741,9 +1863,9 @@ function restartRunFactsBudget(facts: RunFacts | undefined, restartBudget: boole
   };
 }
 
-function runtimeContinuationMessage(terminal: InterruptedTurnTerminal): ModelMessage {
+function runtimeContinuationMessage(terminal: InterruptedTurnTerminal): AgentUserMessage {
   return {
-    role: "system",
+    role: "user",
     content: [
       "## Biny runtime continuation",
       "",
