@@ -1094,9 +1094,7 @@ function testModelChoicesDeduplicateEquivalentAliases(): void {
   config.models["deepseek-deepseek-v4-flash"] = { ...config.models["deepseek-v4-flash"] };
   assert.deepEqual(listModelChoices(config).map((model) => model.alias), [
     "deepseek-v4-flash",
-    "deepseek-v4-pro",
-    "deepseek/deepseek-chat",
-    "deepseek/deepseek-reasoner"
+    "deepseek-v4-pro"
   ]);
 }
 

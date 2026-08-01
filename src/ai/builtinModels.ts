@@ -27,7 +27,7 @@ function model(id: string, displayName = id, options: BuiltinModelOptions = {}):
 }
 
 export const builtinProviderModels: Record<string, ModelCatalogEntry[]> = {
-  deepseek: [model("deepseek-chat", "DeepSeek Chat"), model("deepseek-reasoner", "DeepSeek Reasoner")],
+  deepseek: [],
   openai: [
     model("gpt-5.2", "GPT-5.2", { capabilities: { tools: true, reasoning: true, vision: true } }),
     model("gpt-5-mini", "GPT-5 Mini", { capabilities: { tools: true, reasoning: true, vision: true } }),
