@@ -135,6 +135,8 @@ TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 re
 
 为避免普通聊天在没有明确意图时自动扩大能力面，联网搜索/抓取与共享 Cookie、子代理、持久记忆、自动诊断和本地 telemetry 默认关闭；需要时在全局配置或 Desktop 设置中显式开启。Skill 仍会扫描已配置目录，MCP 只连接明确启用的 server，回合前 Git checkpoint 保持开启。
 
+Skill 按 Agent Skills 格式使用带 YAML frontmatter 的 `SKILL.md`：新根回合只把 `name`、`description` 和路径放入初始清单，清单总长度最多 8,000 字符；命中后由 `invoke_skill` 读取完整正文，再由 `read_skill_resource` 按需读取 `references/`、`scripts/`、`assets/` 中的文本资源。`$skill-name` 表示显式调用；同名 Skill 不合并，模型调用时用清单中的路径消歧。新增 Skill、修改名称或描述会在下一个根回合自动发现。超大正文或资源会明确报错，不会静默截断。
+
 全局配置中的 provider/model、上下文预算、步数与成本上限、子代理、Skill / MCP / Plugin、诊断钩子等设置，schema 见 [`src/config/schema.ts`](./src/config/schema.ts)；项目覆盖只允许运行参数。
 
 ## 数据存在哪
@@ -149,9 +151,9 @@ TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 re
 <project>/.biny/                            settings、runs、turns、todos、logs 等
 ```
 
-全局模型配置在 `~/.biny/config.json`；项目 session、项目 Memory 和 Provider 动态模型目录缓存位于 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）。Session 与 Memory 分别按项目隔离在 `sessions/<project-path-hash>/`、`memory/<project-path-hash>/`，模型目录缓存统一保存在 `models-store.json`。该缓存按 `0600` 原子写入，只保存模型元数据、检查时间和 HTTP 校验信息，不保存 API key、OAuth token、Cookie 或鉴权请求头；文件损坏时会忽略旧内容并在下次成功刷新时重建。全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表和 UI 状态在 `~/Library/Application Support/Biny/workspaces/default/`，附件、run 等其余项目数据暂时仍在项目 `.biny/`。旧的 `<project>/.biny/sessions/` 和 `<project>/.biny/memory/` 不再读取或复制。
+全局模型配置在 `~/.biny/config.json`；项目 session、项目 Memory 和 Provider 动态模型目录缓存位于 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）。Session 与 Memory 分别按项目隔离在 `sessions/<project-path-hash>/`、`memory/<project-path-hash>/`，模型目录缓存统一保存在 `models-store.json`。该缓存按 `0600` 原子写入，只保存模型元数据、检查时间和 HTTP 校验信息，不保存 API key、OAuth token、Cookie 或鉴权请求头；文件损坏时会忽略旧内容并在下次成功刷新时重建。全局 Skill 默认从 `~/.agents/skills/`、兼容目录 `~/.biny/skills/` 和管理员目录 `/etc/codex/skills/` 发现，named agent 仍位于 `~/.biny/agents/`。桌面端的项目列表和 UI 状态在 `~/Library/Application Support/Biny/workspaces/default/`，附件、run 等其余项目数据暂时仍在项目 `.biny/`。旧的 `<project>/.biny/sessions/` 和 `<project>/.biny/memory/` 不再读取或复制。
 
-项目级 Skill 和 named agent 分别从 `<project>/.biny/skills/`、`<project>/.biny/agents/` 覆盖全局同名定义。旧 `<project>/.agent/` 不再扫描或自动迁移。
+项目级 Skill 会从当前工作目录逐层扫描到 Git 仓库根目录下的 `.agents/skills/`，并兼容 `<project>/.biny/skills/`；named agent 仍从 `<project>/.biny/agents/` 覆盖全局同名定义。旧的单数目录 `<project>/.agent/` 不再扫描或自动迁移。
 
 同一个 Session 同一时刻只能由一个运行时执行，另一个会返回占用提示；不同 Session 可以并行。
 
