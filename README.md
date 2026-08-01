@@ -52,7 +52,7 @@ pnpm dev                              # 打开 TUI
 
 桌面端在 **设置 → 模型** 里管理连接和默认模型，API key 与 OAuth 凭据由 macOS 系统钥匙串保护。
 
-CLI / TUI / Desktop 共用全局 `~/.biny/config.json`；项目 session、Memory 等运行数据在 `~/.biny/agent/`。也可以用 `BINY_AGENT_DIR` 指定 Agent 运行数据目录。
+CLI / TUI / Desktop 共用全局 `~/.biny/config.json`；项目 session、Memory 等运行数据在 `~/.biny/agent/`。设置 `BINY_AGENT_DIR` 后，配置与运行数据都会改从该目录读取，适合测试隔离和便携部署。
 项目只在 `<project>/.biny/settings.json` 覆盖运行参数；其中的 `defaultModel` 必须引用全局已有 alias，不能写 `providers`、`models`、API key 或 OAuth 信息。旧项目配置路径只会被 `biny doctor` 报告，不会读取或迁移。
 
 macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON 不保存凭据；其他平台请使用环境变量。全局配置示例（**只写环境变量名，别把真实 key 写进配置文件**）：
@@ -69,7 +69,7 @@ macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON �
 }
 ```
 
-`type` 可以是 `deepseek`、`openai`、`anthropic`、`gemini`、`kimi`、`qwen`、`ollama`、`openai-compatible` 等；自建网关用 `openai-compatible` 并补上 `baseUrl`。单个模型还可以用 `apiBackend`、`baseUrl`、`headers`、`compatibility` 覆盖 provider 默认值，但不能写 API key。配置文件按 `0600` 保存，`biny doctor` 会检测旧的工作区/桌面配置并给出迁移提示，但不会自动复制旧配置或凭据。
+`type` 内置支持 `deepseek`、`openai`、`anthropic`、`gemini`、`kimi`、`qwen`、`xai`、`mistral`、`groq`、`openrouter`、`cerebras`、`togetherai`、`fireworks-ai`、`nvidia`、`siliconflow`、`zai`、`ollama` 等；自建网关可用 `openai-compatible` 并补上 `baseUrl`。Provider 和 `apiBackend` ID 也是插件扩展点，不再受内置枚举限制。单个模型还可以用 `apiBackend`、`baseUrl`、`headers`、`compatibility` 覆盖 provider 默认值，但不能写 API key。配置文件按 `0600` 保存，`biny doctor` 会检测旧的工作区/桌面配置并给出迁移提示，但不会自动复制旧配置或凭据。
 
 模型档位使用模型级 `thinkingLevelMap`，值是 provider 接受的参数名；缺省或 `null` 表示该档位不可用。例如：
 
@@ -117,11 +117,15 @@ macOS 的 API key 和 OAuth refresh token 存在系统 Keychain，配置 JSON �
 }
 ```
 
-Agent 预算默认软限制为 32 个 provider step、硬限制为 96 个 step。达到软限制只会注入收敛提醒；达到硬限制返回可恢复的 `incomplete`，绝不会发布 `run.completed`。`maxProviderRetries` 默认 0，Provider 的 `finishReason` 仍会记录用于诊断，但实际工具调用才决定 Loop 是否继续。
+Agent 预算默认软限制为 32 个 provider step、硬限制为 96 个 step。达到软限制只会注入收敛提醒；达到硬限制返回可恢复的 `incomplete`，绝不会发布 `run.completed`。Provider 请求重试统一由 `providers.<alias>.retry` 控制，`finishReason` 仍会记录用于诊断，但实际工具调用才决定 Loop 是否继续。
 
 ### Agent Runtime
 
-CLI、TUI 和 Desktop 的默认任务入口使用 Biny 自己的 native Agent Runtime：模型请求通过本地 `fetch` transport 归一化为统一的流事件，Agent Loop 自己管理多步请求、工具校验、权限、预算、Session 和 Completion Gate。当前支持 OpenAI Chat Completions、Anthropic Messages，以及配置了 `apiBackend: "responses"` 的 OpenAI Responses；不需要引入 Pi 的 Agent SDK 或各 Provider SDK。模型配置只接受当前的 `defaultModel`、`providers`、`models` 结构，旧格式会直接拒绝并提示手工更新。
+CLI、TUI 和 Desktop 的默认任务入口使用 Biny 自己的 native Agent Runtime：模型请求通过独立 API Adapter 归一化为统一的 `ModelStreamEvent`，文本、reasoning、tool call、usage、错误和停止原因沿同一 Agent Loop 转发。Agent Loop 只处理统一消息，不区分底层的 Anthropic `tool_use`、Responses `function_call`、Google `functionCall` 或 Chat Completions `tool_calls`。内置 Adapter 包括 OpenAI Chat Completions、OpenAI Responses、Anthropic Messages 和 Google Generative AI；插件可注册新的 API ID、Adapter、Provider、OAuth 刷新处理器和离线/动态模型目录。Provider 的模型按内置目录、插件覆盖、实时目录、用户配置依次组合，并可用 `filterModels` 按鉴权状态过滤。实时目录会跨进程缓存；重新启动或临时断网时仍能恢复上次成功取得的模型，在线刷新使用 ETag / Last-Modified 避免重复传输完整目录。模型配置只接受当前的 `defaultModel`、`providers`、`models` 结构，旧格式会直接拒绝并提示手工更新。
+
+插件注册函数通过 `BinyPluginContext` 提供：`registerProvider()`、`registerModels()`、`registerApiAdapter()`、`registerCredentialHandler()` 和 `registerTool()`。插件会在默认模型创建前加载，因此插件 Provider 可以直接作为 `defaultModel` 使用。API Adapter 接收统一的 Message/Tool 上下文并输出统一事件；普通调用走 `streamSimple()`，由 Provider Runtime 将 `off / low / high / max` 等档位转换成当前模型参数。
+
+任务运行中仍可继续输入：同一 Session 的普通发送会进入 follow-up 队列，当前任务准备结束时继续处理；TUI 的 `Ctrl-S` 和 Desktop 的 `Command/Ctrl+Enter` 会把输入作为 steer，在当前模型步骤和工具批次结束后优先注入。每个模型步骤前都会重新读取配置修订、模型设置、动态工具和扩展提示；Provider 拒绝过长上下文时，Runtime 会在完整工具批次边界压缩历史并进行有界恢复。新 Session 会直接保存完整的 assistant/tool-result `AgentMessage`，canonical 消息节点带稳定 ID 和父节点引用；旧的扁平审计事件继续保留用于界面投影，并可向后兼容回放。
 
 当前没有单独的 Durable Task 执行框架。普通问答、代码修改、启动项目和多步工具任务都进入同一个 Agent Loop；验证器只根据文件变化、结构化检查、受管进程等运行事实启动。验证命令的 stdout/stderr 在模型上下文中最多保留 4000 字符摘要，完整结果通过对应的审计 `tool_call` 记录在 Session JSONL 中。
 
@@ -140,11 +144,12 @@ TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 re
 ```text
 ~/.biny/agent/sessions/<project-path-hash>/ 问答历史
 ~/.biny/agent/memory/<project-path-hash>/   项目长期记忆
+~/.biny/agent/models-store.json             Provider 动态模型目录缓存
 <project>/.biny/attachments/                图片、音频等会话附件
 <project>/.biny/                            settings、runs、turns、todos、logs 等
 ```
 
-全局模型配置在 `~/.biny/config.json`；项目 session 和项目 Memory 在 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）。Session 与 Memory 分别按项目隔离在 `sessions/<project-path-hash>/`、`memory/<project-path-hash>/`。全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表和 UI 状态在 `~/Library/Application Support/Biny/workspaces/default/`，附件、run 等其余项目数据暂时仍在项目 `.biny/`。旧的 `<project>/.biny/sessions/` 和 `<project>/.biny/memory/` 不再读取或复制。
+全局模型配置在 `~/.biny/config.json`；项目 session、项目 Memory 和 Provider 动态模型目录缓存位于 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）。Session 与 Memory 分别按项目隔离在 `sessions/<project-path-hash>/`、`memory/<project-path-hash>/`，模型目录缓存统一保存在 `models-store.json`。该缓存按 `0600` 原子写入，只保存模型元数据、检查时间和 HTTP 校验信息，不保存 API key、OAuth token、Cookie 或鉴权请求头；文件损坏时会忽略旧内容并在下次成功刷新时重建。全局 Skill / named agent 仍分别在 `~/.biny/skills/`、`~/.biny/agents/`。桌面端的项目列表和 UI 状态在 `~/Library/Application Support/Biny/workspaces/default/`，附件、run 等其余项目数据暂时仍在项目 `.biny/`。旧的 `<project>/.biny/sessions/` 和 `<project>/.biny/memory/` 不再读取或复制。
 
 项目级 Skill 和 named agent 分别从 `<project>/.biny/skills/`、`<project>/.biny/agents/` 覆盖全局同名定义。旧 `<project>/.agent/` 不再扫描或自动迁移。
 
@@ -153,7 +158,7 @@ TUI 中输入 `/model` 后先选择模型；只有该模型声明了可调的 re
 ## 当前边界
 
 - 本地构建不签名、不公证，公开 Release 需要配置 macOS signing / notarization secrets；
-- 没有语音输入和实时语音对话，只支持把已有音频附件作为模型输入；
+- 没有语音输入和实时语音对话；已有 MP3/WAV 音频可发送给明确声明 audio 能力的 OpenAI-compatible / Responses 模型，Anthropic Messages 不接收音频；
 - 部分桌面端入口仍在开发中，界面上会明确标注。
 
 ## 开发
