@@ -6,7 +6,7 @@ import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ModelMessage } from "../src/agent/core/modelMessage.js";
+import type { AgentMessage } from "../src/agent/core/types.js";
 import { z } from "zod";
 import { AgentSession } from "../src/agent/AgentSession.js";
 import type { AgentTurnOutcome } from "../src/agent/types.js";
@@ -47,16 +47,16 @@ async function main(): Promise<void> {
 /** 续跑的价值全在这里：已完成步骤的工具结果必须原样带回，否则等于重跑。 */
 async function testRoundTripKeepsToolResults(root: string): Promise<void> {
   const store = new TurnStore(root, "session-a");
-  const messages: ModelMessage[] = [
+  const messages: AgentMessage[] = [
     { role: "user", content: "refactor the parser" },
-    { role: "assistant", content: [{ type: "tool-call", toolCallId: "c1", toolName: "read_file", input: { path: "a.ts" } }] },
-    { role: "tool", content: [{ type: "tool-result", toolCallId: "c1", toolName: "read_file", output: { type: "text", value: "file body" } }] }
+    { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "read_file", arguments: { path: "a.ts" } }] },
+    { role: "toolResult", toolCallId: "c1", toolName: "read_file", content: [{ type: "text", text: "file body" }] }
   ];
   const facts = {
     actualToolCallCount: 1,
     changedFiles: ["a.ts"]
   };
-  await store.save("refactor the parser", messages, 3, facts, {
+  await store.save("refactor the parser", "system", messages, 3, facts, {
     status: "incomplete",
     stopReason: "hard_step_limit",
     summary: "The run reached its hard step limit."
@@ -84,14 +84,14 @@ async function testRoundTripKeepsToolResults(root: string): Promise<void> {
     blockedReason: "waiting_for_approval"
   }]);
   const toolMessage = loaded?.messages[2];
-  assert.equal(toolMessage?.role, "tool");
+  assert.equal(toolMessage?.role, "toolResult");
   assert.equal(JSON.stringify(toolMessage).includes("file body"), true, "tool results must survive the round trip");
 }
 
 /** 陈旧的在途状态比没有更糟：它会让下一次启动去续跑一个早已完成的回合。 */
 async function testClearedTurnIsNotResumable(root: string): Promise<void> {
   const store = new TurnStore(root, "session-b");
-  await store.save("done work", [{ role: "user", content: "x" }], 1);
+  await store.save("done work", undefined, [{ role: "user", content: "x" }], 1);
   assert.notEqual(await store.load(), undefined);
   await store.clear();
   assert.equal(await store.load(), undefined);
@@ -110,7 +110,7 @@ async function testCorruptStateIsIgnored(root: string): Promise<void> {
 }
 
 async function testIsolatedPerSession(root: string): Promise<void> {
-  await new TurnStore(root, "session-d").save("d work", [{ role: "user", content: "d" }], 1);
+  await new TurnStore(root, "session-d").save("d work", undefined, [{ role: "user", content: "d" }], 1);
   assert.equal(await new TurnStore(root, "session-e").load(), undefined);
 }
 

@@ -45,6 +45,8 @@ async function testFullForkIsIndependent(root: string, source: string): Promise<
 
   const replayed = await replaySession(forked.filePath);
   assert.equal(replayed.recoveredToolResults.length, 0, "a clean fork must not carry a synthetic interrupted result");
+  assert.equal(replayed.messageTree.length, 2);
+  assert.equal(replayed.messageTree[1]?.parentId, replayed.messageTree[0]?.id);
 
   const appended = new SessionRecorder(root, forked.sessionId, forked.filePath);
   appended.repairTailForAppend();
@@ -53,6 +55,8 @@ async function testFullForkIsIndependent(root: string, source: string): Promise<
 
   const original = await readFile(sessionFilePath(root, source), "utf8");
   assert.equal(original.includes("only in the fork"), false, "writing the fork must not touch the source session");
+  const appendedTree = (await replaySession(forked.filePath)).messageTree;
+  assert.equal(appendedTree.at(-1)?.parentId, appendedTree.at(-2)?.id);
 }
 
 /**

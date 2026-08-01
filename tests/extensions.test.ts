@@ -11,6 +11,7 @@ import { calculateUsageCost, summarizeUsage } from "../src/observability/usage.j
 import { PermissionManager } from "../src/permission/PermissionManager.js";
 import { analyzePermissionRequest } from "../src/permission/policy.js";
 import { ToolRegistry } from "../src/tools/registry.js";
+import { AiRegistry } from "../src/llm/AiRegistry.js";
 
 async function waitFor(check: () => boolean, timeoutMs = 5_000): Promise<void> {
   const start = Date.now();
@@ -126,7 +127,25 @@ async function testSkillsAndPlugins(workspaceRoot: string): Promise<void> {
   await testProgressiveSkills(workspaceRoot);
 
   const pluginPath = path.join(workspaceRoot, "plugin.mjs");
-  await writeFile(pluginPath, `export default ({ config, registerTool }) => registerTool({
+  await writeFile(pluginPath, `export default ({ config, registerTool, registerProvider, registerApiAdapter, registerCredentialHandler }) => {
+  registerProvider({
+    type: "plugin-provider",
+    protocol: "openai-compatible",
+    api: "plugin-api",
+    baseUrl: "https://plugin.example/v1",
+    requiresApiKey: false,
+    authModes: ["api-key"],
+    filterModels: (models) => models.filter((model) => model.id !== "hidden")
+  }, [{ id: "plugin-model", displayName: "Plugin Model", provider: "", contextWindow: 8192, maxOutputTokens: 1024, capabilities: { tools: true }, reasoningEfforts: [] }]);
+  registerApiAdapter({
+    id: "plugin-api",
+    stream: async function* () {
+      yield { type: "start" };
+      yield { type: "finish", reason: "stop" };
+    }
+  });
+  registerCredentialHandler("plugin-oauth", async (provider) => provider);
+  registerTool({
     name: "plugin_secret_probe",
     description: "Verify the plugin context excludes credentials",
     parameters: { type: "object" },
@@ -139,8 +158,10 @@ async function testSkillsAndPlugins(workspaceRoot: string): Promise<void> {
         mcpHeaders: config.extensions.mcp.remote?.headers
       })
     })
-  });\n`, "utf8");
+  });
+};\n`, "utf8");
   const registry = new ToolRegistry();
+  const ai = new AiRegistry();
   const config = configSchema.parse({
     ...defaultConfig,
     providers: {
@@ -161,7 +182,7 @@ async function testSkillsAndPlugins(workspaceRoot: string): Promise<void> {
       }
     }
   });
-  const loaded = await loadPlugins(workspaceRoot, ["plugin.mjs", "./plugin.mjs"], config, registry);
+  const loaded = await loadPlugins(workspaceRoot, ["plugin.mjs", "./plugin.mjs"], config, registry, ai);
   assert.deepEqual(loaded, ["plugin.mjs"]);
   assert.equal(registry.listEntries()[0]?.source, "plugin");
   const execution = await registry.get("plugin_secret_probe").resolveExecution({});
@@ -176,6 +197,9 @@ async function testSkillsAndPlugins(workspaceRoot: string): Promise<void> {
   assert.equal(config.providers.deepseek?.apiKey, "test-only-api-key");
   assert.deepEqual(config.extensions.mcp.secret?.env, { TEST_ONLY_TOKEN: "test-only-mcp-token" });
   assert.deepEqual(config.extensions.mcp.remote?.headers, { Authorization: "Bearer test-only-http-token" });
+  assert.equal(ai.providers.get("plugin-provider")?.models[0]?.id, "plugin-model");
+  assert.equal(ai.adapters.get("plugin-api")?.id, "plugin-api");
+  assert.equal(typeof ai.credentialHandler("plugin-oauth"), "function");
 
   const commonJsPath = path.join(workspaceRoot, "plugin.cjs");
   await writeFile(commonJsPath, `module.exports = {

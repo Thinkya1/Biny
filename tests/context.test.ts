@@ -3,19 +3,18 @@ import { promises as fs } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AgentModel, ModelStreamContext, ModelStreamEvent } from "../src/agent/core/types.js";
-import type { ModelMessage } from "../src/agent/core/modelMessage.js";
+import type { AgentMessage, AgentModel, ModelStreamContext, ModelStreamEvent } from "../src/agent/core/types.js";
 import { AgentSession } from "../src/agent/AgentSession.js";
 import { ContextMemory, estimateMessageTokens } from "../src/agent/context/ContextMemory.js";
 import { LocalMemory, redactSecrets } from "../src/agent/context/LocalMemory.js";
 import { WorkspaceContext } from "../src/agent/context/WorkspaceContext.js";
-import { cloneModelMessages, messageReasoning, messageText } from "../src/agent/modelMessages.js";
-import { buildSystemPrompt } from "../src/agent/prompts.js";
+import { cloneAgentMessages, messageReasoning, messageText } from "../src/agent/modelMessages.js";
+import { buildSystemPrompt, refreshRuntimeSystemPrompt, withActiveRunCompactionSummary } from "../src/agent/prompts.js";
 import { BINY_AGENT_DIR_ENV, projectMemoryDir } from "../src/config/paths.js";
 import type { AgentConfig } from "../src/config/schema.js";
 import { defaultConfig } from "../src/config/schema.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
-import { recordNativeTelemetryEnd } from "../src/observability/telemetry.js";
+import { recordNativeTelemetry } from "../src/observability/telemetry.js";
 import { SessionRecorder, type SessionEvent } from "../src/session/recorder.js";
 import { maxSessionEventLineBytes, maxSessionEvents, maxSessionFileBytes } from "../src/session/limits.js";
 import { replaySession, sessionEventsToConversation } from "../src/session/replay.js";
@@ -35,11 +34,11 @@ import { appendInputHistory, loadInputHistory } from "../src/tui/inputHistory.js
 import { resolveWorkspacePath } from "../src/workspace/resolvePath.js";
 
 class ContextTestModel {
-  readonly requests: ModelMessage[][] = [];
+  readonly requests: AgentMessage[][] = [];
   readonly model: AgentModel = createContextTestModel(this);
 
-  respond(messages: ModelMessage[]): string {
-    this.requests.push(cloneModelMessages(messages));
+  respond(messages: AgentMessage[]): string {
+    this.requests.push(cloneAgentMessages(messages));
     const prompt = messageText(messages.at(-1) ?? { role: "user", content: "" });
     if (prompt.includes("Extract one durable")) {
       return JSON.stringify({
@@ -81,7 +80,7 @@ function createContextTestModel(provider: ContextTestModel): AgentModel {
     provider: "context-test",
     modelId: "context-test",
     async stream(context: ModelStreamContext, options): Promise<AsyncIterable<ModelStreamEvent>> {
-      const text = provider.respond(contextToModelMessages(context));
+      const text = provider.respond(context.messages);
       return (async function* () {
         options?.signal?.throwIfAborted();
         yield { type: "start" as const };
@@ -90,32 +89,6 @@ function createContextTestModel(provider: ContextTestModel): AgentModel {
       })();
     }
   };
-}
-
-function contextToModelMessages(context: ModelStreamContext): ModelMessage[] {
-  const messages: ModelMessage[] = context.systemPrompt ? [{ role: "system", content: context.systemPrompt }] : [];
-  for (const message of context.messages) {
-    if (message.role === "user") messages.push({ role: "user", content: message.content });
-    else if (message.role === "assistant") {
-      messages.push({ role: "assistant", content: message.content.map((part) => {
-        if (part.type === "toolCall") return { type: "tool-call", toolCallId: part.id, toolName: part.name, input: part.arguments };
-        if (part.type === "reasoning") return { type: "reasoning", text: part.text, providerOptions: part.providerMetadata };
-        return { type: "text", text: part.text };
-      }) });
-    } else {
-      messages.push({
-        role: "tool",
-        content: [{
-          type: "tool-result",
-          toolCallId: message.toolCallId,
-          toolName: message.toolName,
-          output: { type: "text", value: message.content.map((part) => part.type === "text" ? part.text : "[image]").join("\n") },
-          isError: message.isError
-        }]
-      });
-    }
-  }
-  return messages;
 }
 
 async function main(): Promise<void> {
@@ -131,6 +104,7 @@ async function main(): Promise<void> {
     await testAutomaticContextSupportsSymlinkedWorkspaceRoot();
     await testBudgetAndCompaction();
     await testMidTurnToolResultPruning();
+    await testActiveRunCompactionPreservesToolBatches();
     await testContextPreparationAbortStopsAutoCompaction();
     await testRestoreWithoutPersistedBudgetUsesHistoryEstimate();
     await testSessionReplayAndAgentResume();
@@ -163,6 +137,16 @@ function testConversationBoundaryPrompt(): void {
   assert.match(prompt, /Never say "I just read\.\.\."/);
   assert.doesNotMatch(prompt, /prefer web_search/u);
   assert.match(buildSystemPrompt("qa", undefined, ["web_search"]), /prefer web_search/u);
+  const compacted = withActiveRunCompactionSummary(
+    buildSystemPrompt("qa", "old dynamic capability", ["web_search"]),
+    "first overflow summary"
+  );
+  const refreshed = refreshRuntimeSystemPrompt(compacted, "new dynamic capability", ["run_command"]);
+  const recoveredAgain = withActiveRunCompactionSummary(refreshed, "second overflow summary");
+  assert.match(recoveredAgain, /new dynamic capability/u);
+  assert.match(recoveredAgain, /Use run_command/u);
+  assert.match(recoveredAgain, /second overflow summary/u);
+  assert.doesNotMatch(recoveredAgain, /old dynamic capability|first overflow summary/u);
 }
 
 async function testInstructionHierarchyAndCap(): Promise<void> {
@@ -290,15 +274,17 @@ async function testMidTurnToolResultPruning(): Promise<void> {
     const workspace = new WorkspaceContext(workspaceRoot, [], 32 * 1024);
     const memory = new ContextMemory(() => provider.model, workspace, undefined, 200, 32 * 1024);
 
-    const messages: ModelMessage[] = [{ role: "user", content: "inspect the repo" }];
+    const messages: AgentMessage[] = [{ role: "user", content: "inspect the repo" }];
     for (let index = 0; index < 5; index += 1) {
       messages.push({
         role: "assistant",
-        content: [{ type: "tool-call", toolCallId: `call-${String(index)}`, toolName: "read_file", input: { path: `f${String(index)}.ts` } }]
+        content: [{ type: "toolCall", id: `call-${String(index)}`, name: "read_file", arguments: { path: `f${String(index)}.ts` } }]
       });
       messages.push({
-        role: "tool",
-        content: [{ type: "tool-result", toolCallId: `call-${String(index)}`, toolName: "read_file", output: { type: "text", value: "body ".repeat(200) } }]
+        role: "toolResult",
+        toolCallId: `call-${String(index)}`,
+        toolName: "read_file",
+        content: [{ type: "text", text: "body ".repeat(200) }]
       });
     }
 
@@ -309,16 +295,16 @@ async function testMidTurnToolResultPruning(): Promise<void> {
 
     // 每个 tool-call 仍然有配对的 tool-result，且 toolCallId 一一对应。
     const callIds = pruned.flatMap((message) => message.role === "assistant" && Array.isArray(message.content)
-      ? message.content.filter((part) => part.type === "tool-call").map((part) => part.toolCallId)
+      ? message.content.filter((part) => part.type === "toolCall").map((part) => part.id)
       : []);
-    const resultIds = pruned.flatMap((message) => message.role === "tool"
-      ? message.content.filter((part) => part.type === "tool-result").map((part) => part.toolCallId)
+    const resultIds = pruned.flatMap((message) => message.role === "toolResult"
+      ? [message.toolCallId]
       : []);
     assert.deepEqual(callIds, resultIds);
 
     // 最近的工具结果保持原样：模型当下要用的就是它们。
     const lastResult = pruned.at(-1);
-    assert.equal(lastResult?.role, "tool");
+    assert.equal(lastResult?.role, "toolResult");
     assert.equal(String(toolResultValue(lastResult)).startsWith("body "), true);
     // 最早的已被换成占位符。
     assert.equal(/elided to fit the context window/.test(String(toolResultValue(pruned[2]))), true);
@@ -330,12 +316,51 @@ async function testMidTurnToolResultPruning(): Promise<void> {
   });
 }
 
-function toolResultValue(message: ModelMessage | undefined): unknown {
-  if (!message || message.role !== "tool") return undefined;
-  const part = message.content.find((entry) => entry.type === "tool-result");
-  if (!part || typeof part.output !== "object" || part.output === null) return undefined;
-  const output = part.output as { type?: unknown; value?: unknown };
-  return output.type === "text" ? output.value : undefined;
+async function testActiveRunCompactionPreservesToolBatches(): Promise<void> {
+  await withTempWorkspace(async (workspaceRoot) => {
+    const provider = new ContextTestModel();
+    const workspace = new WorkspaceContext(workspaceRoot, [], 32 * 1024);
+    const memory = new ContextMemory(() => provider.model, workspace, undefined, 4_000, 32 * 1024);
+    const messages: AgentMessage[] = [
+      { role: "user", content: `old request ${"detail ".repeat(1_600)}` },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "old-call", name: "read_file", arguments: { path: "old.ts" } }]
+      },
+      {
+        role: "toolResult",
+        toolCallId: "old-call",
+        toolName: "read_file",
+        content: [{ type: "text", text: "old result ".repeat(1_600) }]
+      },
+      { role: "user", content: "continue with the recent file" },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "recent-call", name: "read_file", arguments: { path: "recent.ts" } }]
+      },
+      {
+        role: "toolResult",
+        toolCallId: "recent-call",
+        toolName: "read_file",
+        content: [{ type: "text", text: "recent result" }]
+      }
+    ];
+
+    const compacted = await memory.compactRunContext(messages);
+    assert.ok(compacted);
+    assert.equal(compacted.compactedMessageCount > 0, true);
+    assert.equal(compacted.messages.some((message) => message.role === "toolResult" && message.toolCallId === "recent-call"), true);
+    const retainedCallIds = compacted.messages.flatMap((message) => message.role === "assistant" && Array.isArray(message.content)
+      ? message.content.filter((part) => part.type === "toolCall").map((part) => part.id)
+      : []);
+    const retainedResultIds = compacted.messages.flatMap((message) => message.role === "toolResult" ? [message.toolCallId] : []);
+    assert.deepEqual(retainedCallIds, retainedResultIds);
+  });
+}
+
+function toolResultValue(message: AgentMessage | undefined): unknown {
+  if (!message || message.role !== "toolResult") return undefined;
+  return message.content.find((entry) => entry.type === "text")?.text;
 }
 
 async function testBudgetAndCompaction(): Promise<void> {
@@ -345,18 +370,17 @@ async function testBudgetAndCompaction(): Promise<void> {
     const memory = new ContextMemory(() => provider.model, workspace, undefined, 120, 32 * 1024);
     memory.replaceHistory([
       { role: "user", content: "old request ".repeat(40) },
-      { role: "assistant", content: "old response ".repeat(40) }
+      { role: "assistant", content: [{ type: "text", text: "old response ".repeat(40) }] }
     ]);
-    const messages = await memory.prepareTurn("current task ".repeat(20), "system rule ".repeat(30));
+    const { messages } = await memory.prepareTurn("current task ".repeat(20), "system rule ".repeat(30));
     assert.equal(estimateMessageTokens(messages) <= 120, true);
     assert.equal(messages.at(-1)?.role, "user");
     assert.equal(messages.at(-1)?.content.includes("current task"), true);
     assert.equal(estimateMessageTokens([{ role: "assistant", content: [{ type: "reasoning", text: "reason ".repeat(20) }] }]) > 4, true);
 
-    memory.replaceHistory(Array.from({ length: 8 }, (_, index) => ({
-      role: index % 2 ? "assistant" as const : "user" as const,
-      content: `message ${String(index)} ${"detail ".repeat(180)}`
-    })));
+    memory.replaceHistory(Array.from({ length: 8 }, (_, index): AgentMessage => index % 2
+      ? { role: "assistant", content: [{ type: "text", text: `message ${String(index)} ${"detail ".repeat(180)}` }] }
+      : { role: "user", content: `message ${String(index)} ${"detail ".repeat(180)}` }));
     await memory.prepareTurn("continue", "system");
     const compactedStatus = await memory.status();
     assert.equal(compactedStatus.compaction.summaryPresent, true);
@@ -399,7 +423,7 @@ async function testContextPreparationAbortStopsAutoCompaction(): Promise<void> {
     );
     memory.replaceHistory([
       { role: "user", content: "old request ".repeat(80) },
-      { role: "assistant", content: "old response ".repeat(80) }
+      { role: "assistant", content: [{ type: "text", text: "old response ".repeat(80) }] }
     ]);
 
     const controller = new AbortController();
@@ -426,7 +450,7 @@ async function testRestoreWithoutPersistedBudgetUsesHistoryEstimate(): Promise<v
     );
     memory.restore([
       { role: "user", content: "historical request ".repeat(4) },
-      { role: "assistant", content: "historical answer ".repeat(4) }
+      { role: "assistant", content: [{ type: "text", text: "historical answer ".repeat(4) }] }
     ]);
     const status = await memory.status();
     assert.equal(status.budget.usedTokens > 0, true);
@@ -564,7 +588,7 @@ async function testTruncatedSessionTailAndDanglingToolRecovery(): Promise<void> 
     const replay = await replaySession(filePath);
     assert.equal(replay.recoveredToolResults.length, 1);
     assert.equal(replay.recoveredToolResults[0]?.toolCallId, "dangling-1");
-    assert.equal(replay.messages.some((message) => message.role === "tool"), true);
+    assert.equal(replay.messages.some((message) => message.role === "toolResult"), true);
 
     await repairSessionTailForAppend(filePath);
     const recorder = new SessionRecorder(workspaceRoot, "interrupted-session");
@@ -983,7 +1007,7 @@ async function testFailedCurrentSessionResumeKeepsRecorderUsable(): Promise<void
     assert.equal((await agent.runTask("continue in a healthy session")).output, "ok");
     await agent.close();
     const fallbackEvents = await readSessionEvents(fallbackSession.sessionFile);
-    assert.deepEqual(fallbackEvents.map((event) => event.type), ["user_message", "assistant_message", "turn_status"]);
+    assert.deepEqual(fallbackEvents.map((event) => event.type), ["user_message", "agent_message", "assistant_message", "turn_status"]);
     assert.equal(fallbackEvents.at(-1)?.type === "turn_status" ? fallbackEvents.at(-1).status : undefined, "completed");
   });
 }
@@ -1017,14 +1041,45 @@ async function testCredentialAndSymlinkBoundaries(): Promise<void> {
 
       await ensureAgentDirs(workspaceRoot);
       const telemetryPath = path.join(workspaceRoot, ".biny", "telemetry.jsonl");
+      const telemetryConfig = {
+        ...defaultConfig,
+        telemetry: { enabled: true, recordInputs: false, recordOutputs: true }
+      };
+      await recordNativeTelemetry(telemetryConfig, workspaceRoot, {
+        type: "start",
+        provider: "test",
+        modelId: "test",
+        input: "must-not-be-recorded"
+      });
+      await recordNativeTelemetry(telemetryConfig, workspaceRoot, {
+        type: "step",
+        provider: "test",
+        modelId: "test",
+        step: 1,
+        finishReason: "stop",
+        usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+        output: "visible-output"
+      });
+      await recordNativeTelemetry(telemetryConfig, workspaceRoot, {
+        type: "end",
+        provider: "test",
+        modelId: "test",
+        steps: 1,
+        output: "visible-output"
+      });
+      const telemetryEvents = (await fs.readFile(telemetryPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+      assert.deepEqual(telemetryEvents.map((event) => event.type), ["start", "step", "end"]);
+      assert.equal(telemetryEvents[0]?.input, undefined);
+      assert.equal(telemetryEvents[1]?.output, '"visible-output"');
+      await fs.rm(telemetryPath);
       const telemetryVictim = path.join(outsideRoot, "telemetry-victim.txt");
       await fs.writeFile(telemetryVictim, "telemetry-victim-unchanged", "utf8");
       await fs.symlink(telemetryVictim, telemetryPath);
-      await recordNativeTelemetryEnd({ ...defaultConfig, telemetry: { ...defaultConfig.telemetry, enabled: true } }, workspaceRoot, { provider: "test", modelId: "test" });
+      await recordNativeTelemetry(telemetryConfig, workspaceRoot, { type: "end", provider: "test", modelId: "test", steps: 1 });
       assert.equal(await fs.readFile(telemetryVictim, "utf8"), "telemetry-victim-unchanged");
       await fs.rm(telemetryPath);
       await fs.link(telemetryVictim, telemetryPath);
-      await recordNativeTelemetryEnd({ ...defaultConfig, telemetry: { ...defaultConfig.telemetry, enabled: true } }, workspaceRoot, { provider: "test", modelId: "test" });
+      await recordNativeTelemetry(telemetryConfig, workspaceRoot, { type: "end", provider: "test", modelId: "test", steps: 1 });
       assert.equal(await fs.readFile(telemetryVictim, "utf8"), "telemetry-victim-unchanged");
 
       const historyPath = path.join(workspaceRoot, ".biny", "input-history.jsonl");
@@ -1284,7 +1339,7 @@ async function testToolWriteMarksSnapshotAndRepoMapDirty(): Promise<void> {
     assert.equal(dirty.repoMapDirty, true);
     assert.equal(dirty.activePaths.includes("src/new.ts"), true);
 
-    const messages = await memory.prepareTurn("review src/new.ts", "system");
+    const { messages } = await memory.prepareTurn("review src/new.ts", "system");
     assert.equal(messages.at(-1)?.content, "review src/new.ts");
     const refreshed = await memory.status();
     assert.equal(refreshed.snapshotDirty, false);
@@ -1292,12 +1347,12 @@ async function testToolWriteMarksSnapshotAndRepoMapDirty(): Promise<void> {
   });
 }
 
-function hasToolCall(message: ModelMessage | undefined, toolCallId: string): boolean {
-  return Boolean(message?.role === "assistant" && Array.isArray(message.content) && message.content.some((part) => part.type === "tool-call" && part.toolCallId === toolCallId));
+function hasToolCall(message: AgentMessage | undefined, toolCallId: string): boolean {
+  return Boolean(message?.role === "assistant" && message.content.some((part) => part.type === "toolCall" && part.id === toolCallId));
 }
 
-function hasToolResult(message: ModelMessage | undefined, toolCallId: string): boolean {
-  return Boolean(message?.role === "tool" && message.content.some((part) => part.type === "tool-result" && part.toolCallId === toolCallId));
+function hasToolResult(message: AgentMessage | undefined, toolCallId: string): boolean {
+  return message?.role === "toolResult" && message.toolCallId === toolCallId;
 }
 
 function testConfig(): AgentConfig {

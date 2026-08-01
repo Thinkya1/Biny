@@ -110,3 +110,16 @@ const relayCatalogNonReasoning = parseModelCatalog({
   data: [{ id: "llama-3.3-70b-instruct" }]
 }, "relay", "openai-compatible");
 assert.deepEqual(relayCatalogNonReasoning[0]?.reasoningEfforts, []);
+
+const alternateCatalogShape = parseModelCatalog({
+  models: [{ model: "hosted-model", displayName: "Hosted Model", contextLength: 65_536 }]
+}, "hosted", "openai-compatible");
+assert.deepEqual(alternateCatalogShape[0], {
+  id: "hosted-model",
+  displayName: "Hosted Model",
+  provider: "hosted",
+  contextWindow: 65_536,
+  maxOutputTokens: undefined,
+  capabilities: { tools: undefined, reasoning: undefined, vision: undefined, audio: undefined, streaming: true },
+  reasoningEfforts: []
+});

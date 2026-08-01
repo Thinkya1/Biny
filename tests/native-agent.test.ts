@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
@@ -8,20 +8,34 @@ import { defaultConfig, configSchema } from "../src/config/schema.js";
 import { ModelManager } from "../src/llm/ModelManager.js";
 import { createNativeModelSettings } from "../src/llm/nativeFactory.js";
 import { createNativeModel } from "../src/llm/nativeModel.js";
+import { ApiAdapterRegistry } from "../src/llm/ApiAdapterRegistry.js";
+import { ProviderRegistry } from "../src/llm/ProviderRuntime.js";
+import { AiRegistry } from "../src/llm/AiRegistry.js";
+import { ModelRuntime } from "../src/llm/ModelRuntime.js";
+import { FileModelsStore, restoreProviderCatalogs } from "../src/llm/ModelsStore.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
 import { SessionRecorder } from "../src/session/recorder.js";
 import { ensureAgentDirs } from "../src/session/store.js";
 import { ToolRegistry } from "../src/tools/registry.js";
 import type { Tool } from "../src/tools/types.js";
+import type { AgentModel, ModelStreamContext } from "../src/agent/core/types.js";
 import type { AgentSessionEvent } from "../src/agent/types.js";
 
 async function main(): Promise<void> {
+  await testApiAdapterDispatch();
+  await testProviderRuntimeCatalog();
+  await testPersistedProviderCatalog();
+  await testGoogleProviderCatalog();
+  await testExtensibleProviderRuntime();
   await testCompatibleSystemRole();
   await testFactoryProviderDefaults();
   await testAnthropicSubscriptionAndHistory();
   await testCompatibleReasoningPayloads();
   await testNativeTimeout();
   await testOpenAiResponsesTransport();
+  await testGoogleGenerativeAiTransport();
+  await testAudioPayloads();
+  await testQueuedFollowUp();
   const originalFetch = globalThis.fetch;
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-native-agent-"));
   await ensureAgentDirs(workspaceRoot);
@@ -30,10 +44,12 @@ async function main(): Promise<void> {
     requestCount += 1;
     const parts = requestCount === 1
       ? [
+        { choices: [{ index: 0, delta: { reasoning_content: "先检查当前状态。" }, finish_reason: null }] },
         { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call-1", function: { name: "echo", arguments: '{"value":"ok"}' } }] }, finish_reason: null }] },
         { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }
       ]
       : [
+        { choices: [{ index: 0, delta: { reasoning_content: "根据结果整理回复。" }, finish_reason: null }] },
         { choices: [{ index: 0, delta: { content: "native answer" }, finish_reason: null }] },
         { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }
       ];
@@ -80,6 +96,7 @@ async function main(): Promise<void> {
     recorder
   });
   await agent.initialize();
+  let closed = false;
   try {
     const events: AgentSessionEvent[] = [];
     for await (const event of agent.prompt("answer briefly", {
@@ -91,8 +108,355 @@ async function main(): Promise<void> {
     assert.equal(done?.content, "native answer");
     assert.equal(events.some((event) => event.type === "assistant.delta" && event.content === "native answer"), true);
     assert.equal(events.some((event) => event.type === "tool.completed" && event.tool === "echo"), true);
+    await agent.close();
+    closed = true;
+    const storedEvents = (await readFile(recorder.filePath, "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { type: string; reasoningContent?: string });
+    assert.equal(storedEvents.find((event) => event.type === "tool_call")?.reasoningContent, "先检查当前状态。");
+    assert.equal([...storedEvents].reverse().find((event) => event.type === "assistant_message")?.reasoningContent, "根据结果整理回复。");
   } finally {
     globalThis.fetch = originalFetch;
+    if (!closed) await agent.close();
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testGoogleProviderCatalog(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  let requestHeaders: Headers | undefined;
+  globalThis.fetch = (async (input, init) => {
+    assert.equal(String(input), "https://generativelanguage.googleapis.com/v1beta/models");
+    requestHeaders = new Headers(init?.headers);
+    return new Response(JSON.stringify({
+      models: [{
+        name: "models/gemini-catalog-test",
+        displayName: "Gemini Catalog Test",
+        inputTokenLimit: 65_536,
+        outputTokenLimit: 8_192,
+        supportedGenerationMethods: ["generateContent"]
+      }]
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  try {
+    const config = configSchema.parse({
+      ...defaultConfig,
+      defaultModel: "google-test",
+      providers: { google: { type: "google-native", apiKey: "google-key" } },
+      models: { "google-test": { provider: "google", model: "gemini-catalog-test", apiBackend: "google_generative_ai" } }
+    });
+    const models = await new ProviderRegistry(config).refreshModels("google");
+    assert.equal(requestHeaders?.get("x-goog-api-key"), "google-key");
+    assert.equal(models.find((model) => model.id === "gemini-catalog-test")?.apiBackend, "google_generative_ai");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testGoogleGenerativeAiTransport(): Promise<void> {
+  let requestUrl = "";
+  let requestHeaders: Headers | undefined;
+  let requestBody: Record<string, unknown> | undefined;
+  const model = createNativeModel({
+    provider: "google-native",
+    modelId: "gemini-test",
+    api: "google_generative_ai",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    apiKey: "google-key",
+    fetch: async (input, init) => {
+      requestUrl = String(input);
+      requestHeaders = new Headers(init?.headers);
+      requestBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      return new Response([
+        `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: "consider", thought: true }] } }] })}`,
+        `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ functionCall: { name: "lookup", args: { query: "value" } } }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 3, candidatesTokenCount: 2, totalTokenCount: 5 } })}`
+      ].join("\n\n") + "\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+  });
+  const events = [];
+  for await (const event of await model.stream({
+    systemPrompt: "Be useful",
+    messages: [{ role: "user", content: "find it" }],
+    tools: [{ name: "lookup", description: "Lookup", parameters: { type: "object" } }]
+  }, { reasoning: "high" })) events.push(event);
+  assert.equal(requestUrl, "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:streamGenerateContent?alt=sse");
+  assert.equal(requestHeaders?.get("x-goog-api-key"), "google-key");
+  assert.equal(((requestBody?.generationConfig as Record<string, unknown>).thinkingConfig as Record<string, unknown>).thinkingBudget, 8_192);
+  assert.equal(events.find((event) => event.type === "reasoning-delta")?.text, "consider");
+  assert.equal(events.find((event) => event.type === "tool-call")?.name, "lookup");
+  assert.equal(events.find((event) => event.type === "finish")?.usage?.totalTokens, 5);
+}
+
+async function testExtensibleProviderRuntime(): Promise<void> {
+  let observedReasoning: string | undefined;
+  const ai = new AiRegistry();
+  ai.registerProvider({
+    type: "plugin-provider",
+    name: "Plugin Provider",
+    protocol: "openai-compatible",
+    api: "plugin-api",
+    baseUrl: "https://plugin.example/v1",
+    requiresApiKey: false,
+    authModes: ["api-key"],
+    filterModels: (models) => models.filter((model) => model.id !== "hidden")
+  }, [
+    catalogEntry("visible", "Built-in Visible"),
+    catalogEntry("hidden", "Hidden")
+  ]);
+  ai.registerModels("plugin-provider", [catalogEntry("visible", "Extension Visible")]);
+  ai.registerApiAdapter({
+    id: "plugin-api",
+    stream: async function* (_request, _context, options) {
+      observedReasoning = options?.reasoning;
+      yield { type: "start" };
+      yield { type: "reasoning-delta", id: "reasoning-0", text: "check" };
+      yield { type: "tool-call", id: "tool-1", name: "lookup", arguments: { query: "value" } };
+      yield { type: "finish", reason: "tool-calls" };
+    }
+  });
+  const config = configSchema.parse({
+    ...defaultConfig,
+    defaultModel: "configured",
+    providers: {
+      custom: {
+        type: "plugin-provider",
+        baseUrl: "https://configured.example/v1",
+        requiresApiKey: false,
+        apiBackend: "plugin-api"
+      }
+    },
+    models: {
+      configured: {
+        provider: "custom",
+        model: "configured-model",
+        displayName: "Configured Model",
+        capabilities: { tools: true, reasoning: true, streaming: true },
+        thinkingLevelMap: { off: "none", high: "provider-high" }
+      }
+    },
+    thinking: { enabled: true, effort: "high" }
+  });
+  const liveModels = [catalogEntry("visible", "Live Visible"), catalogEntry("live-only", "Live Only")];
+  const runtime = new ModelRuntime(config, [["custom", liveModels]], ai);
+  const choices = runtime.listModels();
+  assert.equal(choices.find((choice) => choice.alias === "custom/visible")?.displayName, "Live Visible");
+  assert.equal(choices.some((choice) => choice.alias === "custom/hidden"), false);
+  assert.equal(choices.some((choice) => choice.alias === "custom/live-only"), true);
+
+  const settings = new ProviderRegistry(config, [["custom", liveModels]], ai).createModelSettings();
+  const events = [];
+  for await (const event of await settings.model.streamSimple?.({
+    messages: [{ role: "user", content: "use a tool" }],
+    tools: []
+  }, { reasoning: "high" }) ?? []) events.push(event);
+  assert.equal(observedReasoning, "high");
+  assert.equal(events.some((event) => event.type === "reasoning-delta"), true);
+  assert.equal(events.find((event) => event.type === "tool-call")?.name, "lookup");
+}
+
+function catalogEntry(id: string, displayName: string) {
+  return {
+    id,
+    displayName,
+    provider: "custom",
+    contextWindow: 32_000,
+    maxOutputTokens: 4_096,
+    capabilities: { tools: true, streaming: true },
+    reasoningEfforts: []
+  };
+}
+
+async function testApiAdapterDispatch(): Promise<void> {
+  let observedProvider = "";
+  const adapters = new ApiAdapterRegistry([{
+    id: "chat_completions",
+    stream: async function* (request, context) {
+      observedProvider = request.provider;
+      assert.equal(context.messages.at(-1)?.role, "user");
+      yield { type: "start" };
+      yield { type: "text-delta", text: "adapter answer" };
+      yield { type: "finish", reason: "stop" };
+    }
+  }]);
+  const model = createNativeModel({
+    provider: "adapter-test",
+    modelId: "adapter-model",
+    api: "chat_completions",
+    baseUrl: "https://example.test/v1",
+    fetch: async () => new Response(null, { status: 500 }),
+    apiAdapters: adapters
+  });
+  const events = [];
+  for await (const event of await model.stream({ messages: [{ role: "user", content: "hello" }], tools: [] })) {
+    events.push(event);
+  }
+  assert.equal(observedProvider, "adapter-test");
+  assert.equal(events.find((event) => event.type === "text-delta")?.text, "adapter answer");
+}
+
+async function testProviderRuntimeCatalog(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input) => {
+    assert.equal(String(input), "https://catalog.example/v1/models");
+    return new Response(JSON.stringify({ data: [{ id: "catalog-model", context_window: 32_000 }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  }) as typeof fetch;
+  try {
+    const config = configSchema.parse({
+      ...defaultConfig,
+      defaultModel: "configured-model",
+      providers: {
+        catalog: {
+          type: "openai-compatible",
+          baseUrl: "https://catalog.example/v1",
+          apiKey: "test-key"
+        }
+      },
+      models: {
+        "configured-model": { provider: "catalog", model: "configured-model" }
+      }
+    });
+    const providers = new ProviderRegistry(config);
+    assert.equal(providers.require("catalog").isConfigured(config.models["configured-model"]), true);
+    const models = await providers.refreshModels("catalog");
+    assert.equal(models[0]?.id, "catalog-model");
+    assert.equal(providers.catalogsSnapshot()[0]?.[1][0]?.provider, "catalog");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testPersistedProviderCatalog(): Promise<void> {
+  const root = await mkdtemp(path.join(os.tmpdir(), "biny-models-store-"));
+  const filePath = path.join(root, "models-store.json");
+  const firstStore = new FileModelsStore(filePath);
+  const secondStore = new FileModelsStore(filePath);
+  const model = {
+    id: "cached-model",
+    displayName: "Cached Model",
+    provider: "catalog",
+    contextWindow: 64_000,
+    maxOutputTokens: 8_000,
+    capabilities: { tools: true, streaming: true },
+    reasoningEfforts: [],
+    headers: { Authorization: "Bearer secret", "x-model-feature": "safe" }
+  };
+  try {
+    await Promise.all([
+      firstStore.write("catalog", { models: [model], checkedAt: 1, etag: "first-etag" }),
+      secondStore.write("other", { models: [{ ...model, id: "other-model", provider: "other" }], checkedAt: 2 })
+    ]);
+    const restored = await new FileModelsStore(filePath).read("catalog");
+    assert.equal(restored?.models[0]?.headers?.Authorization, undefined);
+    assert.equal(restored?.models[0]?.headers?.["x-model-feature"], "safe");
+    assert.equal((await secondStore.read("other"))?.models[0]?.id, "other-model");
+    if (process.platform !== "win32") assert.equal((await stat(filePath)).mode & 0o777, 0o600);
+
+    const config = configSchema.parse({
+      ...defaultConfig,
+      defaultModel: "configured-model",
+      providers: {
+        catalog: {
+          type: "openai-compatible",
+          baseUrl: "https://catalog.example/v1",
+          apiKey: "test-key"
+        }
+      },
+      models: {
+        "configured-model": { provider: "catalog", model: "configured-model" }
+      }
+    });
+    const catalogs = await restoreProviderCatalogs(["catalog"], new FileModelsStore(filePath));
+    const runtime = new ModelRuntime(config, catalogs, undefined, new FileModelsStore(filePath));
+    const originalFetch = globalThis.fetch;
+    let conditionalHeaders: Headers | undefined;
+    globalThis.fetch = (async (_input, init) => {
+      conditionalHeaders = new Headers(init?.headers);
+      return new Response(null, { status: 304, headers: { etag: "first-etag" } });
+    }) as typeof fetch;
+    try {
+      const models = await runtime.refreshModels("catalog");
+      assert.equal(models.some((entry) => entry.id === "cached-model"), true);
+      assert.equal(conditionalHeaders?.get("if-none-match"), "first-etag");
+
+      globalThis.fetch = (async () => {
+        throw new Error("offline");
+      }) as typeof fetch;
+      await assert.rejects(runtime.refreshModels("catalog"), /offline/u);
+      assert.equal(runtime.listModels().some((entry) => entry.model === "cached-model"), true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    await writeFile(filePath, "{broken", "utf8");
+    await firstStore.write("recovered", { models: [{ ...model, id: "recovered-model", provider: "recovered" }] });
+    assert.equal((await secondStore.read("recovered"))?.models[0]?.id, "recovered-model");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testQueuedFollowUp(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-native-follow-up-"));
+  await ensureAgentDirs(workspaceRoot);
+  const firstRequestStarted = deferred<void>();
+  const releaseFirstRequest = deferred<void>();
+  const contexts: ModelStreamContext[] = [];
+  const model: AgentModel = {
+    provider: "test",
+    modelId: "queued-model",
+    stream: async (context) => {
+      contexts.push(structuredClone(context));
+      const request = contexts.length;
+      if (request === 1) {
+        firstRequestStarted.resolve();
+        await releaseFirstRequest.promise;
+      }
+      return (async function* () {
+        yield { type: "start" as const };
+        yield { type: "text-delta" as const, text: request === 1 ? "first answer" : "follow-up answer" };
+        yield { type: "finish" as const, reason: "stop" as const };
+      })();
+    }
+  };
+  const config = configSchema.parse({
+    ...defaultConfig,
+    defaultModel: "queued-model",
+    providers: { test: { type: "openai", apiKey: "test-key", baseUrl: "https://example.test/v1" } },
+    models: { "queued-model": { provider: "test", model: "queued-model" } },
+    context: { ...defaultConfig.context, memory: { enabled: false } }
+  });
+  const recorder = new SessionRecorder(workspaceRoot);
+  const agent = new AgentSession({
+    workspaceRoot,
+    config,
+    model,
+    toolRegistry: new ToolRegistry(),
+    permissionManager: new PermissionManager(config.permission),
+    recorder
+  });
+  await agent.initialize();
+  try {
+    const events: AgentSessionEvent[] = [];
+    const run = (async () => {
+      for await (const event of agent.prompt("first question")) events.push(event);
+    })();
+    await firstRequestStarted.promise;
+    agent.queueFollowUp("queued-message", "second question");
+    releaseFirstRequest.resolve();
+    await run;
+
+    assert.equal(contexts.length, 2);
+    assert.deepEqual(contexts[1]?.messages.at(-1), { role: "user", content: "second question" });
+    assert.equal(events.some((event) => event.type === "message.user"
+      && event.messageId === "queued-message"
+      && event.delivery === "followUp"), true);
+    assert.equal(events.find((event) => event.type === "done")?.content, "follow-up answer");
+  } finally {
     await agent.close();
     await rm(workspaceRoot, { recursive: true, force: true });
   }
@@ -152,7 +516,7 @@ async function testAnthropicSubscriptionAndHistory(): Promise<void> {
   const model = createNativeModel({
     provider: "claude-subscription",
     modelId: "claude-test",
-    protocol: "anthropic",
+    api: "anthropic_messages",
     baseUrl: "https://example.test/anthropic/v1",
     apiKey: "oauth-token",
     anthropicAuthMode: "bearer",
@@ -187,7 +551,7 @@ async function testNativeTimeout(): Promise<void> {
   const model = createNativeModel({
     provider: "timeout-test",
     modelId: "timeout-model",
-    protocol: "openai-compatible",
+    api: "chat_completions",
     baseUrl: "https://example.test/v1",
     fetch: async (_input, init) => await new Promise<Response>((_resolve, reject) => {
       const signal = init?.signal;
@@ -220,7 +584,7 @@ async function testCompatibleReasoningPayloads(): Promise<void> {
   const qwen = createNativeModel({
     provider: "qwen",
     modelId: "qwen-test",
-    protocol: "openai-compatible",
+    api: "chat_completions",
     reasoningProtocol: "alibaba",
     providerOptions: { alibaba: { enableThinking: true, thinkingBudget: 512 } },
     baseUrl: "https://example.test/v1",
@@ -238,7 +602,7 @@ async function testCompatibleReasoningPayloads(): Promise<void> {
   const kimi = createNativeModel({
     provider: "kimi",
     modelId: "kimi-k2.5",
-    protocol: "openai-compatible",
+    api: "chat_completions",
     reasoningProtocol: "moonshotai",
     providerOptions: { moonshotai: { thinking: { type: "enabled" } } },
     baseUrl: "https://example.test/v1",
@@ -262,7 +626,7 @@ async function testCompatibleReasoningPayloads(): Promise<void> {
   const kimiK3 = createNativeModel({
     provider: "kimi",
     modelId: "kimi-k3",
-    protocol: "openai-compatible",
+    api: "chat_completions",
     reasoningProtocol: "moonshotai",
     providerOptions: { moonshotai: { reasoningEffort: "max" } },
     baseUrl: "https://example.test/v1",
@@ -283,7 +647,7 @@ async function testCompatibleSystemRole(): Promise<void> {
   const model = createNativeModel({
     provider: "openai-compatible",
     modelId: "compat-model",
-    protocol: "openai-compatible",
+    api: "chat_completions",
     baseUrl: "https://example.test/v1",
     apiKey: "token",
     fetch: async (_input, init) => {
@@ -307,7 +671,7 @@ async function testOpenAiResponsesTransport(): Promise<void> {
   const model = createNativeModel({
     provider: "openai-codex",
     modelId: "gpt-test",
-    protocol: "openai-responses",
+    api: "responses",
     baseUrl: "https://example.test/backend-api/codex",
     apiKey: "token",
     fetch: async (input, init) => {
@@ -334,6 +698,56 @@ async function testOpenAiResponsesTransport(): Promise<void> {
     reason: "stop",
     usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5, reasoningTokens: undefined }
   });
+}
+
+async function testAudioPayloads(): Promise<void> {
+  const bodies: Record<string, unknown>[] = [];
+  const fetcher = async (_input: URL | RequestInfo, init?: RequestInit): Promise<Response> => {
+    bodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+    return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  };
+  const openAi = createNativeModel({
+    provider: "openai-compatible",
+    modelId: "audio-test",
+    api: "chat_completions",
+    baseUrl: "https://example.test/v1",
+    fetch: fetcher
+  });
+  for await (const _event of await openAi.stream({
+    messages: [{ role: "user", content: [{ type: "text", text: "transcribe" }, { type: "audio", data: "bXAz", mimeType: "audio/mpeg" }] }],
+    tools: []
+  })) {
+    // Drain the native stream.
+  }
+  const messages = bodies[0]?.messages as Array<{ content?: unknown[] }>;
+  assert.deepEqual(messages[0]?.content?.[1], { type: "input_audio", input_audio: { data: "bXAz", format: "mp3" } });
+
+  const anthropic = createNativeModel({
+    provider: "anthropic",
+    modelId: "audio-test",
+    api: "anthropic_messages",
+    baseUrl: "https://example.test/v1",
+    fetch: fetcher
+  });
+  await assert.rejects(async () => {
+    for await (const _event of await anthropic.stream({
+      messages: [{ role: "user", content: [{ type: "audio", data: "bXAz", mimeType: "audio/mpeg" }] }],
+      tools: []
+    })) {
+      // Transport must reject before sending a malformed request.
+    }
+  }, /does not support audio input/u);
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve(value?: T | PromiseLike<T>): void } {
+  let resolvePromise!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: (value) => resolvePromise(value as T | PromiseLike<T>) };
 }
 
 await main();

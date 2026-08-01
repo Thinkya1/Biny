@@ -24,7 +24,7 @@ async function testTodoCompletionConstraint(): Promise<void> {
     const decision = await gate.decide(createFacts(), createBudget());
     assert.equal(decision.kind, "continue");
     if (decision.kind !== "continue") throw new Error("unfinished Todo did not continue");
-    assert.equal(decision.feedback.role, "system", "completion feedback must be an internal system message");
+    assert.equal(decision.feedback.role, "user", "completion feedback must remain in the agent message protocol");
     assert.match(String(decision.feedback.content), /Continue the same user task/);
     assert.doesNotMatch(String(decision.feedback.content), /role.*user/i);
   }
@@ -100,6 +100,37 @@ async function testVerificationFailureThenPass(): Promise<void> {
   assert.deepEqual(second, { kind: "complete" });
   assert.equal(verifier.verifyCalls, 2, "a failed check must rerun after the same-loop repair continuation");
   assert.deepEqual(recorded, [failed, passed]);
+}
+
+async function testVerificationEnvironmentFailureBlocks(): Promise<void> {
+  const checks: StructuredVerificationCheck[] = [{
+    id: "maven-test",
+    kind: "command",
+    description: "Maven tests",
+    command: "./mvnw test"
+  }];
+  const verifier = new ScriptedVerifier([{
+    passed: false,
+    summary: "Maven tests failed in the independent verifier.",
+    evidence: [{
+      id: "maven-test",
+      passed: false,
+      summary: "Maven tests failed in an independent verifier run.",
+      details: { stderr: "java.net.ConnectException: Connection refused" }
+    }]
+  }], true);
+  const gate = createGate({ checks, verifier });
+
+  const decision = await gate.decide(
+    createFacts({ changedFiles: ["src/main/java/Example.java"] }),
+    createBudget()
+  );
+  assert.deepEqual(decision, {
+    kind: "blocked",
+    reason: "environment_unavailable",
+    summary: "Independent verification is blocked by an unavailable environment: Maven tests failed in an independent verifier run.",
+    requiredAction: "Start the required service or repair the test environment, then rerun verification."
+  });
 }
 
 async function testStaleTodoWithCompletedFactsStopsAfterNoProgress(): Promise<void> {
@@ -445,6 +476,7 @@ await testPendingApproval();
 await testCancellation();
 await testHardLimit();
 await testVerificationFailureThenPass();
+await testVerificationEnvironmentFailureBlocks();
 await testStaleTodoWithCompletedFactsStopsAfterNoProgress();
 await testContinuationLimit();
 await testToolAndRepeatedActionLimits();

@@ -29,7 +29,7 @@ import {
   pushNavigation,
   replaceNavigation
 } from "../src/desktop/renderer/src/navigationHistory.js";
-import { activeTimelineTool, buildSessionTimeline, listChangedFiles, listTimelineFiles, timelineToolEntries } from "../src/desktop/renderer/src/sessionTimeline.js";
+import { activeTimelineTool, buildSessionTimeline, listChangedFiles, listTimelineFiles, liveTimelineEvents, timelineToolEntries } from "../src/desktop/renderer/src/sessionTimeline.js";
 import { reasoningDetailText } from "../src/desktop/renderer/src/reasoningPresentation.js";
 import { projectWebSearchView } from "../src/desktop/renderer/src/webSearchPresentation.js";
 import type { TimelineTool } from "../src/desktop/renderer/src/sessionTimeline.js";
@@ -39,6 +39,7 @@ import { splitAttachmentReferences, withAttachmentReferences } from "../src/desk
 import { tokenizeCommand } from "../src/desktop/renderer/src/commandHighlight.js";
 import { workspaceFileMarker } from "../src/desktop/renderer/src/workspaceFileMarker.js";
 import { listModelChoices, ModelManager } from "../src/llm/ModelManager.js";
+import { FileModelsStore } from "../src/llm/ModelsStore.js";
 import type { SessionEvent } from "../src/session/recorder.js";
 import { SessionRecorder } from "../src/session/recorder.js";
 import { listSessionSummaries, readStoredSessionEvents } from "../src/session/events.js";
@@ -47,6 +48,7 @@ import { ensureAgentDirs, resolveSessionFile, sessionFilePath } from "../src/ses
 const execFileAsync = promisify(execFile);
 
 await testInteractiveRuntimeProtocol();
+await testInteractiveRuntimePublishesStatusSnapshot();
 await testInteractiveRuntimeRedactsToolEvents();
 await testInteractiveRuntimeRedactsRunText();
 await testInteractiveRuntimeStrongConfirmation();
@@ -91,6 +93,7 @@ testHistoricalPrefixKeepsUnpersistedDuplicatePrompt();
 testHistoricalEmptyAssistantDoesNotEraseReply();
 testChangedFileProjection();
 testLiveTimelineProjection();
+testLiveTimelineDoesNotRetainReasoningDeltas();
 testLiveBlockedAndCancelledProjection();
 testTerminalRunEventClassification();
 testLiveReasoningAndSkillProjection();
@@ -132,6 +135,28 @@ async function testInteractiveRuntimeProtocol(): Promise<void> {
   ]);
   assert.ok(events.every((event) => event.sessionId === "session-1" && event.runId && event.timestamp));
   await runtime.close();
+}
+
+async function testInteractiveRuntimePublishesStatusSnapshot(): Promise<void> {
+  let releaseStatus!: () => void;
+  const statusGate = new Promise<void>((resolve) => { releaseStatus = resolve; });
+  const runtime = new InteractiveAgentRuntime(fakeCommandRuntime(false, statusGate));
+  let sawCompletedStatus = false;
+  runtime.subscribe((update) => {
+    if (update.snapshot.state.kind === "runs" && update.snapshot.state.activeRun.status === "completed") {
+      sawCompletedStatus = true;
+    }
+  });
+
+  const submitted = runtime.submitPrompt("status-snapshot");
+  try {
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    assert.equal(sawCompletedStatus, true, "AgentSession status must be visible before final done cleanup");
+  } finally {
+    releaseStatus();
+    await submitted.completion;
+    await runtime.close();
+  }
 }
 
 async function testInteractiveRuntimeRedactsToolEvents(): Promise<void> {
@@ -602,6 +627,9 @@ async function testDesktopModelConfiguration(): Promise<void> {
   try {
     const initialConfig = structuredClone(defaultConfig);
     initialConfig.models["deepseek-deepseek-v4-flash"] = { ...initialConfig.models["deepseek-v4-flash"] };
+    initialConfig.providers.deepseek!.headers = { "X-Provider-Route": "stable" };
+    initialConfig.providers.deepseek!.modelsEndpoint = "https://api.deepseek.com/models";
+    initialConfig.models["deepseek-v4-flash"]!.headers = { "X-Model-Route": "flash" };
     const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
     await configStore.save(initialConfig);
     const project = await projects.createProject(workspaceRoot);
@@ -662,6 +690,9 @@ async function testDesktopModelConfiguration(): Promise<void> {
     });
     const cleanedConfig = await configStore.load();
     assert.equal(cleanedConfig.models["deepseek-deepseek-v4-flash"], undefined);
+    assert.deepEqual(cleanedConfig.providers.deepseek?.headers, { "X-Provider-Route": "stable" });
+    assert.equal(cleanedConfig.providers.deepseek?.modelsEndpoint, "https://api.deepseek.com/models");
+    assert.deepEqual(cleanedConfig.models["deepseek-v4-flash"]?.headers, { "X-Model-Route": "flash" });
     await projects.listSessions(project, undefined, new Map());
     const attachment = await projects.saveAttachment(project, "notes.txt", "text/plain", new TextEncoder().encode("desktop only"));
     assert.match(attachment.path, /^@attachments\//);
@@ -868,7 +899,8 @@ async function testDesktopConnectionMetadata(): Promise<void> {
   try {
     const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
     const project = await projects.createProject(workspaceRoot);
-    const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
+    const modelsStore = new FileModelsStore(path.join(desktopRoot, "models-store.json"));
+    const agents = new DesktopAgentManager(state, projects, configStore, () => undefined, undefined, modelsStore);
     const config = structuredClone(defaultConfig);
     config.providers.deepseek!.apiKey = "connection-metadata-secret";
     config.providers.subscription = {
@@ -899,9 +931,20 @@ async function testDesktopConnectionMetadata(): Promise<void> {
     unreachable.providers.deepseek!.baseUrl = "http://127.0.0.1:1/v1";
     unreachable.providers.deepseek!.retry = { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0 };
     await configStore.save(unreachable);
+    await modelsStore.write("deepseek", {
+      models: [{
+        id: "cached-deepseek-model",
+        displayName: "Cached DeepSeek Model",
+        provider: "deepseek",
+        contextWindow: 64_000,
+        maxOutputTokens: 8_000,
+        capabilities: { tools: true, streaming: true },
+        reasoningEfforts: []
+      }]
+    });
     const catalog = await agents.fetchModelCatalog(project.id, "deepseek");
     assert.equal(catalog.source, "fallback");
-    assert.equal(catalog.models.length, 0);
+    assert.deepEqual(catalog.models.map((model) => model.id), ["cached-deepseek-model"]);
     assert.equal(catalog.providerAlias, "deepseek");
     await assert.rejects(agents.fetchModelCatalog(project.id, "missing-provider"), /missing-provider/);
     await agents.closeAll();
@@ -1049,7 +1092,12 @@ function testProviderCatalogResolution(): void {
 function testModelChoicesDeduplicateEquivalentAliases(): void {
   const config = structuredClone(defaultConfig);
   config.models["deepseek-deepseek-v4-flash"] = { ...config.models["deepseek-v4-flash"] };
-  assert.deepEqual(listModelChoices(config).map((model) => model.alias), ["deepseek-v4-flash", "deepseek-v4-pro"]);
+  assert.deepEqual(listModelChoices(config).map((model) => model.alias), [
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "deepseek/deepseek-chat",
+    "deepseek/deepseek-reasoner"
+  ]);
 }
 
 function testHistoricalAbortProjection(): void {
@@ -1166,9 +1214,12 @@ function testExecutionTimelineKeepsReasoningAndToolsInOrder(): void {
   const turn = timeline[0];
   assert.deepEqual(turn?.steps.map((step) => step.kind), ["reasoning", "assistant", "tool", "reasoning", "assistant", "tool", "reasoning", "assistant"]);
   assert.equal(turn?.steps[0]?.kind === "reasoning" ? turn.steps[0].content : undefined, "先确认入口文件。");
+  assert.equal(turn?.steps[1]?.kind === "assistant" ? turn.steps[1].summary : undefined, true);
   assert.equal(turn?.steps[2]?.kind === "tool" ? turn.steps[2].tool.id : undefined, "read");
+  assert.equal(turn?.steps[4]?.kind === "assistant" ? turn.steps[4].summary : undefined, true);
   assert.equal(turn?.steps[5]?.kind === "tool" ? turn.steps[5].tool.id : undefined, "test");
   assert.equal(turn?.steps[6]?.kind === "reasoning" ? turn.steps[6].content : undefined, "最后整理结果。");
+  assert.equal(turn?.assistant, "完成。");
 }
 
 function testLiveExecutionTimelineKeepsReasoningAndToolsInOrder(): void {
@@ -1208,8 +1259,11 @@ function testLiveAssistantCompletionDoesNotDuplicateDelta(): void {
   ]);
   const turn = timeline[0];
   const assistantSteps = turn?.steps.filter((step) => step.kind === "assistant") ?? [];
-  assert.equal(assistantSteps.length, 1);
+  assert.equal(assistantSteps.length, 2);
+  assert.equal(assistantSteps[0]?.kind === "assistant" ? assistantSteps[0].summary : undefined, true);
   assert.equal(assistantSteps[0]?.kind === "assistant" ? assistantSteps[0].content : undefined, "正文");
+  assert.equal(assistantSteps[1]?.kind === "assistant" ? assistantSteps[1].summary : undefined, undefined);
+  assert.equal(assistantSteps[1]?.kind === "assistant" ? assistantSteps[1].content : undefined, "正文");
   assert.equal(turn?.assistant, "正文");
 }
 
@@ -1323,6 +1377,17 @@ function testLiveTimelineProjection(): void {
   assert.equal(typedFailure[0]?.error, "Step limit reached.");
 }
 
+function testLiveTimelineDoesNotRetainReasoningDeltas(): void {
+  const base = { sessionId: "session", runId: "run", timestamp: "2026-01-01T00:00:00.000Z" };
+  const events: AgentHostEvent[] = [
+    { ...base, type: "reasoning.started", phase: "initial" },
+    { ...base, type: "reasoning.delta", content: "private thought" },
+    { ...base, type: "reasoning.completed" },
+    { ...base, type: "assistant.delta", content: "answer" }
+  ];
+  assert.deepEqual(liveTimelineEvents(events).map((event) => event.type), ["reasoning.started", "reasoning.completed", "assistant.delta"]);
+}
+
 function testLiveBlockedAndCancelledProjection(): void {
   const base = { sessionId: "session", timestamp: "2026-01-01T00:00:00.000Z" };
   const blocked = buildSessionTimeline([], [
@@ -1428,7 +1493,7 @@ function testDesktopNavigationHistory(): void {
   assert.deepEqual(moveNavigation(state, 1).target, undefined);
 }
 
-function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
+function fakeCommandRuntime(requireFullYes = false, statusGate?: Promise<void>): CommandRuntime {
   const info: AgentSessionInfo = {
     workspaceRoot: "/tmp/project",
     sessionId: "session-1",
@@ -1472,6 +1537,22 @@ function fakeCommandRuntime(requireFullYes = false): CommandRuntime {
     switchModel: async () => ({ modelAlias: "test", provider: "test", modelLabel: "test/model", reasoningLabel: "Off", thinking: "off" as const }),
     async *prompt(input: string, options: AgentRunOptions): AsyncGenerator<AgentSessionEvent> {
       yield { type: "status", status: "thinking" };
+      if (input === "status-snapshot") {
+        yield { type: "status", status: "completed" };
+        await statusGate;
+        yield {
+          type: "done",
+          content: "done",
+          outcome: {
+            status: "completed",
+            stopReason: "completion_gate",
+            finishReason: "stop",
+            steps: 1,
+            output: "done"
+          }
+        };
+        return;
+      }
       if (input === "terminal-blocked") {
         yield {
           type: "done",

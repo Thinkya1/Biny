@@ -3,9 +3,9 @@ import { CombinedAutocompleteProvider, visibleWidth } from "@earendil-works/pi-t
 import { createInitialTuiState, tuiReducer, type TuiAction } from "../src/tui/reducer.js";
 import { sessionEventsToTranscript } from "../src/tui/sessionTranscript.js";
 import { diffLineStyle } from "../src/tui/diffLines.js";
-import { foldableTranscriptItems, formatSessionAge, formatToolDuration, latestExpandableTranscript } from "../src/tui/transcriptText.js";
+import { formatSessionAge, formatToolDuration } from "../src/tui/transcriptText.js";
 import { TranscriptView } from "../src/tui/components/transcriptView.js";
-import { ThinkingComponent, ToolExecutionComponent, splitToolTitle } from "../src/tui/components/messages.js";
+import { ActivitySummaryComponent, ThinkingComponent, ToolExecutionComponent, splitToolTitle } from "../src/tui/components/messages.js";
 import { PendingAttachmentsComponent, pendingAttachmentLabel } from "../src/tui/components/pendingAttachments.js";
 import { PermissionDialog, SelectDialog, TextViewerDialog } from "../src/tui/components/dialogs.js";
 import {
@@ -16,6 +16,7 @@ import {
   formatTokens,
   shortSessionId,
   shortcutHints,
+  statusDivider,
   statusMessage,
   visibleShortcutHints
 } from "../src/tui/components/chrome.js";
@@ -31,6 +32,7 @@ import {
   themeColorTokens
 } from "../src/tui/theme/index.js";
 import { slashCommandsForSurface } from "../src/runtime/commandRegistry.js";
+import { activitySummaryText } from "../src/runtime/activitySummary.js";
 import { modelThinkingOptions } from "../src/tui/modelOptions.js";
 import {
   confirmedPermissionChoice,
@@ -75,7 +77,9 @@ function renderView(view: TranscriptView, width: number): string {
 
 async function main(): Promise<void> {
   testTranscriptUsesIndependentItemKinds();
-  testReasoningStreamingRendersContent();
+  testReasoningStreamingRendersStatusOnly();
+  testReasoningStepGroupsToolsAndShowsNextMarker();
+  testLateReasoningDoesNotAppearBelowRunningTool();
   testIncompleteSessionStaysDistinctFromCompletion();
   testBlockedSessionShowsRequiredAction();
   testCancelledSessionStaysDistinctFromAbort();
@@ -89,11 +93,15 @@ async function main(): Promise<void> {
   testReusedToolCallIdKeepsUniqueTranscriptCells();
   testRecoverableErrorDoesNotFinalizeSiblingTools();
   testPermissionRejectionKeepsTurnRunning();
+  testMaintenanceDoesNotReuseTaskDuration();
   testPermissionConfirmationContract();
-  testLongCommandStaysInFoldedDetails();
+  testLongCommandKeepsDetailsHidden();
   testCommandDisplayNeverLeaksRawCommand();
   testFailedCommandCommitsOneToolItem();
   testErrorFinalizesActiveCells();
+  testActivitySummaryBeforeTool();
+  testActivitySummaryIsBoundedAndRedacted();
+  testActivitySummaryUsesNormalTextColor();
   testSessionReplayUsesToolItems();
   testSessionReplayFinalizesPendingTools();
   testSessionReplayRestoresTurnStatuses();
@@ -103,7 +111,7 @@ async function main(): Promise<void> {
   testTranscriptViewSyncsIncrementally();
   testAssistantMarkdownRendersBlocks();
   testToolBlockRendersTitleAndClampedOutput();
-  testThinkingBlockCollapses();
+  testThinkingBlockDefersStreamingBody();
   testFooterAndChromeLayout();
   testPendingAttachmentDisplay();
   testStatusAndShortcutHints();
@@ -198,34 +206,75 @@ function testTranscriptUsesIndependentItemKinds(): void {
   assert.equal(state.transcript.committed.at(-1)?.kind, "tool");
 }
 
-function testReasoningStreamingRendersContent(): void {
+function testReasoningStreamingRendersStatusOnly(): void {
   let state = createInitialTuiState("/workspace");
   state = reduce(state, { type: "message.user", content: "inspect" });
   state = reduce(state, { type: "reasoning.delta", content: "先检查" });
   state = reduce(state, { type: "reasoning.delta", content: "入口文件。" });
   assert.deepEqual(state.transcript.active.map((item) => item.kind), ["reasoning"]);
-  assert.equal(state.transcript.active[0]?.content, "先检查入口文件。");
+  assert.equal(state.transcript.active[0]?.content, "");
+
+  const streamingView = new TranscriptView();
+  streamingView.sync(state.transcript);
+  const streamingThinking = renderView(streamingView, 80);
+  assert.match(streamingThinking, /✶ Thinking…/u);
+  assert.doesNotMatch(streamingThinking, /先检查入口文件。/u);
 
   state = reduce(state, { type: "reasoning.completed" });
   assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["user", "reasoning"]);
-  assert.equal(state.transcript.committed[1]?.content, "先检查入口文件。");
-  // Pi keeps completed thinking visible by default; Ctrl+E can still collapse it.
+  assert.equal(state.transcript.committed[1]?.content, "");
+  // 实时 reasoning 不写进 TUI；session 恢复时仍可带回历史正文。
   const view = new TranscriptView();
   view.sync(state.transcript);
   const visibleThinking = renderView(view, 80);
-  assert.match(visibleThinking, /先检查入口文件。/u);
-  const reasoningId = state.transcript.committed[1]?.id;
-  assert.ok(reasoningId);
-  // 折叠后只剩标题行。
-  const thinkingComponent = view.componentFor(reasoningId);
-  assert.ok(thinkingComponent instanceof ThinkingComponent);
-  thinkingComponent.setCollapsed(true);
-  const collapsedThinking = renderView(view, 80);
-  assert.match(collapsedThinking, /Thought/u);
-  assert.doesNotMatch(collapsedThinking, /先检查入口文件。/u);
+  assert.match(visibleThinking, /Thought for/u);
+  assert.doesNotMatch(visibleThinking, /先检查入口文件。/u);
 
   state = reduce(state, { type: "reasoning.delta", content: "继续验证。" });
-  assert.equal(state.transcript.active.at(-1)?.content, "继续验证。");
+  assert.equal(state.transcript.active.at(-1)?.content, "");
+}
+
+function testLateReasoningDoesNotAppearBelowRunningTool(): void {
+  let state = createInitialTuiState("/workspace");
+  state = reduce(state, { type: "reasoning.delta", content: "先检查入口。" });
+  state = reduce(state, { type: "tool.started", toolCallId: "read", tool: "read_file", args: { path: "src/index.ts" } });
+  state = reduce(state, { type: "reasoning.delta", content: "继续确认相关调用。" });
+
+  assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["reasoning"]);
+  assert.equal(state.transcript.committed[0]?.content, "");
+  assert.deepEqual(state.transcript.active.map((item) => item.kind), ["tool"]);
+  const view = new TranscriptView();
+  view.sync(state.transcript);
+  const reasoning = view.componentFor(state.transcript.committed[0]?.id ?? "");
+  assert.ok(reasoning instanceof ThinkingComponent);
+  const output = renderView(view, 80);
+  assert.doesNotMatch(output, /继续确认相关调用。/u);
+}
+
+function testReasoningStepGroupsToolsAndShowsNextMarker(): void {
+  let state = createInitialTuiState("/workspace");
+  state = reduce(state, { type: "reasoning.started", phase: "initial" });
+  assert.deepEqual(state.transcript.active.map((item) => item.kind), ["reasoning"]);
+  state = reduce(state, { type: "reasoning.delta", content: "先定位入口。" });
+  state = reduce(state, { type: "tool.started", toolCallId: "read-1", tool: "read_file", args: { path: "src/index.ts" } });
+  state = reduce(state, { type: "tool.started", toolCallId: "read-2", tool: "read_file", args: { path: "src/app.ts" } });
+
+  assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["reasoning"]);
+  assert.deepEqual(state.transcript.active.map((item) => item.kind), ["tool", "tool"]);
+
+  state = reduce(state, { type: "tool.completed", toolCallId: "read-1", tool: "read_file", result: { content: "one" } });
+  state = reduce(state, { type: "tool.completed", toolCallId: "read-2", tool: "read_file", result: { content: "two" } });
+  state = reduce(state, { type: "reasoning.started", phase: "continuing" });
+
+  assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["reasoning", "tool", "tool"]);
+  assert.deepEqual(state.transcript.active.map((item) => item.kind), ["reasoning"]);
+  const view = new TranscriptView();
+  view.sync(state.transcript);
+  const output = renderView(view, 100);
+  assert.match(output, /Thought for/u);
+  assert.match(output, /Thinking…/u);
+  assert.equal(output.indexOf("Thought for") < output.indexOf("Read"), true);
+  assert.equal(output.indexOf("Read") < output.lastIndexOf("Thinking…"), true);
 }
 
 function testIncompleteSessionStaysDistinctFromCompletion(): void {
@@ -341,11 +390,12 @@ function testActiveToolShowsLatestOutput(): void {
     tool: "run_command",
     update: { kind: "stdout", text: Array.from({ length: 8 }, (_, index) => `line ${String(index + 1)}`).join("\n") }
   });
-  // 运行中的工具优先显示最新输出，最早的几行折叠掉。
-  const output = renderTranscript(state.transcript, 80);
-  assert.equal(output.includes("line 1\n"), false);
-  assert.match(output, /line 8/u);
-  assert.match(output, /earlier lines/u);
+  // 运行中的工具默认只显示标题；原始 stdout 不进入主 transcript。
+  const view = new TranscriptView();
+  view.sync(state.transcript);
+  const compact = renderView(view, 80);
+  assert.doesNotMatch(compact, /line 8/u);
+  assert.doesNotMatch(compact, /earlier lines/u);
 }
 
 function testParallelToolsUpdateById(): void {
@@ -432,7 +482,22 @@ function testPermissionRejectionKeepsTurnRunning(): void {
   assert.equal(state.transcript.active.length, 1);
 }
 
-function testLongCommandStaysInFoldedDetails(): void {
+function testMaintenanceDoesNotReuseTaskDuration(): void {
+  let state = createInitialTuiState("/workspace");
+  state = reduce(state, { type: "message.user", content: "run the task" });
+  state = reduce(state, {
+    type: "run.completed",
+    durationMs: 138,
+    stopReason: "completion_gate",
+    steps: 1
+  });
+  assert.equal(state.lastWorkedMs !== undefined, true);
+
+  state = reduce(state, { type: "maintenance.started" });
+  assert.equal(state.lastWorkedMs, undefined);
+}
+
+function testLongCommandKeepsDetailsHidden(): void {
   const command = `node script.js ${"--very-long-option ".repeat(20)}`;
   let state = createInitialTuiState("/workspace");
   state = reduce(state, {
@@ -447,7 +512,6 @@ function testLongCommandStaysInFoldedDetails(): void {
   assert.equal(active.title.includes(command), false);
   assert.match(active.details ?? "", /Command: node script\.js/);
   assert.match(active.details ?? "", /Exit code: running/);
-  assert.deepEqual(latestExpandableTranscript(state.transcript), { title: "Running command", content: active.details });
 
   state = reduce(state, {
     type: "tool.completed",
@@ -462,15 +526,10 @@ function testLongCommandStaysInFoldedDetails(): void {
 
   const view = new TranscriptView();
   view.sync(state.transcript);
-  const collapsed = renderView(view, 40);
-  assert.equal(collapsed.includes(command), false);
-  assert.equal(collapsed.includes("Exit code"), false);
-  const toolComponent = view.componentFor(tool.id);
-  assert.ok(toolComponent instanceof ToolExecutionComponent);
-  toolComponent.setExpanded(true);
-  const expanded = renderView(view, 40);
-  assert.equal(expanded.includes("Command: node script.js"), true);
-  assert.equal(expanded.includes("Exit code: 0"), true);
+  const rendered = renderView(view, 40);
+  assert.equal(rendered.includes(command), false);
+  assert.equal(rendered.includes("Command: node script.js"), false);
+  assert.equal(rendered.includes("Exit code"), false);
 }
 
 function testCommandDisplayNeverLeaksRawCommand(): void {
@@ -534,26 +593,58 @@ function testErrorFinalizesActiveCells(): void {
   state = reduce(state, { type: "tool.started", toolCallId: "broken", tool: "run_command", args: { command: "bad-command" } });
   state = reduce(state, { type: "run.failed", durationMs: 10, error: "spawn failed" });
   assert.equal(state.transcript.active.length, 0);
-  assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["assistant", "tool", "error"]);
+  assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["activity", "tool", "error"]);
+  const activity = state.transcript.committed[0];
+  assert.equal(activity?.kind === "activity" ? activity.content : undefined, "partial");
   const tool = state.transcript.committed[1] as ToolTranscriptItem;
   assert.equal(tool.status, "failed");
   assert.match(tool.details ?? "", /spawn failed/);
 }
 
+function testActivitySummaryBeforeTool(): void {
+  let state = createInitialTuiState("/workspace");
+  state = reduce(state, { type: "assistant.delta", content: "先读取入口文件，再确认调用关系。" });
+  state = reduce(state, { type: "tool.started", toolCallId: "read", tool: "read_file", args: { path: "src/index.ts" } });
+
+  assert.deepEqual(state.transcript.committed.map((item) => item.kind), ["activity"]);
+  assert.equal(state.transcript.committed[0]?.kind === "activity" ? state.transcript.committed[0].content : undefined, "先读取入口文件，再确认调用关系。");
+  assert.deepEqual(state.transcript.active.map((item) => item.kind), ["tool"]);
+  const output = renderTranscript(state.transcript, 80);
+  assert.match(output, /先读取入口文件，再确认调用关系。/u);
+  assert.doesNotMatch(output, /assistant/u);
+}
+
+function testActivitySummaryIsBoundedAndRedacted(): void {
+  const summary = activitySummaryText(`token=opaque-live-tool-secret ${"x".repeat(300)}`);
+  assert.match(summary, /token=\[redacted\]/u);
+  assert.equal(summary.length, 240);
+  assert.match(summary, /…$/u);
+}
+
+function testActivitySummaryUsesNormalTextColor(): void {
+  setTheme("dark");
+  const content = "先读取入口文件。";
+  const component = new ActivitySummaryComponent({ id: "activity-1", kind: "activity", content });
+  const rendered = component.render(80).join("\n");
+  assert.equal(rendered.includes(theme.fg("text", content)), true);
+  assert.equal(rendered.includes("›"), false);
+  assert.equal(rendered.includes(theme.fg("muted", content)), false);
+}
+
 function testSessionReplayUsesToolItems(): void {
   const items = sessionEventsToTranscript([
     { type: "user_message", content: "read", time: "2026-07-12T00:00:00.000Z" },
-    { type: "tool_call", toolCallId: "read-1", tool: "read_file", args: { path: "README.md" }, reasoningContent: "先读取 README。", time: "2026-07-12T00:00:01.000Z" },
+    { type: "tool_call", toolCallId: "read-1", tool: "read_file", args: { path: "README.md" }, assistantContent: "先读取 README。", reasoningContent: "原始思考不应进入主界面。", time: "2026-07-12T00:00:01.000Z" },
     { type: "tool_result", toolCallId: "read-1", tool: "read_file", result: { path: "README.md", content: "line 1\nline 2" }, time: "2026-07-12T00:00:03.500Z" },
     { type: "assistant_message", content: "done" }
   ] as SessionEvent[]);
-  assert.deepEqual(items.map((item) => item.kind), ["user", "reasoning", "tool", "assistant"]);
+  assert.deepEqual(items.map((item) => item.kind), ["user", "activity", "tool", "assistant"]);
   assert.equal(items[1]?.content, "先读取 README。");
+  assert.equal(items.some((item) => item.kind !== "tool" && item.content.includes("原始思考")), false);
   const tool = items[2] as ToolTranscriptItem;
   assert.equal(tool.title, "Read README.md");
   assert.equal(tool.output, "line 1\nline 2");
   assert.equal(tool.durationMs, 2_500);
-  assert.deepEqual(latestExpandableTranscript({ committed: items, active: [] }), { title: "Read README.md", content: tool.details });
 }
 
 function testSessionReplayFinalizesPendingTools(): void {
@@ -717,32 +808,23 @@ function testToolBlockRendersTitleAndClampedOutput(): void {
   const lines = plainLines(component.render(40));
   const text = lines.join("\n");
   assert.match(text, /✓ Ran tests\s+1\.2s/u);
-  assert.match(text, /line one/u);
-  // 默认只显示前四行，其余折叠成一行提示。
-  assert.match(text, /… 2 more lines/u);
+  // 默认不展开工具输出，避免正常命令结果占满对话区。
+  assert.equal(text.includes("line one"), false);
   assert.equal(text.includes("line six"), false);
   for (const line of lines) assert.equal(visibleWidth(line) <= 40, true, line);
-
-  component.setExpanded(true);
-  assert.match(plainLines(component.render(40)).join("\n"), /Exit code: 0/u);
 
   assert.deepEqual(splitToolTitle("Ran tests"), { verb: "Ran", rest: " tests" });
   assert.deepEqual(splitToolTitle("Ran"), { verb: "Ran", rest: "" });
 }
 
-function testThinkingBlockCollapses(): void {
+function testThinkingBlockDefersStreamingBody(): void {
   setTheme("dark");
-  const component = new ThinkingComponent(
-    { id: "r1", kind: "reasoning", content: "先看 transcript 的结构。", durationMs: 2300 },
-    false
-  );
-  assert.match(plainLines(component.render(40)).join("\n"), /先看 transcript 的结构。/u);
-  assert.match(plainLines(component.render(40)).join("\n"), /Thought for 2\.3s/u);
+  const streaming = new ThinkingComponent({ id: "r1", kind: "reasoning", content: "正在生成的长思考。", startedAtMs: Date.now() - 2300 });
+  assert.doesNotMatch(plainLines(streaming.render(40)).join("\n"), /正在生成的长思考。/u);
 
-  component.setCollapsed(true);
-  const collapsed = plainLines(component.render(40)).join("\n");
-  assert.match(collapsed, /▸ Thought for 2\.3s/u);
-  assert.equal(collapsed.includes("先看 transcript 的结构。"), false);
+  const component = new ThinkingComponent({ id: "r1", kind: "reasoning", content: "先看 transcript 的结构。", durationMs: 2300 });
+  assert.doesNotMatch(plainLines(component.render(40)).join("\n"), /先看 transcript 的结构。/u);
+  assert.match(plainLines(component.render(40)).join("\n"), /Thought for 2\.3s/u);
 }
 
 function testPendingAttachmentDisplay(): void {
@@ -803,16 +885,25 @@ function testFooterAndChromeLayout(): void {
 
 function testStatusAndShortcutHints(): void {
   setTheme("dark");
-  assert.match(statusMessage("running"), /Working… \(esc to interrupt\)/u);
-  assert.match(statusMessage("waiting_permission"), /Waiting for approval/u);
+  assert.equal(statusMessage("running", 30_000, "◦"), "◦ Working (30s · esc to interrupt)");
+  assert.equal(statusMessage("thinking", 1_234, "⠋"), "⠋ Working (1.2s · esc to interrupt)");
+  assert.equal(statusMessage("waiting_permission", 30_000), "• Waiting for approval (30s)");
+  assert.equal(statusMessage("idle", 30_000), "Worked for 30s");
   assert.equal(statusMessage("idle"), "");
+
+  const divider = statusDivider("Worked for 9m 27s", 50);
+  assert.match(divider, /^─ Worked for 9m 27s ─+$/u);
+  assert.equal(visibleWidth(divider), 50);
+  assert.equal(visibleWidth(statusDivider("Working", 2)), 2);
 
   const busy = shortcutHints("running", "chat").map((hint) => hint.key);
   assert.equal(busy.includes("esc"), true);
+  assert.equal(busy.includes("ctrl+o"), false);
   const planHint = shortcutHints("idle", "plan").find((hint) => hint.key === "shift+tab");
   assert.equal(planHint?.description, "chat mode");
   const chatHint = shortcutHints("idle", "chat").find((hint) => hint.key === "shift+tab");
   assert.equal(chatHint?.description, "plan mode");
+  assert.equal(shortcutHints("idle", "chat").some((hint) => hint.key === "ctrl+e"), false);
 
   // 窄终端整条丢弃，不把单条提示截半句。
   const visible = visibleShortcutHints(shortcutHints("idle", "chat"), 14);
@@ -963,14 +1054,6 @@ function testTranscriptTextHelpers(): void {
   assert.equal(formatToolDuration(1_234), "1.2s");
   assert.equal(formatToolDuration(75_000), "1m 15s");
 
-  const foldables = foldableTranscriptItems({
-    committed: [
-      { id: "u1", kind: "user", content: "hi" },
-      { id: "t1", kind: "tool", tool: "read_file", title: "Read a", argsSummary: "a", status: "success" }
-    ],
-    active: [{ id: "r1", kind: "reasoning", content: "thinking" }]
-  });
-  assert.deepEqual(foldables.map((item) => item.id), ["t1", "r1"]);
 }
 
 async function testSlashAutocompleteInsertsSingleSlash(): Promise<void> {

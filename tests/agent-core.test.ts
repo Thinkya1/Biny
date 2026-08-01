@@ -3,6 +3,9 @@ import type { AgentModel, AgentTool, ModelStreamContext, ModelStreamEvent } from
 import { agentLoop } from "../src/agent/core/agentLoop.js";
 
 async function main(): Promise<void> {
+  await testAssistantDeltasAreForwardedBeforeProviderCompletes();
+  await testModelErrorRecoveryRetriesBeforeAnyDelta();
+  await testNextTurnRefreshesModelAndTools();
   const calls: ModelStreamContext[] = [];
   const model: AgentModel = {
     provider: "test",
@@ -51,6 +54,101 @@ async function main(): Promise<void> {
   assert.equal(received.includes("tool_execution_end"), true);
   assert.equal(received.filter((type) => type === "turn_end").length, 2);
   console.log("agent core tests passed");
+}
+
+async function testModelErrorRecoveryRetriesBeforeAnyDelta(): Promise<void> {
+  let requests = 0;
+  const model: AgentModel = {
+    provider: "test",
+    modelId: "recovery-model",
+    async stream(): Promise<AsyncIterable<ModelStreamEvent>> {
+      requests += 1;
+      if (requests === 1) throw new Error("maximum context length exceeded");
+      return events([{ type: "text-delta", text: "recovered" }, { type: "finish", reason: "stop" }]);
+    }
+  };
+  const received: string[] = [];
+  for await (const event of agentLoop([{ role: "user", content: "recover" }], { messages: [], tools: [] }, {
+    model,
+    tools: [],
+    maxSteps: 1,
+    recoverFromModelError: async (_error, context) => {
+      context.messages.splice(0, context.messages.length, { role: "user", content: "compacted" });
+      return { reason: "context_overflow", attempt: 1, compactedMessages: 4 };
+    }
+  })) received.push(event.type);
+  assert.equal(requests, 2);
+  assert.equal(received.includes("model_retry"), true);
+}
+
+async function testNextTurnRefreshesModelAndTools(): Promise<void> {
+  const firstTool: AgentTool = {
+    name: "first_tool",
+    description: "First tool.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    execute: async () => ({ content: [{ type: "text", text: "first result" }] })
+  };
+  const nextTool: AgentTool = { ...firstTool, name: "next_tool", description: "Next tool." };
+  const firstModel: AgentModel = {
+    provider: "test",
+    modelId: "first-model",
+    stream: async () => events([
+      { type: "tool-call", id: "first-call", name: "first_tool", arguments: {} },
+      { type: "finish", reason: "tool-calls" }
+    ])
+  };
+  let refreshedContext: ModelStreamContext | undefined;
+  const nextModel: AgentModel = {
+    provider: "test",
+    modelId: "next-model",
+    stream: async (context) => {
+      refreshedContext = context;
+      return events([{ type: "text-delta", text: "done" }, { type: "finish", reason: "stop" }]);
+    }
+  };
+  for await (const _event of agentLoop([{ role: "user", content: "refresh" }], { messages: [], tools: [firstTool] }, {
+    model: firstModel,
+    tools: [firstTool],
+    maxSteps: 2,
+    prepareNextTurn: async ({ context }) => ({ context: { ...context, systemPrompt: "refreshed" }, model: nextModel, tools: [nextTool] })
+  })) {
+    // Drain the loop.
+  }
+  assert.equal(refreshedContext?.systemPrompt, "refreshed");
+  assert.deepEqual(refreshedContext?.tools.map((tool) => tool.name), ["next_tool"]);
+}
+
+async function testAssistantDeltasAreForwardedBeforeProviderCompletes(): Promise<void> {
+  let providerFinished = false;
+  let firstDeltaForwarded = false;
+  const model: AgentModel = {
+    provider: "stream-test",
+    modelId: "stream-test-model",
+    async stream(): Promise<AsyncIterable<ModelStreamEvent>> {
+      return delayedEvents();
+    }
+  };
+
+  for await (const event of agentLoop([{ role: "user", content: "stream" }], {
+    messages: [],
+    tools: []
+  }, { model, tools: [], maxSteps: 1 })) {
+    if (event.type === "message_update" && event.event.type === "text-delta" && event.event.text === "first") {
+      firstDeltaForwarded = true;
+      assert.equal(providerFinished, false, "the first assistant delta must arrive before the provider finishes");
+    }
+  }
+
+  assert.equal(firstDeltaForwarded, true);
+
+  async function* delayedEvents(): AsyncGenerator<ModelStreamEvent> {
+    yield { type: "start" };
+    yield { type: "text-delta", text: "first" };
+    await new Promise<void>((resolve) => setTimeout(resolve, 15));
+    yield { type: "text-delta", text: "second" };
+    yield { type: "finish", reason: "stop" };
+    providerFinished = true;
+  }
 }
 
 async function* events(events: ModelStreamEvent[]): AsyncGenerator<ModelStreamEvent, void, void> {

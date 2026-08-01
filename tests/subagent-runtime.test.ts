@@ -64,6 +64,7 @@ await testPermissionGateIsAtomic();
 await testEmptyPromptIsRejected();
 await testAsyncEventQueueAcknowledgesAndFailsClosed();
 await testConcurrentRootRunIsRejected();
+await testActiveRunAcceptsSteeringAndFollowUp();
 await testRuntimeUpdatesCarryCanonicalState();
 await testContinueRequiresIdleRuntime();
 await testContinueCommandKeepsStepLimitSeparate();
@@ -747,6 +748,24 @@ async function testConcurrentRootRunIsRejected(): Promise<void> {
   await runtime.close();
 }
 
+async function testActiveRunAcceptsSteeringAndFollowUp(): Promise<void> {
+  const firstGate = deferred<void>();
+  const queued: string[] = [];
+  const runtime = new InteractiveAgentRuntime(fakeCommandRuntime({ firstGate, queued }));
+  const run = runtime.submitPrompt("hold");
+  await waitUntil(() => activeRun(runtime.getSnapshot())?.runId === run.runId);
+
+  const steering = runtime.steer("correct course");
+  const followUp = runtime.followUp("then explain the result");
+  assert.equal(steering.delivery, "steer");
+  assert.equal(followUp.delivery, "followUp");
+  assert.deepEqual(queued, ["steer:correct course", "followUp:then explain the result"]);
+
+  firstGate.resolve();
+  assert.equal((await run.completion).status, "completed");
+  await runtime.close();
+}
+
 async function testRuntimeUpdatesCarryCanonicalState(): Promise<void> {
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
   const updates: Array<ReturnType<InteractiveAgentRuntime["getSnapshot"]>> = [];
@@ -1178,6 +1197,7 @@ interface FakeRuntimeOptions {
   audit?: string[];
   subagentTasks?: SubagentTaskSnapshot[];
   cancelSubagentTask?: (taskId: string, reason?: string) => boolean;
+  queued?: string[];
 }
 
 function fakeCommandRuntime(options: FakeRuntimeOptions = {}): CommandRuntime {
@@ -1207,7 +1227,7 @@ function fakeCommandRuntime(options: FakeRuntimeOptions = {}): CommandRuntime {
     memoryEnabled: false,
     memoryTopics: []
   };
-  const defaultRunSdk = async function* (input: string, runOptions: AgentRunOptions): AsyncGenerator<AgentSessionEvent> {
+  const defaultRun = async function* (input: string, runOptions: AgentRunOptions): AsyncGenerator<AgentSessionEvent> {
     if (input === "hold") {
       await Promise.race([
         options.firstGate?.promise,
@@ -1230,11 +1250,17 @@ function fakeCommandRuntime(options: FakeRuntimeOptions = {}): CommandRuntime {
     usageReport: () => "",
     contextStatus: async () => context,
     compactConversation: options.compactConversation ?? (async () => "summary"),
-    prompt: options.run ?? defaultRunSdk,
+    prompt: options.run ?? defaultRun,
     interruptedTurn: async () => options.interruptedTurn,
     continueInterruptedTurn: options.continueRun ?? (async function* (): AsyncGenerator<AgentSessionEvent> {
       yield completed("continued");
     }),
+    queueSteering: (_messageId: string, input: string) => {
+      options.queued?.push(`steer:${input}`);
+    },
+    queueFollowUp: (_messageId: string, input: string) => {
+      options.queued?.push(`followUp:${input}`);
+    },
     recordHostedUserMessage: (content: string) => {
       options.audit?.push(`user:${content}`);
     },

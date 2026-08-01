@@ -195,7 +195,7 @@ async function testSubagentBudgetExhaustionReturnsPartialFindings(): Promise<voi
     const options: SubagentOptions = {
       workspaceRoot,
       config,
-      getNativeModelSettings: () => createNativeModelSettings(config),
+      getModelSettings: () => createNativeModelSettings(config),
       getAccessMode: () => "read-only",
       toolRegistry: registry
     };

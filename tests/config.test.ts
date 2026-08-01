@@ -40,7 +40,6 @@ function testRunBudget(): void {
     softStepLimit: 32,
     hardStepLimit: 96,
     maxToolCalls: 512,
-    maxProviderRetries: 0,
     maxCompletionContinuations: 3,
     maxRepeatedActions: 3
   });
@@ -52,7 +51,6 @@ function testRunBudget(): void {
       softStepLimit: 12,
       hardStepLimit: 48,
       maxToolCalls: 200,
-      maxProviderRetries: 2,
       maxCompletionContinuations: 4,
       maxRepeatedActions: 5
     }
@@ -61,11 +59,13 @@ function testRunBudget(): void {
     softStepLimit: 12,
     hardStepLimit: 48,
     maxToolCalls: 200,
-    maxProviderRetries: 2,
     maxCompletionContinuations: 4,
     maxRepeatedActions: 5
   });
-
+  assert.throws(() => configSchema.parse({
+    ...defaultConfig,
+    agent: { ...defaultConfig.agent, maxProviderRetries: 2 }
+  }), /Unrecognized key/u);
 }
 
 function testRemovedModelFormatsRequireManualUpdate(): void {
