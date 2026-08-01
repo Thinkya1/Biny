@@ -131,8 +131,8 @@ export function formatTokens(count: number): string {
 /**
  * 会话标识的短形式。
  *
- * 会话 id 形如 `20260726-041954-481e7876`，前缀是日期时间，截前几位每个会话都一样，
- * 所以取最后一段随机后缀；没有分段时才退回截断。
+ * 会话 id 通常是 UUIDv7，时间戳位于前半部分；终端空间有限时取最后一段随机部分，
+ * 没有分段时才退回截断。
  */
 export function shortSessionId(sessionId: string): string {
   const trimmed = sessionId.trim();
@@ -160,7 +160,7 @@ function contextColorize(percent: number | undefined, text: string): string {
   return theme.fg("dim", text);
 }
 
-/** 运行状态行：忙碌时持续动画并显示实时耗时，结束后保留本次执行时间。 */
+/** 运行状态行：只展示 Agent 回合传入的实时和完成耗时。 */
 export class StatusIndicatorComponent implements Component {
   private readonly ui: TUI;
   private readonly frames = ["•", "◦", "·", "◦"];
@@ -182,7 +182,9 @@ export class StatusIndicatorComponent implements Component {
       this.finishedDurationMs = undefined;
       this.startTicker();
     } else {
-      this.finishedDurationMs = finishedDurationMs ?? (this.startedAtMs === undefined ? this.finishedDurationMs : Math.max(0, Date.now() - this.startedAtMs));
+      // 耗时以 reducer 中的真实 Agent 回合为唯一来源；模型切换等维护状态
+      // 返回空闲时没有完成耗时，不能由组件自行结算出 `Worked for`。
+      this.finishedDurationMs = finishedDurationMs;
       this.startedAtMs = undefined;
       this.stopTicker();
     }
@@ -300,7 +302,7 @@ export function shortcutHints(status: TuiStatus, mode: AgentRunMode): ShortcutHi
   });
   hints.push(
     { key: "↑/↓", description: "history" },
-    { key: "ctrl+c", description: "exit" }
+    { key: "ctrl+c twice", description: "exit" }
   );
   return hints;
 }
@@ -349,5 +351,5 @@ export const welcomeHints: readonly ShortcutHint[] = [
   { key: "/", description: "commands" },
   { key: "shift+tab", description: "plan mode" },
   { key: "esc", description: "interrupt" },
-  { key: "ctrl+c", description: "exit" }
+  { key: "ctrl+c twice", description: "exit" }
 ];

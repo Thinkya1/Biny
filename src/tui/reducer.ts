@@ -68,8 +68,8 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
     case "model.changed":
       return { ...state, provider: event.provider, modelLabel: event.modelLabel, reasoningLabel: event.reasoningLabel };
     case "maintenance.started":
-      // 维护操作不属于 Agent 回合，不能复用上一次任务的完成耗时。
-      return { ...state, lastWorkedMs: undefined };
+      // 维护操作不属于 Agent 回合，不能复用或结算任务耗时。
+      return { ...state, turnStartedAt: undefined, lastWorkedMs: undefined };
     case "run.started":
       return state;
     case "run.completed": {

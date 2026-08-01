@@ -66,7 +66,7 @@ export class SelectDialog extends Container {
     this.addChild(new DialogFrame(options.title, "", "top"));
     this.addChild(new Text("", 0, 0));
     this.addChild(this.list);
-    this.addChild(new DialogFrame("", options.hint ?? "↑↓ navigate · enter select · esc cancel", "bottom"));
+    this.addChild(new DialogFrame("", options.hint ?? "↑↓ navigate · enter select · esc/ctrl+c cancel", "bottom"));
   }
 
   handleInput(data: string): void {

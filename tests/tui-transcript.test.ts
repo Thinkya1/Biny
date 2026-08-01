@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { CombinedAutocompleteProvider, visibleWidth } from "@earendil-works/pi-tui";
+import { CombinedAutocompleteProvider, TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { createInitialTuiState, tuiReducer, type TuiAction } from "../src/tui/reducer.js";
 import { sessionEventsToTranscript } from "../src/tui/sessionTranscript.js";
 import { diffLineStyle } from "../src/tui/diffLines.js";
@@ -11,6 +11,7 @@ import { PermissionDialog, SelectDialog, TextViewerDialog } from "../src/tui/com
 import {
   FooterComponent,
   ShortcutsBarComponent,
+  StatusIndicatorComponent,
   WelcomeComponent,
   footerLayout,
   formatTokens,
@@ -20,6 +21,7 @@ import {
   statusMessage,
   visibleShortcutHints
 } from "../src/tui/components/chrome.js";
+import { isDoubleCtrlC, runtimeStatus, selectDialogRow, shouldConfirmAutocompleteOnEnter, skillSlashCommandItems } from "../src/tui/app.js";
 import type { PermissionChoice, ToolTranscriptItem, TranscriptState, TuiPermissionRequest, TuiState } from "../src/tui/types.js";
 import {
   ansi256ToHex,
@@ -32,6 +34,7 @@ import {
   themeColorTokens
 } from "../src/tui/theme/index.js";
 import { slashCommandsForSurface } from "../src/runtime/commandRegistry.js";
+import type { InteractiveRuntimeSnapshot } from "../src/runtime/agentEvents.js";
 import { activitySummaryText } from "../src/runtime/activitySummary.js";
 import { modelThinkingOptions } from "../src/tui/modelOptions.js";
 import {
@@ -94,6 +97,8 @@ async function main(): Promise<void> {
   testRecoverableErrorDoesNotFinalizeSiblingTools();
   testPermissionRejectionKeepsTurnRunning();
   testMaintenanceDoesNotReuseTaskDuration();
+  testMaintenanceKeepsStatusIndicatorIdle();
+  testSelectDialogStaysNextToEditor();
   testPermissionConfirmationContract();
   testLongCommandKeepsDetailsHidden();
   testCommandDisplayNeverLeaksRawCommand();
@@ -106,6 +111,9 @@ async function main(): Promise<void> {
   testSessionReplayFinalizesPendingTools();
   testSessionReplayRestoresTurnStatuses();
   testSlashCommandParity();
+  testSkillSlashCommandItems();
+  testDoubleCtrlCGuard();
+  testAutocompleteEnterOnlyConfirmsVisibleSelection();
   await testSlashAutocompleteInsertsSingleSlash();
   testThemeTokensResolveToAnsi();
   testTranscriptViewSyncsIncrementally();
@@ -121,6 +129,31 @@ async function main(): Promise<void> {
   testPermissionDialogRequiresFullYes();
   testDiffStylesUseThemeTokens();
   testTranscriptTextHelpers();
+}
+
+function testSkillSlashCommandItems(): void {
+  assert.deepEqual(skillSlashCommandItems([
+    { name: "zeta", description: "Zeta workflow" },
+    { name: "ai-slop-taste", description: "Audit AI slop" },
+    { name: "zeta", description: "Duplicate should be hidden" }
+  ]), [
+    { name: "skill:ai-slop-taste", description: "Audit AI slop" },
+    { name: "skill:zeta", description: "Zeta workflow" }
+  ]);
+}
+
+function testDoubleCtrlCGuard(): void {
+  assert.equal(isDoubleCtrlC(0, 100), false);
+  assert.equal(isDoubleCtrlC(1_000, 1_499), true);
+  assert.equal(isDoubleCtrlC(1_000, 1_500), false);
+  assert.equal(isDoubleCtrlC(1_000, 1_501), false);
+}
+
+function testAutocompleteEnterOnlyConfirmsVisibleSelection(): void {
+  assert.equal(shouldConfirmAutocompleteOnEnter("\r", true), true);
+  assert.equal(shouldConfirmAutocompleteOnEnter("\n", true), true);
+  assert.equal(shouldConfirmAutocompleteOnEnter("\r", false), false);
+  assert.equal(shouldConfirmAutocompleteOnEnter("\t", true), false);
 }
 
 function testModelThinkingOptionsUseModelCapabilities(): void {
@@ -494,7 +527,31 @@ function testMaintenanceDoesNotReuseTaskDuration(): void {
   assert.equal(state.lastWorkedMs !== undefined, true);
 
   state = reduce(state, { type: "maintenance.started" });
+  assert.equal(state.turnStartedAt, undefined);
   assert.equal(state.lastWorkedMs, undefined);
+}
+
+function testMaintenanceKeepsStatusIndicatorIdle(): void {
+  const maintenanceSnapshot = {
+    state: { kind: "maintenance", operation: "switch_model" }
+  } as unknown as InteractiveRuntimeSnapshot;
+  assert.equal(runtimeStatus(maintenanceSnapshot), "idle");
+
+  const status = new StatusIndicatorComponent({ requestRender: () => undefined } as unknown as TUI);
+  status.setState("running", Date.now() - 80);
+  status.setState("idle");
+  assert.deepEqual(plainLines(status.render(50)), [""]);
+
+  status.setState("idle", undefined, 80);
+  assert.match(plainLines(status.render(50))[0] ?? "", /Worked for 80ms/u);
+  status.dispose();
+}
+
+function testSelectDialogStaysNextToEditor(): void {
+  // 主内容不足一屏时，选择器紧接输入框，不锚定到终端底部。
+  assert.equal(selectDialogRow(13, 5, 50, 3), 10);
+  // 内容或列表过长时不能超出可见视口。
+  assert.equal(selectDialogRow(50, 8, 20, 3), 12);
 }
 
 function testLongCommandKeepsDetailsHidden(): void {
@@ -946,6 +1003,16 @@ function testDialogsRenderAndHandleKeys(): void {
   assert.equal(selected, "b");
   select.handleInput("\u001B");
   assert.equal(cancelled, true);
+
+  let ctrlCCancelled = false;
+  const ctrlCSelect = new SelectDialog({
+    title: "Select command",
+    items: [{ value: "help", label: "/help" }],
+    onSelect: () => undefined,
+    onCancel: () => { ctrlCCancelled = true; }
+  });
+  ctrlCSelect.handleInput("\u0003");
+  assert.equal(ctrlCCancelled, true);
 
   let closed = false;
   const content = Array.from({ length: 30 }, (_, index) => `line ${String(index)}`).join("\n");

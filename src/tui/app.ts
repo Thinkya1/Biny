@@ -50,6 +50,7 @@ import { editorTheme, theme } from "./theme/index.js";
 import { formatSessionAge } from "./transcriptText.js";
 import type { PermissionChoice, TuiPermissionRequest, TuiState, TuiStatus } from "./types.js";
 import type { AgentAttachment, AgentRunMode } from "../agent/AgentSession.js";
+import type { SkillDefinition } from "../extensions/skills.js";
 
 export interface TuiExitSummary {
   sessionId: string;
@@ -57,6 +58,22 @@ export interface TuiExitSummary {
 }
 
 const TUI_SLASH_COMMANDS = slashCommandsForSurface("tui");
+const TUI_AUTOCOMPLETE_COMMANDS = TUI_SLASH_COMMANDS.filter((command) => command.name !== "/skills");
+
+/** 把已加载 Skill 的元数据投影成 Pi 风格的 `skill:<name>` 补全项。 */
+export function skillSlashCommandItems(
+  skills: readonly Pick<SkillDefinition, "name" | "description">[]
+): Array<{ name: string; description: string }> {
+  const seen = new Set<string>();
+  return skills
+    .filter((skill) => {
+      if (seen.has(skill.name)) return false;
+      seen.add(skill.name);
+      return true;
+    })
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map((skill) => ({ name: `skill:${skill.name}`, description: skill.description }));
+}
 
 export class BinyTui {
   private readonly ui: TUI;
@@ -87,6 +104,8 @@ export class BinyTui {
   private contextUsage: { usedTokens?: number; maxTokens?: number; source?: "estimated" | "provider" } = {};
   private overlay: OverlayHandle | undefined;
   private permissionDialog: PermissionDialog | undefined;
+  /** 与 pi 一致：空闲时 Ctrl+C 需要在短时间内连续按两次才退出。 */
+  private lastCtrlCAt = 0;
   private exiting = false;
   private exitSummary: TuiExitSummary | undefined;
   private unsubscribe: (() => void) | undefined;
@@ -121,7 +140,22 @@ export class BinyTui {
       void this.submit(text);
     };
     this.ui.setFocus(this.editor);
-    this.ui.addInputListener((data) => this.handleGlobalKey(data));
+    this.ui.addInputListener((data) => {
+      if (shouldConfirmAutocompleteOnEnter(data, this.editor.isShowingAutocomplete())) {
+        // pi-tui 的 Editor 对 slash 补全会在 Enter 确认后继续 fall through 到 submit。
+        // 在 TUI 边界把这次 Enter 转成 Tab，只完成插入，下一次 Enter 才是用户发送。
+        this.editor.handleInput("\t");
+        // 全局监听器消费了原始 Enter，TUI 不会再自动请求重绘；补全后的文本要立即可见。
+        this.ui.requestRender();
+        return { consume: true };
+      }
+      if (this.editor.isShowingAutocomplete() && matchesKey(data, "escape")) {
+        // 忙碌时 Escape 默认会取消 Agent；补全弹层打开时应先关闭弹层，不能误取消当前任务。
+        this.dismissAutocomplete();
+        return { consume: true };
+      }
+      return this.handleGlobalKey(data);
+    });
     this.ui.start();
 
     await this.startRuntime();
@@ -143,13 +177,7 @@ export class BinyTui {
       this.permissionMode = permissionMode;
       this.thinking = info.thinking;
       // 补全器要的是不带斜杠的命令名，它自己会补上 `/`；带斜杠会补出 `//resume`。
-      this.editor.setAutocompleteProvider(new CombinedAutocompleteProvider(
-        TUI_SLASH_COMMANDS.map((command) => ({
-          name: command.name.replace(/^\//, ""),
-          description: command.description
-        })),
-        info.workspaceRoot
-      ));
+      this.setAutocompleteProvider(commands.listSkills(), info.workspaceRoot);
       this.editor.borderColor = theme.thinkingBorder(this.thinking);
 
       void readGitBranch(info.workspaceRoot).then((branch) => {
@@ -185,6 +213,20 @@ export class BinyTui {
     } catch (error) {
       this.notify(`TUI startup failed: ${describeError(error)}`);
     }
+  }
+
+  private setAutocompleteProvider(skills: readonly SkillDefinition[], workspaceRoot: string): void {
+    const provider = new CombinedAutocompleteProvider(
+      [
+        ...TUI_AUTOCOMPLETE_COMMANDS.map((command) => ({
+          name: command.name.replace(/^\//, ""),
+          description: command.description
+        })),
+        ...skillSlashCommandItems(skills)
+      ],
+      workspaceRoot
+    );
+    this.editor.setAutocompleteProvider(provider);
   }
 
   private dispatch(event: Parameters<typeof tuiReducer>[1]): void {
@@ -247,13 +289,42 @@ export class BinyTui {
   private async submit(text: string): Promise<void> {
     const value = text.trim();
     if (!value && !this.pendingAttachments.length) return;
+    const runtime = this.runtime;
+    const commands = this.commands;
+    // TUI 在 runtime 启动完成前已经可以接收键盘输入；不能因为 Editor 已清空而丢掉这条消息。
+    if (!runtime) {
+      this.setEditorText(text);
+      this.ui.requestRender();
+      return;
+    }
     const prompt = value || "请分析这个附件。";
     const attachments = this.pendingAttachments;
     this.setPendingAttachments([]);
-    this.editor.setText("");
+    this.setEditorText("");
     this.editor.addToHistory(prompt);
     void appendInputHistory(this.workspaceRoot, prompt)
       .catch((error) => this.notify(`写入输入历史失败：${describeError(error)}`));
+
+    if (value.startsWith("/skill:") && runtime && commands) {
+      try {
+        // 与 Pi 一致：补全只显示元数据，按 Enter 后才读取并注入 Skill 正文。
+        const expandedPrompt = await commands.expandSkillCommand(value);
+        const input = withAttachmentReferences(expandedPrompt, attachments);
+        if (runtimeIsBusy(this.runtimeSnapshot)) {
+          runtime.followUp(input, attachments);
+          this.notify("Skill 消息已加入 follow-up 队列，将在当前任务准备结束时继续处理。");
+          return;
+        }
+        await runtime.submitPrompt(input, this.mode, attachments).completion;
+      } catch (error) {
+        this.setPendingAttachments([...attachments, ...this.pendingAttachments]);
+        this.setEditorText(prompt);
+        this.dispatch({ type: "error.message", message: describeError(error) });
+      } finally {
+        await this.refreshContextUsage();
+      }
+      return;
+    }
 
     if (value.startsWith("/")) {
       // slash 命令不消费附件；保留它们给用户执行命令后继续编辑并发送。
@@ -266,8 +337,6 @@ export class BinyTui {
       return;
     }
 
-    const runtime = this.runtime;
-    if (!runtime) return;
     try {
       if (runtimeIsBusy(this.runtimeSnapshot)) {
         runtime.followUp(withAttachmentReferences(prompt, attachments), attachments);
@@ -277,7 +346,7 @@ export class BinyTui {
       await runtime.submitPrompt(withAttachmentReferences(prompt, attachments), this.mode, attachments).completion;
     } catch (error) {
       this.setPendingAttachments([...attachments, ...this.pendingAttachments]);
-      this.editor.setText(prompt);
+      this.setEditorText(prompt);
       this.dispatch({ type: "error.message", message: describeError(error) });
     } finally {
       await this.refreshContextUsage();
@@ -289,16 +358,32 @@ export class BinyTui {
     const busy = runtimeIsBusy(this.runtimeSnapshot);
 
     if (matchesKey(data, "ctrl+s") && busy && !this.overlay) {
+      this.dismissAutocomplete();
       void this.steerCurrentInput();
       return { consume: true };
     }
 
+    // 选择器自己处理 Ctrl+C 作为取消，不让全局退出逻辑抢先执行。
+    if (matchesKey(data, "ctrl+c") && this.overlay) {
+      this.lastCtrlCAt = 0;
+      return undefined;
+    }
     if (matchesKey(data, "ctrl+c")) {
       if (busy) {
+        this.lastCtrlCAt = 0;
+        this.dismissAutocomplete();
         this.runtime?.cancelCurrentRun();
         return { consume: true };
       }
-      void this.exit();
+      const now = Date.now();
+      if (isDoubleCtrlC(this.lastCtrlCAt, now)) {
+        this.lastCtrlCAt = 0;
+        void this.exit();
+      } else {
+        this.lastCtrlCAt = now;
+        this.setEditorText("");
+        this.setPendingAttachments([]);
+      }
       return { consume: true };
     }
     if (matchesKey(data, "escape")) {
@@ -313,10 +398,11 @@ export class BinyTui {
     // Windows 终端通常把 Ctrl+V 留给文本粘贴，只用 Alt+V 读取图片剪贴板。
     const isClipboardPaste = process.platform === "win32" ? matchesKey(data, "alt+v") : matchesKey(data, "ctrl+v");
     if (isClipboardPaste) {
+      this.dismissAutocomplete();
       void this.pasteClipboard();
       return { consume: true };
     }
-    if (matchesKey(data, "shift+tab")) {
+    if (matchesKey(data, "shift+tab") && !this.editor.isShowingAutocomplete()) {
       this.mode = this.mode === "plan" ? "chat" : "plan";
       this.refreshChrome();
       return { consume: true };
@@ -326,15 +412,19 @@ export class BinyTui {
 
   private async steerCurrentInput(): Promise<void> {
     const runtime = this.runtime;
-    if (!runtime) return;
+    const commands = this.commands;
+    if (!runtime || !commands) return;
     const value = this.editor.getText().trim();
     if (!value && !this.pendingAttachments.length) return;
     const prompt = value || "请分析这个附件。";
     const attachments = this.pendingAttachments;
     try {
-      runtime.steer(withAttachmentReferences(prompt, attachments), attachments);
+      const expandedPrompt = value.startsWith("/skill:")
+        ? await commands.expandSkillCommand(value)
+        : prompt;
+      runtime.steer(withAttachmentReferences(expandedPrompt, attachments), attachments);
       this.setPendingAttachments([]);
-      this.editor.setText("");
+      this.setEditorText("");
       this.editor.addToHistory(prompt);
       void appendInputHistory(this.workspaceRoot, prompt)
         .catch((error) => this.notify(`写入输入历史失败：${describeError(error)}`));
@@ -345,8 +435,6 @@ export class BinyTui {
   }
 
   private async pasteClipboard(): Promise<void> {
-    const runtime = this.runtime;
-    if (!runtime) return;
     try {
       const pasted = await pasteTuiClipboard(this.workspaceRoot);
       if (pasted.kind === "image") {
@@ -371,14 +459,41 @@ export class BinyTui {
     this.ui.requestRender();
   }
 
+  private setEditorText(text: string): void {
+    this.editor.setText(text);
+  }
+
+  private dismissAutocomplete(): void {
+    if (!this.editor.isShowingAutocomplete()) return;
+    this.editor.handleInput("\x1b");
+    this.ui.requestRender();
+  }
+
   // ---------------------------------------------------------------- 弹层
 
-  private showOverlay(component: Container, options?: { maxHeight?: `${number}%` }): void {
+  private showOverlay(component: Container, options?: {
+    maxHeight?: `${number}%`;
+    placement?: "below_editor";
+  }): void {
+    this.dismissAutocomplete();
     this.closeOverlay();
+    const maxHeight = options?.maxHeight ?? "70%";
+    const row = options?.placement === "below_editor"
+      ? selectDialogRow(
+        this.ui.render(this.ui.terminal.columns).length,
+        Math.min(
+          component.render(this.ui.terminal.columns).length,
+          Math.max(1, Math.floor(this.ui.terminal.rows * Number.parseFloat(maxHeight) / 100))
+        ),
+        this.ui.terminal.rows,
+        this.footer.render(this.ui.terminal.columns).length + this.shortcuts.render(this.ui.terminal.columns).length
+      )
+      : undefined;
     this.overlay = this.ui.showOverlay(component, {
       width: "100%",
-      anchor: "bottom-center",
-      maxHeight: options?.maxHeight ?? "70%"
+      anchor: row === undefined ? "bottom-center" : undefined,
+      row,
+      maxHeight
     });
     this.overlay.focus();
   }
@@ -416,7 +531,7 @@ export class BinyTui {
       },
       onCancel: () => this.closeOverlay()
     });
-    this.showOverlay(dialog);
+    this.showOverlay(dialog, { placement: "below_editor" });
   }
 
   /** 权限请求进出时同步弹层，避免请求切换后还留着上一份确认状态。 */
@@ -474,9 +589,9 @@ export class BinyTui {
           label: entry.name,
           description: entry.description
         })),
-        hint: "↑↓ navigate · enter insert · esc cancel",
+        hint: "↑↓ navigate · enter insert · esc/ctrl+c cancel",
         onSelect: (item) => {
-          this.editor.setText(`${item.value} `);
+          this.setEditorText(`${item.value} `);
           this.ui.requestRender();
         }
       });
@@ -718,8 +833,7 @@ export class BinyTui {
     if (!commands) return;
     const summaries = (await commands.agent.listSessions())
       .filter((summary) => summary.firstUserMessage.trim())
-      .slice()
-      .reverse();
+      .slice();
     if (!summaries.length) {
       this.showTextViewer("Sessions", "No sessions yet.");
       return;
@@ -781,6 +895,16 @@ export class BinyTui {
   }
 }
 
+/** 补全弹层存在时，Enter 只能确认候选；没有弹层才允许进入提交路径。 */
+export function shouldConfirmAutocompleteOnEnter(data: string, autocompleteVisible: boolean): boolean {
+  return autocompleteVisible && matchesKey(data, "enter");
+}
+
+/** 判断两次 Ctrl+C 是否处于 pi 的 500ms 退出窗口内。 */
+export function isDoubleCtrlC(lastCtrlCAt: number, now: number): boolean {
+  return lastCtrlCAt > 0 && now >= lastCtrlCAt && now - lastCtrlCAt < 500;
+}
+
 function sessionLabel(summary: SessionSummary, nowMs: number): string {
   return `${summary.fileName.replace(/\.jsonl$/, "")} · ${formatSessionAge(summary.updatedAt, nowMs)}`;
 }
@@ -794,11 +918,27 @@ const runModes: Array<{ mode: Extract<AgentRunMode, "chat" | "plan">; label: str
   { mode: "plan", label: "Plan", description: "只读分析与方案，不执行副作用工具" }
 ];
 
-function runtimeStatus(snapshot: InteractiveRuntimeSnapshot | undefined): TuiStatus {
+export function runtimeStatus(snapshot: InteractiveRuntimeSnapshot | undefined): TuiStatus {
   if (!snapshot || snapshot.state.kind === "idle") return "idle";
-  if (snapshot.state.kind !== "runs") return "running";
+  // 模型切换、会话恢复和内存整理等 maintenance 不是 Agent 工作回合，
+  // 状态行保持空闲留白，不展示 Working 或耗时。
+  if (snapshot.state.kind !== "runs") return "idle";
   if (snapshot.state.pendingPermission) return "waiting_permission";
   return snapshot.state.activeRun.status === "thinking" ? "thinking" : "running";
+}
+
+/**
+ * 选择器从输入框下方展开，临时覆盖 footer 和快捷键行。
+ * 窄终端或长列表时向上收缩，保证弹层不越过当前视口。
+ */
+export function selectDialogRow(
+  contentHeight: number,
+  dialogHeight: number,
+  terminalHeight: number,
+  chromeTailHeight: number
+): number {
+  const belowEditor = Math.max(0, contentHeight - chromeTailHeight);
+  return Math.min(belowEditor, Math.max(0, terminalHeight - dialogHeight));
 }
 
 function tuiPermissionRequest(snapshot: InteractiveRuntimeSnapshot | undefined): TuiPermissionRequest | undefined {
