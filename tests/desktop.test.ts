@@ -1194,6 +1194,8 @@ function testWebSearchProjection(): void {
 function testHistoricalReasoningAndSkillProjection(): void {
   const timeline = buildSessionTimeline([
     { type: "user_message", content: "explain", skills: [".agent/skills/programmatic-tools/SKILL.md"], time: "2026-01-01T00:00:00.000Z" },
+    { type: "tool_call", tool: "invoke_skill", args: { skill: "programmatic-tools" }, toolCallId: "skill", time: "2026-01-01T00:00:00.500Z" },
+    { type: "tool_result", tool: "invoke_skill", result: { instructions: "Use tools." }, toolCallId: "skill", time: "2026-01-01T00:00:00.750Z" },
     { type: "tool_call", tool: "run_command", args: { command: "pwd" }, reasoningContent: "先确认当前工作目录。", time: "2026-01-01T00:00:01.000Z" },
     { type: "assistant_message", content: "done", reasoningContent: "然后整理结果。", time: "2026-01-01T00:00:02.512Z" }
   ], []);
@@ -1456,6 +1458,8 @@ function testLiveReasoningAndSkillProjection(): void {
       model: { alias: "test", provider: "test", label: "test/model", reasoning: "High" },
       skills: [".agent/skills/programmatic-tools/SKILL.md"]
     },
+    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:00.500Z", type: "tool.started", toolCallId: "skill", tool: "invoke_skill", args: { skill: "programmatic-tools" } },
+    { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:00.750Z", type: "tool.completed", toolCallId: "skill", tool: "invoke_skill", result: { instructions: "Use tools." } },
     { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:01.000Z", type: "reasoning.started", phase: "initial" },
     { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:02.512Z", type: "reasoning.delta", content: "先拆分问题。" },
     { sessionId: "session", runId: "reasoning-run", timestamp: "2026-01-01T00:00:02.512Z", type: "reasoning.completed" },

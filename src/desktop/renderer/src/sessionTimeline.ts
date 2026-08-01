@@ -219,7 +219,6 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
       current.user = publicUserMessage(event.content);
       current.userMessageIndex = userMessageIndex;
       userMessageIndex += 1;
-      current.skills = skillNames(event.skills);
       turns.push(current);
       continue;
     }
@@ -258,6 +257,7 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
     }
     if (event.type === "tool_call") {
       const turn = ensureTurn(event.time);
+      appendInvokedSkill(turn, event.tool, event.args);
       const projection = historicalToolProjection(event.tool, event.args);
       appendHistoricalReasoning(turn, event.reasoningContent);
       appendHistoricalAssistant(turn, event.assistantContent, true);
@@ -433,7 +433,6 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
     } else if (event.type === "run.started") {
       turn.status = "running";
       turn.model = event.model;
-      turn.skills = skillNames(event.skills);
     } else if (event.type === "context.retrying") {
       turn.steps.push({
         kind: "reasoning",
@@ -471,6 +470,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       }
     } else if (event.type === "tool.started") {
       finishReasoning(event.runId, event.timestamp);
+      appendInvokedSkill(turn, event.tool, event.args);
       const tool = toolFor(event, event.tool);
       tool.tool = event.tool;
       tool.args = event.args;
@@ -629,17 +629,11 @@ function appendReasoning(existing: string, next: string | undefined): string {
   return `${existing}\n\n${next}`;
 }
 
-/** 技能路径转成去重后的展示名，界面上只显示名字而不是完整路径。 */
-function skillNames(paths: string[] | undefined): string[] {
-  const names = (paths ?? []).map(skillName).filter(Boolean);
-  return [...new Set(names)];
-}
-
-function skillName(value: string): string {
-  const parts = value.replaceAll("\\", "/").split("/").filter(Boolean);
-  const fileName = parts.at(-1) ?? value;
-  const stem = fileName.replace(/\.(?:md|markdown)$/i, "");
-  return /^skill$/i.test(stem) && parts.length > 1 ? parts.at(-2) ?? stem : stem;
+/** “已使用技能”只认真实 invoke_skill 调用，不能把启动时全部可用路径投影成已使用。 */
+function appendInvokedSkill(turn: TimelineTurn, tool: string, args: unknown): void {
+  if (tool !== "invoke_skill" || typeof args !== "object" || args === null || !("skill" in args)) return;
+  const skill = (args as { skill?: unknown }).skill;
+  if (typeof skill === "string" && skill.trim() && !turn.skills.includes(skill.trim())) turn.skills.push(skill.trim());
 }
 
 function addReasoningDuration(total: number | undefined, startedAt: string | undefined, endedAt: string): number | undefined {
