@@ -37,6 +37,7 @@ export function createApplyPatchTool(context: ToolContext): Tool<ApplyPatchArgs,
   return {
     name: "apply_patch",
     description: "Apply exact unified-diff hunks to one existing UTF-8 workspace file atomically. Use write_file for new files and delete_file/move_file for path changes.",
+    promptSnippet: "Apply exact unified-diff hunks to one existing file",
     parameters: {
       type: "object",
       properties: {

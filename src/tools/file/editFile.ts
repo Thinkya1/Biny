@@ -34,6 +34,8 @@ export function createEditFileTool(context: ToolContext): Tool<EditFileArgs, Edi
   return {
     name: "edit_file",
     description: `Edit a UTF-8 file up to ${String(maxEditFileBytes)} bytes by replacing oldText with newText. Larger files are rejected.`,
+    promptSnippet: "Replace one exact text occurrence in an existing UTF-8 file",
+    promptGuidelines: ["Keep edit_file oldText small and unique, and read the relevant file content before editing"],
     parameters: {
       type: "object",
       properties: {

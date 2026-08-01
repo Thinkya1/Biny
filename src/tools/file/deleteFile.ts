@@ -22,6 +22,7 @@ export function createDeleteFileTool(context: ToolContext): Tool<DeleteFileArgs,
   return {
     name: "delete_file",
     description: "Delete one regular file inside the workspace. Directories and symbolic links are rejected.",
+    promptSnippet: "Delete one regular workspace file",
     parameters: {
       type: "object",
       properties: {

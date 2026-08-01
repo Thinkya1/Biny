@@ -63,6 +63,8 @@ export function createWebSearchTool(config?: WebSearchConfig, cookies?: WebCooki
   return {
     name: "web_search",
     description: "Search the public web and return relevant result links and snippets. Use this for current information, research, news, weather, or facts outside the workspace.",
+    promptSnippet: "Search the public web for current information and external facts",
+    promptGuidelines: ["Use web_search for current public information, research, news, weather, or facts outside the workspace"],
     parameters: {
       type: "object",
       properties: {

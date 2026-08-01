@@ -23,6 +23,7 @@ export function createGitDiffTool(context: ToolContext): Tool<Record<string, nev
   return {
     name: "git_diff",
     description: "Run git diff.",
+    promptSnippet: "Inspect unstaged Git changes",
     parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
     schema: z.object({}).default({}),
     capability: "git.diff",

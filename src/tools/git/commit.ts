@@ -31,6 +31,8 @@ export function createGitCommitTool(context: ToolContext): Tool<GitCommitArgs, G
   return {
     name: "git_commit",
     description: "Stage the given workspace paths and create a git commit. Paths must be listed explicitly; there is no commit-everything option.",
+    promptSnippet: "Stage explicit workspace paths and create a Git commit",
+    promptGuidelines: ["Use git_commit only when the user explicitly asks for a commit, and pass only the intended paths"],
     parameters: {
       type: "object",
       properties: {

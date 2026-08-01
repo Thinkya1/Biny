@@ -44,6 +44,8 @@ export function createWebFetchTool(config?: WebFetchConfig, cookies?: WebCookies
   return {
     name: "web_fetch",
     description: `Fetch a public http(s) URL and return its readable text. HTML is converted to text. Returns at most ${String(maxLength)} characters; page through longer documents with offset.`,
+    promptSnippet: "Fetch readable text from a public HTTP or HTTPS URL",
+    promptGuidelines: ["Use web_fetch to inspect a known URL and page through truncated documents with offset"],
     parameters: {
       type: "object",
       properties: {

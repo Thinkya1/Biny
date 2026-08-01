@@ -23,6 +23,7 @@ export function createListFilesTool(context: ToolContext): Tool<ListFilesArgs, L
   return {
     name: "list_files",
     description: "List workspace files.",
+    promptSnippet: "List files in the workspace",
     parameters: {
       type: "object",
       properties: {

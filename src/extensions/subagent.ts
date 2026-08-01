@@ -60,6 +60,7 @@ export function createSubagentTool(options: SubagentOptions, taskManager: Subage
   return {
     name: "delegate_task",
     description: "Delegate a focused repository investigation, implementation, repair, or finite validation task to a bounded subagent. Pass agent to run a named subagent definition.",
+    promptSnippet: "Delegate a focused, bounded workspace task to a subagent",
     parameters: subagentParameters,
     schema: z.object({ task: z.string().min(1).max(20_000), agent: z.string().trim().min(1).max(64).optional() }),
     source: "subagent",

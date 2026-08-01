@@ -293,6 +293,13 @@ export class AgentSession {
     return [...(paths ?? [])];
   }
 
+  /** 只把当前模型步骤真正可见的工具元数据交给提示词构建器。 */
+  private promptTools(toolNames?: readonly string[]) {
+    if (!toolNames) return this.options.toolRegistry.list();
+    const active = new Set(toolNames);
+    return this.options.toolRegistry.list().filter((tool) => active.has(tool.name));
+  }
+
   /** 上次被打断、尚未收尾的回合；没有则为 undefined。 */
   async interruptedTurn(): Promise<InterruptedTurn | undefined> {
     return await this.turnStore.load();
@@ -502,11 +509,13 @@ export class AgentSession {
     // 这样即使模型不支持图片、上下文构建失败或进程随后中断，恢复会话时仍能看到这次输入。
     recordUserMessage();
     try {
-      const baseSystemPrompt = buildSystemPrompt(
-        mode === "plan" ? "plan" : "qa",
-        this.extensionPrompt(),
-        this.options.toolRegistry.list().map((tool) => tool.name)
-      );
+      const initialTools = this.options.toolRegistry.list().filter((tool) => mode !== "plan" || tool.risk === "read");
+      const baseSystemPrompt = buildSystemPrompt({
+        mode: mode === "plan" ? "plan" : "qa",
+        extensionPrompt: this.extensionPrompt(),
+        tools: initialTools,
+        cwd: this.options.workspaceRoot
+      });
       const prepared = await this.contextMemory.prepareTurn(
         input,
         baseSystemPrompt,
@@ -737,7 +746,7 @@ export class AgentSession {
           context.systemPrompt = refreshRuntimeSystemPrompt(
             context.systemPrompt,
             this.extensionPrompt(),
-            tools.map((tool) => tool.name)
+            this.promptTools(tools.map((tool) => tool.name))
           );
           return {
             context,

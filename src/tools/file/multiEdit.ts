@@ -48,6 +48,8 @@ export function createMultiEditTool(context: ToolContext): Tool<MultiEditArgs, M
   return {
     name: "multi_edit",
     description: "Atomically apply an ordered batch of exact text replacements to one UTF-8 workspace file.",
+    promptSnippet: "Apply an ordered batch of exact replacements to one file",
+    promptGuidelines: ["Use multi_edit for multiple localized replacements in the same file; edits must be ordered and non-overlapping"],
     parameters: {
       type: "object",
       properties: {

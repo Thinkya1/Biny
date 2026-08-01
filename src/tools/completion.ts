@@ -49,6 +49,7 @@ function createReportBlockedTool(store: CompletionStateStore): Tool<BlockedState
   return {
     name: "report_blocked",
     description: "Report a structured blocker only when the current user task cannot continue without user input, approval, a missing dependency, an unavailable environment or service, or an unsafe action. This does not mark the task completed.",
+    promptSnippet: "Record a structured blocker that prevents the current task from continuing",
     parameters: {
       type: "object",
       properties: {
@@ -82,6 +83,7 @@ function createRequestVerificationTool(
   return {
     name: "request_verification",
     description: "Register deterministic commands that Biny must rerun independently before completing this turn. Use when the user explicitly requests a check or when a required check cannot be derived from changed project files.",
+    promptSnippet: "Register deterministic checks for Biny to rerun before completion",
     parameters: {
       type: "object",
       properties: {

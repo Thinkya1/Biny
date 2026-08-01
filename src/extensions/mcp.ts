@@ -429,6 +429,7 @@ export function createMcpResourceTools(host: McpToolHost): Tool[] {
     {
       name: "mcp_list_resources",
       description: "List resources exposed by connected MCP servers. Optionally filter by server name.",
+      promptSnippet: "List resources exposed by connected MCP servers",
       parameters: {
         type: "object",
         properties: { server: { type: "string", description: "Only list resources from this MCP server." } },
@@ -456,6 +457,7 @@ export function createMcpResourceTools(host: McpToolHost): Tool[] {
     {
       name: "mcp_read_resource",
       description: "Read one resource from a connected MCP server by uri (use mcp_list_resources to discover uris).",
+      promptSnippet: "Read one resource from a connected MCP server",
       parameters: {
         type: "object",
         properties: {

@@ -32,6 +32,7 @@ function createSaveMemoryTool(getMemory: () => LocalMemory | undefined): Tool {
   return {
     name: "save_memory",
     description: "Save one durable, auditable project memory entry (decision, convention, gotcha, workflow) to this project's partition in the global Biny memory store. Use it when the user asks you to remember something or when you learn a non-obvious project fact worth keeping across sessions. Never store secrets or large source excerpts.",
+    promptSnippet: "Save a durable project decision, convention, gotcha, or workflow",
     parameters: {
       type: "object",
       properties: {
@@ -79,6 +80,7 @@ function createRecallMemoryTool(getMemory: () => LocalMemory | undefined): Tool 
   return {
     name: "recall_memory",
     description: "Search this project's partition in the durable global Biny memory store for notes relevant to a query, or read one full topic. Use it when past decisions, debugging notes, or workflows may already cover the current task.",
+    promptSnippet: "Recall durable notes about the current project",
     parameters: {
       type: "object",
       properties: {

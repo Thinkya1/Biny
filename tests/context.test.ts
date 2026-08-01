@@ -131,17 +131,31 @@ async function main(): Promise<void> {
 }
 
 function testConversationBoundaryPrompt(): void {
-  const prompt = buildSystemPrompt("qa");
-  assert.match(prompt, /messages, tool calls, file reads, command results, plans, and approvals before the latest user message are inherited history/);
-  assert.match(prompt, /Only the latest user message is the active task/);
-  assert.match(prompt, /Never say "I just read\.\.\."/);
-  assert.doesNotMatch(prompt, /prefer web_search/u);
-  assert.match(buildSystemPrompt("qa", undefined, ["web_search"]), /prefer web_search/u);
+  const prompt = buildSystemPrompt({ mode: "qa", cwd: "/workspace" });
+  assert.match(prompt, /expert coding assistant operating inside Biny/u);
+  assert.match(prompt, /Available tools:\n\(none\)/u);
+  assert.match(prompt, /only the latest user message as the active task/u);
+  assert.match(prompt, /Current working directory: \/workspace/u);
+  assert.doesNotMatch(prompt, /Search the public web/u);
+  const webTool = {
+    name: "web_search",
+    promptSnippet: "Search the public web",
+    promptGuidelines: ["Use web_search for current public information"]
+  };
+  assert.match(buildSystemPrompt({ mode: "qa", cwd: "/workspace", tools: [webTool] }), /Use web_search for current public information/u);
+  assert.doesNotMatch(
+    buildSystemPrompt({ mode: "qa", cwd: "/workspace", tools: [{ name: "custom_tool" }] }),
+    /- custom_tool:/u
+  );
   const compacted = withActiveRunCompactionSummary(
-    buildSystemPrompt("qa", "old dynamic capability", ["web_search"]),
+    buildSystemPrompt({ mode: "qa", cwd: "/workspace", extensionPrompt: "old dynamic capability", tools: [webTool] }),
     "first overflow summary"
   );
-  const refreshed = refreshRuntimeSystemPrompt(compacted, "new dynamic capability", ["run_command"]);
+  const refreshed = refreshRuntimeSystemPrompt(compacted, "new dynamic capability", [{
+    name: "run_command",
+    promptSnippet: "Run a finite command",
+    promptGuidelines: ["Use run_command only for finite commands"]
+  }]);
   const recoveredAgain = withActiveRunCompactionSummary(refreshed, "second overflow summary");
   assert.match(recoveredAgain, /new dynamic capability/u);
   assert.match(recoveredAgain, /Use run_command/u);
@@ -163,6 +177,11 @@ async function testInstructionHierarchyAndCap(): Promise<void> {
     workspace.observeToolResult("read_file", { path: "src/example.ts" }, { path: "src/example.ts", content: "export {};" });
     await workspace.prepareTurn("explain the file");
     assert.deepEqual(workspace.status().loadedInstructions, ["AGENTS.md", "src/AGENTS.override.md"]);
+    const memory = new ContextMemory(() => new ContextTestModel().model, workspace, undefined, 8_000, 32 * 1024);
+    const prepared = await memory.prepareTurn("explain the file", "base prompt");
+    assert.match(prepared.systemPrompt ?? "", /<project_context>/u);
+    assert.match(prepared.systemPrompt ?? "", /<project_instructions path="AGENTS\.md">\nroot rule/u);
+    assert.match(prepared.systemPrompt ?? "", /<project_instructions path="src\/AGENTS\.override\.md">\nnested override rule/u);
 
     const capped = new WorkspaceContext(workspaceRoot, [], 10);
     await capped.initialize();

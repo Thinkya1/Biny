@@ -22,6 +22,7 @@ export function createGitStatusTool(context: ToolContext): Tool<Record<string, n
   return {
     name: "git_status",
     description: "Run git status --short.",
+    promptSnippet: "Inspect the concise Git worktree status",
     parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
     schema: z.object({}).default({}),
     capability: "git.status",

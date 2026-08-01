@@ -24,6 +24,7 @@ export function createMoveFileTool(context: ToolContext): Tool<MoveFileArgs, Mov
   return {
     name: "move_file",
     description: "Move one regular UTF-8 workspace file to a new path without replacing an existing destination.",
+    promptSnippet: "Move one regular workspace file to a new path",
     parameters: {
       type: "object",
       properties: {

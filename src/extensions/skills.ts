@@ -204,6 +204,7 @@ export function createSkillTool(source: SkillBundleSource): Tool {
   return {
     name: "invoke_skill",
     description: "Load the full instructions of an available skill by name. Call this before performing a task that a listed skill covers, then follow the returned instructions.",
+    promptSnippet: "Load the full instructions for an available skill",
     parameters: {
       type: "object",
       properties: {
@@ -273,6 +274,7 @@ export function createSkillResourceTool(source: SkillBundleSource): Tool {
   return {
     name: "read_skill_resource",
     description: "Read a text resource from an activated skill. Use a relative path listed by invoke_skill.",
+    promptSnippet: "Read a referenced text resource from an activated skill",
     parameters: {
       type: "object",
       properties: {

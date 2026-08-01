@@ -31,6 +31,7 @@ export function createSearchFilesTool(context: ToolContext): Tool<SearchFilesArg
   return {
     name: "search_files",
     description: `Search text in workspace files. Each file is limited to its first ${String(maxSearchFileBytes)} bytes; truncated paths are returned in truncatedFiles.`,
+    promptSnippet: "Search plain text across workspace files",
     parameters: {
       type: "object",
       properties: {

@@ -57,6 +57,8 @@ export function createRunCommandTool(
   return {
     name: "run_command",
     description: "Run a finite local shell command in the workspace. Commands have a bounded timeout; use start_process for long-running servers instead of &, nohup, or disown.",
+    promptSnippet: "Run a finite local shell command inside the workspace",
+    promptGuidelines: ["Use run_command only for finite commands and pass a workspace-relative cwd when the command belongs in a subdirectory"],
     parameters: {
       type: "object",
       properties: {

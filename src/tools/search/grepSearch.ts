@@ -32,6 +32,7 @@ export function createGrepSearchTool(context: ToolContext): Tool<GrepSearchArgs,
   return {
     name: "grep_search",
     description: `Search for a keyword in workspace files. Each file is limited to its first ${String(maxSearchFileBytes)} bytes; truncated paths are returned in truncatedFiles.`,
+    promptSnippet: "Find keyword matches in workspace files",
     parameters: {
       type: "object",
       properties: {

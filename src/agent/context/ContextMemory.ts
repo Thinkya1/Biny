@@ -608,7 +608,21 @@ function assembleContext(
 }
 
 function formatInstructions(instructions: LoadedInstruction[]): string {
-  return instructions.map((instruction) => `Instructions from ${instruction.path}:\n${instruction.content}`).join("\n\n");
+  if (!instructions.length) return "";
+  return [
+    "<project_context>",
+    "Project-specific instructions and guidelines:",
+    ...instructions.map((instruction) => [
+      `<project_instructions path="${escapeXmlAttribute(instruction.path)}">`,
+      instruction.content,
+      "</project_instructions>"
+    ].join("\n")),
+    "</project_context>"
+  ].join("\n\n");
+}
+
+function escapeXmlAttribute(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function formatExplicitPaths(paths: string[]): string {

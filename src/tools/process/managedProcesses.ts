@@ -103,6 +103,8 @@ export function createStartProcessTool(
   return {
     name: "start_process",
     description: "Start a long-running workspace process managed by Biny. Use this instead of run_command, &, nohup, or disown for servers. Optional HTTP, TCP, or log readiness is checked before the tool returns. Processes are cleaned up when the runtime closes unless lifecycle is explicitly set to retain.",
+    promptSnippet: "Start and readiness-check a long-running managed workspace process",
+    promptGuidelines: ["Use start_process for servers and other long-running commands; do not background them with &, nohup, or disown"],
     parameters: {
       type: "object",
       properties: {
@@ -168,6 +170,7 @@ export function createProcessStatusTool(
   return {
     name: "process_status",
     description: "Get the current state, readiness evidence, PID/process group, URL, log path, and cleanup policy for a Biny-managed process.",
+    promptSnippet: "Inspect a managed process and its readiness evidence",
     parameters: {
       type: "object",
       properties: { processId: { type: "string", description: "Opaque runtime process ID returned by start_process." } },
@@ -203,6 +206,7 @@ export function createReadProcessOutputTool(
   return {
     name: "read_process_output",
     description: "Read bounded output from a Biny-managed process log. Use nextOffset for incremental reads or fromEnd for a bounded tail.",
+    promptSnippet: "Read bounded output from a managed process",
     parameters: {
       type: "object",
       properties: {
@@ -245,6 +249,7 @@ export function createStopProcessTool(
   return {
     name: "stop_process",
     description: "Stop an entire Biny-managed process group and record the cleanup result.",
+    promptSnippet: "Stop a managed process group",
     parameters: {
       type: "object",
       properties: {
@@ -278,6 +283,7 @@ export function createListProcessesTool(
   return {
     name: "list_processes",
     description: "List Biny-managed processes with current state, readiness evidence, URLs, logs, and cleanup policy.",
+    promptSnippet: "List current and exited Biny-managed processes",
     parameters: {
       type: "object",
       properties: {

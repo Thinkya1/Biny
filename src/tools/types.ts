@@ -52,6 +52,10 @@ export type ToolExecution<TResult = unknown> = RunnableToolExecution<TResult> | 
 export interface Tool<TArgs = unknown, TResult = unknown> {
   name: string;
   description: string;
+  /** 默认 system prompt 中 Available tools 段使用的一行能力摘要；省略时不在该段重复展示。 */
+  promptSnippet?: string;
+  /** 仅当该工具在当前模型步骤可用时注入的操作规则。 */
+  promptGuidelines?: string[];
   parameters: JsonObjectSchema;
   schema: z.ZodType<TArgs, z.ZodTypeDef, unknown>;
   source?: ToolSource;
