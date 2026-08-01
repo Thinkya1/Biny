@@ -10,7 +10,7 @@ import { LocalMemory, redactSecrets } from "../src/agent/context/LocalMemory.js"
 import { WorkspaceContext } from "../src/agent/context/WorkspaceContext.js";
 import { cloneAgentMessages, messageReasoning, messageText } from "../src/agent/modelMessages.js";
 import { buildSystemPrompt, refreshRuntimeSystemPrompt, withActiveRunCompactionSummary } from "../src/agent/prompts.js";
-import { BINY_AGENT_DIR_ENV, projectMemoryDir } from "../src/config/paths.js";
+import { BINY_AGENT_DIR_ENV, projectMemoryDir, projectSessionsDir } from "../src/config/paths.js";
 import type { AgentConfig } from "../src/config/schema.js";
 import { defaultConfig } from "../src/config/schema.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
@@ -111,6 +111,7 @@ async function main(): Promise<void> {
     await testLegacyAgentStateIsIgnored();
     await testSessionPathBoundaries();
     await testGlobalSessionsStayProjectScoped();
+    await testSessionSummariesSortByUpdatedAt();
     await testSessionReadLimits();
     await testDeleteSessionReplacementRace();
     await testFailedCurrentSessionResumeKeepsRecorderUsable();
@@ -791,6 +792,8 @@ async function testSessionPathBoundaries(): Promise<void> {
   await withTempWorkspace(async (workspaceRoot) => {
     await ensureAgentDirs(workspaceRoot);
     const safeFile = sessionFilePath(workspaceRoot, "2026-07-18-safe");
+    const sessionsRoot = projectSessionsDir(await fs.realpath(workspaceRoot));
+    assert.equal(path.relative(sessionsRoot, path.dirname(safeFile)), path.join("2026", "07", "18"));
     await fs.writeFile(safeFile, `${JSON.stringify({ type: "user_message", content: "safe session" })}\n`, "utf8");
     const canonicalSafeFile = await fs.realpath(safeFile);
 
@@ -850,17 +853,17 @@ async function testSessionPathBoundaries(): Promise<void> {
       assert.match((await readSessionSnapshot(workspaceAlias, "2026-07-18-safe")).bytes.toString("utf8"), /safe session/);
 
       const pinnedRecorder = new SessionRecorder(workspaceRoot, "pinned-before-parent-swap");
-      const originalSessionsDir = `${sessionsDir}-original`;
-      await fs.rename(sessionsDir, originalSessionsDir);
-      await fs.symlink(outsideRoot, sessionsDir);
+      const originalSessionsRoot = `${sessionsRoot}-original`;
+      await fs.rename(sessionsRoot, originalSessionsRoot);
+      await fs.symlink(outsideRoot, sessionsRoot);
       assert.throws(
         () => pinnedRecorder.record({ type: "user_message", content: "must not escape" }),
         /changed while it was being opened|ENOENT/
       );
       await pinnedRecorder.close();
       await assert.rejects(fs.access(path.join(outsideRoot, "pinned-before-parent-swap.jsonl")));
-      await fs.rm(sessionsDir, { force: true });
-      await fs.rename(originalSessionsDir, sessionsDir);
+      await fs.rm(sessionsRoot, { force: true });
+      await fs.rename(originalSessionsRoot, sessionsRoot);
 
       const config = testConfig();
       config.context.memory.enabled = false;
@@ -878,8 +881,9 @@ async function testSessionPathBoundaries(): Promise<void> {
       assert.equal(await fs.readFile(outsideFile, "utf8"), outsideContent);
       await agent.close();
 
-      await fs.rm(sessionsDir, { recursive: true, force: true });
-      await fs.symlink(outsideRoot, sessionsDir);
+      const outsideSessionsDir = path.dirname(sessionFilePath(workspaceRoot, "outside"));
+      await fs.rm(outsideSessionsDir, { recursive: true, force: true });
+      await fs.symlink(outsideRoot, outsideSessionsDir);
       await assert.rejects(resolveSessionFile(workspaceRoot, "outside"), /real directory, not a symbolic link/);
       await assert.rejects(readSessionSnapshot(workspaceRoot, "outside"), /real directory, not a symbolic link/);
       await assert.rejects(duplicateSessionFile(workspaceRoot, "outside", "must-not-copy"), /real directory, not a symbolic link/);
@@ -888,7 +892,7 @@ async function testSessionPathBoundaries(): Promise<void> {
       assert.throws(() => new SessionRecorder(workspaceRoot, "must-not-escape"), /real directory, not a symbolic link/);
       await assert.rejects(fs.access(path.join(outsideRoot, "must-not-escape.jsonl")));
 
-      await fs.rm(sessionsDir, { force: true });
+      await fs.rm(outsideSessionsDir, { force: true });
       await fs.rm(path.join(workspaceRoot, ".biny"), { recursive: true, force: true });
       await fs.symlink(outsideRoot, path.join(workspaceRoot, ".biny"));
       await assert.rejects(ensureAgentDirs(workspaceRoot), /real directory, not a symbolic link/);
@@ -1363,6 +1367,24 @@ async function testToolWriteMarksSnapshotAndRepoMapDirty(): Promise<void> {
     const refreshed = await memory.status();
     assert.equal(refreshed.snapshotDirty, false);
     assert.equal(refreshed.repoMapDirty, false);
+  });
+}
+
+async function testSessionSummariesSortByUpdatedAt(): Promise<void> {
+  await withTempWorkspace(async (workspaceRoot) => {
+    await ensureAgentDirs(workspaceRoot);
+    const older = new SessionRecorder(workspaceRoot, "older-summary");
+    older.record({ type: "user_message", content: "older", time: "2026-01-01T00:00:00.000Z" });
+    await older.close();
+
+    const newer = new SessionRecorder(workspaceRoot, "newer-summary");
+    newer.record({ type: "user_message", content: "newer", time: "2026-01-02T00:00:00.000Z" });
+    await newer.close();
+
+    assert.deepEqual(
+      (await listSessionSummaries(workspaceRoot)).map((summary) => summary.fileName),
+      ["newer-summary.jsonl", "older-summary.jsonl"]
+    );
   });
 }
 

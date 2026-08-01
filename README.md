@@ -144,18 +144,20 @@ Skill 按 Agent Skills 格式使用带 YAML frontmatter 的 `SKILL.md`：新根�
 项目会话脱离工作区存放，桌面端和 CLI 按项目路径哈希访问同一份历史：
 
 ```text
-~/.biny/agent/sessions/<project-path-hash>/ 问答历史
+~/.biny/agent/sessions/<project-path-hash>/<YYYY>/<MM>/<DD>/*.jsonl 问答历史
 ~/.biny/agent/memory/<project-path-hash>/   项目长期记忆
 ~/.biny/agent/models-store.json             Provider 动态模型目录缓存
 <project>/.biny/attachments/                图片、音频等会话附件
 <project>/.biny/                            settings、runs、turns、todos、logs 等
 ```
 
-全局模型配置在 `~/.biny/config.json`；项目 session、项目 Memory 和 Provider 动态模型目录缓存位于 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）。Session 与 Memory 分别按项目隔离在 `sessions/<project-path-hash>/`、`memory/<project-path-hash>/`，模型目录缓存统一保存在 `models-store.json`。该缓存按 `0600` 原子写入，只保存模型元数据、检查时间和 HTTP 校验信息，不保存 API key、OAuth token、Cookie 或鉴权请求头；文件损坏时会忽略旧内容并在下次成功刷新时重建。全局 Skill 默认从 `~/.agents/skills/`、兼容目录 `~/.biny/skills/` 和管理员目录 `/etc/codex/skills/` 发现，named agent 仍位于 `~/.biny/agents/`。桌面端的项目列表和 UI 状态在 `~/Library/Application Support/Biny/workspaces/default/`，附件、run 等其余项目数据暂时仍在项目 `.biny/`。旧的 `<project>/.biny/sessions/` 和 `<project>/.biny/memory/` 不再读取或复制。
+全局模型配置在 `~/.biny/config.json`；项目 session、项目 Memory 和 Provider 动态模型目录缓存位于 `~/.biny/agent/`（可由 `BINY_AGENT_DIR` 覆盖）。Session 与 Memory 分别按项目隔离在 `sessions/<project-path-hash>/<YYYY>/<MM>/<DD>/`、`memory/<project-path-hash>/`，模型目录缓存统一保存在 `models-store.json`。新建 session 会按本地日期写入年/月/日目录，旧的平铺 `sessions/<project-path-hash>/*.jsonl` 仍可读取，不会在运行中的 session 被静默移动。该缓存按 `0600` 原子写入，只保存模型元数据、检查时间和 HTTP 校验信息，不保存 API key、OAuth token、Cookie 或鉴权请求头；文件损坏时会忽略旧内容并在下次成功刷新时重建。全局 Skill 默认从 `~/.agents/skills/`、兼容目录 `~/.biny/skills/` 和管理员目录 `/etc/codex/skills/` 发现，named agent 仍位于 `~/.biny/agents/`。桌面端的项目列表和 UI 状态在 `~/Library/Application Support/Biny/workspaces/default/`，附件、run 等其余项目数据暂时仍在项目 `.biny/`。旧的 `<project>/.biny/sessions/` 和 `<project>/.biny/memory/` 不再读取或复制。
 
 项目级 Skill 会从当前工作目录逐层扫描到 Git 仓库根目录下的 `.agents/skills/`，并兼容 `<project>/.biny/skills/`；named agent 仍从 `<project>/.biny/agents/` 覆盖全局同名定义。旧的单数目录 `<project>/.agent/` 不再扫描或自动迁移。
 
 同一个 Session 同一时刻只能由一个运行时执行，另一个会返回占用提示；不同 Session 可以并行。
+
+新建 Session 使用 UUIDv7 作为文件名（例如 `019...jsonl`）：UUID 高位包含 UTC 毫秒时间戳，因此按文件名字典序可以按创建时间排序；同一毫秒内用随机位避免冲突。已有的旧格式 session ID 仍可按完整 ID 或唯一前缀恢复。`biny sessions`、TUI 会话选择器和 Desktop 会话列表按最近更新时间从新到旧展示，`resume latest` 仍按文件修改时间选择最近会话。
 
 ## 当前边界
 

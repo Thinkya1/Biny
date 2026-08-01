@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { forkSession } from "../src/session/fork.js";
-import { SessionRecorder, type SessionEvent } from "../src/session/recorder.js";
+import { createSessionId, SessionRecorder, type SessionEvent } from "../src/session/recorder.js";
 import { replaySession } from "../src/session/replay.js";
 import { ensureAgentDirs, sessionFilePath } from "../src/session/store.js";
 
@@ -11,6 +11,7 @@ async function main(): Promise<void> {
   const root = await mkdtemp(path.join(os.tmpdir(), "biny-fork-"));
   try {
     await ensureAgentDirs(root);
+    testSessionIdsAreTimeSortable();
     const source = await seedSession(root);
     await testFullForkIsIndependent(root, source);
     await testTruncatedForkNeverSplitsAToolCall(root, source);
@@ -19,6 +20,14 @@ async function main(): Promise<void> {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+}
+
+function testSessionIdsAreTimeSortable(): void {
+  const earlier = createSessionId(Date.UTC(2026, 0, 1, 0, 0, 0, 1));
+  const later = createSessionId(Date.UTC(2026, 0, 1, 0, 0, 0, 2));
+  assert.match(earlier, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+  assert.equal(earlier < later, true);
+  assert.notEqual(createSessionId(Date.UTC(2026, 0, 1, 0, 0, 0, 1)), earlier);
 }
 
 async function seedSession(root: string): Promise<string> {

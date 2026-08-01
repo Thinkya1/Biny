@@ -290,7 +290,14 @@ export async function listSessionSummaries(workspaceRoot: string): Promise<Sessi
     }
   });
   await Promise.all(workers);
-  return summaries.filter((summary): summary is SessionSummary => summary !== undefined).sort((a, b) => a.fileName.localeCompare(b.fileName));
+  return summaries
+    .filter((summary): summary is SessionSummary => summary !== undefined)
+    .sort((a, b) => sessionTime(b.updatedAt) - sessionTime(a.updatedAt) || b.fileName.localeCompare(a.fileName));
+}
+
+function sessionTime(value: string): number {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 async function assertStandaloneSessionBinding(filePath: string, handle: FileHandle): Promise<void> {

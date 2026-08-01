@@ -7,7 +7,7 @@
  * 所有工作区路径都经过 `resolveWorkspacePath` / `resolveWorkspaceDirectory` 收敛，渲染层传来的
  * 相对路径不能逃出项目目录。
  */
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -22,7 +22,7 @@ import {
   type InteractiveRuntimeSnapshot
 } from "../../../runtime/agentEvents.js";
 import { listSessionSummaries, readStoredSessionEvents } from "../../../session/events.js";
-import type { SessionTurnStatus } from "../../../session/recorder.js";
+import { createSessionId, type SessionTurnStatus } from "../../../session/recorder.js";
 import { createSessionFile, deleteSessionFile, duplicateSessionFile, ensureAgentDirs } from "../../../session/store.js";
 import { gitInspectionEnvironment } from "../../../tools/git/environment.js";
 import { resolveWorkspaceDirectory, resolveWorkspacePath, toWorkspaceRelative } from "../../../workspace/resolvePath.js";
@@ -433,20 +433,6 @@ function sessionResumable(
   return finalEvent.type === "run.blocked" || finalEvent.type === "run.incomplete"
     ? finalEvent.resumable
     : undefined;
-}
-
-function createSessionId(): string {
-  const now = new Date();
-  const stamp = [
-    now.getFullYear(),
-    String(now.getMonth() + 1).padStart(2, "0"),
-    String(now.getDate()).padStart(2, "0"),
-    "-",
-    String(now.getHours()).padStart(2, "0"),
-    String(now.getMinutes()).padStart(2, "0"),
-    String(now.getSeconds()).padStart(2, "0")
-  ].join("");
-  return `${stamp}-${randomBytes(4).toString("hex")}`;
 }
 
 function isNotFound(error: unknown): boolean {

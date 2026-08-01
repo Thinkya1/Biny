@@ -9,10 +9,12 @@ import {
   constants,
   createWriteStream,
   existsSync,
+  chmodSync,
   fchmodSync,
   fstatSync,
   ftruncateSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readSync,
   realpathSync,
@@ -89,7 +91,7 @@ export class SessionRecorder {
   private lastMessageId: string | undefined;
 
   constructor(workspaceRoot: string, sessionId = createSessionId(), resolvedFilePath = sessionFilePath(workspaceRoot, sessionId)) {
-    // sessionId 默认按时间和随机后缀生成，便于人工排序也避免同秒冲突。
+    // sessionId 默认使用 UUIDv7：高位携带毫秒时间戳，既能保持 UUID 格式，也便于按字典序排序。
     this.sessionId = sessionId;
     this.filePath = canonicalSessionFilePath(workspaceRoot, sessionId, resolvedFilePath);
     this.existedAtCreation = existsSync(this.filePath);
@@ -332,11 +334,15 @@ function canonicalSessionFilePath(workspaceRoot: string, sessionId: string, requ
   if (canonicalSessions !== sessionsPath) {
     throw new Error("Session storage resolves outside the current project's global session directory.");
   }
-  if (realpathSync(path.dirname(requestedFilePath)) !== canonicalSessions || path.basename(requestedFilePath) !== expectedName) {
+  const requestedParent = path.resolve(path.dirname(requestedFilePath));
+  ensureSessionParentDirectorySync(canonicalSessions, requestedParent);
+  const canonicalParent = realpathSync(requestedParent);
+  const relativeParent = path.relative(canonicalSessions, canonicalParent);
+  if (relativeParent.startsWith("..") || path.isAbsolute(relativeParent) || path.basename(requestedFilePath) !== expectedName) {
     throw new Error(`Session file resolves outside the current project's global session directory: ${expectedName}`);
   }
 
-  const canonicalFile = path.join(canonicalSessions, expectedName);
+  const canonicalFile = path.join(canonicalParent, expectedName);
   if (existsSync(canonicalFile)) {
     const stat = lstatSync(canonicalFile);
     if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) {
@@ -344,6 +350,29 @@ function canonicalSessionFilePath(workspaceRoot: string, sessionId: string, requ
     }
   }
   return canonicalFile;
+}
+
+function ensureSessionParentDirectorySync(sessionsPath: string, parentPath: string): void {
+  const relativeParent = path.relative(sessionsPath, parentPath);
+  if (!relativeParent || relativeParent.startsWith("..") || path.isAbsolute(relativeParent)) {
+    if (relativeParent === "") return;
+    throw new Error("Session file resolves outside the current project's global session directory.");
+  }
+
+  let current = sessionsPath;
+  for (const segment of relativeParent.split(path.sep)) {
+    current = path.join(current, segment);
+    try {
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new Error("Session date directory must be a real directory, not a symbolic link.");
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      mkdirSync(current, { mode: 0o700 });
+    }
+    chmodSync(current, 0o700);
+  }
 }
 
 function sessionOpenFlags(): number {
@@ -407,17 +436,21 @@ function lastPersistedMessageId(raw: Buffer): string | undefined {
   return undefined;
 }
 
-export function createSessionId(): string {
-  // 文件名中避免使用冒号，兼容不同平台的路径规则。
-  const now = new Date();
-  const stamp = [
-    now.getFullYear(),
-    String(now.getMonth() + 1).padStart(2, "0"),
-    String(now.getDate()).padStart(2, "0"),
-    "-",
-    String(now.getHours()).padStart(2, "0"),
-    String(now.getMinutes()).padStart(2, "0"),
-    String(now.getSeconds()).padStart(2, "0")
-  ].join("");
-  return `${stamp}-${randomBytes(4).toString("hex")}`;
+export function createSessionId(timestampMs = Date.now()): string {
+  if (!Number.isSafeInteger(timestampMs) || timestampMs < 0 || timestampMs > 0xffffffffffff) {
+    throw new RangeError("Session timestamp must be a non-negative safe integer within UUIDv7's 48-bit range.");
+  }
+
+  const bytes = randomBytes(16);
+  let remaining = timestampMs;
+  for (let index = 5; index >= 0; index -= 1) {
+    bytes[index] = remaining % 256;
+    remaining = Math.floor(remaining / 256);
+  }
+  // UUIDv7: version 7 occupies the high nibble of byte 6; RFC 9562 variant is 10xx.
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x70;
+  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }

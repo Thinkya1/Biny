@@ -1,12 +1,12 @@
 /**
  * Session 存储定位模块。
  *
- * 全局项目 session 目录以及 `.biny` 内其余运行目录的创建、session 文件名生成、latest
- * 解析和 session id 前缀匹配都在这里处理。命令层只需要给出 workspace 和可选 session
- * 参数，不必关心文件布局。
+ * 全局项目 session 目录以及 `.biny` 内其余运行目录的创建、按年/月/日组织的 session
+ * 文件路径、latest 解析和 session id 前缀匹配都在这里处理。命令层只需要给出 workspace
+ * 和可选 session 参数，不必关心文件布局。
  */
 import { randomBytes } from "node:crypto";
-import { constants, promises as fs, realpathSync, type Stats } from "node:fs";
+import { chmodSync, constants, existsSync, lstatSync, mkdirSync, promises as fs, readdirSync, realpathSync, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { globalAgentDir, projectSessionsDir } from "../config/paths.js";
@@ -26,6 +26,11 @@ interface SessionStorageLocation {
   global: PathIdentity;
   globalSessions: PathIdentity;
   sessions: PathIdentity;
+}
+
+interface SessionFileEntry {
+  fileName: string;
+  filePath: string;
 }
 
 export interface SessionFileSnapshot {
@@ -82,7 +87,21 @@ export function sessionFilePath(workspaceRoot: string, sessionId: string): strin
     throw new Error(`Invalid session id: ${sessionId}`);
   }
   const canonicalWorkspace = realpathSync(path.resolve(workspaceRoot));
-  return path.join(projectSessionsDir(canonicalWorkspace), `${sessionId}.jsonl`);
+  const candidatePath = sessionFileCandidatePath(canonicalWorkspace, sessionId);
+  const sessionsPath = projectSessionsDir(canonicalWorkspace);
+  // 已存在的旧平铺文件由 candidatePath 优先返回，避免显式创建 recorder 时悄悄生成第二份会话。
+  const existingPath = findSessionPathByNameSync(sessionsPath, `${sessionId}.jsonl`);
+  if (existingPath) return existingPath;
+  const dateDirectory = path.dirname(candidatePath);
+  ensureSessionDirectorySync(sessionsPath, dateDirectory);
+  return candidatePath;
+}
+
+function sessionFileCandidatePath(workspaceRoot: string, sessionId: string): string {
+  const sessionsPath = projectSessionsDir(workspaceRoot);
+  const legacyPath = path.join(sessionsPath, `${sessionId}.jsonl`);
+  if (existsSync(legacyPath)) return legacyPath;
+  return path.join(sessionsPath, ...sessionDateSegments(sessionId), `${sessionId}.jsonl`);
 }
 
 export function sessionIdFromFile(filePath: string): string {
@@ -92,7 +111,7 @@ export function sessionIdFromFile(filePath: string): string {
 export async function listSessionFiles(workspaceRoot: string): Promise<string[]> {
   // 只列出 JSONL session，避免 logs 或临时文件混进恢复列表。
   const location = await resolveSessionStorage(workspaceRoot);
-  return await listSessionFilesInDirectory(location);
+  return (await listSessionFileEntries(location)).map((entry) => entry.fileName);
 }
 
 export async function resolveSessionFile(workspaceRoot: string, session: string | undefined): Promise<string> {
@@ -103,55 +122,56 @@ export async function resolveSessionFile(workspaceRoot: string, session: string 
 export async function readSessionSnapshot(workspaceRoot: string, session: string | undefined): Promise<SessionFileSnapshot> {
   const location = await resolveSessionStorage(workspaceRoot);
   const filePath = await resolveSessionFileAt(location, session);
-  return await readSessionSnapshotAt(location, path.basename(filePath));
+  return await readSessionSnapshotAt(location, filePath);
 }
 
 export async function duplicateSessionFile(workspaceRoot: string, sourceSession: string, targetSessionId: string): Promise<string> {
   const location = await resolveSessionStorage(workspaceRoot);
   const sourcePath = await resolveSessionFileAt(location, sourceSession);
-  const source = await readSessionSnapshotAt(location, path.basename(sourcePath));
-  const targetName = path.basename(sessionFilePath(location.workspace.path, targetSessionId));
-  const targetPath = path.join(location.sessions.path, targetName);
+  const source = await readSessionSnapshotAt(location, sourcePath);
+  const targetPath = sessionFilePath(location.workspace.path, targetSessionId);
   let handle: FileHandle | undefined;
   let identity: Pick<Stats, "dev" | "ino"> | undefined;
   let completed = false;
   try {
     await assertSessionStorage(location);
+    await ensureSessionDirectory(location, path.dirname(targetPath));
     handle = await fs.open(targetPath, writeNewFlags(), 0o600);
-    const stat = await assertSessionBinding(location, targetName, handle);
+    const stat = await assertSessionBinding(location, targetPath, handle);
     identity = { dev: stat.dev, ino: stat.ino };
     await handle.chmod(0o600);
     await handle.writeFile(source.bytes);
     await handle.sync();
-    await assertSessionBinding(location, targetName, handle);
+    await assertSessionBinding(location, targetPath, handle);
     completed = true;
     return targetPath;
   } finally {
     await handle?.close().catch(() => undefined);
-    if (!completed && identity) await removeBoundSessionFile(location, targetName, identity);
+    if (!completed && identity) await removeBoundSessionFile(location, targetPath, identity);
   }
 }
 
 export async function createSessionFile(workspaceRoot: string, targetSessionId: string, bytes: Uint8Array): Promise<string> {
   const location = await resolveSessionStorage(workspaceRoot);
-  const targetName = path.basename(sessionFilePath(location.workspace.path, targetSessionId));
+  const targetPath = sessionFilePath(location.workspace.path, targetSessionId);
   let handle: FileHandle | undefined;
   let identity: Pick<Stats, "dev" | "ino"> | undefined;
   let completed = false;
   try {
     await assertSessionStorage(location);
-    handle = await fs.open(path.join(location.sessions.path, targetName), writeNewFlags(), 0o600);
-    const stat = await assertSessionBinding(location, targetName, handle);
+    await ensureSessionDirectory(location, path.dirname(targetPath));
+    handle = await fs.open(targetPath, writeNewFlags(), 0o600);
+    const stat = await assertSessionBinding(location, targetPath, handle);
     identity = { dev: stat.dev, ino: stat.ino };
     await handle.chmod(0o600);
     await handle.writeFile(bytes);
     await handle.sync();
-    await assertSessionBinding(location, targetName, handle);
+    await assertSessionBinding(location, targetPath, handle);
     completed = true;
-    return path.join(location.sessions.path, targetName);
+    return targetPath;
   } finally {
     await handle?.close().catch(() => undefined);
-    if (!completed && identity) await removeBoundSessionFile(location, targetName, identity);
+    if (!completed && identity) await removeBoundSessionFile(location, targetPath, identity);
   }
 }
 
@@ -162,22 +182,21 @@ export async function deleteSessionFile(
 ): Promise<void> {
   const location = await resolveSessionStorage(workspaceRoot);
   const filePath = await resolveSessionFileAt(location, session);
-  const fileName = path.basename(filePath);
-  const handle = await openSessionHandle(location, fileName, true);
+  const handle = await openSessionHandle(location, filePath, true);
   const tombstoneName = sessionDeleteTombstoneName();
-  const tombstonePath = path.join(location.sessions.path, tombstoneName);
+  const tombstonePath = path.join(path.dirname(filePath), tombstoneName);
   try {
-    const stat = await assertSessionBinding(location, fileName, handle);
+    const stat = await assertSessionBinding(location, filePath, handle);
     const identity = { dev: stat.dev, ino: stat.ino };
     await assertSessionStorage(location);
-    await assertSessionBinding(location, fileName, handle);
+    await assertSessionBinding(location, filePath, handle);
     await hooks.beforeTombstoneMove?.({ filePath, tombstonePath });
     await fs.rename(filePath, tombstonePath);
-    const pinned = await isHandleBoundToPath(location, tombstoneName, handle, identity);
+    const pinned = await isHandleBoundToPath(location, tombstonePath, handle, identity);
     if (!pinned) {
-      const restored = await preserveUnexpectedTombstone(location, tombstoneName, fileName);
+      const restored = await preserveUnexpectedTombstone(location, tombstonePath, filePath);
       const recovery = restored
-        ? ` A recovery copy was restored to ${fileName}; the moved file remains preserved as ${tombstoneName}.`
+        ? ` A recovery copy was restored to ${path.basename(filePath)}; the moved file remains preserved as ${tombstoneName}.`
         : ` The moved file remains preserved as ${tombstoneName}.`;
       throw new Error(`Session changed during deletion; no replacement file was unlinked.${recovery}`);
     }
@@ -186,7 +205,7 @@ export async function deleteSessionFile(
     await handle.sync();
     const deletedStat = await handle.stat();
     if (deletedStat.dev !== identity.dev || deletedStat.ino !== identity.ino || deletedStat.size !== 0) {
-      throw new Error(`Session deletion could not verify the removed identity: ${fileName}`);
+      throw new Error(`Session deletion could not verify the removed identity: ${path.basename(filePath)}`);
     }
     await assertSessionStorage(location);
   } finally {
@@ -202,7 +221,7 @@ async function resolveSessionFileAt(location: SessionStorageLocation, session: s
 
   const explicitFileName = explicitSessionFileName(session);
   if (explicitFileName) {
-    const filePath = await existingSessionFile(location, explicitFileName);
+    const filePath = await findSessionFileByName(location, explicitFileName);
     if (filePath) return filePath;
     throw new Error(`Session file not found: ${explicitFileName}`);
   }
@@ -211,22 +230,20 @@ async function resolveSessionFileAt(location: SessionStorageLocation, session: s
     throw new Error(`Invalid session reference: ${session}`);
   }
 
-  const exact = await existingSessionFile(location, `${session}.jsonl`);
+  const exact = await findSessionFileByName(location, `${session}.jsonl`);
   if (exact) return exact;
 
-  const sessions = await listSessionFilesInDirectory(location);
-  const prefixMatches = sessions.filter((fileName) => fileName.startsWith(session));
+  const sessions = await listSessionFileEntries(location);
+  const prefixMatches = sessions.filter((entry) => entry.fileName.startsWith(session));
   // 支持用 session id 前缀恢复，减少复制完整文件名的成本；如果前缀不唯一就明确报错。
   if (prefixMatches.length === 1) {
     const match = prefixMatches[0];
     if (!match) throw new Error(`Session not found: ${session}`);
-    const filePath = await existingSessionFile(location, match);
-    if (!filePath) throw new Error(`Session not found: ${session}`);
-    return filePath;
+    return match.filePath;
   }
 
   if (prefixMatches.length > 1) {
-    throw new Error(`Session id is ambiguous: ${session}\nMatches:\n${prefixMatches.join("\n")}`);
+    throw new Error(`Session id is ambiguous: ${session}\nMatches:\n${prefixMatches.map((match) => match.fileName).join("\n")}`);
   }
 
   throw new Error(`Session not found: ${session}\nUse "biny sessions" to list sessions, or "biny resume latest" for the latest session.`);
@@ -234,7 +251,7 @@ async function resolveSessionFileAt(location: SessionStorageLocation, session: s
 
 async function latestSessionFile(location: SessionStorageLocation): Promise<string> {
   // latest 基于修改时间而不是文件名，能覆盖恢复后继续追加的旧 session。
-  const sessions = await listSessionFilesInDirectory(location);
+  const sessions = await listSessionFileEntries(location);
   if (!sessions.length) throw new Error("No sessions found for the current project.");
   const stats: Array<{ fileName: string; filePath: string; mtimeMs: number } | undefined> = new Array(sessions.length);
   let nextIndex = 0;
@@ -242,18 +259,17 @@ async function latestSessionFile(location: SessionStorageLocation): Promise<stri
     while (nextIndex < sessions.length) {
       const index = nextIndex;
       nextIndex += 1;
-      const fileName = sessions[index];
-      if (!fileName) continue;
-      const filePath = await existingSessionFile(location, fileName);
-      if (!filePath) throw new Error(`Session file disappeared during resolution: ${fileName}`);
-      const handle = await openSessionHandle(location, fileName);
+      const session = sessions[index];
+      if (!session) continue;
+      const filePath = session.filePath;
+      const handle = await openSessionHandle(location, filePath);
       let stat: Stats;
       try {
-        stat = await assertSessionBinding(location, fileName, handle);
+        stat = await assertSessionBinding(location, filePath, handle);
       } finally {
         await handle.close();
       }
-      stats[index] = stat.size > 0 ? { fileName, filePath, mtimeMs: stat.mtimeMs } : undefined;
+      stats[index] = stat.size > 0 ? { fileName: session.fileName, filePath, mtimeMs: stat.mtimeMs } : undefined;
     }
   });
   await Promise.all(workers);
@@ -319,6 +335,23 @@ async function ensureProjectSessionStorage(canonicalWorkspace: string): Promise<
   if (await fs.realpath(sessionsPath) !== sessionsPath) {
     throw new Error("Project session storage resolves outside the global sessions directory.");
   }
+  await validateSessionDirectories(sessionsPath);
+}
+
+async function validateSessionDirectories(directory: string): Promise<void> {
+  const entries = await fs.readdir(directory, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) {
+      if (entry.name.endsWith(".jsonl")) continue;
+      throw new Error("Session date directory must be a real directory, not a symbolic link.");
+    }
+    if (!entry.isDirectory()) continue;
+    const child = path.join(directory, entry.name);
+    if (await fs.realpath(child) !== child) {
+      throw new Error("Session date directory resolves outside the current project's global session directory.");
+    }
+    await validateSessionDirectories(child);
+  }
 }
 
 async function ensureRealDirectory(directory: string, label: string): Promise<void> {
@@ -340,22 +373,146 @@ async function ensureRealDirectory(directory: string, label: string): Promise<vo
   await fs.chmod(directory, 0o700);
 }
 
-async function listSessionFilesInDirectory(location: SessionStorageLocation): Promise<string[]> {
-  await assertSessionStorage(location);
-  const entries = await fs.readdir(location.sessions.path, { withFileTypes: true });
-  const safeFiles: string[] = [];
-  for (const entry of entries) {
-    if (!entry.isFile() || !isSessionFileName(entry.name)) continue;
-    if (await existingSessionFile(location, entry.name)) safeFiles.push(entry.name);
+async function ensureSessionDirectory(location: SessionStorageLocation, directory: string): Promise<void> {
+  const relativeDirectory = path.relative(location.sessions.path, path.resolve(directory));
+  if (!relativeDirectory || relativeDirectory.startsWith("..") || path.isAbsolute(relativeDirectory)) {
+    if (relativeDirectory === "") return;
+    throw new Error("Session date directory resolves outside the current project's global session directory.");
   }
-  await assertSessionStorage(location);
-  return safeFiles.sort();
+
+  let current = location.sessions.path;
+  for (const segment of relativeDirectory.split(path.sep)) {
+    current = path.join(current, segment);
+    await ensureRealDirectory(current, `session date directory ${segment}`);
+    if (await fs.realpath(current) !== current) {
+      throw new Error("Session date directory resolves outside the current project's global session directory.");
+    }
+  }
 }
 
-async function existingSessionFile(location: SessionStorageLocation, fileName: string): Promise<string | undefined> {
+function ensureSessionDirectorySync(sessionsPath: string, directory: string): void {
+  const relativeDirectory = path.relative(sessionsPath, path.resolve(directory));
+  if (!relativeDirectory || relativeDirectory.startsWith("..") || path.isAbsolute(relativeDirectory)) {
+    if (relativeDirectory === "") return;
+    throw new Error("Session date directory resolves outside the current project's global session directory.");
+  }
+
+  let current = sessionsPath;
+  for (const segment of relativeDirectory.split(path.sep)) {
+    current = path.join(current, segment);
+    let stat;
+    try {
+      stat = lstatSync(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        try {
+          mkdirSync(current, { mode: 0o700 });
+        } catch (mkdirError) {
+          if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+        }
+        stat = lstatSync(current);
+      } else {
+        throw error;
+      }
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error("Session date directory must be a real directory, not a symbolic link.");
+    }
+    chmodSync(current, 0o700);
+  }
+}
+
+function findSessionPathByNameSync(directory: string, fileName: string): string | undefined {
+  let entries;
+  try {
+    entries = readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (entry.name === fileName) return path.join(directory, entry.name);
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const nested = findSessionPathByNameSync(path.join(directory, entry.name), fileName);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+async function listSessionFileEntries(location: SessionStorageLocation): Promise<SessionFileEntry[]> {
+  await assertSessionStorage(location);
+  const entries = await fs.readdir(location.sessions.path, { withFileTypes: true });
+  const safeFiles: SessionFileEntry[] = [];
+  for (const entry of entries) {
+    const filePath = path.join(location.sessions.path, entry.name);
+    if (entry.isDirectory()) {
+      await listSessionFileEntriesFromDirectory(location, filePath, safeFiles);
+      continue;
+    }
+    if (!entry.isFile() || !isSessionFileName(entry.name)) continue;
+    const existing = await existingSessionFileAt(location, filePath, entry.name);
+    if (existing) safeFiles.push({ fileName: entry.name, filePath: existing });
+  }
+  await assertSessionStorage(location);
+  return safeFiles.sort((left, right) => left.fileName.localeCompare(right.fileName));
+}
+
+async function listSessionFileEntriesFromDirectory(
+  location: SessionStorageLocation,
+  directory: string,
+  files: SessionFileEntry[]
+): Promise<void> {
+  const directoryStat = await fs.lstat(directory);
+  if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
+    throw new Error(`Session date directory must be a real directory: ${path.basename(directory)}`);
+  }
+  const canonicalDirectory = await fs.realpath(directory);
+  const canonicalSessions = location.sessions.path;
+  const relativeDirectory = path.relative(canonicalSessions, canonicalDirectory);
+  if (relativeDirectory.startsWith("..") || path.isAbsolute(relativeDirectory)) {
+    throw new Error("Session date directory resolves outside the current project's global session directory.");
+  }
+  const entries = await fs.readdir(canonicalDirectory, { withFileTypes: true });
+  for (const entry of entries) {
+    const filePath = path.join(canonicalDirectory, entry.name);
+    if (entry.isDirectory()) {
+      await listSessionFileEntriesFromDirectory(location, filePath, files);
+      continue;
+    }
+    if (!entry.isFile() || !isSessionFileName(entry.name)) continue;
+    const existing = await existingSessionFileAt(location, filePath, entry.name);
+    if (existing) files.push({ fileName: entry.name, filePath: existing });
+  }
+}
+
+async function findSessionFileByName(location: SessionStorageLocation, fileName: string): Promise<string | undefined> {
+  const directPath = sessionFileCandidatePath(location.workspace.path, fileName.replace(/\.jsonl$/u, ""));
+  const direct = await existingSessionFileAt(location, directPath, fileName);
+  if (direct) return direct;
+  const matchingPath = await findSessionPathByName(location.sessions.path, fileName);
+  if (matchingPath) return await existingSessionFileAt(location, matchingPath, fileName);
+  return undefined;
+}
+
+async function findSessionPathByName(directory: string, fileName: string): Promise<string | undefined> {
+  const entries = await fs.readdir(directory, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name === fileName) return path.join(directory, entry.name);
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const nested = await findSessionPathByName(path.join(directory, entry.name), fileName);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+async function existingSessionFileAt(location: SessionStorageLocation, filePath: string, fileName: string): Promise<string | undefined> {
   if (!isSessionFileName(fileName)) throw new Error(`Invalid session file name: ${fileName}`);
   await assertSessionStorage(location);
-  const filePath = path.join(location.sessions.path, fileName);
+  if (!await isSessionFileParentBound(location, filePath)) return undefined;
   let stat;
   try {
     stat = await fs.lstat(filePath);
@@ -368,31 +525,53 @@ async function existingSessionFile(location: SessionStorageLocation, fileName: s
   }
 
   const canonicalFile = await fs.realpath(filePath);
-  if (path.dirname(canonicalFile) !== location.sessions.path || path.basename(canonicalFile) !== fileName) {
+  const relativeFile = path.relative(location.sessions.path, canonicalFile);
+  if (relativeFile.startsWith("..") || path.isAbsolute(relativeFile) || path.basename(canonicalFile) !== fileName) {
     throw new Error(`Session resolves outside the current project's global session directory: ${fileName}`);
   }
   await assertSessionStorage(location);
   return canonicalFile;
 }
 
-async function readSessionSnapshotAt(location: SessionStorageLocation, fileName: string): Promise<SessionFileSnapshot> {
-  const handle = await openSessionHandle(location, fileName);
+async function isSessionFileParentBound(location: SessionStorageLocation, filePath: string): Promise<boolean> {
+  const parent = path.dirname(filePath);
+  let parentStat;
   try {
-    await assertSessionBinding(location, fileName, handle);
+    parentStat = await fs.lstat(parent);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+    throw new Error("Session date directory must be a real directory, not a symbolic link.");
+  }
+  const canonicalParent = await fs.realpath(parent);
+  const relativeParent = path.relative(location.sessions.path, canonicalParent);
+  if (canonicalParent !== parent || relativeParent.startsWith("..") || path.isAbsolute(relativeParent)) {
+    throw new Error("Session date directory resolves outside the current project's global session directory.");
+  }
+  return true;
+}
+
+async function readSessionSnapshotAt(location: SessionStorageLocation, filePath: string): Promise<SessionFileSnapshot> {
+  const fileName = path.basename(filePath);
+  const handle = await openSessionHandle(location, filePath);
+  try {
+    await assertSessionBinding(location, filePath, handle);
     // 超限时读尾部而不是抛错：否则一条很长的会话就彻底打不开，而用户是在想恢复它的时候
     // 才发现的。`truncated` 让调用方能如实告知只拿到了最近的部分。
     const { bytes, truncated } = await readSessionTail(handle, fileName);
-    const stat = await assertSessionBinding(location, fileName, handle);
-    return { filePath: path.join(location.sessions.path, fileName), fileName, bytes, stat, truncated };
+    const stat = await assertSessionBinding(location, filePath, handle);
+    return { filePath, fileName, bytes, stat, truncated };
   } finally {
     await handle.close();
   }
 }
 
-async function openSessionHandle(location: SessionStorageLocation, fileName: string, writable = false): Promise<FileHandle> {
+async function openSessionHandle(location: SessionStorageLocation, filePath: string, writable = false): Promise<FileHandle> {
+  const fileName = path.basename(filePath);
   if (!isSessionFileName(fileName)) throw new Error(`Invalid session file name: ${fileName}`);
   await assertSessionStorage(location);
-  const filePath = path.join(location.sessions.path, fileName);
   let handle: FileHandle;
   try {
     handle = await fs.open(filePath, (writable ? constants.O_RDWR : constants.O_RDONLY) | noFollowFlag());
@@ -401,7 +580,7 @@ async function openSessionHandle(location: SessionStorageLocation, fileName: str
     throw error;
   }
   try {
-    await assertSessionBinding(location, fileName, handle);
+    await assertSessionBinding(location, filePath, handle);
     return handle;
   } catch (error) {
     await handle.close();
@@ -409,11 +588,12 @@ async function openSessionHandle(location: SessionStorageLocation, fileName: str
   }
 }
 
-async function assertSessionBinding(location: SessionStorageLocation, fileName: string, handle: FileHandle): Promise<Stats> {
+async function assertSessionBinding(location: SessionStorageLocation, filePath: string, handle: FileHandle): Promise<Stats> {
+  const fileName = path.basename(filePath);
   const descriptorStat = await handle.stat();
   if (!descriptorStat.isFile() || descriptorStat.nlink !== 1) throw unsafeSessionError(fileName);
   await assertSessionStorage(location);
-  const pathStat = await fs.lstat(path.join(location.sessions.path, fileName));
+  const pathStat = await fs.lstat(filePath);
   if (
     pathStat.isSymbolicLink()
     || !pathStat.isFile()
@@ -449,12 +629,12 @@ async function assertPathIdentity(identity: PathIdentity, message: string): Prom
 
 async function isBoundSessionFile(
   location: SessionStorageLocation,
-  fileName: string,
+  filePath: string,
   identity: Pick<Stats, "dev" | "ino">
 ): Promise<boolean> {
   try {
     await assertSessionStorage(location);
-    const stat = await fs.lstat(path.join(location.sessions.path, fileName));
+    const stat = await fs.lstat(filePath);
     return !stat.isSymbolicLink() && stat.isFile() && stat.nlink === 1 && stat.dev === identity.dev && stat.ino === identity.ino;
   } catch {
     return false;
@@ -463,7 +643,7 @@ async function isBoundSessionFile(
 
 async function isHandleBoundToPath(
   location: SessionStorageLocation,
-  fileName: string,
+  filePath: string,
   handle: FileHandle,
   identity: Pick<Stats, "dev" | "ino">
 ): Promise<boolean> {
@@ -471,7 +651,7 @@ async function isHandleBoundToPath(
     await assertSessionStorage(location);
     const [descriptorStat, pathStat] = await Promise.all([
       handle.stat(),
-      fs.lstat(path.join(location.sessions.path, fileName))
+      fs.lstat(filePath)
     ]);
     return descriptorStat.isFile()
       && descriptorStat.nlink === 1
@@ -489,17 +669,16 @@ async function isHandleBoundToPath(
 
 async function preserveUnexpectedTombstone(
   location: SessionStorageLocation,
-  tombstoneName: string,
-  originalName: string
+  tombstonePath: string,
+  originalPath: string
 ): Promise<boolean> {
   try {
     await assertSessionStorage(location);
-    const tombstonePath = path.join(location.sessions.path, tombstoneName);
     const stat = await fs.lstat(tombstonePath);
     if (stat.isSymbolicLink() || !stat.isFile()) return false;
     await fs.copyFile(
       tombstonePath,
-      path.join(location.sessions.path, originalName),
+      originalPath,
       constants.COPYFILE_EXCL
     );
     await assertSessionStorage(location);
@@ -513,11 +692,11 @@ async function preserveUnexpectedTombstone(
 
 async function removeBoundSessionFile(
   location: SessionStorageLocation,
-  fileName: string,
+  filePath: string,
   identity: Pick<Stats, "dev" | "ino">
 ): Promise<void> {
-  if (!await isBoundSessionFile(location, fileName, identity)) return;
-  await fs.unlink(path.join(location.sessions.path, fileName));
+  if (!await isBoundSessionFile(location, filePath, identity)) return;
+  await fs.unlink(filePath);
 }
 
 function writeNewFlags(): number {
@@ -562,4 +741,37 @@ function isSessionFileName(fileName: string): boolean {
     && path.basename(fileName) === fileName
     && !fileName.includes("\0")
     && !fileName.includes("\\");
+}
+
+function sessionDateSegments(sessionId: string): [string, string, string] {
+  const date = sessionDate(sessionId);
+  return [
+    String(date.getFullYear()).padStart(4, "0"),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0")
+  ];
+}
+
+function sessionDate(sessionId: string): Date {
+  const uuidV7 = /^([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-/iu.exec(sessionId);
+  if (uuidV7) {
+    const timestampMs = Number.parseInt(`${uuidV7[1]}${uuidV7[2]}`, 16);
+    const date = new Date(timestampMs);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+
+  const compactDate = /^(\d{4})(\d{2})(\d{2})-/u.exec(sessionId);
+  if (compactDate) return localDate(Number(compactDate[1]), Number(compactDate[2]), Number(compactDate[3]));
+
+  const dashedDate = /^(\d{4})-(\d{2})-(\d{2})/u.exec(sessionId);
+  if (dashedDate) return localDate(Number(dashedDate[1]), Number(dashedDate[2]), Number(dashedDate[3]));
+
+  return new Date();
+}
+
+function localDate(year: number, month: number, day: number): Date {
+  const date = new Date(year, month - 1, day);
+  return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day
+    ? date
+    : new Date();
 }
