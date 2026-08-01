@@ -49,16 +49,18 @@ export function createToolCounts(entries: Array<{ source: ToolSource }>): Record
 
 export function formatExtensionReport(status: ExtensionStatus, section: ExtensionSection = "all"): string {
   if (section === "mcp") return formatMcpReport(status.mcp);
-  if (section === "skills") return formatSkillReport(status.skills, status.skillWarnings);
+  if (section === "skills") return formatSkillReport(status.skills);
   if (section === "plugins") return formatPathReport("Plugins", status.plugins, "No plugins loaded.");
 
   const counts = status.toolCounts;
+  const skillDiagnostics = formatSkillDiagnostics(status.skillWarnings);
   return [
     "Extensions",
     "",
     formatMcpReport(status.mcp),
     "",
-    formatSkillReport(status.skills, status.skillWarnings),
+    formatSkillReport(status.skills),
+    ...(skillDiagnostics ? ["", skillDiagnostics] : []),
     "",
     formatPathReport("Plugins", status.plugins, "No plugins loaded."),
     "",
@@ -120,15 +122,16 @@ function formatSubagentAgents(agents: SubagentDefinition[]): string[] {
   return lines;
 }
 
-function formatSkillReport(skills: SkillDefinition[], warnings: string[]): string {
-  if (!skills.length && !warnings.length) return "Skills\n  No skills loaded.";
-  const lines = ["Skills"];
-  for (const skill of skills) {
-    lines.push(`  ${skill.name} · ${skill.scope} · ${skill.path}`);
-    lines.push(`    ${skill.description}`);
-  }
-  for (const warning of warnings) lines.push(`  ! ${warning}`);
-  return lines.join("\n");
+function formatSkillReport(skills: SkillDefinition[]): string {
+  // 空态只描述成功加载的结果，避免失败路径里的 Skill 名称看起来像已加载项。
+  if (!skills.length) return "Skills\n  No skills loaded.";
+  const names = [...new Set(skills.map((skill) => skill.name))].sort((left, right) => left.localeCompare(right));
+  return ["Skills", `  ${names.join(", ")}`].join("\n");
+}
+
+function formatSkillDiagnostics(warnings: string[]): string {
+  if (!warnings.length) return "";
+  return ["Skill conflicts", ...warnings.map((warning) => `  ${warning}`)].join("\n");
 }
 
 function formatPathReport(title: string, paths: string[], empty: string): string {

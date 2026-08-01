@@ -18,7 +18,7 @@ import { CompletionStateStore } from "../agent/completionState.js";
 import { createCompletionStateTools } from "../tools/completion.js";
 import { CheckpointStore } from "../session/checkpointStore.js";
 import { PermissionManager } from "../permission/PermissionManager.js";
-import { createSkillResourceTool, createSkillTool, loadSkills, type SkillBundle } from "../extensions/skills.js";
+import { createSkillResourceTool, createSkillTool, expandSkillCommand as expandSkillCommandText, loadSkills, type SkillBundle, type SkillDefinition } from "../extensions/skills.js";
 import { loadPlugins } from "../extensions/plugins.js";
 import { createMcpResourceTools, McpToolHost } from "../extensions/mcp.js";
 import { createSubagentTool, runSubagentTask as executeSubagentTask, type SubagentOptions } from "../extensions/subagent.js";
@@ -48,6 +48,10 @@ export interface CommandRuntime {
   mcp: McpToolHost;
   subagents: SubagentTaskManager | undefined;
   extensionReport(section?: ExtensionSection): string;
+  /** 当前可用于 TUI 补全的 Skill 元数据；正文仍按需加载。 */
+  listSkills(): SkillDefinition[];
+  /** 用户提交 `/skill:name` 后才读取并展开 Skill 正文。 */
+  expandSkillCommand(input: string): Promise<string>;
   /** 每个新根回合前重新扫描 Skill，使新增和元数据修改无需重启即可生效。 */
   refreshSkills(): Promise<void>;
   /** 实时重新扫描具名子代理定义（会话期间可编辑生效）。 */
@@ -241,6 +245,8 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     mcp: mcpHost,
     subagents: subagentTaskManager,
     extensionReport: (section?: ExtensionSection): string => formatExtensionReport(extensionStatus(), section),
+    listSkills: (): SkillDefinition[] => [...requireSkillBundle(skills).skills],
+    expandSkillCommand: async (input: string): Promise<string> => await expandSkillCommandText(requireSkillBundle(skills), input),
     refreshSkills: async (): Promise<void> => {
       skills = await loadSkills({ workspaceRoot, projectPaths: config.extensions.skills });
     },

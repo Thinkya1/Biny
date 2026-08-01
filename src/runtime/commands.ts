@@ -58,7 +58,7 @@ export async function executeRuntimeCommand(
         : `Reconnect failed for ${serverName}: ${status.lastError ?? "unknown error"}`
     );
   }
-  if (command === "/skills") return result(command, "Skills", services.extensionReport("skills").replace(/^Skills\n/, ""));
+  if (command === "/skills") return result(command, "[Skills]", services.extensionReport("skills").replace(/^Skills\n/, ""));
   if (command === "/plugins") return result(command, "Plugins", services.extensionReport("plugins").replace(/^Plugins\n/, ""));
   if (command === "/memory") {
     return result(

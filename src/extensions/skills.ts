@@ -2,7 +2,8 @@
  * Agent Skills 扩展模块（渐进式披露）。
  *
  * 新根回合开始前只扫描 YAML frontmatter 的 name/description 并按总预算拼进 system prompt；
- * 完整指令与 references/scripts/assets 分别由 invoke_skill、read_skill_resource 按需读取。
+ * 完整指令由显式 `/skill:name` 提交或 invoke_skill 按需读取，references/scripts/assets
+ * 仍由 read_skill_resource 按需读取。
  * 默认同时发现官方 .agents/skills、~/.agents/skills 与 Biny 旧目录。
  */
 import { constants, promises as fs, type BigIntStats } from "node:fs";
@@ -174,7 +175,7 @@ async function appendSkillDefinitions(
 function buildSkillPrompt(skills: SkillDefinition[]): string {
   if (!skills.length) return "";
   const header = "Available skills (metadata only; full instructions are not loaded yet):";
-  const footer = "Before doing a task that matches a skill, call invoke_skill with its name. A $skill-name mention is an explicit invocation and must be honored. When names are duplicated, also pass the listed path.";
+  const footer = "Before doing a task that matches a skill, call invoke_skill with its name. A $skill-name mention is an explicit invocation and must be honored. When names are duplicated, also pass the listed path. If a user submits /skill:name, its full instructions are already included in that message; follow them without loading the same Skill again.";
   const render = (descriptionLimit: number, limit = skills.length): string => {
     const lines = skills.slice(0, limit).map((skill) => {
       const description = truncateChars(skill.description, descriptionLimit);
@@ -199,6 +200,40 @@ const invokeSkillArgsSchema = z.object({
 });
 
 type SkillBundleSource = SkillBundle | (() => SkillBundle);
+
+/**
+ * 按 Pi 的交互约定展开 `/skill:name args`。
+ *
+ * 补全阶段只需要元数据；用户提交后才在这里重新读取正文，避免把所有
+ * Skill 指令提前塞进上下文。未知 Skill 保留原输入，让模型自行处理。
+ */
+export async function expandSkillCommand(bundle: SkillBundle, input: string): Promise<string> {
+  if (!input.startsWith("/skill:")) return input;
+  const spaceIndex = input.indexOf(" ");
+  const skillName = spaceIndex === -1 ? input.slice("/skill:".length) : input.slice("/skill:".length, spaceIndex);
+  const args = spaceIndex === -1 ? "" : input.slice(spaceIndex + 1).trim();
+  const skill = bundle.skills.find((candidate) => candidate.name === skillName);
+  if (!skill) return input;
+
+  const content = await readSkillFileFresh(skill.rootPath, skill.filePath, maxSkillInstructionBytes);
+  let body = content;
+  try {
+    const parsed = splitFrontmatter(content);
+    if (path.basename(skill.filePath) === "SKILL.md" || parsed.frontmatter.name || parsed.frontmatter.description) {
+      body = parsed.body;
+    }
+  } catch (error) {
+    if (path.basename(skill.filePath) === "SKILL.md") throw error;
+  }
+  const skillBlock = [
+    `<skill name="${skill.name}" location="${skill.filePath}">`,
+    `References are relative to ${path.dirname(skill.filePath)}.`,
+    "",
+    body.trim(),
+    "</skill>"
+  ].join("\n");
+  return args ? `${skillBlock}\n\n${args}` : skillBlock;
+}
 
 export function createSkillTool(source: SkillBundleSource): Tool {
   return {

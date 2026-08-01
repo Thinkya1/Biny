@@ -6,7 +6,8 @@ import path from "node:path";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
 import { createMcpResourceTools, expandEnvTemplate, McpToolHost } from "../src/extensions/mcp.js";
 import { loadPlugins } from "../src/extensions/plugins.js";
-import { createSkillResourceTool, createSkillTool, loadSkills } from "../src/extensions/skills.js";
+import { formatExtensionReport } from "../src/extensions/report.js";
+import { createSkillResourceTool, createSkillTool, expandSkillCommand, loadSkills } from "../src/extensions/skills.js";
 import { calculateUsageCost, summarizeUsage } from "../src/observability/usage.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
 import { analyzePermissionRequest } from "../src/permission/policy.js";
@@ -24,6 +25,7 @@ async function waitFor(check: () => boolean, timeoutMs = 5_000): Promise<void> {
 async function main(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-extensions-"));
   try {
+    testEmptySkillReport();
     await testSkillsAndPlugins(workspaceRoot);
     await testExtensionPathBoundary(workspaceRoot);
     await testMcpStdioTool(workspaceRoot);
@@ -32,6 +34,41 @@ async function main(): Promise<void> {
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
   }
+}
+
+function testEmptySkillReport(): void {
+  const status = {
+    mcp: [],
+    skills: [],
+    skillWarnings: ["Skipped skill root /tmp/skills: Skill paths cannot contain symbolic links: /tmp/skills/ai-slop-taste"],
+    plugins: [],
+    subagent: {
+      enabled: false,
+      maxSteps: 16,
+      maxOutputTokens: 8_000,
+      maxConcurrentSubagents: 2,
+      maxPendingSubagents: 16,
+      timeoutMs: 300_000,
+      model: undefined,
+      maxCostUsd: undefined,
+      allowedTools: [],
+      agents: []
+    },
+    toolScheduling: { maxConcurrentTools: 4, maxQueuedToolCalls: 32 },
+    toolCounts: { builtin: 0, mcp: 0, skill: 0, plugin: 0, subagent: 0 }
+  };
+  const report = formatExtensionReport(status, "skills");
+
+  assert.equal(report, "Skills\n  No skills loaded.");
+
+  const loadedReport = formatExtensionReport({
+    ...status,
+    skills: [
+      { name: "zeta", description: "hidden from compact listing", path: "~/.biny/skills/zeta/SKILL.md", filePath: "/tmp/zeta/SKILL.md", rootPath: "/tmp", scope: "global" },
+      { name: "alpha", description: "hidden from compact listing", path: ".biny/skills/alpha/SKILL.md", filePath: "/tmp/alpha/SKILL.md", rootPath: "/tmp", scope: "project" }
+    ]
+  }, "skills");
+  assert.equal(loadedReport, "Skills\n  alpha, zeta");
 }
 
 function testShellPermissionBoundary(): void {
@@ -263,6 +300,14 @@ async function testProgressiveSkills(workspaceRoot: string): Promise<void> {
     assert.match(bundle.prompt, /invoke_skill/);
     assert.equal(bundle.prompt.includes("Always run pnpm test"), false);
     assert.equal(bundle.prompt.includes("Global variant must lose"), true);
+
+    // Pi 风格的 Skill 命令只在提交后读取正文；补全阶段不会把正文放进元数据 prompt。
+    const expanded = await expandSkillCommand(bundle, "/skill:test-runner run the tests");
+    assert.match(expanded, /<skill name="test-runner" location="[^"]+\/test-runner\/SKILL\.md">/);
+    assert.match(expanded, /References are relative to .*test-runner\./);
+    assert.match(expanded, /Always run pnpm test from the workspace root\./);
+    assert.match(expanded, /<\/skill>\n\nrun the tests$/);
+    assert.equal(await expandSkillCommand(bundle, "/skill:missing do something"), "/skill:missing do something");
 
     const tool = createSkillTool(bundle);
     assert.equal(tool.name, "invoke_skill");
