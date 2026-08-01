@@ -1,7 +1,7 @@
 /**
  * 终端剪贴板读取。
  *
- * Pi 的做法是优先使用可选原生模块，在 Linux 再退回 Wayland/X11 工具。Biny 沿用这个顺序，
+ * 优先使用可选原生模块，在 Linux 再退回 Wayland/X11 工具，
  * 因为 Ctrl+V 只会把控制字符交给终端，图片二进制必须从系统剪贴板单独读取。
  */
 import { spawnSync } from "node:child_process";

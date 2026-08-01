@@ -264,13 +264,14 @@ export function registerDesktopIpc(context: IpcContext): void {
     return await showSessionMenu(context.getWindow(), z.boolean().parse(pinned));
   });
 
-  handle(desktopIpc.sendPrompt, async (_event, projectId: unknown, sessionId: unknown, input: unknown, mode: unknown, attachments: unknown) => {
+  handle(desktopIpc.sendPrompt, async (_event, projectId: unknown, sessionId: unknown, input: unknown, mode: unknown, attachments: unknown, delivery: unknown) => {
     return await context.agents.sendPrompt(
       idSchema.parse(projectId),
       sessionId === undefined ? undefined : idSchema.parse(sessionId),
       promptSchema.parse(input),
       runModeSchema.parse(mode),
-      z.array(attachmentSchema).max(20).parse(attachments)
+      z.array(attachmentSchema).max(20).parse(attachments),
+      z.enum(["steer", "followUp"]).optional().parse(delivery)
     );
   });
 

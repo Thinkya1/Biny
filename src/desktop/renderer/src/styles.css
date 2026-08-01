@@ -288,6 +288,7 @@ button:disabled { opacity: 0.42; }
 .message-timeline { width: min(840px, calc(100% - 72px)); margin: 0 auto; padding: 12px 0 0; }
 .timeline-turn { padding: 10px 0 34px; content-visibility: auto; contain-intrinsic-size: auto 320px; }
 .user-message { display: flex; flex-direction: column; align-items: flex-end; margin: 0 0 26px; }
+.execution-user-step.user-message { margin: 14px 0; }
 .user-bubble { max-width: min(720px, 86%); padding: 10px 14px; border-radius: 17px 17px 4px 17px; color: var(--text); background: var(--user-bubble); font-size: calc(14px * var(--font-scale)); line-height: 1.55; overflow-wrap: anywhere; }
 /* 用户输入里的换行是手打的，Markdown 会把段内单个换行折叠掉，靠 pre-wrap 保住原来的分行。 */
 .user-bubble .markdown-body p { white-space: pre-wrap; }
@@ -326,6 +327,8 @@ button:disabled { opacity: 0.42; }
 .execution-reasoning .reasoning-detail { margin: 4px 0 10px 1px; }
 .execution-assistant-step { padding: 8px 0; }
 .reasoning-row { display: flex; height: 28px; align-items: center; gap: 8px; margin: 0 0 10px; padding: 0; color: var(--text-secondary); font-size: calc(12px * var(--font-scale)); }
+.reasoning-row.is-summary { height: 24px; margin-bottom: 2px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.reasoning-summary-marker { flex: 0 0 auto; color: var(--text-tertiary); }
 .reasoning-row.is-static { pointer-events: none; }
 .reasoning-row:hover { color: var(--text); }
 .reasoning-chevron { transform: rotate(-90deg); }

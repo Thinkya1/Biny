@@ -2,8 +2,7 @@
  * Tool transcript projection.
  *
  * Runtime tool events stay unchanged. This module converts their structured
- * input/result into a semantic transcript title, a full output body for
- * width-aware previewing, and folded details for raw command/result data.
+ * input/result into a semantic transcript title and compact output metadata.
  */
 import type { ToolInputDisplay, ToolUpdate } from "../tools/types.js";
 import type { ToolTranscriptItem, ToolTranscriptStatus } from "./types.js";
@@ -142,10 +141,6 @@ export function semanticToolTitle(
   const safeDescription = description?.trim();
   if (safeDescription && safeDescription.length <= 120) return safeDescription;
   return `${running ? "Running" : "Ran"} ${humanizeToolName(tool)}`;
-}
-
-export function toolDetailsText(item: ToolTranscriptItem): string | undefined {
-  return item.details;
 }
 
 interface ToolResultProjection {

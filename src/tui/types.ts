@@ -22,6 +22,11 @@ export interface AssistantTranscriptItem extends TranscriptItemBase {
   content: string;
 }
 
+export interface ActivityTranscriptItem extends TranscriptItemBase {
+  kind: "activity";
+  content: string;
+}
+
 export interface ReasoningTranscriptItem extends TranscriptItemBase {
   kind: "reasoning";
   content: string;
@@ -67,6 +72,7 @@ export type TranscriptItem =
   | UserTranscriptItem
   | ReasoningTranscriptItem
   | AssistantTranscriptItem
+  | ActivityTranscriptItem
   | ToolTranscriptItem
   | NotificationTranscriptItem
   | ErrorTranscriptItem;

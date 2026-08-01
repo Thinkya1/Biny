@@ -1,8 +1,8 @@
 /**
- * 桌面端专属数据目录（Electron userData 下）：配置、凭据、界面状态，以及不属于任何项目的会话。
+ * 桌面端专属数据目录（Electron userData 下）。这里只管理未关联项目的数据根目录，
+ * 模型配置与凭据由全局配置存储负责。
  *
- * 属于项目的 session 放在全局项目会话目录；附件、run 和记忆仍在 `<项目>/.biny`。
- *
+ * 属于项目的数据统一通过 session/store 的路径规则解析，避免桌面端另建一套目录语义。
  */
 import { promises as fs } from "node:fs";
 import path from "node:path";

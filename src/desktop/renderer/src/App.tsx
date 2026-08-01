@@ -50,7 +50,7 @@ import {
   type DesktopNavigationState,
   type DesktopNavigationTarget
 } from "./navigationHistory.js";
-import { buildSessionTimeline, listChangedFiles, type TimelineTurn } from "./sessionTimeline.js";
+import { buildSessionTimeline, listChangedFiles, liveTimelineEvents, type TimelineTurn } from "./sessionTimeline.js";
 import { Composer, type ContextUsage } from "./components/Composer.js";
 import { NavigationControls } from "./components/NavigationControls.js";
 import { RenameOverlay, SearchOverlay, SettingsOverlay, SlashResultOverlay, Toast } from "./components/Overlays.js";
@@ -221,15 +221,16 @@ export function App(): React.JSX.Element {
           const currentEvents = projectBatch
             .map((envelope) => envelope.event)
             .filter((event): event is AgentHostEvent => event !== undefined && event.sessionId === currentSessionId);
-          if (currentEvents.length) {
+          const timelineEvents = liveTimelineEvents(currentEvents);
+          if (timelineEvents.length) {
             setDocument((current) => current?.session.id === currentSessionId
-              ? { ...current, liveEvents: [...current.liveEvents, ...currentEvents] }
+              ? { ...current, liveEvents: [...current.liveEvents, ...timelineEvents] }
               : current);
-            // 上下文用量只认最后一条：一轮里会多次上报，界面只需要最新值。
-            const contextEvents = currentEvents.filter(hasContextStatus);
-            const latestContext = contextEvents[contextEvents.length - 1];
-            if (latestContext) setContextBudget(latestContext.context.budget);
           }
+          // 上下文用量只认最后一条：一轮里会多次上报，界面只需要最新值。
+          const contextEvents = currentEvents.filter(hasContextStatus);
+          const latestContext = contextEvents[contextEvents.length - 1];
+          if (latestContext) setContextBudget(latestContext.context.budget);
         }
       }
       // 终态事件要触发一次项目刷新（分支、脏状态、会话摘要都可能变），这里对整批事件都处理，
@@ -366,12 +367,12 @@ export function App(): React.JSX.Element {
     };
   }, [newTask, openProject]);
 
-  const sendPrompt = useCallback(async (input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[]): Promise<void> => {
+  const sendPrompt = useCallback(async (input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[], delivery?: "steer" | "followUp"): Promise<void> => {
     const projectId = projectRef.current;
     if (!projectId) throw new Error("请先打开一个项目。");
     const previousSessionId = selectedRef.current;
     const previousNavigation = navigationRef.current;
-    const receipt = await window.biny.sendPrompt(projectId, selectedRef.current, input, mode, attachments);
+    const receipt = await window.biny.sendPrompt(projectId, selectedRef.current, input, mode, attachments, delivery);
     setSelectedSessionId(receipt.sessionId);
     if (receipt.sessionId !== previousSessionId) {
       const target: DesktopNavigationTarget = { projectId, sessionId: receipt.sessionId };

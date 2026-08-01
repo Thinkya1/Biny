@@ -7,6 +7,7 @@
 import { Container } from "@earendil-works/pi-tui";
 import {
   AssistantMessageComponent,
+  ActivitySummaryComponent,
   NoticeComponent,
   ThinkingComponent,
   ToolExecutionComponent,
@@ -76,7 +77,9 @@ export class TranscriptView extends Container {
 function createItemComponent(item: TranscriptItem): TranscriptItemComponent | undefined {
   if (item.kind === "user") return new UserMessageComponent(item);
   if (item.kind === "assistant") return new AssistantMessageComponent(item);
-  if (item.kind === "reasoning") return new ThinkingComponent(item, false);
+  if (item.kind === "activity") return new ActivitySummaryComponent(item);
+  // 思考只保留状态行，完整 reasoning 不进入 TUI 主界面。
+  if (item.kind === "reasoning") return new ThinkingComponent(item);
   if (item.kind === "tool") return new ToolExecutionComponent(item);
   return new NoticeComponent(item);
 }

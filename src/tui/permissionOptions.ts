@@ -1,7 +1,7 @@
 /**
  * 权限确认选项状态模块。
  *
- * PermissionPrompt 用这里的纯函数处理键盘选择，便于不启动 Ink 就能测试上下移动和 Enter 映射。
+ * PermissionPrompt 用这里的纯函数处理键盘选择，便于不启动完整 TUI 就能测试上下移动和 Enter 映射。
  */
 import type { PermissionChoice, TuiPermissionRequest } from "./types.js";
 import { isFullYesConfirmation } from "../permission/confirmation.js";

@@ -14,15 +14,15 @@
 import type { AgentAttachment, InteractiveAgentRunMode } from "../../../agent/AgentSession.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { fetchModelCatalog } from "../../../ai/modelCatalog.js";
 import { thinkingLevelMapForModel } from "../../../ai/capabilities.js";
 import { providerDefinition } from "../../../ai/provider.js";
 import { loadProjectSettings } from "../../../config/projectSettings.js";
 import { configSchema, type AgentConfig, type ProviderConfig } from "../../../config/schema.js";
 import type { AgentConfigStore } from "../../../config/store.js";
 import { createNativeModelSettings, validateModelConfiguration } from "../../../llm/nativeFactory.js";
+import { ModelRuntime } from "../../../llm/ModelRuntime.js";
+import { FileModelsStore, restoreProviderCatalogs, type ModelsStore } from "../../../llm/ModelsStore.js";
 import { hasUsableModelConfiguration, listConfiguredModelChoices, type ModelRuntimeInfo, type ThinkingSelection } from "../../../llm/ModelManager.js";
-import { providerProfile } from "../../../llm/profiles.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
 import { webSearchKeyEnvNames } from "../../../tools/web/search.js";
 import { executeRuntimeCommand } from "../../../runtime/commands.js";
@@ -77,7 +77,8 @@ export class DesktopAgentManager {
     private readonly projects: DesktopProjectService,
     private readonly configStore: AgentConfigStore,
     private readonly emit: (projectId: string, update: AgentRuntimeUpdate) => void,
-    openExternal?: (url: string) => Promise<void>
+    openExternal?: (url: string) => Promise<void>,
+    private readonly modelsStore: ModelsStore = new FileModelsStore()
   ) {
     this.modelLogin = new DesktopModelLoginService(openExternal ?? (async () => {
       throw new Error("当前环境无法打开浏览器。");
@@ -144,12 +145,27 @@ export class DesktopAgentManager {
     sessionId: string | undefined,
     input: string,
     mode: InteractiveAgentRunMode,
-    attachments: DesktopAttachment[]
+    attachments: DesktopAttachment[],
+    delivery?: "steer" | "followUp"
   ): Promise<DesktopRunReceipt> {
     const { runtime } = await this.ensureRuntime(projectId);
     const snapshot = runtime.getSnapshot();
     if (runtimeIsBusy(snapshot)) {
-      throw new Error("当前任务仍在运行。请先停止它，再发送下一条消息。");
+      if (sessionId && snapshot.info.sessionId !== sessionId) {
+        throw new Error("当前项目的另一条会话仍在运行，请返回该会话或先停止任务。");
+      }
+      const project = this.projects.requireProject(projectId);
+      const prompt = withAttachmentReferences(input, attachments);
+      const nativeAttachments = await loadNativeAttachments(this.projects.attachmentsRoot(project), attachments);
+      const queued = delivery === "steer"
+        ? runtime.steer(prompt, nativeAttachments)
+        : runtime.followUp(prompt, nativeAttachments);
+      await this.state.setSelectedSession(projectId, snapshot.info.sessionId);
+      return {
+        sessionId: snapshot.info.sessionId,
+        runId: queued.runId,
+        messageId: queued.messageId
+      };
     }
     // 目标会话不是运行时当前会话时需要切过去，但只能在完全空闲时切。
     if (sessionId && runtime.getSnapshot().info.sessionId !== sessionId) {
@@ -484,9 +500,8 @@ export class DesktopAgentManager {
   }
 
   /**
-   * Asks the provider for its live model list. Never throws for an offline or
-   * unauthenticated provider — the caller renders `source: "fallback"` and keeps
-   * showing whatever static catalog it already had.
+   * 拉取服务商的实时模型目录。离线或鉴权失效时不向界面抛错，而是返回上次成功缓存的目录；
+   * 静态内置目录仍由渲染层合并，避免一次网络故障让模型选择器变空。
    */
   async fetchModelCatalog(projectId: string, providerAlias: string): Promise<DesktopModelCatalogResult> {
     this.projects.requireProject(projectId);
@@ -494,15 +509,14 @@ export class DesktopAgentManager {
     const provider = config.providers[providerAlias];
     if (!provider) throw new Error(`未找到服务商配置：${providerAlias}`);
     const fetchedAt = new Date().toISOString();
+    const catalogs = await restoreProviderCatalogs(Object.keys(config.providers), this.modelsStore);
+    const runtime = new ModelRuntime(config, catalogs, undefined, this.modelsStore);
     try {
-      const models = await fetchModelCatalog({
-        alias: providerAlias,
-        config: provider,
-        definition: providerDefinition(provider.type)
-      });
+      const models = await runtime.refreshModels(providerAlias);
       return { providerAlias, source: "fetched", fetchedAt, models };
     } catch {
-      return { providerAlias, source: "fallback", fetchedAt, models: [] };
+      const models = catalogs.find(([alias]) => alias === providerAlias)?.[1] ?? [];
+      return { providerAlias, source: "fallback", fetchedAt, models };
     }
   }
 
@@ -520,7 +534,7 @@ export class DesktopAgentManager {
     if (!provider) {
       return { ok: false, message: `未找到服务商配置：${model.provider}` };
     }
-    const profile = providerProfile(provider.type);
+    const profile = providerDefinition(provider.type);
     const envName = provider.apiKeyEnv ?? profile.apiKeyEnv;
     const hasKey = Boolean(provider.apiKey || (envName && process.env[envName]));
     if ((provider.requiresApiKey ?? profile.requiresApiKey) && !hasKey) {
@@ -559,7 +573,8 @@ export class DesktopAgentManager {
 
   private buildConfigWithModel(current: AgentConfig, input: DesktopModelConfigurationInput): AgentConfig {
     const existingProvider = current.providers[input.providerAlias];
-    const profile = providerProfile(input.providerType);
+    const profile = providerDefinition(input.providerType);
+    const sameProvider = existingProvider?.type === input.providerType;
     const provider = {
       type: input.providerType,
       protocol: input.protocol,
@@ -569,8 +584,15 @@ export class DesktopAgentManager {
       requiresApiKey: input.requiresApiKey,
       authMode: existingProvider?.authMode,
       oauth: existingProvider?.oauth,
-      timeoutMs: existingProvider?.timeoutMs
+      timeoutMs: sameProvider ? existingProvider.timeoutMs : undefined,
+      retry: sameProvider ? existingProvider.retry : undefined,
+      modelsEndpoint: sameProvider ? existingProvider.modelsEndpoint : undefined,
+      headers: sameProvider ? existingProvider.headers : undefined,
+      apiBackend: sameProvider ? existingProvider.apiBackend : undefined,
+      compatibility: sameProvider ? existingProvider.compatibility : undefined
     };
+    const existingModel = current.models[input.alias];
+    const sameModel = existingModel?.provider === input.providerAlias && existingModel.model === input.model;
     const models = Object.fromEntries(Object.entries(current.models).filter(([alias, model]) => (
       alias === input.alias || model.provider !== input.providerAlias || model.model !== input.model
     )));
@@ -599,8 +621,11 @@ export class DesktopAgentManager {
           contextWindow: input.contextWindow,
           maxOutputTokens: input.maxOutputTokens,
           apiBackend: input.apiBackend,
+          baseUrl: sameModel ? existingModel.baseUrl : undefined,
+          headers: sameModel ? existingModel.headers : undefined,
           thinkingLevelMap: input.thinkingLevelMap ?? thinkingLevelMapForModel(input.model, input.supportsThinking),
-          compatibility: input.compatibility
+          compatibility: input.compatibility ?? (sameModel ? existingModel.compatibility : undefined),
+          pricing: sameModel ? existingModel.pricing : undefined
         }
       },
       // Thinking is validated against the *default* model, so it only has to be
@@ -790,7 +815,7 @@ export class DesktopAgentManager {
   private buildConfigWithAuthenticatedLogin(current: AgentConfig, authenticated: AuthenticatedModelLogin): AgentConfig {
     const providerAlias = authenticated.provider;
     const providerType = authenticated.provider === "claude-code" ? "claude-subscription" : "openai-codex";
-    const profile = providerProfile(providerType);
+    const profile = providerDefinition(providerType);
     const models = Object.fromEntries(Object.entries(current.models).filter(([, model]) => model.provider !== providerAlias));
     const configuredModels = authenticated.models.map((model) => {
       const alias = modelAliasForAuthenticatedModel(providerAlias, model.id);
@@ -879,7 +904,7 @@ function describeMemorySettings(config: AgentConfig): DesktopMemorySettings {
 
 function describeModelConnections(config: AgentConfig): DesktopModelConnection[] {
   return Object.entries(config.providers).map(([providerAlias, provider]) => {
-    const profile = providerProfile(provider.type);
+    const profile = providerDefinition(provider.type);
     const apiKeyEnv = provider.apiKeyEnv ?? profile.apiKeyEnv;
     const credentialSource = describeCredentialSource(provider, apiKeyEnv);
     return {

@@ -1,16 +1,17 @@
 /**
  * 底部信息区、状态行、快捷键行和启动头部。
  *
- * 这些组件都直接实现 pi-tui 的 `Component`：按当前宽度算好一行文本再着色，
+ * 这些组件都直接实现终端 `Component`：按当前宽度算好一行文本再着色，
  * 宽度不够时整条丢弃或截断，不会撑破终端。
  */
 import os from "node:os";
 import path from "node:path";
-import { type Component, Loader, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { PermissionMode } from "../../permission/PermissionManager.js";
 import type { AgentRunMode } from "../../agent/AgentSession.js";
 import type { TuiStatus } from "../types.js";
 import { theme } from "../theme/index.js";
+import { formatToolDuration } from "../transcriptText.js";
 
 export interface FooterData {
   cwd: string;
@@ -159,55 +160,93 @@ function contextColorize(percent: number | undefined, text: string): string {
   return theme.fg("dim", text);
 }
 
-/** 运行状态行：忙碌时 spinner，空闲时留一行空白保持布局稳定。 */
+/** 运行状态行：忙碌时持续动画并显示实时耗时，结束后保留本次执行时间。 */
 export class StatusIndicatorComponent implements Component {
-  private readonly loader: Loader;
+  private readonly ui: TUI;
+  private readonly frames = ["•", "◦", "·", "◦"];
   private status: TuiStatus = "idle";
-  private running = false;
+  private frameIndex = 0;
+  private startedAtMs: number | undefined;
+  private finishedDurationMs: number | undefined;
+  private tickTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(ui: TUI) {
-    this.loader = new Loader(
-      ui,
-      (spinner) => theme.fg("accent", spinner),
-      (text) => theme.fg("muted", text),
-      ""
-    );
+    this.ui = ui;
   }
 
-  setState(status: TuiStatus): void {
+  setState(status: TuiStatus, startedAtMs?: number, finishedDurationMs?: number): void {
     this.status = status;
-    const busy = status === "thinking" || status === "running";
-    if (busy && !this.running) {
-      this.running = true;
-      this.loader.start();
-    } else if (!busy && this.running) {
-      this.running = false;
-      this.loader.stop();
+    const active = status !== "idle";
+    if (active) {
+      if (this.startedAtMs === undefined) this.startedAtMs = startedAtMs ?? Date.now();
+      this.finishedDurationMs = undefined;
+      this.startTicker();
+    } else {
+      this.finishedDurationMs = finishedDurationMs ?? (this.startedAtMs === undefined ? this.finishedDurationMs : Math.max(0, Date.now() - this.startedAtMs));
+      this.startedAtMs = undefined;
+      this.stopTicker();
     }
-    if (busy) this.loader.setMessage(statusMessage(status));
+    this.ui.requestRender();
   }
 
   dispose(): void {
-    this.loader.stop();
+    this.stopTicker();
   }
 
   invalidate(): void {
-    this.loader.invalidate();
+    // 每次 render 都按当前时间计算耗时，无缓存需要失效。
   }
 
   render(width: number): string[] {
-    if (this.running) return this.loader.render(width).slice(0, 1);
-    const message = statusMessage(this.status);
+    const durationMs = this.startedAtMs === undefined
+      ? this.finishedDurationMs
+      : Math.max(0, Date.now() - this.startedAtMs);
+    const message = statusMessage(
+      this.status,
+      durationMs,
+      this.startedAtMs === undefined ? "✓" : this.frames[this.frameIndex] ?? "•"
+    );
     if (!message) return [""];
-    return [truncateToWidth(statusColorize(this.status, message), width, "…")];
+    const rendered = this.status === "idle" && durationMs !== undefined
+      ? statusDivider(message, width)
+      : truncateToWidth(message, width, "…");
+    return [statusColorize(this.status, rendered)];
+  }
+
+  private startTicker(): void {
+    if (this.tickTimer !== undefined) return;
+    this.tickTimer = setInterval(() => {
+      this.frameIndex = (this.frameIndex + 1) % this.frames.length;
+      this.ui.requestRender();
+    }, 120);
+  }
+
+  private stopTicker(): void {
+    if (this.tickTimer === undefined) return;
+    clearInterval(this.tickTimer);
+    this.tickTimer = undefined;
   }
 }
 
-export function statusMessage(status: TuiStatus): string {
-  if (status === "thinking") return "Thinking… (esc to interrupt)";
-  if (status === "running") return "Working… (esc to interrupt)";
-  if (status === "waiting_permission") return "Waiting for approval";
+export function statusMessage(status: TuiStatus, durationMs?: number, indicator = "•"): string {
+  const duration = durationMs === undefined ? "" : ` (${formatToolDuration(durationMs)}`;
+  const suffix = duration
+    ? `${duration}${status === "thinking" || status === "running" ? " · esc to interrupt)" : ")"}`
+    : status === "thinking" || status === "running" ? " (esc to interrupt)" : "";
+  if (status === "thinking" || status === "running") return `${indicator} Working${suffix}`;
+  if (status === "waiting_permission") return `${indicator} Waiting for approval${suffix}`;
+  if (durationMs !== undefined) return `Worked for ${formatToolDuration(durationMs)}`;
   return "";
+}
+
+/** 将状态文案嵌入整行分割线，避免底部出现孤立的完成提示。 */
+export function statusDivider(message: string, width: number): string {
+  const safeWidth = Math.max(1, Math.floor(width));
+  const labelWidth = safeWidth - 3;
+  if (labelWidth <= 0) return "─".repeat(safeWidth);
+  const label = truncateToWidth(message, labelWidth, "…");
+  const remaining = Math.max(0, safeWidth - 3 - visibleWidth(label));
+  return `─ ${label} ${"─".repeat(remaining)}`;
 }
 
 function statusColorize(status: TuiStatus, text: string): string {
@@ -250,10 +289,7 @@ export function shortcutHints(status: TuiStatus, mode: AgentRunMode): ShortcutHi
   if (status === "waiting_permission") {
     hints.push({ key: "enter", description: "answer" }, { key: "ctrl+o", description: "details" });
   } else if (busy) {
-    hints.push(
-      { key: "esc", description: "interrupt" },
-      { key: "ctrl+o", description: "details" }
-    );
+    hints.push({ key: "esc", description: "interrupt" });
   } else {
     hints.push({ key: "enter", description: "send" }, { key: "/", description: "commands" });
   }
@@ -264,7 +300,6 @@ export function shortcutHints(status: TuiStatus, mode: AgentRunMode): ShortcutHi
   });
   hints.push(
     { key: "↑/↓", description: "history" },
-    { key: "ctrl+e", description: "expand" },
     { key: "ctrl+c", description: "exit" }
   );
   return hints;
@@ -313,7 +348,6 @@ export class WelcomeComponent implements Component {
 export const welcomeHints: readonly ShortcutHint[] = [
   { key: "/", description: "commands" },
   { key: "shift+tab", description: "plan mode" },
-  { key: "ctrl+e", description: "expand" },
   { key: "esc", description: "interrupt" },
   { key: "ctrl+c", description: "exit" }
 ];

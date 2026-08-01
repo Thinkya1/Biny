@@ -11,6 +11,7 @@
  */
 import type { ToolInputDisplay, ToolUpdate } from "../../../tools/types.js";
 import type { AgentPermissionEventRequest, AgentRunModel, AgentHostEvent } from "../../../runtime/agentEvents.js";
+import { activitySummaryText } from "../../../runtime/activitySummary.js";
 import type { SessionEvent } from "../../../session/recorder.js";
 import type { SessionUsage } from "../../../session/metadata.js";
 import { publicUserMessage } from "../../../session/publicMessage.js";
@@ -81,6 +82,8 @@ export interface TimelineAssistantStep {
   kind: "assistant";
   id: string;
   content: string;
+  /** 工具前的公开说明，只作为活动摘要展示，不计入最终 assistant 正文。 */
+  summary?: boolean;
 }
 
 export interface TimelineToolStep {
@@ -89,7 +92,14 @@ export interface TimelineToolStep {
   tool: TimelineTool;
 }
 
-export type TimelineStep = TimelineReasoningStep | TimelineAssistantStep | TimelineToolStep;
+export interface TimelineUserStep {
+  kind: "user";
+  id: string;
+  content: string;
+  delivery: "steer" | "followUp";
+}
+
+export type TimelineStep = TimelineReasoningStep | TimelineAssistantStep | TimelineToolStep | TimelineUserStep;
 
 export function activeTimelineTool(tools: TimelineTool[], selectedToolId?: string): TimelineTool | undefined {
   return [...tools].reverse().find((tool) => tool.permission && !tool.permission.resolved)
@@ -144,6 +154,17 @@ export interface TimelineChangedFile {
   path: string;
   operation: "write" | "edit";
   status: "writing" | "completed";
+}
+
+/**
+ * 过滤实时时间线中的 reasoning 增量。
+ *
+ * 原始 thinking 仍由主进程写入 session，完成后从历史事件恢复；渲染进程只需要
+ * reasoning.started / completed 来显示状态和耗时。把每个增量都留在 liveEvents
+ * 会让每一帧都从头重放越来越长的字符串，长思考时会拖慢整个桌面端。
+ */
+export function liveTimelineEvents(events: AgentHostEvent[]): AgentHostEvent[] {
+  return events.filter((event) => event.type !== "reasoning.delta");
 }
 
 /** 合成完整时间线；末尾过滤掉完全空的轮次（只有元信息、没有任何可展示内容）。 */
@@ -239,7 +260,7 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
       const turn = ensureTurn(event.time);
       const projection = historicalToolProjection(event.tool, event.args);
       appendHistoricalReasoning(turn, event.reasoningContent);
-      appendHistoricalAssistant(turn, event.assistantContent);
+      appendHistoricalAssistant(turn, event.assistantContent, true);
       const tool: TimelineTool = {
         id: event.toolCallId ?? `history-tool-${String(turn.tools.length)}`,
         tool: event.tool,
@@ -265,6 +286,7 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
       }
       continue;
     }
+    if (event.type === "agent_message") continue;
     const turn = ensureTurn(event.time);
     turn.error = event.message;
     turn.durationMs = elapsedMs(turn.timestamp, event.time) ?? turn.durationMs;
@@ -307,9 +329,9 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
     const turn = turnFor(event);
     const tools = toolMaps.get(event.runId);
     if (!tools) throw new Error("Timeline tool map is missing.");
+    markActiveAssistantSummary(turn, event.runId);
     const current = tools.get(event.toolCallId);
     if (current) return current;
-    activeAssistant.delete(event.runId);
     const tool: TimelineTool = {
       id: event.toolCallId,
       tool: toolName,
@@ -375,17 +397,51 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
     activeAssistant.set(turn.id, step);
   };
 
+  const markActiveAssistantSummary = (turn: TimelineTurn, runId: string): void => {
+    const step = activeAssistant.get(runId);
+    if (!step) return;
+    const content = activitySummaryText(step.content);
+    const index = turn.steps.indexOf(step);
+    if (!content) {
+      if (index >= 0) turn.steps.splice(index, 1);
+    } else {
+      step.content = content;
+      step.summary = true;
+    }
+    activeAssistant.delete(runId);
+  };
+
   for (const event of events) {
     const turn = turnFor(event);
     if (event.type === "message.user") {
-      turn.user = publicUserMessage(event.content);
-      turn.userMessageIndex = userMessageIndex;
+      const content = publicUserMessage(event.content);
+      if (event.delivery && turn.user) {
+        finishReasoning(event.runId, event.timestamp);
+        activeAssistant.delete(event.runId);
+        turn.steps.push({
+          kind: "user",
+          id: `${event.runId}:user:${event.messageId}`,
+          content,
+          delivery: event.delivery
+        });
+      } else {
+        turn.user = content;
+        turn.userMessageIndex = userMessageIndex;
+      }
       userMessageIndex += 1;
       turn.status = "running";
     } else if (event.type === "run.started") {
       turn.status = "running";
       turn.model = event.model;
       turn.skills = skillNames(event.skills);
+    } else if (event.type === "context.retrying") {
+      turn.steps.push({
+        kind: "reasoning",
+        id: `${event.runId}:context-retry:${String(event.attempt)}`,
+        content: "",
+        status: `上下文已压缩 ${String(event.compactedMessages)} 条消息，正在恢复请求`,
+        completed: true
+      });
     } else if (event.type === "assistant.delta") {
       finishReasoning(event.runId, event.timestamp);
       appendAssistant(turn, event.content);
@@ -525,13 +581,16 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
     }
   }
   return order.map((runId) => turns.get(runId)).filter((turn): turn is TimelineTurn => Boolean(turn)).map((turn) => {
-    turn.assistant = turn.steps.filter((step): step is TimelineAssistantStep => step.kind === "assistant").map((step) => step.content).join("\n\n");
+    turn.assistant = turn.steps
+      .filter((step): step is TimelineAssistantStep => step.kind === "assistant" && !step.summary)
+      .map((step) => step.content)
+      .join("\n\n");
     return turn;
   });
 }
 
 function latestAssistantContent(turn: TimelineTurn): string | undefined {
-  return [...turn.steps].reverse().find((step): step is TimelineAssistantStep => step.kind === "assistant")?.content;
+  return [...turn.steps].reverse().find((step): step is TimelineAssistantStep => step.kind === "assistant" && !step.summary)?.content;
 }
 
 function emptyTurn(id: string, timestamp?: string): TimelineTurn {
@@ -554,11 +613,12 @@ function appendHistoricalReasoning(turn: TimelineTurn, content: string | undefin
   turn.steps.push({ kind: "reasoning", id: `${turn.id}:reasoning:${String(turn.steps.filter((step) => step.kind === "reasoning").length)}`, content, completed: true });
 }
 
-function appendHistoricalAssistant(turn: TimelineTurn, content: string | undefined): void {
-  if (!content) return;
+function appendHistoricalAssistant(turn: TimelineTurn, content: string | undefined, summary = false): void {
+  const visibleContent = summary ? activitySummaryText(content ?? "") : content;
+  if (!visibleContent) return;
   const previous = turn.steps.at(-1);
-  if (previous?.kind === "assistant" && previous.content === content) return;
-  turn.steps.push({ kind: "assistant", id: `${turn.id}:assistant:${String(turn.steps.filter((step) => step.kind === "assistant").length)}`, content });
+  if (previous?.kind === "assistant" && previous.content === visibleContent && previous.summary === summary) return;
+  turn.steps.push({ kind: "assistant", id: `${turn.id}:assistant:${String(turn.steps.filter((step) => step.kind === "assistant").length)}`, content: visibleContent, summary: summary || undefined });
 }
 
 /** 追加思考内容。已经以同样内容结尾时跳过：session 里同一段思考可能被重复记录。 */

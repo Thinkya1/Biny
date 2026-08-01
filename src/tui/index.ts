@@ -1,7 +1,7 @@
 /**
  * TUI 启动模块。
  *
- * 创建终端和 pi-tui 渲染循环，交给 `BinyTui` 组装界面；界面退出后再打印 session
+ * 创建终端渲染循环，交给 `BinyTui` 组装界面；界面退出后再打印 session
  * 摘要，避免和 TUI 输出混在一起。
  */
 import { ProcessTerminal, TUI } from "@earendil-works/pi-tui";

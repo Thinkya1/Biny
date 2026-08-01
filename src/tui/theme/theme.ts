@@ -2,7 +2,7 @@
  * 主题解析与当前生效主题。
  *
  * 主题定义里的色值可以是十六进制、`vars` 引用名或 256 色索引，这里统一解析成
- * 可直接写进终端的 ANSI 序列。pi-tui 的组件接受的是 `(text) => string` 着色函数，
+ * 可直接写进终端的 ANSI 序列。界面组件接受的是 `(text) => string` 着色函数，
  * 所以取色的主入口是 `theme.fg(token, text)` 而不是十六进制。
  */
 import { builtInThemes, darkTheme } from "./palettes.js";

@@ -7,6 +7,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
 import { splitAttachmentReferences, type AttachmentReference } from "../../../attachmentReferences.js";
+import { activitySummaryText } from "../../../../runtime/activitySummary.js";
 import { copyToClipboard } from "../copyToClipboard.js";
 import { useInlineImage } from "../inlineImage.js";
 import { listChangedFiles, type TimelineReasoningStep, type TimelineStep, type TimelineTurn } from "../sessionTimeline.js";
@@ -259,8 +260,25 @@ function ExecutionTimeline({
         if (step.kind === "tool") {
           return <ToolActivity key={step.id} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} onResolvePermission={onResolvePermission} projectId={projectId} tool={step.tool} />;
         }
+        if (step.kind === "user") {
+          return (
+            <div className="execution-user-step user-message" key={step.id}>
+              <div className="user-bubble"><MarkdownContent content={step.content} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} /></div>
+            </div>
+          );
+        }
+        if (step.summary) return <ActivitySummaryStep content={step.content} key={step.id} />;
         return <div className="execution-assistant-step" key={step.id}><MarkdownContent content={step.content} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} /></div>;
       })}
+    </div>
+  );
+}
+
+function ActivitySummaryStep({ content }: { content: string }): React.JSX.Element {
+  return (
+    <div className="reasoning-row is-summary" role="status">
+      <span className="reasoning-summary-marker"></span>
+      <span>{activitySummaryText(content)}</span>
     </div>
   );
 }

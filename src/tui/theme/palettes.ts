@@ -1,7 +1,7 @@
 /**
  * 内置主题调色板。
  *
- * 两套主题沿用 Pi 的配色：`vars` 声明基础色，`colors` 只做语义映射，
+ * 两套主题的 `vars` 声明基础色，`colors` 只做语义映射，
  * 因此调整某个基础色会同时影响所有引用它的语义 token。
  */
 import type { ThemeDefinition } from "./tokens.js";

@@ -1,7 +1,7 @@
 /**
  * TUI 应用外壳。
  *
- * 负责把 pi-tui 的渲染循环、TUI runtime、reducer 状态和各展示组件串起来：
+ * 负责把终端渲染循环、TUI runtime、reducer 状态和各展示组件串起来：
  * 组装布局、订阅运行时事件、分发 slash command、处理全局键位。
  * 具体的上下文、会话、工具逻辑仍在 runtime 层，这里不直接执行工具。
  */
@@ -36,7 +36,6 @@ import {
 import type { SessionSummary } from "../session/events.js";
 import { FooterComponent, ShortcutsBarComponent, StatusIndicatorComponent, WelcomeComponent } from "./components/chrome.js";
 import { PermissionDialog, SelectDialog, TextViewerDialog } from "./components/dialogs.js";
-import { ThinkingComponent, ToolExecutionComponent } from "./components/messages.js";
 import { PendingAttachmentsComponent } from "./components/pendingAttachments.js";
 import { TranscriptView } from "./components/transcriptView.js";
 import { appendInputHistory, loadInputHistory } from "./inputHistory.js";
@@ -48,7 +47,7 @@ import { sessionEventsToTranscript } from "./sessionTranscript.js";
 import { modelThinkingOptions } from "./modelOptions.js";
 import { createInitialTuiState, tuiReducer } from "./reducer.js";
 import { editorTheme, theme } from "./theme/index.js";
-import { foldableTranscriptItems, formatSessionAge, latestExpandableTranscript } from "./transcriptText.js";
+import { formatSessionAge } from "./transcriptText.js";
 import type { PermissionChoice, TuiPermissionRequest, TuiState, TuiStatus } from "./types.js";
 import type { AgentAttachment, AgentRunMode } from "../agent/AgentSession.js";
 
@@ -166,6 +165,7 @@ export class BinyTui {
       this.unsubscribe = runtime.subscribe((update) => {
         this.runtimeSnapshot = update.snapshot;
         if (update.event) this.dispatch(update.event);
+        else if (update.snapshot.state.kind === "maintenance") this.dispatch({ type: "maintenance.started" });
         else this.refreshChrome();
         if (isTerminalRunEvent(update.event)) {
           void this.refreshContextUsage();
@@ -188,7 +188,11 @@ export class BinyTui {
   }
 
   private dispatch(event: Parameters<typeof tuiReducer>[1]): void {
-    this.state = tuiReducer(this.state, event);
+    const nextState = tuiReducer(this.state, event);
+    // 长思考会产生大量 reasoning.delta；这些增量只用于 provider/session，TUI
+    // 不展示原文。忽略没有改变界面的增量，避免每个 token 都同步组件树并请求重绘。
+    if (nextState === this.state && event.type === "reasoning.delta") return;
+    this.state = nextState;
     this.syncPermissionDialog();
     this.chatContainer.sync(this.state.transcript);
     this.refreshChrome();
@@ -200,7 +204,7 @@ export class BinyTui {
 
   private refreshChrome(): void {
     const status = runtimeStatus(this.runtimeSnapshot);
-    this.status.setState(status);
+    this.status.setState(status, this.state.turnStartedAt, this.state.lastWorkedMs);
     this.shortcuts.setState(status, this.mode);
     this.footer.setData(this.footerData());
     this.ui.requestRender();
@@ -243,10 +247,6 @@ export class BinyTui {
   private async submit(text: string): Promise<void> {
     const value = text.trim();
     if (!value && !this.pendingAttachments.length) return;
-    if (!value.startsWith("/") && runtimeIsBusy(this.runtimeSnapshot)) {
-      this.notify("当前任务仍在运行。按 Esc 停止后再发送下一条消息。");
-      return;
-    }
     const prompt = value || "请分析这个附件。";
     const attachments = this.pendingAttachments;
     this.setPendingAttachments([]);
@@ -269,6 +269,11 @@ export class BinyTui {
     const runtime = this.runtime;
     if (!runtime) return;
     try {
+      if (runtimeIsBusy(this.runtimeSnapshot)) {
+        runtime.followUp(withAttachmentReferences(prompt, attachments), attachments);
+        this.notify("消息已加入 follow-up 队列，将在当前任务准备结束时继续处理。");
+        return;
+      }
       await runtime.submitPrompt(withAttachmentReferences(prompt, attachments), this.mode, attachments).completion;
     } catch (error) {
       this.setPendingAttachments([...attachments, ...this.pendingAttachments]);
@@ -282,6 +287,11 @@ export class BinyTui {
   /** 全局键位。返回 `{consume:true}` 表示不再投递给焦点组件。 */
   private handleGlobalKey(data: string): { consume?: boolean } | undefined {
     const busy = runtimeIsBusy(this.runtimeSnapshot);
+
+    if (matchesKey(data, "ctrl+s") && busy && !this.overlay) {
+      void this.steerCurrentInput();
+      return { consume: true };
+    }
 
     if (matchesKey(data, "ctrl+c")) {
       if (busy) {
@@ -300,7 +310,7 @@ export class BinyTui {
       return undefined;
     }
     if (this.overlay) return undefined;
-    // Windows 终端通常把 Ctrl+V 留给文本粘贴，和 Pi 一样只用 Alt+V 读取图片剪贴板。
+    // Windows 终端通常把 Ctrl+V 留给文本粘贴，只用 Alt+V 读取图片剪贴板。
     const isClipboardPaste = process.platform === "win32" ? matchesKey(data, "alt+v") : matchesKey(data, "ctrl+v");
     if (isClipboardPaste) {
       void this.pasteClipboard();
@@ -311,25 +321,27 @@ export class BinyTui {
       this.refreshChrome();
       return { consume: true };
     }
-    if (matchesKey(data, "ctrl+e")) {
-      this.toggleLatestFoldable();
-      return { consume: true };
-    }
-    if (matchesKey(data, "ctrl+o")) {
-      this.showLatestDetails();
-      return { consume: true };
-    }
     return undefined;
   }
 
-  private toggleLatestFoldable(): void {
-    const foldables = foldableTranscriptItems(this.state.transcript);
-    const latest = foldables[foldables.length - 1];
-    if (!latest) return;
-    const component = this.chatContainer.componentFor(latest.id);
-    if (component instanceof ThinkingComponent) component.setCollapsed(!component.isCollapsed());
-    else if (component instanceof ToolExecutionComponent) component.setExpanded(!component.isExpanded());
-    this.ui.requestRender();
+  private async steerCurrentInput(): Promise<void> {
+    const runtime = this.runtime;
+    if (!runtime) return;
+    const value = this.editor.getText().trim();
+    if (!value && !this.pendingAttachments.length) return;
+    const prompt = value || "请分析这个附件。";
+    const attachments = this.pendingAttachments;
+    try {
+      runtime.steer(withAttachmentReferences(prompt, attachments), attachments);
+      this.setPendingAttachments([]);
+      this.editor.setText("");
+      this.editor.addToHistory(prompt);
+      void appendInputHistory(this.workspaceRoot, prompt)
+        .catch((error) => this.notify(`写入输入历史失败：${describeError(error)}`));
+      this.notify("消息已加入 steer 队列，将在当前模型步骤和工具批次结束后处理。");
+    } catch (error) {
+      this.dispatch({ type: "error.message", message: describeError(error) });
+    }
   }
 
   private async pasteClipboard(): Promise<void> {
@@ -351,11 +363,6 @@ export class BinyTui {
     } catch (error) {
       this.notify(`读取剪贴板失败：${describeError(error)}`);
     }
-  }
-
-  private showLatestDetails(): void {
-    const expandable = latestExpandableTranscript(this.state.transcript);
-    if (expandable) this.showTextViewer(expandable.title, expandable.content);
   }
 
   private setPendingAttachments(attachments: AgentAttachment[]): void {

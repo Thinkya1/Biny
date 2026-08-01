@@ -6,6 +6,7 @@
  * a same-tool fallback for older sessions) instead of becoming system text.
  */
 import type { SessionEvent } from "../session/recorder.js";
+import { activitySummaryText } from "../runtime/activitySummary.js";
 import { completeToolItem, createRunningToolItem } from "./toolPresentation.js";
 import type { ToolTranscriptItem, TranscriptItem } from "./types.js";
 
@@ -20,13 +21,12 @@ export function sessionEventsToTranscript(events: SessionEvent[]): TranscriptIte
     }
 
     if (event.type === "assistant_message") {
-      appendReasoning(items, event.reasoningContent, index);
       if (event.content) items.push({ id: replayId("assistant", index), kind: "assistant", content: event.content });
       continue;
     }
 
     if (event.type === "tool_call") {
-      appendReasoning(items, event.reasoningContent, index);
+      appendActivity(items, event.assistantContent, index);
       pendingTools.push(createRunningToolItem({
         id: replayId(`tool-${event.tool}`, index),
         toolCallId: event.toolCallId,
@@ -81,6 +81,9 @@ export function sessionEventsToTranscript(events: SessionEvent[]): TranscriptIte
       continue;
     }
 
+    // 权威模型消息只供恢复模型上下文；历史界面继续使用稳定审计事件，避免重复展示。
+    if (event.type === "agent_message") continue;
+
     while (pendingTools.length > 0) {
       const pending = pendingTools.shift();
       if (pending) items.push(completeToolItem(pending, { error: event.message }, "failed", eventTimeMs(event.time) ?? Number.NaN));
@@ -101,9 +104,10 @@ function turnStatusContent(event: Extract<SessionEvent, { type: "turn_status" }>
   return `${summary}${requiredAction}${resumable}`;
 }
 
-function appendReasoning(items: TranscriptItem[], content: string | undefined, index: number): void {
-  if (!content) return;
-  items.push({ id: replayId("reasoning", index), kind: "reasoning", content });
+function appendActivity(items: TranscriptItem[], content: string | undefined, index: number): void {
+  const summary = activitySummaryText(content ?? "");
+  if (!summary) return;
+  items.push({ id: replayId("activity", index), kind: "activity", content: summary });
 }
 
 function findPendingTool(pending: ToolTranscriptItem[], toolCallId: string | undefined, tool: string): number {

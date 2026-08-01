@@ -6,6 +6,7 @@
  * completion event commits each cell exactly once.
  */
 import type { AgentHostEvent } from "../runtime/agentEvents.js";
+import { activitySummaryText } from "../runtime/activitySummary.js";
 import {
   completeToolItem,
   createRunningToolItem,
@@ -13,6 +14,7 @@ import {
 } from "./toolPresentation.js";
 import type {
   ActiveTranscriptItem,
+  ActivityTranscriptItem,
   AssistantTranscriptItem,
   NotificationTranscriptItem,
   ReasoningTranscriptItem,
@@ -25,6 +27,7 @@ import type {
 export type TuiAction = AgentHostEvent
   | { type: "session.started"; sessionId: string; sessionFile: string; cwd: string; provider: string; modelLabel: string; reasoningLabel: string }
   | { type: "model.changed"; provider: string; modelLabel: string; reasoningLabel: string }
+  | { type: "maintenance.started" }
   | { type: "error.message"; message: string }
   | { type: "system.message"; content: string }
   | { type: "transcript.cleared" }
@@ -64,6 +67,9 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
       };
     case "model.changed":
       return { ...state, provider: event.provider, modelLabel: event.modelLabel, reasoningLabel: event.reasoningLabel };
+    case "maintenance.started":
+      // 维护操作不属于 Agent 回合，不能复用上一次任务的完成耗时。
+      return { ...state, lastWorkedMs: undefined };
     case "run.started":
       return state;
     case "run.completed": {
@@ -162,6 +168,14 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
           content: event.content
         })
       };
+    case "context.retrying":
+      return {
+        ...state,
+        transcript: commitItem(state.transcript, notificationItem(
+          state.transcript,
+          `上下文已压缩 ${String(event.compactedMessages)} 条消息，正在进行第 ${String(event.attempt)} 次恢复请求。`
+        ))
+      };
     case "reasoning.delta":
       return {
         ...state,
@@ -185,7 +199,7 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
     case "tool.started":
       return {
         ...state,
-        transcript: startTool(commitReasoning(state.transcript), event)
+        transcript: startTool(commitAssistantAsActivity(commitReasoning(state.transcript)), event)
       };
     case "tool.progress":
       return {
@@ -206,7 +220,10 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
     case "permission.resolved":
       return state;
     case "reasoning.started":
-      return state;
+      return {
+        ...state,
+        transcript: startReasoning(state.transcript)
+      };
     case "context.updated":
     case "compact.started":
     case "compact.completed":
@@ -234,6 +251,12 @@ function updateAssistantDelta(transcript: TranscriptState, content: string): Tra
 function updateReasoningDelta(transcript: TranscriptState, content: string): TranscriptState {
   if (!content) return transcript;
   const index = transcript.active.findIndex((item) => item.kind === "reasoning");
+  if (index === -1 && transcript.active.some((item) => item.kind === "tool")) {
+    // 工具开始后偶尔还会到达同一 provider step 的 reasoning 尾部。不能把它
+    // 新建到工具下面，否则终端会出现“工具执行中，底下又冒出一块思考”的错位。
+    // 原文由 session 保存，TUI 这里只保留状态标记。
+    return transcript;
+  }
   if (index === -1) {
     return {
       ...transcript,
@@ -242,20 +265,37 @@ function updateReasoningDelta(transcript: TranscriptState, content: string): Tra
         {
           id: nextTranscriptId(transcript, "reasoning"),
           kind: "reasoning",
-          content,
+          // 不在流式状态里累计原始 thinking，避免每个增量都复制和重排全文。
+          content: "",
           startedAtMs: Date.now()
         }
       ]
     };
   }
-  const active = [...transcript.active];
-  const item = active[index] as ReasoningTranscriptItem;
-  active[index] = {
-    ...item,
-    content: `${item.content}${content}`,
-    startedAtMs: item.startedAtMs ?? Date.now()
+  // 状态已经存在时，reasoning 增量不再改变 TUI transcript；完整内容仍由
+  // AgentSession 写入 session，恢复会话时再按需展示。
+  return transcript;
+}
+
+function startReasoning(transcript: TranscriptState): TranscriptState {
+  if (transcript.active.some((item) => item.kind === "reasoning")) return transcript;
+  if (transcript.active.some((item) => item.kind === "tool")) {
+    // 同一轮工具还在执行时，reasoning.started 仍属于上一个 assistant step，
+    // 不要在工具列表下面再插入一个新的思考标记。
+    return transcript;
+  }
+  return {
+    ...transcript,
+    active: [
+      ...transcript.active,
+      {
+        id: nextTranscriptId(transcript, "reasoning"),
+        kind: "reasoning",
+        content: "",
+        startedAtMs: Date.now()
+      }
+    ]
   };
-  return { ...transcript, active };
 }
 
 function commitReasoning(transcript: TranscriptState): TranscriptState {
@@ -263,7 +303,7 @@ function commitReasoning(transcript: TranscriptState): TranscriptState {
   if (index === -1) return transcript;
   const item = transcript.active[index];
   const active = transcript.active.filter((_, itemIndex) => itemIndex !== index);
-  if (!item || item.kind !== "reasoning" || !item.content) return { ...transcript, active };
+  if (!item || item.kind !== "reasoning") return { ...transcript, active };
   const durationMs = item.startedAtMs === undefined
     ? item.durationMs
     : Math.max(0, Date.now() - item.startedAtMs);
@@ -289,6 +329,22 @@ function commitAssistant(transcript: TranscriptState, content: string): Transcri
     content: finalContent
   };
   return { committed: [...transcript.committed, item], active };
+}
+
+function commitAssistantAsActivity(transcript: TranscriptState): TranscriptState {
+  const index = transcript.active.findIndex((item) => item.kind === "assistant");
+  if (index === -1) return transcript;
+  const item = transcript.active[index];
+  const active = transcript.active.filter((_, itemIndex) => itemIndex !== index);
+  if (!item || item.kind !== "assistant") return { ...transcript, active };
+  const content = activitySummaryText(item.content);
+  if (!content) return { ...transcript, active };
+  const activity: ActivityTranscriptItem = {
+    id: nextTranscriptId(transcript, "activity"),
+    kind: "activity",
+    content
+  };
+  return { committed: [...transcript.committed, activity], active };
 }
 
 function startTool(

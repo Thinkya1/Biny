@@ -166,7 +166,7 @@ export interface DesktopBootstrap {
   fontPreference: DesktopFontPreference;
 }
 
-/** 发送提示后的回执；Desktop 忙碌时会拒绝提交，不维护隐式 follow-up 队列。 */
+/** 发送提示或排队运行中消息后的回执。 */
 export interface DesktopRunReceipt {
   sessionId: string;
   runId: string;
@@ -248,7 +248,7 @@ export interface DesktopModelConnection {
   credentialSource?: "keychain" | "config" | "env";
   apiKeyEnv?: string;
   authMode?: "api-key" | "oauth-bearer";
-  oauthProvider?: DesktopModelLoginProvider;
+  oauthProvider?: string;
   /** Epoch millis; present only for OAuth-backed connections. */
   oauthExpiresAt?: number;
 }
@@ -403,7 +403,7 @@ export interface DesktopApi {
   duplicateSession(projectId: string, sessionId: string): Promise<DesktopWorkspaceSnapshot>;
   deleteSession(projectId: string, sessionId: string): Promise<DesktopWorkspaceSnapshot>;
   showSessionMenu(projectId: string, sessionId: string, pinned: boolean): Promise<DesktopSessionMenuAction | undefined>;
-  sendPrompt(projectId: string, sessionId: string | undefined, input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[]): Promise<DesktopRunReceipt>;
+  sendPrompt(projectId: string, sessionId: string | undefined, input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[], delivery?: "steer" | "followUp"): Promise<DesktopRunReceipt>;
   editPrompt(projectId: string, sessionId: string, userMessageIndex: number, input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[]): Promise<DesktopRunReceipt>;
   cancelRun(projectId: string): Promise<void>;
   runSlashCommand(projectId: string, sessionId: string | undefined, command: string): Promise<DesktopSlashResult>;

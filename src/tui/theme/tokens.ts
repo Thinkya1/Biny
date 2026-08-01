@@ -1,7 +1,7 @@
 /**
  * 主题 token 定义。
  *
- * Token 集与 Pi 的主题 schema 对齐：前景色按语义命名，背景色单独成组，
+ * Token 集按语义命名前景色，背景色单独成组，
  * 主题文件通过 `vars` 间接引用具体色值，组件只使用 token，不接触十六进制。
  */
 
@@ -69,7 +69,7 @@ export type ColorToken = ThemeColor | ThemeBg;
 /** 主题文件中的色值：十六进制、`vars` 引用名，或 256 色索引。 */
 export type ColorValue = string | number;
 
-/** 主题定义，结构与 Pi 的 theme JSON 一致。 */
+/** 主题定义，基础色和语义色分层维护。 */
 export interface ThemeDefinition {
   name: string;
   /** 命名色板，`colors` 中可直接引用这些名字。 */

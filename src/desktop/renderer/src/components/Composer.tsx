@@ -29,7 +29,7 @@ interface ComposerProps {
   modelSetupRequired: boolean;
   focusToken: number;
   onOpenProject(): void;
-  onSend(input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[]): Promise<void>;
+  onSend(input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[], delivery?: "steer" | "followUp"): Promise<void>;
   onSlashCommand(command: string): Promise<void>;
   onStop(): Promise<void>;
   onPermissionMode(mode: PermissionMode): Promise<void>;
@@ -157,7 +157,7 @@ export const Composer = memo(function Composer({
     void runSlash(command.name);
   };
 
-  const submit = async (): Promise<void> => {
+  const submit = async (delivery?: "steer" | "followUp"): Promise<void> => {
     const value = input.trim() || (attachments.length ? "请分析这些附件。" : "");
     if (!project || !value || busy) return;
     // 命令是否接收参数由共享注册表声明；其他以 / 开头的自然语言仍作为普通消息发送。
@@ -174,7 +174,7 @@ export const Composer = memo(function Composer({
     setError(undefined);
     setBusy(true);
     try {
-      await onSend(value, mode, sentAttachments);
+      await onSend(value, mode, sentAttachments, delivery);
     } catch (submitError) {
       setInput(value);
       setAttachments(sentAttachments);
@@ -299,7 +299,7 @@ export const Composer = memo(function Composer({
             }
             if (event.key !== "Enter" || event.shiftKey) return;
             event.preventDefault();
-            void submit();
+            void submit(running && (event.metaKey || event.ctrlKey) ? "steer" : undefined);
           }}
           onPaste={(event) => {
             const images = [...event.clipboardData.items]

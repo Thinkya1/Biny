@@ -1,7 +1,7 @@
 /**
  * Transcript 条目组件。
  *
- * 每种条目对应一个 pi-tui 组件：用户消息和工具调用是带背景色的整宽卡片，
+ * 每种条目对应一个终端组件：用户消息和工具调用是带背景色的整宽卡片，
  * assistant 正文和 thinking 走 Markdown 渲染，通知和错误是单行文本。
  * 组件只负责展示，内容由 `TranscriptView` 从 reducer 状态同步进来。
  */
@@ -10,6 +10,7 @@ import { markdownTheme, theme } from "../theme/index.js";
 import { formatToolDuration, thinkingHeaderLabel } from "../transcriptText.js";
 import type {
   AssistantTranscriptItem,
+  ActivityTranscriptItem,
   NotificationTranscriptItem,
   ReasoningTranscriptItem,
   ToolTranscriptItem,
@@ -65,56 +66,68 @@ export class AssistantMessageComponent extends Container implements TranscriptIt
   }
 }
 
-/** Thinking：斜体 + thinkingText，折叠时只留一行标题。 */
+/** Thinking：只显示状态和耗时，原始 reasoning 不进入 TUI 主界面。 */
 export class ThinkingComponent extends Container implements TranscriptItemComponent {
   readonly itemId: string;
   private readonly header: Text;
   private readonly body: Markdown;
-  private collapsed: boolean;
   private item: ReasoningTranscriptItem;
 
-  constructor(item: ReasoningTranscriptItem, collapsed: boolean) {
+  constructor(item: ReasoningTranscriptItem) {
     super();
     this.itemId = item.id;
-    this.collapsed = collapsed;
     this.item = item;
-    this.header = new Text(thinkingHeader(item, collapsed), 1, 0);
-    this.body = new Markdown(item.content.trim(), 1, 0, markdownTheme(), {
+    this.header = new Text(thinkingHeader(item), 1, 0);
+    this.body = new Markdown(reasoningBody(), 1, 0, markdownTheme(), {
       color: (text) => theme.fg("thinkingText", text),
       italic: true
     });
     this.addChild(new Spacer(1));
-    this.rebuild();
-  }
-
-  setCollapsed(collapsed: boolean): void {
-    if (this.collapsed === collapsed) return;
-    this.collapsed = collapsed;
-    this.rebuild();
-  }
-
-  isCollapsed(): boolean {
-    return this.collapsed;
+    this.addChild(this.header);
+    this.addChild(this.body);
   }
 
   update(item: TranscriptItem): void {
     if (item.kind !== "reasoning") return;
     this.item = item;
-    this.header.setText(thinkingHeader(item, this.collapsed));
-    this.body.setText(item.content.trim());
-  }
-
-  private rebuild(): void {
-    this.header.setText(thinkingHeader(this.item, this.collapsed));
-    this.children = [new Spacer(1), this.header];
-    if (!this.collapsed) this.children.push(this.body);
+    this.header.setText(thinkingHeader(item));
+    // reasoning 增量只用于让状态行进入进行中状态；原文保留在 Session，不在这里渲染。
+    this.body.setText(reasoningBody());
   }
 }
 
-function thinkingHeader(item: ReasoningTranscriptItem, collapsed: boolean): string {
-  const running = item.startedAtMs !== undefined && item.durationMs === undefined;
-  const marker = collapsed ? "▸ " : "▾ ";
+function reasoningBody(): string {
+  return "";
+}
+
+function reasoningIsRunning(item: ReasoningTranscriptItem): boolean {
+  return item.startedAtMs !== undefined && item.durationMs === undefined;
+}
+
+function thinkingHeader(item: ReasoningTranscriptItem): string {
+  const running = reasoningIsRunning(item);
+  const marker = running ? "✶ " : "• ";
   return theme.fg("thinkingText", `${marker}${theme.italic(thinkingHeaderLabel(item, running))}`);
+}
+
+/** 工具前的公开说明：作为活动摘要显示，不占用 assistant 正文语义。 */
+export class ActivitySummaryComponent extends Container implements TranscriptItemComponent {
+  readonly itemId: string;
+  private readonly text: Text;
+
+  constructor(item: ActivityTranscriptItem) {
+    super();
+    this.itemId = item.id;
+    this.text = new Text("", 1, 0);
+    this.addChild(new Spacer(1));
+    this.addChild(this.text);
+    this.update(item);
+  }
+
+  update(item: TranscriptItem): void {
+    if (item.kind !== "activity") return;
+    this.text.setText(theme.fg("text", item.content));
+  }
 }
 
 /** 工具调用：整宽卡片，背景色表达状态；标题是动词加粗 + 目标强调色 + 右对齐耗时。 */
@@ -124,7 +137,6 @@ export class ToolExecutionComponent extends Container implements TranscriptItemC
   private readonly title: Text;
   private readonly output: Text;
   private item: ToolTranscriptItem;
-  private expanded = false;
 
   constructor(item: ToolTranscriptItem) {
     super();
@@ -132,22 +144,13 @@ export class ToolExecutionComponent extends Container implements TranscriptItemC
     this.item = item;
     this.title = new ToolTitleText(item);
     this.output = new Text("", 1, 0);
-    this.box = new Box(1, 1, (text) => theme.bg(toolBackgroundToken(item.status), text));
+    // 工具列表只保留一行标题，避免多个并行工具把对话区撑高。
+    this.box = new Box(1, 0, (text) => theme.bg(toolBackgroundToken(item.status), text));
     this.box.addChild(this.title);
     this.box.addChild(this.output);
     this.addChild(new Spacer(1));
     this.addChild(this.box);
     this.refresh();
-  }
-
-  setExpanded(expanded: boolean): void {
-    if (this.expanded === expanded) return;
-    this.expanded = expanded;
-    this.refresh();
-  }
-
-  isExpanded(): boolean {
-    return this.expanded;
   }
 
   update(item: TranscriptItem): void {
@@ -159,10 +162,8 @@ export class ToolExecutionComponent extends Container implements TranscriptItemC
   private refresh(): void {
     (this.title as ToolTitleText).setItem(this.item);
     this.box.setBgFn((text) => theme.bg(toolBackgroundToken(this.item.status), text));
-    const source = this.expanded
-      ? this.item.details ?? this.item.output ?? emptyToolOutput(this.item)
-      : this.item.output ?? this.item.progress ?? emptyToolOutput(this.item);
-    this.output.setText(toolOutputText(source, this.item.status, this.expanded));
+    const source = this.item.output ?? this.item.progress ?? emptyToolOutput(this.item);
+    this.output.setText(toolOutputText(source, this.item.status));
   }
 }
 
@@ -208,26 +209,17 @@ export function splitToolTitle(title: string): { verb: string; rest: string } {
   return { verb: title.slice(0, boundary), rest: title.slice(boundary) };
 }
 
-/** 未展开时只显示末尾若干行，运行中的工具优先显示最新输出。 */
-const defaultToolOutputLines = 4;
-
-function toolOutputText(source: string, status: ToolTranscriptStatus, expanded: boolean): string {
+function toolOutputText(source: string, status: ToolTranscriptStatus): string {
   const normalized = source.replaceAll("\t", "    ").trimEnd();
   if (!normalized) return "";
   const colorize = (text: string): string => (status === "failed" || status === "denied"
     ? theme.fg("error", text)
     : theme.fg("toolOutput", text));
-  if (expanded) return colorize(normalized);
-
-  const lines = normalized.split("\n");
-  if (lines.length <= defaultToolOutputLines) return colorize(normalized);
-  const running = status === "running" || status === "pending";
-  const visible = running ? lines.slice(-defaultToolOutputLines) : lines.slice(0, defaultToolOutputLines);
-  const hidden = lines.length - visible.length;
-  const notice = theme.fg("dim", `… ${String(hidden)} ${running ? "earlier" : "more"} line${hidden === 1 ? "" : "s"}`);
-  return running
-    ? `${notice}\n${colorize(visible.join("\n"))}`
-    : `${colorize(visible.join("\n"))}\n${notice}`;
+  // 工具主列表只保留标题和状态。失败时补一行真实错误，正常 stdout、文件正文
+  // 和 diff 都不进入主对话区，避免一个工具占满整个 transcript。
+  if (status !== "failed" && status !== "denied") return "";
+  const firstLine = normalized.split("\n").find((line) => line.trim())?.trim() ?? "";
+  return firstLine ? colorize(truncateToWidth(firstLine, 96, "…")) : "";
 }
 
 function emptyToolOutput(item: ToolTranscriptItem): string {
