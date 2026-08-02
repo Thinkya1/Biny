@@ -167,23 +167,23 @@ async function testAgentSessionCrashRecovery(
     assert.equal(resumedResult.code, 0, resumedResult.stderr);
     const outcome = JSON.parse(resumedResult.stdout.trim()) as AgentTurnOutcome;
     assert.equal(outcome.status, "completed");
-    assert.equal(outcome.steps, 3);
+    assert.equal(outcome.steps, crash === "during-tool-b" ? 2 : 3);
     assert.equal(await new TurnStore(workspaceRoot, sessionId).load(), undefined);
 
     const executions = (await readFile(executionLog, "utf8")).trim().split("\n");
     assert.equal(executions.filter((entry) => entry === "tool-a:done").length, 1);
-    assert.equal(executions.filter((entry) => entry === "tool-b:done").length, 1);
+    assert.equal(executions.filter((entry) => entry === "tool-b:done").length, crash === "during-tool-b" ? 0 : 1);
     assert.equal(
       executions.filter((entry) => entry === "tool-b:start").length,
-      crash === "during-tool-b" ? 2 : 1
+      1
     );
 
     const resumedRequest = provider.resumedRequests[0];
     assert.ok(resumedRequest?.includes("call-a"), "resumed context must include tool A");
     assert.equal(
       resumedRequest?.includes("call-b"),
-      crash === "after-tool-b",
-      "the resume point must match whether tool B completed before the crash"
+      true,
+      "recovery must expose tool B's assistant call and its persisted or recovered result"
     );
   } finally {
     await provider.close();

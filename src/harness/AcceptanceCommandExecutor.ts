@@ -21,6 +21,7 @@ import {
   type RunCommandResult
 } from "../tools/shell/runCommand.js";
 import { ToolScheduler } from "../tools/scheduler.js";
+import { createToolOperationId } from "../tools/types.js";
 import {
   resolveWorkspaceDirectory,
   toWorkspaceRelative
@@ -226,6 +227,7 @@ export function createControlledAcceptanceCommandExecutor(
             request.signal?.throwIfAborted();
             return await execution.execute({
               toolCallId,
+              operationId: createToolOperationId(options.sessionId, toolCallId),
               signal: request.signal
             });
           }

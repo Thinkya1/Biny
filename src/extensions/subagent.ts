@@ -11,7 +11,7 @@ import { usageSnapshot } from "../session/metadata.js";
 import { ToolAccesses } from "../tools/access.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { ToolScheduler } from "../tools/scheduler.js";
-import type { RunnableToolExecution, Tool } from "../tools/types.js";
+import { createToolOperationId, type RunnableToolExecution, type Tool } from "../tools/types.js";
 import { filterProtectedGitDiff, isProtectedCredentialPath, redactSecrets } from "../utils/secrets.js";
 import { findSubagentDefinition, type SubagentDefinition } from "./agents.js";
 
@@ -245,7 +245,7 @@ async function executeNativeSubagentTool(
         }
       }
     }
-    return await execution.execute({ toolCallId, signal });
+    return await execution.execute({ toolCallId, operationId: createToolOperationId("subagent", toolCallId), signal });
   };
   return scheduler
     ? await scheduler.schedule({ accesses: execution.accesses ?? ToolAccesses.all(), signal, start: execute })

@@ -55,8 +55,9 @@ export function createEditFileTool(context: ToolContext): Tool<EditFileArgs, Edi
         accesses: ToolAccesses.readWriteFile(absolutePath),
         display: { kind: "file_io", operation: "edit", path: args.path, before: args.oldText, after: args.newText },
         description: `Edit ${args.path}`,
+        retrySafety: "unsafe",
         approvalRule: `edit_file(${args.path})`,
-        async execute({ signal, approvedFile }) {
+        async execute({ signal, approvedFile, onExecutionState }) {
           signal?.throwIfAborted();
           const currentPath = resolveWorkspacePath(context.workspaceRoot, args.path, context.ignore);
           if (currentPath !== absolutePath) throw new Error("The edit target changed after the tool call was prepared.");
@@ -77,7 +78,8 @@ export function createEditFileTool(context: ToolContext): Tool<EditFileArgs, Edi
             absolutePath,
             next,
             approvedFile ? approvedFile.snapshot : snapshot,
-            signal
+            signal,
+            (evidence) => onExecutionState?.("side_effect_committed", evidence)
           );
           return { path: args.path, replacements: 1 };
         }

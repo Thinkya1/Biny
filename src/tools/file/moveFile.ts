@@ -53,8 +53,9 @@ export function createMoveFileTool(context: ToolContext): Tool<MoveFileArgs, Mov
           detail: `move to ${args.to}`
         },
         description: `Move ${args.from} to ${args.to}`,
+        retrySafety: "unsafe",
         approvalRule: `move_file(${args.from} -> ${args.to})`,
-        async execute({ signal, approvedFile }) {
+        async execute({ signal, approvedFile, onExecutionState }) {
           signal?.throwIfAborted();
           const currentSource = resolveWorkspacePath(context.workspaceRoot, args.from, context.ignore);
           const currentDestination = resolveWorkspacePath(context.workspaceRoot, args.to, context.ignore);
@@ -69,7 +70,7 @@ export function createMoveFileTool(context: ToolContext): Tool<MoveFileArgs, Mov
           if (expectedSnapshot === null || !sameFileSnapshot(currentSnapshot, expectedSnapshot)) {
             throw new Error("The move source changed before permission approval.");
           }
-          await moveBoundRegularFile(sourcePath, destinationPath, expectedSnapshot, signal);
+          await moveBoundRegularFile(sourcePath, destinationPath, expectedSnapshot, signal, (evidence) => onExecutionState?.("side_effect_committed", evidence));
           return { from: args.from, to: args.to, moved: true };
         }
       };

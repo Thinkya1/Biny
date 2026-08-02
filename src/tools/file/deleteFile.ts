@@ -41,8 +41,9 @@ export function createDeleteFileTool(context: ToolContext): Tool<DeleteFileArgs,
         accesses: ToolAccesses.writeFile(absolutePath),
         display: { kind: "file_io", operation: "edit", path: args.path, detail: "delete regular file" },
         description: `Delete ${args.path}`,
+        retrySafety: "unsafe",
         approvalRule: `delete_file(${args.path})`,
-        async execute({ signal, approvedFile }) {
+        async execute({ signal, approvedFile, onExecutionState }) {
           signal?.throwIfAborted();
           const currentPath = resolveWorkspacePath(context.workspaceRoot, args.path, context.ignore);
           if (currentPath !== absolutePath) throw new Error("The delete target changed after the tool call was prepared.");
@@ -52,7 +53,7 @@ export function createDeleteFileTool(context: ToolContext): Tool<DeleteFileArgs,
           if (approvedFile && !sameOptionalFileSnapshot(approvedFile.snapshot, preparedSnapshot)) {
             throw new Error("The delete target changed before permission approval.");
           }
-          await deleteBoundRegularFile(absolutePath, preparedSnapshot, signal);
+          await deleteBoundRegularFile(absolutePath, preparedSnapshot, signal, (evidence) => onExecutionState?.("side_effect_committed", evidence));
           return { path: args.path, deleted: true };
         }
       };

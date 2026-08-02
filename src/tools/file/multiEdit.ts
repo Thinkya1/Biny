@@ -87,8 +87,9 @@ export function createMultiEditTool(context: ToolContext): Tool<MultiEditArgs, M
         accesses: ToolAccesses.readWriteFile(absolutePath),
         display: { kind: "file_io", operation: "edit", path: args.path, detail: `${String(args.edits.length)} exact edits` },
         description: `Apply ${String(args.edits.length)} edits to ${args.path}`,
+        retrySafety: "unsafe",
         approvalRule: `multi_edit(${args.path})`,
-        async execute({ signal, approvedFile }) {
+        async execute({ signal, approvedFile, onExecutionState }) {
           signal?.throwIfAborted();
           const currentPath = resolveWorkspacePath(context.workspaceRoot, args.path, context.ignore);
           if (currentPath !== absolutePath) throw new Error("The multi-edit target changed after the tool call was prepared.");
@@ -104,7 +105,7 @@ export function createMultiEditTool(context: ToolContext): Tool<MultiEditArgs, M
           }
           const applied = applyMultiEdits(current.content, args.edits, args.path);
           signal?.throwIfAborted();
-          const bytes = await atomicWriteUtf8File(absolutePath, applied.content, current.snapshot, signal);
+          const bytes = await atomicWriteUtf8File(absolutePath, applied.content, current.snapshot, signal, (evidence) => onExecutionState?.("side_effect_committed", evidence));
           return { path: args.path, edits: args.edits.length, replacements: applied.replacements, bytes };
         }
       };

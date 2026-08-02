@@ -27,11 +27,15 @@ import type {
   ApprovedFileSnapshot,
   Tool,
   ToolExecution,
+  ToolExecutionResultStatus,
+  ToolExecutionState,
+  ToolRetrySafety,
   ToolInputDisplay,
   RunnableToolExecution,
   ToolRisk,
   ToolSource
 } from "../tools/types.js";
+import { createToolOperationId } from "../tools/types.js";
 import { resolveWorkspacePath, toWorkspaceRelative } from "../workspace/resolvePath.js";
 import type { ReasoningBlock } from "../session/recorder.js";
 import { archiveToolResult, serializeToolResult, toolResultPreview } from "../session/toolResultArchive.js";
@@ -48,6 +52,18 @@ interface ToolExecutionOutcome {
   result: unknown;
   errorMessage?: string;
   permissionRequest?: AgentPermissionRequest;
+  executionStatus?: ToolExecutionResultStatus;
+  evidence?: string;
+}
+
+export interface ToolExecutionCheckpoint {
+  tool: string;
+  toolCallId: string;
+  sequence: number;
+  operationId: string;
+  state: ToolExecutionState;
+  evidence?: string;
+  retrySafety?: ToolRetrySafety;
 }
 
 interface FilePermissionBaseline {
@@ -72,6 +88,8 @@ interface FailedPreparedToolCall {
   ok: false;
   result: unknown;
   errorMessage: string;
+  executionStatus?: ToolExecutionResultStatus;
+  evidence?: string;
 }
 
 const externalToolAbortDrainMs = 500;
@@ -144,6 +162,7 @@ export class ToolExecutionCoordinator {
   private accountedToolCallCount = 0;
   private restoredMaxRepeatedActionCount = 0;
   private readonly accountedActionCounts = new Map<string, number>();
+  private readonly executionCheckpoints = new Map<string, ToolExecutionCheckpoint>();
 
   constructor(
     private readonly context: AgentRuntimeContext,
@@ -151,7 +170,8 @@ export class ToolExecutionCoordinator {
     private readonly emit: (event: AgentToolEvent | Extract<AgentSessionEvent, { type: "error" }>) => void,
     private readonly getStepContext: () => AgentStepContext = () => ({}),
     private readonly allowedToolNames?: ReadonlySet<string>,
-    private readonly executionBudget?: ToolExecutionBudget
+    private readonly executionBudget?: ToolExecutionBudget,
+    private readonly onToolResultPersisted?: () => Promise<void>
   ) {
     if (executionBudget) {
       assertPositiveSafeInteger(executionBudget.maxToolCalls, "maxToolCalls");
@@ -224,6 +244,10 @@ export class ToolExecutionCoordinator {
     };
   }
 
+  getExecutionCheckpoints(): ToolExecutionCheckpoint[] {
+    return [...this.executionCheckpoints.values()].map((checkpoint) => ({ ...checkpoint }));
+  }
+
   observeToolCall(toolCallId: string): string | undefined {
     const count = (this.observedToolCallCounts.get(toolCallId) ?? 0) + 1;
     this.observedToolCallCounts.set(toolCallId, count);
@@ -236,9 +260,10 @@ export class ToolExecutionCoordinator {
     if (this.allowedToolNames && !this.allowedToolNames.has(toolName)) {
       const call = { id: toolCallId, name: toolName, args: input };
       const sequence = this.nextSequence();
+      const operationId = createToolOperationId(this.context.recorder.sessionId, toolCallId);
       const errorMessage = `Tool ${toolName} is not available in the current mode.`;
       const stepContext = this.getStepContext();
-      this.context.recorder.record({
+      await this.context.recorder.recordAndFlush({
         type: "tool_call",
         tool: toolName,
         args: input,
@@ -249,8 +274,10 @@ export class ToolExecutionCoordinator {
         reasoningProviderOptions: stepContext.reasoningProviderOptions,
         reasoningBlocks: stepContext.reasoningBlocks
       });
-      this.emit({ type: "tool.started", toolCallId, tool: toolName, args: input });
-      return await this.finishSyntheticCall(call, sequence, { error: errorMessage }, errorMessage);
+      await this.context.recorder.recordAndFlush({ type: "tool_execution", tool: toolName, toolCallId, sequence, operationId, state: "not_started", retrySafety: "unknown" });
+      await this.context.recorder.recordAndFlush({ type: "tool_execution", tool: toolName, toolCallId, sequence, operationId, state: "failed", evidence: errorMessage, retrySafety: "unknown" });
+      this.emit({ type: "tool.started", toolCallId, tool: toolName, args: input, operationId });
+      return await this.finishSyntheticCall(call, sequence, { error: errorMessage }, errorMessage, { executionStatus: "failed", operationId });
     }
     let registered: Tool;
     try {
@@ -258,8 +285,8 @@ export class ToolExecutionCoordinator {
     } catch {
       const result = { error: `Unknown tool: ${toolName}` };
       const sequence = this.nextSequence();
-      this.emit({ type: "tool.started", toolCallId, tool: toolName, args: input });
-      this.context.recorder.record({
+      const operationId = createToolOperationId(this.context.recorder.sessionId, toolCallId);
+      await this.context.recorder.recordAndFlush({
         type: "tool_call",
         tool: toolName,
         args: input,
@@ -270,11 +297,15 @@ export class ToolExecutionCoordinator {
         reasoningProviderOptions: this.getStepContext().reasoningProviderOptions,
         reasoningBlocks: this.getStepContext().reasoningBlocks
       });
+      await this.context.recorder.recordAndFlush({ type: "tool_execution", tool: toolName, toolCallId, sequence, operationId, state: "not_started", retrySafety: "unknown" });
+      await this.context.recorder.recordAndFlush({ type: "tool_execution", tool: toolName, toolCallId, sequence, operationId, state: "failed", evidence: result.error, retrySafety: "unknown" });
+      this.emit({ type: "tool.started", toolCallId, tool: toolName, args: input, operationId });
       return await this.finishSyntheticCall(
         { id: toolCallId, name: toolName, args: input },
         sequence,
         result,
-        result.error
+        result.error,
+        { executionStatus: "failed", operationId }
       );
     }
     const source = this.context.toolRegistry.listEntries().find((entry) => entry.tool.name === toolName)?.source ?? registered.source ?? "builtin";
@@ -295,7 +326,8 @@ export class ToolExecutionCoordinator {
     };
     const signal = options.abortSignal;
     const stepContext = this.getStepContext();
-    this.context.recorder.record({
+    const operationId = createToolOperationId(this.context.recorder.sessionId, call.id);
+    await this.context.recorder.recordAndFlush({
       type: "tool_call",
       tool: call.name,
       args: call.args,
@@ -306,29 +338,100 @@ export class ToolExecutionCoordinator {
       reasoningProviderOptions: stepContext.reasoningProviderOptions,
       reasoningBlocks: stepContext.reasoningBlocks
     });
-    let toolResultRecorded = false;
-    const finish = async (result: unknown, errorMessage?: string): Promise<unknown> => {
-      toolResultRecorded = true;
-      return await this.finishSyntheticCall(call, sequence, result, errorMessage);
+    let latestState: ToolExecutionState = "not_started";
+    let latestEvidence: string | undefined;
+    let retrySafety: ToolRetrySafety = "unknown";
+    let executionStarted = false;
+    let finishPromise: Promise<unknown> | undefined;
+    const updateCheckpoint = (state: ToolExecutionState, evidence?: string): void => {
+      latestState = state;
+      latestEvidence = evidence ?? latestEvidence;
+      this.executionCheckpoints.set(operationId, {
+        tool: call.name,
+        toolCallId: call.id,
+        sequence,
+        operationId,
+        state,
+        evidence: latestEvidence,
+        retrySafety
+      });
+    };
+    const persistState = async (state: ToolExecutionState, evidence?: string): Promise<void> => {
+      updateCheckpoint(state, evidence);
+      await this.context.recorder.recordAndFlush({
+        type: "tool_execution",
+        tool: call.name,
+        toolCallId: call.id,
+        sequence,
+        operationId,
+        state,
+        evidence: latestEvidence,
+        retrySafety
+      });
+    };
+    const recordState = (state: ToolExecutionState, evidence?: string): void => {
+      updateCheckpoint(state, evidence);
+      void this.context.recorder.recordAndFlush({
+        type: "tool_execution",
+        tool: call.name,
+        toolCallId: call.id,
+        sequence,
+        operationId,
+        state,
+        evidence: latestEvidence,
+        retrySafety
+      }).catch(() => undefined);
+    };
+    await persistState("not_started");
+    const onAbort = (): void => {
+      if (latestState === "running" || latestState === "side_effect_committed") recordState("cancel_requested", "Cancellation was requested while the tool was executing.");
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const finish = (
+      result: unknown,
+      errorMessage?: string,
+      executionStatus?: ToolExecutionResultStatus,
+      auditOnly = false
+    ): Promise<unknown> => {
+      if (finishPromise) return finishPromise;
+      const status = executionStatus ?? terminalResultStatus(latestState, result);
+      finishPromise = (async () => {
+        const neverStarted = latestState === "not_started";
+        const terminalState = executionStateForResultStatus(status);
+        if (latestState !== terminalState) await persistState(terminalState, latestEvidence);
+        return await this.finishSyntheticCall(
+          call,
+          sequence,
+          exposeExecutionMetadata(result, status, operationId, latestEvidence),
+          errorMessage,
+          {
+            executionStatus: status,
+            operationId,
+            evidence: latestEvidence,
+            auditOnly: auditOnly || neverStarted && status === "cancelled"
+          }
+        );
+      })();
+      return finishPromise;
     };
 
     try {
       if (duplicate) {
-        this.emit({ type: "tool.started", toolCallId: call.id, tool: call.name, args: call.args });
+        this.emit({ type: "tool.started", toolCallId: call.id, tool: call.name, args: call.args, operationId });
         const message = `Duplicate tool call id was rejected before execution: ${options.toolCallId}.`;
         // The turn already emitted one fatal protocol error. Keep each rejected
         // call auditable through its tool_result without duplicating UI errors.
-        return await finish({ error: message, duplicateToolCallId: true });
+        return await finish({ error: message, duplicateToolCallId: true }, message, "failed");
       }
       if (signal?.aborted) {
-        this.emit({ type: "tool.started", toolCallId: call.id, tool: call.name, args: call.args });
+        this.emit({ type: "tool.started", toolCallId: call.id, tool: call.name, args: call.args, operationId });
         const message = abortedToolMessage(call.name, signal.reason);
-        return await finish({ status: "aborted", error: message }, message);
+        return await finish({ status: "skipped", error: message }, message, "cancelled");
       }
       const budgetRejection = this.admitToolCall(call);
       if (budgetRejection) {
-        this.emit({ type: "tool.started", toolCallId: call.id, tool: call.name, args: call.args });
-        return await finish(budgetRejection, budgetRejection.error);
+        this.emit({ type: "tool.started", toolCallId: call.id, tool: call.name, args: call.args, operationId });
+        return await finish(budgetRejection, budgetRejection.error, "failed");
       }
 
       return await this.admissionScheduler.schedule({
@@ -336,11 +439,14 @@ export class ToolExecutionCoordinator {
         signal,
         start: async () => {
           signal?.throwIfAborted();
+          await persistState("running");
           const prepared = await this.prepareToolCall(toolDefinition, call, source, signal);
           if (!prepared.ok) {
-            this.emit({ type: "tool.started", toolCallId: call.id, tool: call.name, args: call.args });
-            return await finish(prepared.result, prepared.errorMessage);
+            this.emit({ type: "tool.started", toolCallId: call.id, tool: call.name, args: call.args, operationId });
+            return await finish(prepared.result, prepared.errorMessage, prepared.executionStatus ?? "failed");
           }
+          retrySafety = prepared.execution.retrySafety ?? (toolDefinition.risk === "read" ? "safe" : "unknown");
+          updateCheckpoint(latestState, latestEvidence);
 
           this.emit({
             type: "tool.started",
@@ -348,7 +454,8 @@ export class ToolExecutionCoordinator {
             tool: call.name,
             args: call.args,
             description: prepared.execution.description,
-            display: prepared.execution.display
+            display: prepared.execution.display,
+            operationId
           });
 
           signal?.throwIfAborted();
@@ -359,7 +466,7 @@ export class ToolExecutionCoordinator {
           let grantedPermission: AgentPermissionResult | undefined;
           if (evaluation.decision === "deny") {
             this.permissionManager.applyResult(permissionRequest, { approved: false, message: evaluation.reason });
-            return await finish(deniedToolResult(permissionRequest, evaluation.reason));
+            return await finish(deniedToolResult(permissionRequest, evaluation.reason), undefined, "failed");
           }
 
           if (evaluation.decision === "ask") {
@@ -382,7 +489,7 @@ export class ToolExecutionCoordinator {
               return validatedResult;
             }, signal);
             if (!permissionResult.approved) {
-              return await finish(deniedToolResult(permissionRequest, permissionResult.message ?? "Denied by user."));
+              return await finish(deniedToolResult(permissionRequest, permissionResult.message ?? "Denied by user."), undefined, "failed");
             }
           } else {
             this.permissionManager.applyResult(permissionRequest, { approved: true, scope: "once" });
@@ -427,51 +534,95 @@ export class ToolExecutionCoordinator {
                 await this.context.beforeWorkspaceMutation?.().catch(() => undefined);
               }
               await this.ensureCheckpoint(toolDefinition.risk, call.name);
-              return await this.executeResolvedTool(call, prepared.execution, source, signal, approvedFile);
+              return await this.executeResolvedTool(
+                call,
+                prepared.execution,
+                source,
+                signal,
+                approvedFile,
+                operationId,
+                retrySafety,
+                (state, evidence) => recordState(state, evidence),
+                () => { executionStarted = true; }
+              );
             }
           });
           const result = attachPermissionPreview(outcome.result, outcome.permissionRequest ?? permissionRequest);
           const diagnosed = await this.attachDiagnostics(toolDefinition.risk, prepared.args, result, outcome.errorMessage, signal);
           const hooked = await this.attachAfterToolHooks(call.name, prepared.args, diagnosed, signal);
-          const modelResult = await this.applyToolResultBudget(call, sequence, hooked);
-          toolResultRecorded = true;
-          this.context.recorder.record({ type: "tool_result", tool: call.name, result: modelResult, toolCallId: call.id, sequence });
-          this.context.contextMemory?.observeToolResult(call.name, call.args, modelResult);
-          if (outcome.errorMessage) {
-            this.context.recorder.record({ type: "error", message: outcome.errorMessage });
-            this.emit({ type: "error", message: outcome.errorMessage, recorded: true, fatal: false });
-          }
-          this.emitToolResult(call, modelResult, outcome.errorMessage);
-          return modelResult;
+          return await finish(
+            hooked,
+            outcome.errorMessage,
+            outcome.executionStatus ?? terminalResultStatus(latestState, hooked)
+          );
         }
       });
     } catch (error) {
-      if (toolResultRecorded) throw error;
       const aborted = isAbortError(error, signal);
+      const status = aborted
+        ? classifyCancellation(latestState, executionStarted, retrySafety)
+        : "failed";
       const message = aborted ? abortedToolMessage(call.name, error) : formatToolError(call.name, error);
-      return await finish(aborted ? { status: "aborted", error: message } : { error: message }, message);
+      return await finish(
+        aborted ? { status: status === "unknown" ? "unknown" : status, error: message } : { error: message },
+        message,
+        status
+      );
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
     }
   }
 
-  private async finishSyntheticCall(call: { id: string; name: string; args: unknown }, sequence: number, result: unknown, errorMessage?: string): Promise<unknown> {
+  private async finishSyntheticCall(
+    call: { id: string; name: string; args: unknown },
+    sequence: number,
+    result: unknown,
+    errorMessage: string | undefined,
+    metadata: {
+      executionStatus?: ToolExecutionResultStatus;
+      recovered?: boolean;
+      operationId?: string;
+      evidence?: string;
+      auditOnly?: boolean;
+    } = {}
+  ): Promise<unknown> {
     const modelResult = await this.applyToolResultBudget(call, sequence, result);
-    this.context.recorder.record({ type: "tool_result", tool: call.name, result: modelResult, toolCallId: call.id, sequence });
+    await this.context.recorder.recordAndFlush({
+      type: "tool_result",
+      tool: call.name,
+      result: modelResult,
+      toolCallId: call.id,
+      sequence,
+      executionStatus: metadata.executionStatus,
+      recovered: metadata.recovered,
+      operationId: metadata.operationId,
+      evidence: metadata.evidence,
+      auditOnly: metadata.auditOnly
+    });
+    try {
+      await this.onToolResultPersisted?.();
+    } catch {
+      // TurnStore 是崩溃安全断点，不能把已经持久化的 tool_result 变成工具失败。
+    }
     this.context.contextMemory?.observeToolResult(call.name, call.args, modelResult);
     if (errorMessage) {
       this.context.recorder.record({ type: "error", message: errorMessage });
       this.emit({ type: "error", message: errorMessage, recorded: true, fatal: false });
     }
-    this.emitToolResult(call, modelResult, errorMessage);
+    this.emitToolResult(call, modelResult, errorMessage, metadata);
     return modelResult;
   }
 
   private emitToolResult(
     call: { id: string; name: string },
     result: unknown,
-    errorMessage?: string
+    errorMessage?: string,
+    metadata: { executionStatus?: ToolExecutionResultStatus; recovered?: boolean; operationId?: string; evidence?: string } = {}
   ): void {
     const durationMs = resultNumber(result, "durationMs");
-    const error = errorMessage ?? failedToolResultMessage(result);
+    const error = metadata.executionStatus === "unknown" || metadata.executionStatus === "cancelled"
+      ? undefined
+      : errorMessage ?? failedToolResultMessage(result);
     if (error) {
       this.emit({
         type: "tool.failed",
@@ -479,7 +630,11 @@ export class ToolExecutionCoordinator {
         tool: call.name,
         error,
         result,
-        durationMs
+        durationMs,
+        executionStatus: metadata.executionStatus,
+        recovered: metadata.recovered,
+        operationId: metadata.operationId,
+        evidence: metadata.evidence
       });
       return;
     }
@@ -488,7 +643,11 @@ export class ToolExecutionCoordinator {
       toolCallId: call.id,
       tool: call.name,
       result,
-      durationMs
+      durationMs,
+      executionStatus: metadata.executionStatus,
+      recovered: metadata.recovered,
+      operationId: metadata.operationId,
+      evidence: metadata.evidence
     });
   }
 
@@ -663,13 +822,15 @@ export class ToolExecutionCoordinator {
         return {
           ok: false,
           result: {
-            status: "aborted",
+            status: "unknown",
             quarantined: true,
             externalToolSource: source,
             stage: "resolveExecution",
             error: message
           },
-          errorMessage: message
+          errorMessage: message,
+          executionStatus: "unknown",
+          evidence: message
         };
       }
       if (isAbortError(error, signal)) throw error;
@@ -687,18 +848,32 @@ export class ToolExecutionCoordinator {
     execution: RunnableToolExecution,
     source: ToolSource,
     signal?: AbortSignal,
-    approvedFile?: ApprovedFileSnapshot
+    approvedFile?: ApprovedFileSnapshot,
+    operationId?: string,
+    retrySafety: ToolRetrySafety = "unknown",
+    onExecutionState?: (state: ToolExecutionState, evidence?: string) => void,
+    onStarted?: () => void
   ): Promise<ToolExecutionOutcome> {
     const startedAt = Date.now();
     let executionPromise: Promise<unknown> | undefined;
+    let executionStarted = false;
+    let latestExecutionState: ToolExecutionState = "running";
+    const reportExecutionState = (state: ToolExecutionState, evidence?: string): void => {
+      latestExecutionState = state;
+      onExecutionState?.(state, evidence);
+    };
     try {
       signal?.throwIfAborted();
+      executionStarted = true;
+      onStarted?.();
       executionPromise = execution.execute({
         toolCallId: call.id,
+        operationId: operationId ?? createToolOperationId(this.context.recorder.sessionId, call.id),
         signal,
         onUpdate: (update) => {
           if (!signal?.aborted) this.emit({ type: "tool.progress", toolCallId: call.id, tool: call.name, update });
         },
+        onExecutionState: reportExecutionState,
         approvedFile
       });
       // Built-ins own a real cancellation contract, so their scheduler resources
@@ -707,30 +882,50 @@ export class ToolExecutionCoordinator {
       const result = source === "builtin"
         ? await executionPromise
         : await waitForAbortWithDrain(executionPromise, signal, externalToolAbortDrainMs);
-      signal?.throwIfAborted();
-      return { result: attachToolSummary(result, Date.now() - startedAt) };
+      const summarized = attachToolSummary(result, Date.now() - startedAt);
+      const executionFailure = failedToolResultMessage(summarized);
+      reportExecutionState(executionFailure ? "failed" : "succeeded", executionFailure);
+      return {
+        result: summarized,
+        errorMessage: executionFailure,
+        executionStatus: executionFailure ? "failed" : "succeeded",
+        evidence: executionFailure
+      };
     } catch (error) {
       if (error instanceof ExternalToolQuarantineError && executionPromise) {
         this.context.quarantineExternalTool?.(call.name, call.id, executionPromise);
         const message = `Tool ${call.name} was aborted, but its external ${source} execution did not settle within ${String(externalToolAbortDrainMs)}ms. This agent session is quarantined until that execution settles, so later operations cannot overlap its possible side effects.`;
+        reportExecutionState("unknown", message);
         return {
           result: {
-            status: "aborted",
+            status: "unknown",
             quarantined: true,
             externalToolSource: source,
             error: message,
             durationMs: Date.now() - startedAt
           },
-          errorMessage: message
+          errorMessage: message,
+          executionStatus: "unknown",
+          evidence: message
         };
       }
       const message = formatToolError(call.name, error);
       const aborted = isAbortError(error, signal);
+      const status: ToolExecutionResultStatus = aborted
+        ? isSideEffectCommitted(latestExecutionState)
+          ? "unknown"
+          : !executionStarted || retrySafety === "safe" || retrySafety === "idempotent"
+            ? "cancelled"
+            : "unknown"
+        : "failed";
+      reportExecutionState(executionStateForResultStatus(status), message);
       return {
         result: aborted
-          ? { status: "aborted", error: message, durationMs: Date.now() - startedAt }
+          ? { status: status === "unknown" ? "unknown" : "cancelled", error: message, durationMs: Date.now() - startedAt }
           : { error: message, durationMs: Date.now() - startedAt },
-        errorMessage: message
+        errorMessage: message,
+        executionStatus: status,
+        evidence: message
       };
     }
   }
@@ -940,6 +1135,48 @@ function isToolExecutionError(execution: unknown): execution is { isError: true;
   return typeof execution === "object" && execution !== null && "isError" in execution && execution.isError === true && "errorMessage" in execution && typeof execution.errorMessage === "string";
 }
 
+function executionStateForResultStatus(status: ToolExecutionResultStatus): ToolExecutionState {
+  if (status === "cancelled") return "cancelled";
+  if (status === "succeeded") return "succeeded";
+  if (status === "failed") return "failed";
+  return "unknown";
+}
+
+function terminalResultStatus(state: ToolExecutionState, result: unknown): ToolExecutionResultStatus {
+  if (state === "cancelled" || state === "cancel_requested") return "cancelled";
+  if (state === "unknown" || state === "running" || state === "side_effect_committed" || state === "not_started") return "unknown";
+  if (state === "failed") return "failed";
+  return failedToolResultMessage(result) ? "failed" : "succeeded";
+}
+
+function classifyCancellation(state: ToolExecutionState, executionStarted: boolean, retrySafety: ToolRetrySafety): ToolExecutionResultStatus {
+  if (!executionStarted || retrySafety === "safe" || retrySafety === "idempotent") return "cancelled";
+  if (state === "side_effect_committed" || state === "cancel_requested" || executionStarted) return "unknown";
+  return "cancelled";
+}
+
+function isSideEffectCommitted(state: ToolExecutionState): boolean {
+  return state === "side_effect_committed";
+}
+
+function exposeExecutionMetadata(
+  result: unknown,
+  status: ToolExecutionResultStatus,
+  operationId: string,
+  evidence: string | undefined
+): unknown {
+  if (status === "succeeded" || status === "failed" || status === "cancelled") return result;
+  if (typeof result === "object" && result !== null && !Array.isArray(result)) {
+    return {
+      ...(result as Record<string, unknown>),
+      executionStatus: status,
+      operationId,
+      evidence
+    };
+  }
+  return { result, executionStatus: status, operationId, evidence };
+}
+
 function hasWritableAccess(accesses: RunnableToolExecution["accesses"]): boolean {
   return accesses?.some((access) =>
     access.kind === "all"
@@ -1036,16 +1273,16 @@ async function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal | undefi
 
 async function waitForAbortWithDrain<T>(promise: Promise<T>, signal: AbortSignal | undefined, drainMs: number): Promise<T> {
   if (!signal) return await promise;
-  if (signal.aborted) {
-    const settled = await drainPromise(promise, drainMs);
-    if (!settled) throw new ExternalToolQuarantineError(abortReason(signal));
-    throw abortReason(signal);
-  }
-
   const outcome = promise.then(
     (value) => ({ kind: "value" as const, value }),
     (error: unknown) => ({ kind: "error" as const, error })
   );
+  if (signal.aborted) {
+    const settled = await Promise.race([outcome, delay(drainMs).then(() => ({ kind: "timeout" as const }))]);
+    if (settled.kind === "timeout") throw new ExternalToolQuarantineError(abortReason(signal));
+    if (settled.kind === "value") return settled.value;
+    throw settled.error;
+  }
   let onAbort!: () => void;
   const aborted = new Promise<{ kind: "aborted" }>((resolve) => {
     onAbort = () => resolve({ kind: "aborted" });
@@ -1055,17 +1292,10 @@ async function waitForAbortWithDrain<T>(promise: Promise<T>, signal: AbortSignal
   signal.removeEventListener("abort", onAbort);
   if (first.kind === "value") return first.value;
   if (first.kind === "error") throw first.error;
-  const settled = await Promise.race([
-    outcome.then(() => true),
-    delay(drainMs).then(() => false)
-  ]);
-  if (!settled) throw new ExternalToolQuarantineError(abortReason(signal));
-  throw abortReason(signal);
-}
-
-async function drainPromise(promise: Promise<unknown>, drainMs: number): Promise<boolean> {
-  const settled = promise.then(() => true, () => true);
-  return await Promise.race([settled, delay(drainMs).then(() => false)]);
+  const settled = await Promise.race([outcome, delay(drainMs).then(() => ({ kind: "timeout" as const }))]);
+  if (settled.kind === "timeout") throw new ExternalToolQuarantineError(abortReason(signal));
+  if (settled.kind === "value") return settled.value;
+  throw settled.error;
 }
 
 async function delay(ms: number): Promise<void> {

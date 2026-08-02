@@ -46,8 +46,9 @@ export function createWriteFileTool(context: ToolContext): Tool<WriteFileArgs, W
         accesses: ToolAccesses.writeFile(absolutePath),
         display: { kind: "file_io", operation: "write", path: args.path, content: args.content },
         description: `Write ${args.path}`,
+        retrySafety: "unsafe",
         approvalRule: `write_file(${args.path})`,
-        async execute({ signal, approvedFile }) {
+        async execute({ signal, approvedFile, onExecutionState }) {
           signal?.throwIfAborted();
           const currentPath = resolveWorkspacePath(context.workspaceRoot, args.path, context.ignore);
           if (currentPath !== absolutePath) throw new Error("The write target changed after the tool call was prepared.");
@@ -59,7 +60,8 @@ export function createWriteFileTool(context: ToolContext): Tool<WriteFileArgs, W
             absolutePath,
             args.content,
             approvedFile ? approvedFile.snapshot : undefined,
-            signal
+            signal,
+            (evidence) => onExecutionState?.("side_effect_committed", evidence)
           );
           return { path: args.path, bytes };
         }

@@ -112,7 +112,8 @@ export async function atomicWriteUtf8File(
   filePath: string,
   content: string,
   expectedSnapshot: FileSnapshot | null | undefined,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onCommit?: (evidence: string) => void
 ): Promise<number> {
   signal?.throwIfAborted();
   const directory = path.dirname(filePath);
@@ -214,6 +215,7 @@ export async function atomicWriteUtf8File(
     // 走到这里文件已经提交成功。对目录 fsync 只是为了在支持的文件系统上提高断电耐久性，
     // 某些文件系统不允许同步目录，那种失败不能让已完成的写入被报成失败。
     await syncDirectory(directory).catch(() => undefined);
+    reportCommitted(onCommit, `Atomic file commit completed for ${path.basename(filePath)}.`);
     return Buffer.byteLength(content, "utf8");
   } finally {
     if (!committed && handle && temporarySnapshot) {
@@ -244,14 +246,15 @@ export async function atomicWriteWorkspaceUtf8File(
   filePath: string,
   content: string,
   expectedSnapshot: FileSnapshot | null | undefined,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onCommit?: (evidence: string) => void
 ): Promise<number> {
   signal?.throwIfAborted();
   const createdDirectories = await createMissingWorkspaceDirectories(workspaceRoot, path.dirname(filePath), signal);
   let committed = false;
   try {
     signal?.throwIfAborted();
-    const bytes = await atomicWriteUtf8File(filePath, content, expectedSnapshot, signal);
+    const bytes = await atomicWriteUtf8File(filePath, content, expectedSnapshot, signal, onCommit);
     committed = true;
     return bytes;
   } finally {
@@ -279,7 +282,8 @@ export async function snapshotRegularFile(filePath: string, signal?: AbortSignal
 export async function deleteBoundRegularFile(
   filePath: string,
   expectedSnapshot: FileSnapshot,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onCommit?: (evidence: string) => void
 ): Promise<void> {
   signal?.throwIfAborted();
   const directory = path.dirname(filePath);
@@ -312,6 +316,7 @@ export async function deleteBoundRegularFile(
     }
     await fs.unlink(quarantinePath);
     quarantined = false;
+    reportCommitted(onCommit, `Atomic file deletion completed for ${path.basename(filePath)}.`);
     await syncDirectory(directory).catch(() => undefined);
   } catch (error) {
     if (quarantined) {
@@ -343,7 +348,8 @@ export async function moveBoundRegularFile(
   sourcePath: string,
   destinationPath: string,
   expectedSnapshot: FileSnapshot,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onCommit?: (evidence: string) => void
 ): Promise<void> {
   signal?.throwIfAborted();
   const source = path.resolve(sourcePath);
@@ -401,6 +407,7 @@ export async function moveBoundRegularFile(
     await fs.unlink(source);
     sourceRemoved = true;
     linked = false;
+    reportCommitted(onCommit, `Atomic file move committed from ${path.basename(source)} to ${path.basename(destination)}.`);
     await syncDirectory(sourceDirectory).catch(() => undefined);
     if (destinationDirectory !== sourceDirectory) await syncDirectory(destinationDirectory).catch(() => undefined);
   } catch (error) {
@@ -416,6 +423,14 @@ export async function moveBoundRegularFile(
     throw error;
   } finally {
     await handle.close().catch(() => undefined);
+  }
+}
+
+function reportCommitted(onCommit: ((evidence: string) => void) | undefined, evidence: string): void {
+  try {
+    onCommit?.(evidence);
+  } catch {
+    // 审计回调不能改变已经提交的文件事务结果。
   }
 }
 

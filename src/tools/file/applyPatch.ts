@@ -65,8 +65,9 @@ export function createApplyPatchTool(context: ToolContext): Tool<ApplyPatchArgs,
           detail: `${String(preview.hunks)} patch hunk(s)`
         },
         description: `Apply patch to ${args.path}`,
+        retrySafety: "unsafe",
         approvalRule: `apply_patch(${args.path})`,
-        async execute({ signal, approvedFile }) {
+        async execute({ signal, approvedFile, onExecutionState }) {
           signal?.throwIfAborted();
           const currentPath = resolveWorkspacePath(context.workspaceRoot, args.path, context.ignore);
           if (currentPath !== absolutePath) throw new Error("The patch target changed after the tool call was prepared.");
@@ -81,7 +82,7 @@ export function createApplyPatchTool(context: ToolContext): Tool<ApplyPatchArgs,
             throw new Error("The patch target changed after the tool call was prepared.");
           }
           const applied = applyUnifiedPatch(current.content, args.patch, args.path);
-          const bytes = await atomicWriteUtf8File(absolutePath, applied.content, current.snapshot, signal);
+          const bytes = await atomicWriteUtf8File(absolutePath, applied.content, current.snapshot, signal, (evidence) => onExecutionState?.("side_effect_committed", evidence));
           return { path: args.path, hunks: applied.hunks, changedLines: applied.changedLines, bytes };
         }
       };

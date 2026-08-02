@@ -3,7 +3,7 @@ import type { AgentConfig } from "../config/schema.js";
 import type { AgentModel } from "./core/types.js";
 import type { SessionRecorder } from "../session/recorder.js";
 import type { ToolRegistry } from "../tools/registry.js";
-import type { ToolInputDisplay, ToolUpdate } from "../tools/types.js";
+import type { ToolExecutionResultStatus, ToolInputDisplay, ToolUpdate } from "../tools/types.js";
 import type { PermissionManager, PermissionPrompt, PermissionResult } from "../permission/PermissionManager.js";
 import type { SessionUsage } from "../session/metadata.js";
 import type { ContextMemory } from "./context/ContextMemory.js";
@@ -65,10 +65,10 @@ export type AgentSessionUpdate =
   | AgentToolEvent;
 
 export type AgentToolEvent =
-  | { type: "tool.started"; toolCallId: string; tool: string; args: unknown; description?: string; display?: ToolInputDisplay }
+  | { type: "tool.started"; toolCallId: string; tool: string; args: unknown; description?: string; display?: ToolInputDisplay; operationId?: string }
   | { type: "tool.progress"; toolCallId: string; tool: string; update: ToolUpdate }
-  | { type: "tool.completed"; toolCallId: string; tool: string; result: unknown; durationMs?: number }
-  | { type: "tool.failed"; toolCallId: string; tool: string; error: string; result?: unknown; durationMs?: number };
+  | { type: "tool.completed"; toolCallId: string; tool: string; result: unknown; durationMs?: number; executionStatus?: ToolExecutionResultStatus; recovered?: boolean; operationId?: string; evidence?: string }
+  | { type: "tool.failed"; toolCallId: string; tool: string; error: string; result?: unknown; durationMs?: number; executionStatus?: ToolExecutionResultStatus; recovered?: boolean; operationId?: string; evidence?: string };
 
 /** Provider 原始分片在 Session 内归一化，宿主不需要理解 provider wire 协议。 */
 export type AgentSessionEvent =

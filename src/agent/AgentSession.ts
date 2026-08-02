@@ -12,7 +12,7 @@ import {
 } from "../llm/ModelManager.js";
 import { PermissionManager, type PermissionMode } from "../permission/PermissionManager.js";
 import { runPermissionCommand } from "../permission/commands.js";
-import { listSessionSummaries, parseSessionEvents, type SessionSummary } from "../session/events.js";
+import { listSessionSummaries, parseSessionEvents, readSessionEvents, type SessionSummary } from "../session/events.js";
 import { SessionRecorder, type ReasoningBlock } from "../session/recorder.js";
 import { replaySessionEvents, type SessionReplay } from "../session/replay.js";
 import {
@@ -305,6 +305,15 @@ export class AgentSession {
     return await this.turnStore.load();
   }
 
+  /** 只补齐 session 中缺失的协议结果；恢复过程不调用任何工具执行函数。 */
+  private async reconcileInterruptedToolExecutions(): Promise<SessionReplay> {
+    await this.recorder.flush().catch(() => undefined);
+    const events = await readSessionEvents(this.recorder.filePath);
+    const replay = replaySessionEvents(events, { sessionId: this.recorder.sessionId });
+    for (const event of replay.recoveredToolResults) await this.recorder.recordAndFlush(event);
+    return replay;
+  }
+
   /**
    * 从被打断的地方继续同一个回合。
    *
@@ -314,6 +323,7 @@ export class AgentSession {
   async *continueInterruptedTurn(runOptions: AgentRunOptions = {}): AsyncGenerator<AgentSessionEvent> {
     const turn = await this.turnStore.load();
     if (!turn) throw new Error("There is no interrupted turn to continue.");
+    const replay = await this.reconcileInterruptedToolExecutions();
     if (
       turn.terminal?.status === "blocked"
       && (turn.terminal.blockedReason === "missing_user_input"
@@ -335,9 +345,10 @@ export class AgentSession {
       );
     }
     if (turn.terminal?.status === "blocked") this.options.completionState?.clearBlocked();
+    const recoveredMessages = replay.messages.length ? replay.messages : turn.messages;
     const continuationMessages = turn.terminal
-      ? [...turn.messages, runtimeContinuationMessage(turn.terminal)]
-      : turn.messages;
+      ? [...recoveredMessages, runtimeContinuationMessage(turn.terminal)]
+      : recoveredMessages;
     const previousTerminals = [
       ...(turn.previousTerminals ?? []),
       ...(turn.terminal ? [turn.terminal] : [])
@@ -458,7 +469,7 @@ export class AgentSession {
       });
     };
     try {
-    // 新根输入明确放弃旧断点；否则它在首个新 step 落盘前崩溃时，/continue 会错误复活上一回合。
+    // 新根输入明确放弃旧断点；否则它在首个新 step 落盘前崩溃时，恢复逻辑会错误复活上一回合。
     if (!continuing) await this.turnStore.clear().catch(() => undefined);
     if (abortSignal.aborted) {
       recordUserMessage();
@@ -548,6 +559,18 @@ export class AgentSession {
       yield { type: "status", status: "cancelled" };
       yield doneEvent(outcome);
       return;
+    }
+    if (!continuing) {
+      await this.recorder.flush().catch(() => undefined);
+      await this.turnStore.save(
+        input,
+        systemPrompt,
+        messages,
+        completedStepsBeforeRun,
+        undefined,
+        undefined,
+        runOptions.previousTerminals
+      ).catch(() => undefined);
     }
     const configuredBudget = resolveRunBudget(this.options.config.agent);
     const remainingConfiguredSteps = configuredBudget.hardStepLimit - completedStepsBeforeRun;
@@ -658,6 +681,32 @@ export class AgentSession {
       ) facts.observeToolEvent(event);
       pendingEvents.push(event);
     };
+    let observedSteps = 0;
+    let toolResultCheckpointBarrier = Promise.resolve();
+    const coordinatorRef: { current?: ToolExecutionCoordinator } = {};
+    const persistToolResultCheckpoint = (): Promise<void> => {
+      const current = toolResultCheckpointBarrier.then(async () => {
+        const coordinator = coordinatorRef.current;
+        if (!coordinator) return;
+        const replay = replaySessionEvents(
+          await readSessionEvents(this.recorder.filePath),
+          { sessionId: this.recorder.sessionId }
+        );
+        if (!replay.messages.length) return;
+        await this.turnStore.save(
+          input,
+          systemPrompt,
+          replay.messages,
+          completedStepsBeforeRun + observedSteps + 1,
+          facts.snapshot(false),
+          undefined,
+          runOptions.previousTerminals,
+          coordinator.getExecutionCheckpoints()
+        );
+      });
+      toolResultCheckpointBarrier = current.catch(() => undefined);
+      return current;
+    };
     const coordinator = new ToolExecutionCoordinator(
       runtime,
       permissionManager,
@@ -675,8 +724,10 @@ export class AgentSession {
         maxRepeatedActions: runBudget.maxRepeatedActions,
         initialToolCallCount: runOptions.initialRunFacts?.actualToolCallCount,
         initialMaxRepeatedActionCount: runOptions.initialRunFacts?.maxRepeatedActionCount
-      }
+      },
+      persistToolResultCheckpoint
     );
+    coordinatorRef.current = coordinator;
 
     const verificationCommandExecutor = createControlledAcceptanceCommandExecutor({
       workspaceRoot: this.options.workspaceRoot,
@@ -711,7 +762,6 @@ export class AgentSession {
     let pendingSteering: AgentMessage[] = [];
     let lastAssistant: AgentAssistantMessage | undefined;
     let newMessages: AgentMessage[] = [];
-    let observedSteps = 0;
     let reasoningActive = false;
     let lastStepReasoningOutput = "";
     const stepUsageRecords: SessionUsage[] = [];
@@ -917,7 +967,8 @@ export class AgentSession {
               completedStepsBeforeRun + observedSteps,
               facts.snapshot(false),
               undefined,
-              runOptions.previousTerminals
+              runOptions.previousTerminals,
+              coordinator.getExecutionCheckpoints()
             ).catch(() => undefined);
           }
         } else if (event.type === "agent_end") {
@@ -1017,7 +1068,8 @@ export class AgentSession {
             blockedReason: outcome.blockedReason,
             requiredAction: outcome.requiredAction
           },
-          runOptions.previousTerminals
+          runOptions.previousTerminals,
+          coordinator.getExecutionCheckpoints()
         ).catch(() => undefined);
       } else {
         await this.turnStore.clear().catch(() => undefined);
@@ -1076,7 +1128,7 @@ export class AgentSession {
       }
       replacementRecorder = new SessionRecorder(this.persistenceRoot(), sessionIdFromFile(filePath), filePath);
       replacementRecorder.repairTailForAppend();
-      const replay = replaySessionEvents(parseSessionEvents(replacementRecorder.readText()));
+      const replay = replaySessionEvents(parseSessionEvents(replacementRecorder.readText()), { sessionId: replacementRecorder.sessionId });
       replacementRecorder.restoreToolCallSequence(maxToolCallSequence(replay.events));
       replacementRecorder.restoreMessageParent(replay.messageTree.at(-1)?.id);
 
@@ -1084,7 +1136,7 @@ export class AgentSession {
         previousClosed = true;
         await previousRecorder.close();
       }
-      for (const event of replay.recoveredToolResults) replacementRecorder.record(event);
+      for (const event of replay.recoveredToolResults) await replacementRecorder.recordAndFlush(event);
       this.options.permissionManager.resetSession();
       this.usageRecords = [...replay.usage];
       this.unpersistedRelatedUsage = [];
