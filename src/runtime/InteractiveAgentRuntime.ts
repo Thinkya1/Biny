@@ -792,12 +792,12 @@ export class InteractiveAgentRuntime {
     }
 
     if (event.type === "tool.completed") {
-      this.completeTool(run, event.toolCallId, event.tool, event.result, event.durationMs);
+      this.completeTool(run, event.toolCallId, event.tool, event.result, event.durationMs, event.executionStatus, event.recovered, event.operationId, event.evidence);
       return undefined;
     }
 
     if (event.type === "tool.failed") {
-      this.failTool(run, event.toolCallId, event.tool, event.error, event.result, event.durationMs);
+      this.failTool(run, event.toolCallId, event.tool, event.error, event.result, event.durationMs, event.executionStatus, event.recovered, event.operationId, event.evidence);
       return undefined;
     }
 
@@ -840,14 +840,18 @@ export class InteractiveAgentRuntime {
     toolCallId: string,
     tool: string,
     result: unknown,
-    reportedDurationMs?: number
+    reportedDurationMs?: number,
+    executionStatus?: "cancelled" | "succeeded" | "failed" | "unknown",
+    recovered?: boolean,
+    operationId?: string,
+    evidence?: string
   ): void {
     const active = this.tools.get(toolCallId);
     const durationMs = reportedDurationMs
       ?? readNumber(result, "durationMs")
       ?? (active ? Date.now() - active.startedAtMs : undefined);
     const publicResult = redactSensitiveValue(result);
-    this.emit({ ...this.eventBase(run), type: "tool.completed", toolCallId, tool, result: publicResult, durationMs });
+    this.emit({ ...this.eventBase(run), type: "tool.completed", toolCallId, tool, result: publicResult, durationMs, executionStatus, recovered, operationId, evidence });
     this.tools.delete(toolCallId);
   }
 
@@ -857,7 +861,11 @@ export class InteractiveAgentRuntime {
     tool: string,
     error: string,
     result?: unknown,
-    reportedDurationMs?: number
+    reportedDurationMs?: number,
+    executionStatus?: "cancelled" | "succeeded" | "failed" | "unknown",
+    recovered?: boolean,
+    operationId?: string,
+    evidence?: string
   ): void {
     const active = this.tools.get(toolCallId);
     const durationMs = reportedDurationMs
@@ -872,7 +880,11 @@ export class InteractiveAgentRuntime {
       tool,
       error: publicError,
       result: publicResult,
-      durationMs
+      durationMs,
+      executionStatus,
+      recovered,
+      operationId,
+      evidence
     });
     this.tools.delete(toolCallId);
   }

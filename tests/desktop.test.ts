@@ -1107,7 +1107,7 @@ function testHistoricalAbortProjection(): void {
   ];
   const timeline = buildSessionTimeline(events, []);
   assert.equal(timeline[0]?.status, "aborted");
-  assert.equal(timeline[0]?.tools[0]?.status, "aborted");
+  assert.equal(timeline[0]?.tools[0]?.status, "unknown");
 }
 
 function testHistoricalUsageProjection(): void {

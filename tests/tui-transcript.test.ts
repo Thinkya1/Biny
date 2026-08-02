@@ -216,12 +216,12 @@ function testSlashCommandParity(): void {
   const tuiCommands = slashCommandsForSurface("tui");
   const desktopCommands = slashCommandsForSurface("desktop");
   const desktopNames = new Set(desktopCommands.map((command) => command.name));
-  assert.equal(tuiCommands.length, 24);
+  assert.equal(tuiCommands.length, 23);
   assert.equal(tuiCommands.find((command) => command.name === "/plan")?.requiresArgs, undefined);
   assert.ok(tuiCommands.some((command) => command.name === "/mode"));
   assert.ok(tuiCommands.some((command) => command.name === "/memory"));
   assert.ok(tuiCommands.some((command) => command.name === "/undo"));
-  assert.ok(tuiCommands.some((command) => command.name === "/continue"));
+  assert.equal(tuiCommands.some((command) => command.name === "/continue"), false);
   assert.ok(tuiCommands.some((command) => command.name === "/fork"));
   assert.ok(["/status", "/context", "/usage", "/memory", "/subagent"].every((name) => desktopNames.has(name)));
 }
@@ -716,7 +716,7 @@ function testSessionReplayFinalizesPendingTools(): void {
     { type: "tool_call", toolCallId: "pending", tool: "run_command", args: { command: "sleep 10" } }
   ] as SessionEvent[]);
   assert.equal((interrupted[0] as ToolTranscriptItem).status, "skipped");
-  assert.equal((interrupted[0] as ToolTranscriptItem).title, "Interrupted command");
+  assert.equal((interrupted[0] as ToolTranscriptItem).title, "Skipped command");
 }
 
 function testSessionReplayRestoresTurnStatuses(): void {
@@ -738,7 +738,7 @@ function testSessionReplayRestoresTurnStatuses(): void {
   assert.equal(blockedStatus?.kind, "notification");
   assert.equal(blockedStatus?.kind === "notification" ? blockedStatus.tone : undefined, "warning");
   assert.match(blockedStatus?.content ?? "", /Choose staging or production/u);
-  assert.match(blockedStatus?.content ?? "", /continued from its saved state/u);
+  assert.match(blockedStatus?.content ?? "", /Send a new message to continue this task/u);
 
   const failed = sessionEventsToTranscript([
     { type: "user_message", content: "run" },

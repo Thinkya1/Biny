@@ -43,7 +43,6 @@ interface WorkspaceProps {
   onOpenExternal(url: string): void;
   onPanelNotice(message: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
-  onContinue(): void;
   onRetry(input: string): void;
   onEditUserMessage(input: string, userMessageIndex: number): Promise<void>;
   onCreateBranch(): void;
@@ -91,7 +90,6 @@ export function Workspace({
   onOpenExternal,
   onPanelNotice,
   onResolvePermission,
-  onContinue,
   onRetry,
   onEditUserMessage,
   onCreateBranch,
@@ -301,7 +299,6 @@ export function Workspace({
               onOpenExternal={onOpenExternal}
               onResolvePermission={onResolvePermission}
               onRollbackFiles={onRollbackFiles}
-              onContinue={onContinue}
               onRetry={onRetry}
               projectId={projectId}
               sessionId={sessionId}

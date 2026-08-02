@@ -25,7 +25,6 @@ interface MessageTimelineProps {
   onPreviewFile(path: string): void;
   onOpenExternal(url: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
-  onContinue(): void;
   onRetry(input: string): void;
   onEditUserMessage(input: string, userMessageIndex: number): Promise<void>;
   onCreateBranch(): void;
@@ -33,7 +32,7 @@ interface MessageTimelineProps {
   onDeleteUserMessage(turnId: string): void;
 }
 
-export const MessageTimeline = memo(function MessageTimeline({ projectId, sessionId, turns, onPreviewFile, onOpenExternal, onResolvePermission, onContinue, onRetry, onEditUserMessage, onCreateBranch, onRollbackFiles, onDeleteUserMessage }: MessageTimelineProps): React.JSX.Element {
+export const MessageTimeline = memo(function MessageTimeline({ projectId, sessionId, turns, onPreviewFile, onOpenExternal, onResolvePermission, onRetry, onEditUserMessage, onCreateBranch, onRollbackFiles, onDeleteUserMessage }: MessageTimelineProps): React.JSX.Element {
   const [editing, setEditing] = useState<{ turnId: string; value: string; userMessageIndex: number }>();
 
   const startEditing = (turn: TimelineTurn): void => {
@@ -64,7 +63,6 @@ export const MessageTimeline = memo(function MessageTimeline({ projectId, sessio
           onOpenExternal={onOpenExternal}
           onResolvePermission={onResolvePermission}
           onRollbackFiles={onRollbackFiles}
-          onContinue={onContinue}
           onRetry={onRetry}
           projectId={projectId}
           turn={turn}
@@ -81,7 +79,6 @@ const Turn = memo(function Turn({
   onPreviewFile,
   onOpenExternal,
   onResolvePermission,
-  onContinue,
   onRetry,
   onCancelEdit,
   onChangeEdit,
@@ -97,7 +94,6 @@ const Turn = memo(function Turn({
   onPreviewFile(path: string): void;
   onOpenExternal(url: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
-  onContinue(): void;
   onRetry(input: string): void;
   onCancelEdit(): void;
   onChangeEdit(value: string): void;
@@ -189,7 +185,6 @@ const Turn = memo(function Turn({
             <button className="run-error-heading" onClick={() => setErrorOpen(!errorOpen)} type="button"><span>{runErrorHeading(turn.status)}</span><Icon name="chevron" size={12} /></button>
             {errorOpen ? <pre><code>{turn.error}</code></pre> : null}
             <div className="run-error-actions">
-              {turn.resumable === true ? <button onClick={onContinue} type="button">继续</button> : null}
               {turn.status === "failed" && turn.user ? <button onClick={() => onRetry(turn.user)} type="button">重试</button> : null}
               <button onClick={() => void copyToClipboard(turn.error ?? "")} type="button">复制错误</button>
             </div>

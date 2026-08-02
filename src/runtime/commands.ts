@@ -76,20 +76,6 @@ export async function executeRuntimeCommand(
   if (command === "/compact") {
     return result(command, "Compact", await runtime.compactConversation(args.join(" ").trim() || undefined));
   }
-  if (command === "/continue") {
-    const outcome = await runtime.continueInterruptedTurn();
-    if (!outcome) {
-      return result(
-        command,
-        "Continue",
-        "No interrupted, blocked, or resumable incomplete turn is available."
-      );
-    }
-    const content = outcome.status === "completed"
-      ? "Continued the interrupted turn from its last completed tool step."
-      : outcome.error ?? "The interrupted turn did not complete.";
-    return result(command, "Continue", content);
-  }
   if (command === "/undo") {
     const checkpointStore = services.checkpoints;
     const checkpoints = checkpointStore ? await checkpointStore.list() : [];

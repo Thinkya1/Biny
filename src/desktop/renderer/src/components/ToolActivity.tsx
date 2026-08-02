@@ -24,7 +24,7 @@ interface ToolActivityProps {
 
 export const ToolActivity = memo(function ToolActivity({ projectId, tool, onPreviewFile, onOpenExternal, onResolvePermission }: ToolActivityProps): React.JSX.Element {
   const permissionPending = Boolean(tool.permission && !tool.permission.resolved);
-  const auto = permissionPending || tool.status === "failed" || tool.status === "denied";
+  const auto = permissionPending || tool.status === "failed" || tool.status === "denied" || tool.status === "unknown" || tool.status === "cancelled";
   // override 连同当时的状态一起记：状态一变（比如从 running 变 success）就作废，回到自动策略。
   const [override, setOverride] = useState<{ status: TimelineTool["status"]; expanded: boolean }>();
   const expanded = override?.status === tool.status ? override.expanded : auto;
@@ -456,6 +456,9 @@ function ToolStatusGlyph({ status }: { status: TimelineTool["status"] }): React.
   if (status === "success") return <span className="tool-status-glyph is-success"><Icon name="check" size={13} /></span>;
   if (status === "failed") return <span className="tool-status-glyph is-error"><Icon name="close" size={13} /></span>;
   if (status === "denied") return <span className="tool-status-glyph is-error"><Icon name="shield" size={12} /></span>;
+  if (status === "unknown") return <span className="tool-status-glyph is-error"><Icon name="warning" size={12} /></span>;
+  if (status === "cancelled") return <span className="tool-status-glyph"><Icon name="stop" size={12} /></span>;
+  if (status === "skipped") return <span className="tool-status-glyph"><Icon name="stop" size={12} /></span>;
   if (status === "aborted") return <span className="tool-status-glyph"><Icon name="stop" size={12} /></span>;
   return <span className="tool-status-glyph is-waiting"><span className="tool-waiting-dot" /></span>;
 }

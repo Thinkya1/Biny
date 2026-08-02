@@ -15,6 +15,7 @@ export function sessionEventsToTranscript(events: SessionEvent[]): TranscriptIte
   const pendingTools: ToolTranscriptItem[] = [];
 
   for (const [index, event] of events.entries()) {
+    if (event.type === "tool_result" && event.auditOnly && event.recovered && resultStatus(event.result) !== "skipped") continue;
     if (event.type === "user_message") {
       items.push({ id: replayId("user", index), kind: "user", content: event.content });
       continue;
@@ -83,6 +84,7 @@ export function sessionEventsToTranscript(events: SessionEvent[]): TranscriptIte
 
     // 权威模型消息只供恢复模型上下文；历史界面继续使用稳定审计事件，避免重复展示。
     if (event.type === "agent_message") continue;
+    if (event.type === "tool_execution") continue;
 
     while (pendingTools.length > 0) {
       const pending = pendingTools.shift();
@@ -98,7 +100,7 @@ export function sessionEventsToTranscript(events: SessionEvent[]): TranscriptIte
 }
 
 function turnStatusContent(event: Extract<SessionEvent, { type: "turn_status" }>): string {
-  const resumable = event.resumable ? "\nThis task can be continued from its saved state." : "";
+  const resumable = event.resumable ? "\nSend a new message to continue this task." : "";
   const summary = event.summary ?? `Task ended with status ${event.status} (${event.stopReason}).`;
   const requiredAction = event.requiredAction ? `\nRequired action: ${event.requiredAction}` : "";
   return `${summary}${requiredAction}${resumable}`;
@@ -125,4 +127,10 @@ function eventTimeMs(time: string | undefined): number | undefined {
   if (!time) return undefined;
   const value = Date.parse(time);
   return Number.isFinite(value) ? value : undefined;
+}
+
+function resultStatus(result: unknown): string | undefined {
+  if (typeof result !== "object" || result === null) return undefined;
+  const status = (result as Record<string, unknown>).status;
+  return typeof status === "string" ? status : undefined;
 }

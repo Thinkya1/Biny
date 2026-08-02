@@ -393,10 +393,6 @@ export function App(): React.JSX.Element {
     setSlashResult(await window.biny.runSlashCommand(projectId, selectedRef.current, command));
   }, []);
 
-  const continueInterruptedTurn = useCallback((): void => {
-    void runSlashCommand("/continue").catch((error) => setToast(errorMessage(error)));
-  }, [runSlashCommand]);
-
   const editPrompt = useCallback(async (
     input: string,
     mode: InteractiveAgentRunMode,
@@ -797,7 +793,6 @@ export function App(): React.JSX.Element {
         onRefreshProject={() => { const projectId = projectRef.current; if (projectId) void window.biny.refreshProject(projectId).then(mergeWorkspaceProject).catch((error) => setToast(errorMessage(error))); }}
         onResolvePermission={resolvePermission}
         onRollbackFiles={rollbackFiles}
-        onContinue={continueInterruptedTurn}
         onRetry={(input) => void sendPrompt(input, "chat", []).catch((error) => setToast(errorMessage(error)))}
         project={workspace?.project}
         projectId={workspace?.project.id}

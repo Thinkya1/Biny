@@ -214,10 +214,12 @@ function toolOutputText(source: string, status: ToolTranscriptStatus): string {
   if (!normalized) return "";
   const colorize = (text: string): string => (status === "failed" || status === "denied"
     ? theme.fg("error", text)
+    : status === "unknown" || status === "cancelled"
+      ? theme.fg("warning", text)
     : theme.fg("toolOutput", text));
   // 工具主列表只保留标题和状态。失败时补一行真实错误，正常 stdout、文件正文
   // 和 diff 都不进入主对话区，避免一个工具占满整个 transcript。
-  if (status !== "failed" && status !== "denied") return "";
+  if (status !== "failed" && status !== "denied" && status !== "unknown" && status !== "cancelled") return "";
   const firstLine = normalized.split("\n").find((line) => line.trim())?.trim() ?? "";
   return firstLine ? colorize(truncateToWidth(firstLine, 96, "…")) : "";
 }
@@ -227,12 +229,16 @@ function emptyToolOutput(item: ToolTranscriptItem): string {
   if (item.status === "success") return "Completed";
   if (item.status === "denied") return "Denied";
   if (item.status === "skipped") return "Skipped";
+  if (item.status === "cancelled") return "Cancelled";
+  if (item.status === "unknown") return "Completion status unknown";
   return "Failed";
 }
 
 export function toolStatusMarker(status: ToolTranscriptStatus): string {
   if (status === "success") return "✓ ";
   if (status === "failed" || status === "denied") return "✗ ";
+  if (status === "unknown") return "? ";
+  if (status === "cancelled") return "⏹ ";
   if (status === "running") return "● ";
   if (status === "pending") return "○ ";
   if (status === "skipped") return "– ";
@@ -242,6 +248,7 @@ export function toolStatusMarker(status: ToolTranscriptStatus): string {
 function toolStatusToken(status: ToolTranscriptStatus): "success" | "error" | "accent" | "warning" | "muted" {
   if (status === "success") return "success";
   if (status === "failed" || status === "denied") return "error";
+  if (status === "unknown" || status === "cancelled") return "warning";
   if (status === "running") return "accent";
   if (status === "pending") return "warning";
   return "muted";

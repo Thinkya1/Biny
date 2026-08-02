@@ -70,7 +70,11 @@ export function completeToolItem(
 ): ToolTranscriptItem {
   const status = forcedStatus ?? toolStatusFromResult(result);
   const title = status === "skipped"
-    ? interruptedToolTitle(item)
+    ? skippedToolTitle(item)
+    : status === "cancelled"
+      ? cancelledToolTitle(item)
+      : status === "unknown"
+        ? unknownToolTitle(item)
     : semanticToolTitle(item.tool, item.argsSummary, item.display, item.description, false);
   const projection = projectToolResult({ ...item, title }, result, status);
   return {
@@ -84,14 +88,21 @@ export function completeToolItem(
     durationMs: projection.durationMs ?? elapsedDuration(item.startedAtMs, completedAtMs),
     outputLines: projection.outputLines,
     exitCode: projection.exitCode,
-    truncated: projection.truncated
+    truncated: projection.truncated,
+    operationId: resultField(result, "operationId"),
+    recovered: resultFieldBoolean(result, "recovered"),
+    evidence: resultField(result, "evidence")
   };
 }
 
 export function toolStatusFromResult(result: unknown): ToolTranscriptStatus {
   if (typeof result === "object" && result !== null) {
     const record = result as Record<string, unknown>;
+    if (record.executionStatus === "unknown") return "unknown";
+    if (record.executionStatus === "cancelled") return record.status === "skipped" ? "skipped" : "cancelled";
+    if (record.executionStatus === "succeeded" || record.status === "recovered-success") return "success";
     if (record.status === "denied") return "denied";
+    if (record.status === "cancelled") return "cancelled";
     if (record.status === "failed" || record.status === "timed_out" || record.status === "aborted") return "failed";
     if (typeof record.exitCode === "number" && record.exitCode !== 0) return "failed";
     if ("error" in record) return "failed";
@@ -190,7 +201,7 @@ function projectToolResult(item: ToolTranscriptItem, result: unknown, status: To
   const formatted = formatToolResultSummary(item.tool, result);
   const rawOutput = extractOutput(result);
   const output = removeDuplicateTitle(formatted ?? rawOutput ?? summarizeValue(result, 64 * 1024), item.title)
-    || (status === "success" ? "Completed" : status === "denied" ? "Denied" : "Failed");
+    || (status === "success" ? "Completed" : status === "denied" ? "Denied" : status === "skipped" ? "Skipped" : status === "cancelled" ? "Cancelled" : status === "unknown" ? "Completion status unknown" : "Failed");
   return {
     output,
     details: [
@@ -254,7 +265,9 @@ function projectWebSearchResult(
 }
 
 function commandOutputPreview(stdout: string, stderr: string, status: ToolTranscriptStatus): string {
-  if (status === "failed" || status === "denied") return stderr || stdout || (status === "denied" ? "Denied" : "Command failed");
+  if (status === "failed" || status === "denied" || status === "unknown" || status === "cancelled") {
+    return stderr || stdout || (status === "denied" ? "Denied" : status === "unknown" ? "Completion status unknown" : status === "cancelled" ? "Cancelled" : "Command failed");
+  }
   if (stdout && stderr) return `${stdout}\nstderr:\n${stderr}`;
   return stdout || stderr || "Command completed";
 }
@@ -271,12 +284,28 @@ function runningToolDetails(item: ToolTranscriptItem): string {
   return item.argsSummary ? `Input: ${item.argsSummary}` : "Working…";
 }
 
-function interruptedToolTitle(item: ToolTranscriptItem): string {
+function skippedToolTitle(item: ToolTranscriptItem): string {
   const title = item.title.replace(
     /^(?:Reading|Writing|Editing|Running|Checking|Listing|Searching|Building|Installing)\s*/u,
-    "Interrupted "
+    "Skipped "
   ).trimEnd();
-  return title === item.title ? `Interrupted ${humanizeToolName(item.tool)}` : title;
+  return title === item.title ? `Skipped ${humanizeToolName(item.tool)}` : title;
+}
+
+function cancelledToolTitle(item: ToolTranscriptItem): string {
+  const title = item.title.replace(
+    /^(?:Reading|Writing|Editing|Running|Checking|Listing|Searching|Building|Installing)\s*/u,
+    "Cancelled "
+  ).trimEnd();
+  return title === item.title ? `Cancelled ${humanizeToolName(item.tool)}` : title;
+}
+
+function unknownToolTitle(item: ToolTranscriptItem): string {
+  const title = item.title.replace(
+    /^(?:Reading|Writing|Editing|Running|Checking|Listing|Searching|Building|Installing)\s*/u,
+    "Status unknown for "
+  ).trimEnd();
+  return title === item.title ? `Status unknown for ${humanizeToolName(item.tool)}` : title;
 }
 
 function semanticCommandTitle(command: string, running: boolean): string {
@@ -333,4 +362,16 @@ function elapsedDuration(startedAtMs: number | undefined, completedAtMs: number)
 
 function humanizeToolName(tool: string): string {
   return tool.replaceAll("_", " ");
+}
+
+function resultField(result: unknown, key: string): string | undefined {
+  if (typeof result !== "object" || result === null) return undefined;
+  const value = (result as Record<string, unknown>)[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function resultFieldBoolean(result: unknown, key: string): boolean | undefined {
+  if (typeof result !== "object" || result === null) return undefined;
+  const value = (result as Record<string, unknown>)[key];
+  return typeof value === "boolean" ? value : undefined;
 }

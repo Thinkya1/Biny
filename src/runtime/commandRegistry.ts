@@ -32,7 +32,6 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   { name: "/permissions", description: "View or change permission mode", category: "system", surfaces: terminalOnly },
   { name: "/approvals", description: "Alias for /permissions", category: "system", surfaces: terminalOnly },
   { name: "/undo", description: "Restore the workspace from a Biny checkpoint", category: "system", acceptsArgs: true, surfaces: allInteractive },
-  { name: "/continue", description: "Resume an interrupted, blocked, or resumable incomplete turn", category: "system", surfaces: allInteractive },
   { name: "/fork", description: "Fork a session into a new one", category: "session", surfaces: terminalOnly },
   { name: "/plan", description: "Toggle Plan mode or plan the next task", category: "plan", surfaces: terminalOnly },
   { name: "/mode", description: "Choose Chat or read-only Plan mode", category: "plan", surfaces: terminalOnly },

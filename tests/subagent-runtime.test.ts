@@ -67,7 +67,6 @@ await testConcurrentRootRunIsRejected();
 await testActiveRunAcceptsSteeringAndFollowUp();
 await testRuntimeUpdatesCarryCanonicalState();
 await testContinueRequiresIdleRuntime();
-await testContinueCommandKeepsStepLimitSeparate();
 await testRuntimeSetupFailureSettlesRun();
 await testMissingTerminalResultFailsRun();
 await testDuplicateTerminalResultFailsRun();
@@ -788,15 +787,6 @@ async function testContinueRequiresIdleRuntime(): Promise<void> {
   runtime.cancelCurrentRun();
   firstGate.resolve();
   await run.completion;
-  await runtime.close();
-}
-
-async function testContinueCommandKeepsStepLimitSeparate(): Promise<void> {
-  const commands = fakeCommandRuntime();
-  const runtime = new InteractiveAgentRuntime(commands);
-  const result = await executeRuntimeCommand(runtime, commands, "/continue", "tui");
-  assert.match(result?.content ?? "", /No interrupted.*turn/u);
-  assert.doesNotMatch(result?.content ?? "", /Step-limit/u);
   await runtime.close();
 }
 

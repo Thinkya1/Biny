@@ -16,12 +16,12 @@
 - **完整工具集** —— 文件读写与补丁、代码搜索、Git、Shell、长期进程管理、联网搜索与网页抓取、跨回合待办清单。
 - **执行可控** —— 读写和命令执行走统一权限策略，高风险操作必须完整输入 `yes`；可选的 macOS 沙箱把 `run_command` 的写入限制在工作区内。
 - **可回退** —— 每个回合首次改动工作区前自动建快照，`/undo` 回退。快照挂在独立 ref 上，不碰你的暂存区、分支和 `git log`。
-- **可恢复** —— 消息、工具调用和续跑状态都写在本机；进程退出或断网导致回合异常中断后，`/continue` 从最后一个完成的工具步继续，不重跑已完成工具。可续跑的 `blocked / incomplete` 只在用户显式 `/continue` 后开启新的安全预算，原 Turn 终态仍保留在 Session JSONL；缺少用户信息或需要不安全操作时，必须发送新的用户消息。
+- **可恢复** —— 消息、工具调用和续跑状态都写在本机；进程退出或断网导致回合异常中断后，打开同一 Session 并发送新的用户消息即可继续任务。可恢复的 `blocked / incomplete` 会保留原 Turn 终态；缺少用户信息或需要不安全操作时，必须发送新的用户消息。
 - **统一完成门** —— Provider 的 `stop` 只表示一次响应结束。模型停止调用工具后，Completion Gate 会检查 Todo、审批、活跃执行、结构化阻塞、预算和独立验证，再决定 `completed / blocked / incomplete / cancelled`；陈旧 Todo 的 continuation 有无进展上限，后续同动作成功可以覆盖旧失败，验证失败会回到当前 Agent Loop 修复。
 - **可扩展** —— Skill、Plugin、MCP server（stdio / http）、具名子代理，以及跨会话的持久记忆。
 - **Plan 模式** —— 先出计划，不执行会产生副作用的操作。
 - **统一交互、按策略限权** —— Desktop、TUI 和 `biny run` 的普通输入都直接进入同一个 AgentSession，不再根据“修改、修复、启动”等自然语言关键词切换执行框架；Chat 和单次任务使用当前权限策略，Plan 只开放只读工具。
-- **统一命令语义** —— `/status`、`/context`、`/usage`、`/memory`、`/subagent`、`/continue` 等命令由 Desktop 与 TUI 共用同一份声明和执行逻辑；`biny chat` 是默认 TUI 的兼容别名，不再启动第二套交互循环。
+- **统一命令语义** —— `/status`、`/context`、`/usage`、`/memory`、`/subagent` 等命令由 Desktop 与 TUI 共用同一份声明和执行逻辑；`biny chat` 是默认 TUI 的兼容别名，不再启动第二套交互循环。
 - **图片附件** —— Desktop 可直接粘贴/拖入图片，TUI 用 `Ctrl+V`（Windows 为 `Alt+V`）粘贴系统剪贴板图片；附件保存在项目 `.biny/attachments`，会话只记录引用。输入会先写入会话；模型未声明 `vision` 时会记录明确错误，不会静默丢弃图片。
 
 ## 快速开始
@@ -158,6 +158,8 @@ Skill 按 Agent Skills 格式使用带 YAML frontmatter 的 `SKILL.md`：新根�
 同一个 Session 同一时刻只能由一个运行时执行，另一个会返回占用提示；不同 Session 可以并行。
 
 新建 Session 使用 UUIDv7 作为文件名（例如 `019...jsonl`）：UUID 高位包含 UTC 毫秒时间戳，因此按文件名字典序可以按创建时间排序；同一毫秒内用随机位避免冲突。已有的旧格式 session ID 仍可按完整 ID 或唯一前缀恢复。`biny sessions`、TUI 会话选择器和 Desktop 会话列表按最近更新时间从新到旧展示，`resume latest` 仍按文件修改时间选择最近会话。
+
+工具执行中断时，Session JSONL 会分别记录工具调用、执行状态和工具结果。已经开始但无法确认最终副作用的调用会恢复为 `unknown`，不会被展示为成功，也不会由 Biny 自动重试；模型会看到恢复结果并自行决定下一步。尚未开始执行的调用会从模型恢复上下文中移除并标记为 skipped。用户不需要也不能通过 `/continue` 恢复工具回合：`/resume` 只选择并打开最近的 Session，发送普通新消息即可继续当前上下文；内部断点续跑只用于进程崩溃后的安全恢复。
 
 ## 当前边界
 

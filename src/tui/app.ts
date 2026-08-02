@@ -701,7 +701,7 @@ export class BinyTui {
     const sharedResult = await executeRuntimeCommand(runtime, commands, value, "tui");
     if (sharedResult) {
       this.showTextViewer(sharedResult.title, sharedResult.content);
-      if (command === "/compact" || command === "/continue") await this.refreshContextUsage();
+      if (command === "/compact") await this.refreshContextUsage();
       return;
     }
 

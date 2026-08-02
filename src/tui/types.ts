@@ -47,7 +47,7 @@ export interface ErrorTranscriptItem extends TranscriptItemBase {
   content: string;
 }
 
-export type ToolTranscriptStatus = "pending" | "running" | "success" | "failed" | "denied" | "skipped";
+export type ToolTranscriptStatus = "pending" | "running" | "success" | "failed" | "denied" | "skipped" | "cancelled" | "unknown";
 
 export interface ToolTranscriptItem extends TranscriptItemBase {
   kind: "tool";
@@ -66,6 +66,9 @@ export interface ToolTranscriptItem extends TranscriptItemBase {
   outputLines?: number;
   exitCode?: number;
   truncated?: boolean;
+  operationId?: string;
+  recovered?: boolean;
+  evidence?: string;
 }
 
 export type TranscriptItem =

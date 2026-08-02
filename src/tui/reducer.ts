@@ -103,7 +103,7 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
       };
     }
     case "run.cancelled": {
-      const finalized = finalizeActiveCells(state.transcript, "skipped", event.reason);
+      const finalized = finalizeActiveCells(state.transcript, "unknown", event.reason);
       return {
         ...state,
         lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
@@ -112,7 +112,7 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
       };
     }
     case "run.aborted": {
-      const finalized = finalizeActiveCells(state.transcript, "skipped", event.reason);
+      const finalized = finalizeActiveCells(state.transcript, "unknown", event.reason);
       return {
         ...state,
         lastWorkedMs: state.turnStartedAt === undefined ? state.lastWorkedMs : Date.now() - state.turnStartedAt,
@@ -209,12 +209,18 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
     case "tool.completed":
       return {
         ...state,
-        transcript: finishTool(state.transcript, event.toolCallId, event.tool, event.result)
+        transcript: finishTool(state.transcript, event.toolCallId, event.tool, event.result, liveToolStatus(event.result, event.executionStatus))
       };
     case "tool.failed":
       return {
         ...state,
-        transcript: finishTool(state.transcript, event.toolCallId, event.tool, { error: event.error }, "failed")
+        transcript: finishTool(
+          state.transcript,
+          event.toolCallId,
+          event.tool,
+          event.result ?? { error: event.error },
+          liveToolStatus(event.result ?? { error: event.error }, event.executionStatus, "failed")
+        )
       };
     case "permission.requested":
     case "permission.resolved":
@@ -412,6 +418,19 @@ function finishTool(
   return { committed: [...transcript.committed, completed], active };
 }
 
+function liveToolStatus(
+  result: unknown,
+  executionStatus: "cancelled" | "succeeded" | "failed" | "unknown" | undefined,
+  fallback?: ToolTranscriptItem["status"]
+): ToolTranscriptItem["status"] | undefined {
+  if (executionStatus === "unknown") return "unknown";
+  if (executionStatus === "cancelled") {
+    if (typeof result === "object" && result !== null && (result as Record<string, unknown>).status === "skipped") return "skipped";
+    return "cancelled";
+  }
+  return fallback;
+}
+
 function findActiveToolIndex(active: ActiveTranscriptItem[], toolCallId: string | undefined, tool: string): number {
   if (toolCallId) {
     return active.findIndex((item) => item.kind === "tool" && item.toolCallId === toolCallId);
@@ -451,7 +470,7 @@ function replaceTranscript(state: TuiState, items: TranscriptItem[], viewingSess
 
 function finalizeActiveCells(
   transcript: TranscriptState,
-  toolStatus: "failed" | "skipped",
+  toolStatus: "failed" | "skipped" | "cancelled" | "unknown",
   message: string
 ): TranscriptState {
   if (transcript.active.length === 0) return transcript;

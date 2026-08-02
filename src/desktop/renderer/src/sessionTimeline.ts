@@ -26,7 +26,7 @@ export type TimelineRunStatus =
   | "cancelled"
   | "aborted"
   | "failed";
-export type TimelineToolStatus = "waiting" | "running" | "success" | "failed" | "denied" | "aborted";
+export type TimelineToolStatus = "waiting" | "running" | "success" | "failed" | "denied" | "aborted" | "cancelled" | "skipped" | "unknown";
 
 export interface TimelinePermission {
   requestId: string;
@@ -60,6 +60,10 @@ export interface TimelineTool {
   command?: TimelineCommand;
   permission?: TimelinePermission;
   timestamp?: string;
+  executionStatus?: "cancelled" | "succeeded" | "failed" | "unknown";
+  recovered?: boolean;
+  operationId?: string;
+  evidence?: string;
 }
 
 export interface TimelineToolEntry {
@@ -213,6 +217,7 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
   };
 
   for (const event of events) {
+    if (event.type === "tool_result" && event.auditOnly && event.recovered && resultString(event.result, "status") !== "skipped") continue;
     if (event.type === "user_message") {
       anonymousIndex += 1;
       current = emptyTurn(`history-${String(anonymousIndex)}`, event.time);
@@ -251,7 +256,7 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
         : historicalTurnStatusSummary(event);
       for (const tool of turn.tools) {
         if (tool.status !== "running" && tool.status !== "waiting") continue;
-        tool.status = event.status === "failed" ? "failed" : "aborted";
+        tool.status = event.status === "failed" ? "failed" : event.status === "cancelled" ? "cancelled" : "unknown";
       }
       continue;
     }
@@ -280,13 +285,18 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
       const tool = [...turn.tools].reverse().find((candidate) => candidate.id === event.toolCallId || (candidate.tool === event.tool && candidate.result === undefined));
       if (tool) {
         tool.result = event.result;
-        tool.status = resultFailed(event.result) ? "failed" : "success";
+        tool.status = timelineToolStatus(event.result, event.executionStatus);
         tool.error = resultError(event.result);
         tool.diff = resultString(event.result, "output") ?? resultString(event.result, "diffPreview");
+        tool.executionStatus = event.executionStatus;
+        tool.recovered = event.recovered;
+        tool.operationId = event.operationId;
+        tool.evidence = event.evidence;
       }
       continue;
     }
     if (event.type === "agent_message") continue;
+    if (event.type === "tool_execution") continue;
     const turn = ensureTurn(event.time);
     turn.error = event.message;
     turn.durationMs = elapsedMs(turn.timestamp, event.time) ?? turn.durationMs;
@@ -295,7 +305,7 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
     turn.status = aborted ? "aborted" : "failed";
     if (aborted) {
       for (const tool of turn.tools) {
-        if (tool.status === "running" || tool.status === "failed") tool.status = "aborted";
+        if (tool.status === "running" || tool.status === "failed") tool.status = "unknown";
       }
     }
   }
@@ -492,12 +502,20 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
     } else if (event.type === "tool.completed") {
       const tool = toolFor(event, event.tool);
       applyToolResult(tool, event.result);
-      tool.status = "success";
+      tool.status = timelineToolStatus(event.result, event.executionStatus);
+      tool.executionStatus = event.executionStatus;
+      tool.recovered = event.recovered;
+      tool.operationId = event.operationId;
+      tool.evidence = event.evidence;
       tool.durationMs = event.durationMs;
     } else if (event.type === "tool.failed") {
       const tool = toolFor(event, event.tool);
       if (event.result !== undefined) applyToolResult(tool, event.result);
-      tool.status = "failed";
+      tool.status = timelineToolStatus(event.result ?? { error: event.error }, event.executionStatus === "unknown" ? "unknown" : event.executionStatus === "cancelled" ? "cancelled" : "failed");
+      tool.executionStatus = event.executionStatus;
+      tool.recovered = event.recovered;
+      tool.operationId = event.operationId;
+      tool.evidence = event.evidence;
       tool.error = event.error;
       tool.durationMs = event.durationMs;
     } else if (event.type === "permission.requested") {
@@ -534,7 +552,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       finishReasoning(event.runId, event.timestamp);
       turn.usage = event.usage;
       for (const tool of turn.tools) {
-        if (tool.status === "running" || tool.status === "waiting") tool.status = "aborted";
+        if (tool.status === "running" || tool.status === "waiting") tool.status = "unknown";
       }
     } else if (event.type === "run.incomplete") {
       turn.status = "incomplete";
@@ -545,7 +563,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       finishReasoning(event.runId, event.timestamp);
       turn.usage = event.usage;
       for (const tool of turn.tools) {
-        if (tool.status === "running" || tool.status === "waiting") tool.status = "aborted";
+        if (tool.status === "running" || tool.status === "waiting") tool.status = "unknown";
       }
     } else if (event.type === "run.cancelled") {
       turn.status = "cancelled";
@@ -556,7 +574,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       finishReasoning(event.runId, event.timestamp);
       turn.usage = event.usage;
       for (const tool of turn.tools) {
-        if (tool.status === "running" || tool.status === "waiting") tool.status = "aborted";
+        if (tool.status === "running" || tool.status === "waiting") tool.status = "unknown";
       }
     } else if (event.type === "run.aborted") {
       turn.status = "aborted";
@@ -566,7 +584,7 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       turn.durationMs = event.durationMs;
       finishReasoning(event.runId, event.timestamp);
       for (const tool of turn.tools) {
-        if (tool.status === "running" || tool.status === "waiting") tool.status = "aborted";
+        if (tool.status === "running" || tool.status === "waiting") tool.status = "unknown";
       }
     } else if (event.type === "run.failed") {
       turn.status = "failed";
@@ -675,6 +693,21 @@ function resultFailed(result: unknown): boolean {
     || record.status === "denied";
 }
 
+function timelineToolStatus(
+  result: unknown,
+  executionStatus: "cancelled" | "succeeded" | "failed" | "unknown" | undefined
+): TimelineToolStatus {
+  if (executionStatus === "unknown") return "unknown";
+  if (executionStatus === "cancelled") {
+    return resultString(result, "status") === "skipped" ? "skipped" : "cancelled";
+  }
+  if (resultString(result, "status") === "skipped") return "skipped";
+  if (executionStatus === "failed") return "failed";
+  if (executionStatus === "succeeded") return "success";
+  if (resultString(result, "status") === "recovered-success") return "success";
+  return resultFailed(result) ? "failed" : "success";
+}
+
 // 只保留真实错误文本；「失败」本身由状态字形表达，不值得一段占位文案。
 function resultError(result: unknown): string | undefined {
   return resultString(result, "error");
@@ -744,7 +777,7 @@ export function listChangedFiles(turn: TimelineTurn): TimelineChangedFile[] {
   for (const tool of turn.tools) {
     const operation = changedFileOperation(tool);
     const path = tool.path ?? (tool.display?.kind === "file_io" ? tool.display.path : undefined);
-    if (!operation || !path || tool.status === "failed" || tool.status === "denied" || tool.status === "aborted") continue;
+    if (!operation || !path || tool.status === "failed" || tool.status === "denied" || tool.status === "aborted" || tool.status === "cancelled" || tool.status === "skipped" || tool.status === "unknown") continue;
     files.set(path, {
       path,
       operation,
