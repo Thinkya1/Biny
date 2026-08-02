@@ -9,14 +9,15 @@
  * 下次启动发现它还在，就能从最后一个完成的步继续，而不是从头再来。
  *
  * 工具步之间保存实际已用步数；blocked 或可恢复的 incomplete 终态用 0 保存，表示只有用户
- * 显式 /continue 后才开启一个新预算窗口。正常 completed、cancelled、failed 或新根回合会清掉。
+ * 显式恢复请求后才开启一个新预算窗口。正常 completed、cancelled、failed 或新根回合会清掉。
  */
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { AgentMessage } from "../agent/core/types.js";
+import type { ToolExecutionState, ToolRetrySafety } from "../tools/types.js";
 import { agentDir, ensureAgentDirs } from "./store.js";
 
-const turnStateVersion = 2;
+const turnStateVersion = 3;
 
 export interface InterruptedTurn {
   sessionId: string;
@@ -32,7 +33,20 @@ export interface InterruptedTurn {
   terminal?: InterruptedTurnTerminal;
   /** 同一 Turn 续跑前已经发生的终态；新预算窗口不能覆盖原终态。 */
   previousTerminals?: InterruptedTurnTerminal[];
+  /** 只记录恢复审计需要的工具断点，不作为会话事实的替代。 */
+  lastToolSequence?: number;
+  pendingToolExecutions?: InterruptedToolExecutionCheckpoint[];
   updatedAt: string;
+}
+
+export interface InterruptedToolExecutionCheckpoint {
+  tool: string;
+  toolCallId: string;
+  sequence: number;
+  operationId: string;
+  state: ToolExecutionState;
+  evidence?: string;
+  retrySafety?: ToolRetrySafety;
 }
 
 export interface InterruptedTurnTerminal {
@@ -53,7 +67,8 @@ export class TurnStore {
     completedSteps: number,
     facts?: unknown,
     terminal?: InterruptedTurnTerminal,
-    previousTerminals?: readonly InterruptedTurnTerminal[]
+    previousTerminals?: readonly InterruptedTurnTerminal[],
+    pendingToolExecutions?: readonly InterruptedToolExecutionCheckpoint[]
   ): Promise<void> {
     await ensureAgentDirs(this.persistenceRoot);
     const payload: InterruptedTurn = {
@@ -65,6 +80,8 @@ export class TurnStore {
       facts,
       terminal,
       previousTerminals: previousTerminals ? [...previousTerminals] : undefined,
+      lastToolSequence: pendingToolExecutions?.reduce((maximum, checkpoint) => Math.max(maximum, checkpoint.sequence), 0) || undefined,
+      pendingToolExecutions: pendingToolExecutions?.length ? [...pendingToolExecutions] : undefined,
       updatedAt: new Date().toISOString()
     };
     const target = this.filePath();
@@ -75,7 +92,8 @@ export class TurnStore {
   async load(): Promise<InterruptedTurn | undefined> {
     try {
       const parsed: unknown = JSON.parse(await fs.readFile(this.filePath(), "utf8"));
-      if ((parsed as { version?: unknown }).version !== turnStateVersion) return undefined;
+      const version = (parsed as { version?: unknown }).version;
+      if (version !== turnStateVersion && version !== 2) return undefined;
       const turn = (parsed as { turn?: unknown }).turn;
       return isInterruptedTurn(turn) ? turn : undefined;
     } catch {
@@ -107,7 +125,35 @@ function isInterruptedTurn(value: unknown): value is InterruptedTurn {
     && (candidate.previousTerminals === undefined
       || Array.isArray(candidate.previousTerminals)
       && candidate.previousTerminals.every(isInterruptedTurnTerminal))
+    && (candidate.lastToolSequence === undefined || Number.isSafeInteger(candidate.lastToolSequence) && candidate.lastToolSequence >= 0)
+    && (candidate.pendingToolExecutions === undefined
+      || Array.isArray(candidate.pendingToolExecutions)
+      && candidate.pendingToolExecutions.every(isInterruptedToolExecutionCheckpoint))
     && typeof candidate.updatedAt === "string";
+}
+
+function isInterruptedToolExecutionCheckpoint(value: unknown): value is InterruptedToolExecutionCheckpoint {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<InterruptedToolExecutionCheckpoint>;
+  return typeof candidate.tool === "string"
+    && typeof candidate.toolCallId === "string"
+    && Number.isSafeInteger(candidate.sequence)
+    && (candidate.sequence ?? -1) >= 0
+    && typeof candidate.operationId === "string"
+    && (candidate.state === "not_started"
+      || candidate.state === "running"
+      || candidate.state === "side_effect_committed"
+      || candidate.state === "cancel_requested"
+      || candidate.state === "cancelled"
+      || candidate.state === "succeeded"
+      || candidate.state === "failed"
+      || candidate.state === "unknown")
+    && (candidate.evidence === undefined || typeof candidate.evidence === "string")
+    && (candidate.retrySafety === undefined
+      || candidate.retrySafety === "safe"
+      || candidate.retrySafety === "idempotent"
+      || candidate.retrySafety === "unsafe"
+      || candidate.retrySafety === "unknown");
 }
 
 function isAgentMessage(value: unknown): value is AgentMessage {

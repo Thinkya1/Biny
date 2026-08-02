@@ -626,8 +626,9 @@ async function testTruncatedSessionTailAndDanglingToolRecovery(): Promise<void> 
       JSON.stringify({ type: "user_message", content: "later turn" })
     ].join("\n") + "\n", "utf8");
     const supersededReplay = await replaySession(supersededFile);
-    assert.equal(supersededReplay.recoveredToolResults.length, 0);
-    assert.equal(supersededReplay.messages.some((message) => hasToolResult(message, "old-call")), false);
+    assert.equal(supersededReplay.recoveredToolResults.length, 1);
+    assert.equal(supersededReplay.recoveredToolResults[0]?.executionStatus, "unknown");
+    assert.equal(supersededReplay.messages.some((message) => hasToolResult(message, "old-call")), true);
 
     const healthyListFile = sessionFilePath(workspaceRoot, "healthy-list-session");
     const corruptListFile = sessionFilePath(workspaceRoot, "corrupt-list-session");

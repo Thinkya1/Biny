@@ -5,12 +5,37 @@
  * 与 ignore 规则。权限判断、session 记录和 UI 展示不放在工具里，而由调用方统一处理。
  */
 import type { z } from "zod";
+import { createHash } from "node:crypto";
 import type { ToolAccessList } from "./access.js";
 import type { FileSnapshot } from "./file/safeFileIo.js";
 import type { JsonObjectSchema } from "./schema.js";
 
 export type ToolSource = "builtin" | "mcp" | "skill" | "plugin" | "subagent";
 export type ToolRisk = "read" | "write" | "execute";
+
+/** 工具执行状态与模型消息协议解耦；side_effect_committed 只表示审计证据，不是终态。 */
+export type ToolExecutionState =
+  | "not_started"
+  | "running"
+  | "side_effect_committed"
+  | "cancel_requested"
+  | "cancelled"
+  | "succeeded"
+  | "failed"
+  | "unknown";
+
+export type ToolRetrySafety = "safe" | "idempotent" | "unsafe" | "unknown";
+export type ToolExecutionResultStatus = "cancelled" | "succeeded" | "failed" | "unknown";
+
+export interface ToolExecutionQueryResult {
+  state: ToolExecutionState;
+  evidence?: string;
+}
+
+/** sessionId + toolCallId 的稳定标识，不把调用参数或敏感内容放进审计事件。 */
+export function createToolOperationId(sessionId: string, toolCallId: string): string {
+  return `op_${createHash("sha256").update(`${sessionId}\0${toolCallId}`).digest("hex")}`;
+}
 
 export type ToolUpdateKind = "stdout" | "stderr" | "progress" | "status" | "custom";
 
@@ -29,8 +54,10 @@ export interface ApprovedFileSnapshot {
 
 export interface ToolExecutionContext {
   toolCallId: string;
+  operationId: string;
   signal?: AbortSignal;
   onUpdate?: (update: ToolUpdate) => void;
+  onExecutionState?: (state: ToolExecutionState, evidence?: string) => void;
   approvedFile?: ApprovedFileSnapshot;
 }
 
@@ -43,7 +70,10 @@ export interface RunnableToolExecution<TResult = unknown> {
   accesses?: ToolAccessList;
   display?: ToolInputDisplay;
   description?: string;
+  retrySafety?: ToolRetrySafety;
   approvalRule: string;
+  /** 只能查询 operationId 的真实状态，不能触发一次新的工具执行。 */
+  queryStatus?: (operationId: string, signal?: AbortSignal) => Promise<ToolExecutionQueryResult>;
   execute(context: ToolExecutionContext): Promise<TResult>;
 }
 

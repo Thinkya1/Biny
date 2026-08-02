@@ -103,12 +103,27 @@ const sessionEventSchema = z.discriminatedUnion("type", [
     time: z.string().optional()
   }).passthrough(),
   z.object({
+    type: z.literal("tool_execution"),
+    tool: z.string(),
+    toolCallId: z.string(),
+    sequence: z.number().finite(),
+    operationId: z.string(),
+    state: z.enum(["not_started", "running", "side_effect_committed", "cancel_requested", "cancelled", "succeeded", "failed", "unknown"]),
+    evidence: z.string().optional(),
+    retrySafety: z.enum(["safe", "idempotent", "unsafe", "unknown"]).optional(),
+    time: z.string().optional()
+  }).passthrough(),
+  z.object({
     type: z.literal("tool_result"),
     tool: z.string(),
     result: z.unknown().optional(),
     toolCallId: z.string().optional(),
     sequence: z.number().finite().optional(),
     relatedUsage: z.array(sessionUsageSchema).optional(),
+    executionStatus: z.enum(["cancelled", "succeeded", "failed", "unknown"]).optional(),
+    recovered: z.boolean().optional(),
+    operationId: z.string().optional(),
+    evidence: z.string().optional(),
     auditOnly: z.boolean().optional(),
     time: z.string().optional()
   }).passthrough(),

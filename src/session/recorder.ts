@@ -18,6 +18,7 @@ import {
   openSync,
   readSync,
   realpathSync,
+  fsync,
   unlinkSync,
   writeSync,
   type Stats,
@@ -32,6 +33,7 @@ import { projectSessionsDir } from "../config/paths.js";
 import type { SessionContextState, SessionContextUsage, SessionUsage } from "./metadata.js";
 import type { AttachmentReference } from "../attachments/store.js";
 import type { AgentMessage } from "../agent/core/types.js";
+import type { ToolExecutionResultStatus, ToolExecutionState, ToolRetrySafety } from "../tools/types.js";
 
 export type { SessionContextState, SessionContextUsage, SessionUsage, UsageOperation } from "./metadata.js";
 
@@ -71,7 +73,8 @@ export type SessionEvent =
   | { type: "user_message"; content: string; attachments?: AttachmentReference[]; skills?: string[]; contextUsage?: SessionContextUsage; contextState?: SessionContextState; preparationUsage?: SessionUsage[]; messageId?: string; parentMessageId?: string; auditOnly?: boolean; time?: string }
   | { type: "assistant_message"; content: string; reasoningContent?: string; reasoningProviderOptions?: Record<string, unknown>; reasoningBlocks?: ReasoningBlock[]; usage?: SessionUsage; relatedUsage?: SessionUsage[]; contextState?: SessionContextState; auditOnly?: boolean; time?: string }
   | { type: "tool_call"; tool: string; args: unknown; toolCallId?: string; sequence?: number; assistantContent?: string; reasoningContent?: string; reasoningProviderOptions?: Record<string, unknown>; reasoningBlocks?: ReasoningBlock[]; auditOnly?: boolean; time?: string }
-  | { type: "tool_result"; tool: string; result: unknown; toolCallId?: string; sequence?: number; relatedUsage?: SessionUsage[]; auditOnly?: boolean; time?: string }
+  | { type: "tool_execution"; tool: string; toolCallId: string; sequence: number; operationId: string; state: ToolExecutionState; evidence?: string; retrySafety?: ToolRetrySafety; time?: string }
+  | { type: "tool_result"; tool: string; result: unknown; toolCallId?: string; sequence?: number; relatedUsage?: SessionUsage[]; executionStatus?: ToolExecutionResultStatus; recovered?: boolean; operationId?: string; evidence?: string; auditOnly?: boolean; time?: string }
   | { type: "agent_message"; message: Exclude<AgentMessage, { role: "user" }>; messageId?: string; parentMessageId?: string; time?: string }
   | SessionTurnStatusEvent
   | { type: "error"; message: string; detail?: unknown; relatedUsage?: SessionUsage[]; time?: string };
@@ -85,10 +88,12 @@ export class SessionRecorder {
   private closePromise?: Promise<void>;
   private streamError: Error | undefined;
   private closed = false;
+  private closing = false;
   private toolCallSequence = 0;
   private recordedEvents = 0;
   private readonly existedAtCreation: boolean;
   private lastMessageId: string | undefined;
+  private persistenceBarrier: Promise<void> = Promise.resolve();
 
   constructor(workspaceRoot: string, sessionId = createSessionId(), resolvedFilePath = sessionFilePath(workspaceRoot, sessionId)) {
     // sessionId 默认使用 UUIDv7：高位携带毫秒时间戳，既能保持 UUID 格式，也便于按字典序排序。
@@ -112,7 +117,7 @@ export class SessionRecorder {
 
   record(event: SessionEvent): void {
     // 每个事件一行 JSON，便于追加写入，也方便后续按行读取和压缩。
-    if (this.closed) throw new Error(`Session recorder is already closed: ${this.sessionId}`);
+    if (this.closed || this.closing) throw new Error(`Session recorder is already closed: ${this.sessionId}`);
     const safeEvent = redactSessionEvent(this.linkCanonicalMessage(event));
     const line = JSON.stringify({ ...safeEvent, time: event.time ?? new Date().toISOString() });
     if (!this.stream) {
@@ -133,6 +138,37 @@ export class SessionRecorder {
     }
     this.stream.write(`${line}\n`);
     this.recordedEvents += 1;
+  }
+
+  /** 关键协议事件使用有序屏障，确保 JSONL 已交给文件系统后再推进执行状态。 */
+  recordAndFlush(event: SessionEvent): Promise<void> {
+    const current = this.persistenceBarrier.then(async () => {
+      this.record(event);
+      await this.flush();
+    });
+    this.persistenceBarrier = current.catch(() => undefined);
+    return current;
+  }
+
+  async flush(): Promise<void> {
+    if (!this.stream) {
+      if (this.streamError) throw this.streamError;
+      return;
+    }
+    const stream = this.stream;
+    await new Promise<void>((resolve, reject) => {
+      stream.write("", (error?: Error | null) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+    if (this.streamError) throw this.streamError;
+    const descriptor = (stream as WriteStream & { fd?: number | null }).fd;
+    if (typeof descriptor !== "number") return;
+    await new Promise<void>((resolve, reject) => {
+      fsync(descriptor, (error) => error ? reject(error) : resolve());
+    });
+    if (this.streamError) throw this.streamError;
   }
 
   nextToolCallSequence(): number {
@@ -190,6 +226,13 @@ export class SessionRecorder {
 
   close(): Promise<void> {
     // close 可能被 finally 和外部清理重复调用，用同一个 promise 保证只 end 一次。
+    this.closing = true;
+    this.closePromise ??= this.closeAfterBarrier();
+    return this.closePromise;
+  }
+
+  private async closeAfterBarrier(): Promise<void> {
+    await this.persistenceBarrier;
     this.closed = true;
     if (!this.stream) {
       if (this.descriptor !== undefined) {
@@ -197,9 +240,10 @@ export class SessionRecorder {
         this.descriptor = undefined;
       }
       if (this.isUnrecordedDraft()) removeDraftFile(this.filePath, this.descriptorIdentity);
-      return this.streamError ? Promise.reject(this.streamError) : Promise.resolve();
+      if (this.streamError) throw this.streamError;
+      return;
     }
-    this.closePromise ??= new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       const stream = this.stream;
       if (!stream) return resolve();
       let settled = false;
@@ -214,7 +258,6 @@ export class SessionRecorder {
       stream.once("close", settle);
       stream.end();
     });
-    return this.closePromise;
   }
 
   private openDescriptor(): number {
@@ -272,6 +315,13 @@ function redactSessionEvent(event: SessionEvent): SessionEvent {
   }
   if (event.type === "tool_result") {
     return { ...event, result: redactSensitiveValue(event.result) };
+  }
+  if (event.type === "tool_execution") {
+    return {
+      ...event,
+      tool: redactSecrets(event.tool),
+      evidence: event.evidence === undefined ? undefined : redactSecrets(event.evidence)
+    };
   }
   if (event.type === "agent_message") {
     return { ...event, message: redactAgentMessage(event.message) };

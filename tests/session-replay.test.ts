@@ -22,10 +22,45 @@ function main(): void {
   const replay = replaySessionEvents(events);
 
   assert.equal(replay.recoveredToolResults.length, 1);
-  assert.deepEqual(replay.recoveredToolResults[0]?.result, { error: "Tool call was interrupted before completion.", interrupted: true });
+  assert.deepEqual(replay.recoveredToolResults[0]?.result, {
+    error: "Tool call was interrupted; completion status is unknown.",
+    interrupted: true,
+    recovered: true,
+    executionStatus: "unknown",
+    operationId: replay.recoveredToolResults[0]?.operationId
+  });
   const toolCall = replay.messages.find((message) => hasToolCall(message, "read-1"));
   assert.deepEqual(reasoningProviderOptions(toolCall), signedReasoning);
   assert.equal(replay.messages.some((message) => hasToolResult(message, "check-1")), true);
+
+  const notStarted = replaySessionEvents([
+    { type: "user_message", content: "cancel before admission" },
+    { type: "tool_call", tool: "write_file", args: { path: "a.txt" }, toolCallId: "not-started", sequence: 1 },
+    { type: "tool_execution", tool: "write_file", toolCallId: "not-started", sequence: 1, operationId: "op-not-started", state: "not_started" }
+  ]);
+  assert.equal(notStarted.recoveredToolResults[0]?.auditOnly, true);
+  assert.equal(notStarted.discardedToolCalls[0]?.state, "not_started");
+  assert.equal(notStarted.messages.some((message) => hasToolCall(message, "not-started")), false);
+
+  const sideEffectCommitted = replaySessionEvents([
+    { type: "user_message", content: "write once" },
+    { type: "tool_call", tool: "write_file", args: { path: "a.txt" }, toolCallId: "write-1", sequence: 1 },
+    { type: "tool_execution", tool: "write_file", toolCallId: "write-1", sequence: 1, operationId: "op-write-1", state: "side_effect_committed", evidence: "rename committed" }
+  ]);
+  assert.equal(sideEffectCommitted.recoveredToolResults[0]?.result && typeof sideEffectCommitted.recoveredToolResults[0].result === "object"
+    ? (sideEffectCommitted.recoveredToolResults[0].result as Record<string, unknown>).status
+    : undefined, "recovered-success");
+  assert.equal(sideEffectCommitted.messages.some((message) => hasToolResult(message, "write-1")), true);
+  const replayedRecovery = replaySessionEvents([...sideEffectCommitted.events]);
+  assert.equal(replayedRecovery.recoveredToolResults.length, 0, "replay must not append a second recovery result");
+
+  const legacyBoundary = replaySessionEvents([
+    { type: "user_message", content: "run two checks" },
+    { type: "tool_call", tool: "check_a", args: {}, toolCallId: "legacy-a", sequence: 1 },
+    { type: "tool_call", tool: "check_b", args: {}, toolCallId: "legacy-b", sequence: 2 },
+    { type: "user_message", content: "new request" }
+  ]);
+  assert.deepEqual(legacyBoundary.messages.map((message) => message.role), ["user", "assistant", "toolResult", "toolResult", "user"]);
 
   const unsigned = sessionEventsToConversation([
     { type: "user_message", content: "old session" },
