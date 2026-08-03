@@ -13,8 +13,8 @@ import {
 import { PermissionManager, type PermissionMode } from "../permission/PermissionManager.js";
 import { runPermissionCommand } from "../permission/commands.js";
 import { listSessionSummaries, parseSessionEvents, readSessionEvents, type SessionSummary } from "../session/events.js";
-import { SessionRecorder, type ReasoningBlock } from "../session/recorder.js";
-import { replaySessionEvents, type SessionReplay } from "../session/replay.js";
+import { SessionRecorder, type ReasoningBlock, type SessionEvent } from "../session/recorder.js";
+import { replaySessionEvents, type SessionMessageReference, type SessionReplay } from "../session/replay.js";
 import {
   TurnStore,
   type InterruptedTurn,
@@ -44,11 +44,11 @@ import { ContextMemory } from "./context/ContextMemory.js";
 import { LocalMemory } from "./context/LocalMemory.js";
 import { runMemoryCommand } from "./context/memoryCommands.js";
 import { WorkspaceContext } from "./context/WorkspaceContext.js";
-import type { ContextStatus } from "./context/types.js";
+import type { CompactionResult, ContextStatus } from "./context/types.js";
 import { recordNativeTelemetry } from "../observability/telemetry.js";
 import { createSessionUsage, formatUsageSummary, sumSessionUsage, summarizeUsage, type UsageModelInfo } from "../observability/usage.js";
-import type { SessionUsage, UsageSummary } from "../session/metadata.js";
-import { defaultModelContextWindow, modelContextBudget } from "../ai/capabilities.js";
+import type { SessionContextCheckpoint, SessionUsage, UsageSummary } from "../session/metadata.js";
+import { defaultModelContextWindow } from "../ai/capabilities.js";
 import { modelCapabilities } from "../ai/capabilities.js";
 import { createNativeModelForConfig } from "../llm/nativeFactory.js";
 import type { NativeModelSettings } from "../llm/nativeFactory.js";
@@ -172,6 +172,7 @@ interface NativeTurnArgs {
   input: string;
   systemPrompt?: string;
   messages: AgentMessage[];
+  messageReferences: Array<SessionMessageReference | undefined>;
   runOptions: AgentRunOptions & {
     initialRunFacts?: RunFacts;
     previousTerminals?: InterruptedTurnTerminal[];
@@ -217,6 +218,9 @@ export class AgentSession {
   private activeOperation: string | undefined;
   private activeRunMessageQueues: ActiveRunMessageQueues | undefined;
   private readonly lingeringExternalTools = new Map<Promise<unknown>, { tool: string; toolCallId: string }>();
+  /** 与 ContextMemory history 一一对应；内部 steering 消息没有持久化引用。 */
+  private contextMessageReferences: Array<SessionMessageReference | undefined> = [];
+  private nextSessionMessageIndex = 0;
 
   constructor(private readonly options: AgentSessionOptions) {
     const persistenceRoot = this.persistenceRoot();
@@ -240,6 +244,7 @@ export class AgentSession {
     const getMemoryModel = memoryModelAlias
       ? (): AgentModel => (memoryModel ??= createNativeModelForConfig(options.config, memoryModelAlias))
       : getModel;
+    const initialContextBudget = options.modelManager?.getContextBudget();
     this.localMemory = memoryConfig.enabled
       ? new LocalMemory(persistenceRoot, getMemoryModel, onUsage, memoryConfig.maxRecalled)
       : undefined;
@@ -247,23 +252,16 @@ export class AgentSession {
       getModel,
       workspace,
       this.localMemory,
-      options.config.context.maxInputTokens ?? defaultModelContextWindow,
+      initialContextBudget?.maxInputTokens ?? options.config.context.maxInputTokens ?? defaultModelContextWindow,
       options.config.context.instructionsMaxBytes,
       onUsage,
       () => {
-        const activeModel = options.config.models[options.config.defaultModel];
-        if (!activeModel) {
-          // 模型别名缺失时只能退回保守窗口，真实预算永远以模型自身声明为准。
-          const fallback = options.config.context.maxInputTokens ?? defaultModelContextWindow;
-          return {
-            modelAlias: options.config.defaultModel,
-            contextWindow: fallback,
-            maxInputTokens: fallback,
-            maxOutputTokens: undefined
-          };
-        }
-        return modelContextBudget(activeModel, options.config.context.maxInputTokens, options.config.defaultModel);
-      }
+        if (options.modelManager) return options.modelManager.getContextBudget();
+        // 直接注入 AgentModel 的宿主没有 ModelManager，只能使用显式上下文上限；这里不猜测模型能力。
+        const fallback = options.config.context.maxInputTokens ?? defaultModelContextWindow;
+        return { contextWindow: fallback, maxInputTokens: fallback, maxOutputTokens: undefined };
+      },
+      options.config.context.compaction
     );
     this.recorder = options.recorder;
     this.turnStore = new TurnStore(this.persistenceRoot(), options.recorder.sessionId);
@@ -345,10 +343,25 @@ export class AgentSession {
       );
     }
     if (turn.terminal?.status === "blocked") this.options.completionState?.clearBlocked();
-    const recoveredMessages = replay.messages.length ? replay.messages : turn.messages;
+    const replayMessages = await this.rehydrateSessionAttachments(
+      replay.messages,
+      replay.events,
+      replay.contextStartUserMessageIndex
+    );
+    const recoveredMessages = replayMessages.length ? replayMessages : turn.messages;
+    const recoveredReferences = replay.messages.length
+      ? replay.messageReferences
+      : turn.messages.map(() => undefined);
     const continuationMessages = turn.terminal
       ? [...recoveredMessages, runtimeContinuationMessage(turn.terminal)]
       : recoveredMessages;
+    const continuationReferences = turn.terminal
+      ? [...recoveredReferences, undefined]
+      : recoveredReferences;
+    this.contextMemory.restore(recoveredMessages, replay.contextState ?? replay.contextUsage);
+    if (replay.contextCheckpoint) this.contextMemory.setCheckpoint(replay.contextCheckpoint);
+    this.contextMessageReferences = recoveredReferences.map((reference) => reference === undefined ? undefined : { ...reference });
+    this.nextSessionMessageIndex = replay.totalMessageCount;
     const previousTerminals = [
       ...(turn.previousTerminals ?? []),
       ...(turn.terminal ? [turn.terminal] : [])
@@ -357,6 +370,7 @@ export class AgentSession {
       ...runOptions,
       maxSteps: remainingSteps,
       continueFrom: continuationMessages,
+      continueMessageReferences: continuationReferences,
       continueSystemPrompt: turn.systemPrompt,
       recordSessionUserMessage: false,
       completedStepsBeforeRun: turn.completedSteps,
@@ -417,6 +431,7 @@ export class AgentSession {
       completedStepsBeforeRun?: number;
       initialRunFacts?: RunFacts;
       previousTerminals?: InterruptedTurnTerminal[];
+      continueMessageReferences?: Array<SessionMessageReference | undefined>;
     } = {}
   ): AsyncGenerator<AgentSessionEvent> {
     const release = this.beginOperation("agent turn");
@@ -454,11 +469,12 @@ export class AgentSession {
     };
     const usageBeforePreparation = this.usageRecords.length;
     let userMessageRecorded = false;
-    const recordUserMessage = (): void => {
-      if (userMessageRecorded) return;
+    let userMessageReference: SessionMessageReference | undefined;
+    const recordUserMessage = (): SessionMessageReference | undefined => {
+      if (userMessageRecorded) return userMessageReference;
       userMessageRecorded = true;
-      if (runOptions.recordSessionUserMessage === false) return;
-      this.recorder.record({
+      if (runOptions.recordSessionUserMessage === false) return undefined;
+      userMessageReference = this.recordCanonicalMessage({
         type: "user_message",
         content: input,
         attachments: sessionAttachments(runOptions.attachments),
@@ -467,6 +483,7 @@ export class AgentSession {
         contextState: this.contextMemory.persistedState(),
         preparationUsage: this.usageRecords.slice(usageBeforePreparation)
       });
+      return userMessageReference;
     };
     try {
     // 新根输入明确放弃旧断点；否则它在首个新 step 落盘前崩溃时，恢复逻辑会错误复活上一回合。
@@ -510,9 +527,11 @@ export class AgentSession {
     const mode = runOptions.mode ?? "chat";
     let systemPrompt: string | undefined;
     let messages: AgentMessage[];
+    let messageReferences: Array<SessionMessageReference | undefined>;
     if (runOptions.continueFrom?.length) {
       // 续跑用的是被打断那一刻的 context，重新组装会丢掉已完成步骤的工具结果。
       messages = [...runOptions.continueFrom];
+      messageReferences = [...(runOptions.continueMessageReferences ?? messages.map(() => undefined))];
       systemPrompt = runOptions.continueSystemPrompt;
       userMessageRecorded = true;
     } else {
@@ -533,8 +552,21 @@ export class AgentSession {
         abortSignal,
         this.supportedAttachments(runOptions.attachments)
       );
+      if (prepared.compaction) {
+        this.persistContextCheckpoint(
+          prepared.compaction,
+          "threshold",
+          this.contextMessageReferences,
+          userMessageReference
+        );
+      }
       systemPrompt = prepared.systemPrompt;
       messages = prepared.messages;
+      const selectedHistoryCount = Math.max(0, messages.length - 1);
+      messageReferences = [
+        ...this.contextMessageReferences.slice(-selectedHistoryCount),
+        userMessageReference
+      ];
     } catch (error) {
       recordUserMessage();
       const outcome = abortSignal.aborted
@@ -594,6 +626,7 @@ export class AgentSession {
       input,
       systemPrompt,
       messages,
+      messageReferences,
       runOptions,
       abortSignal,
       mode,
@@ -622,6 +655,7 @@ export class AgentSession {
       input,
       systemPrompt,
       messages,
+      messageReferences,
       runOptions,
       abortSignal,
       mode,
@@ -762,6 +796,12 @@ export class AgentSession {
     let pendingSteering: AgentMessage[] = [];
     let lastAssistant: AgentAssistantMessage | undefined;
     let newMessages: AgentMessage[] = [];
+    let finalContextMessages: AgentMessage[] = [...messages];
+    const referenceByMessage = new WeakMap<AgentMessage, SessionMessageReference>();
+    for (const [index, message] of messages.entries()) {
+      const reference = messageReferences[index];
+      if (reference) referenceByMessage.set(message, reference);
+    }
     let reasoningActive = false;
     let lastStepReasoningOutput = "";
     const stepUsageRecords: SessionUsage[] = [];
@@ -812,17 +852,19 @@ export class AgentSession {
         },
         recoverFromModelError: async (error, context, signal) => {
           if (!isModelContextOverflowError(error) || contextRecoveryAttempts >= 2) return undefined;
+          const sourceReferences = context.messages.map((message) => referenceByMessage.get(message));
           const compacted = await this.contextMemory.compactRunContext(context.messages, signal);
           if (!compacted) return undefined;
           contextRecoveryAttempts += 1;
+          this.persistContextCheckpoint(compacted, "overflow", sourceReferences);
+          const retainedReferences = sourceReferences.slice(compacted.compactedMessageCount);
+          for (const [index, message] of compacted.messages.entries()) {
+            const reference = retainedReferences[index];
+            if (reference) referenceByMessage.set(message, reference);
+          }
           context.messages.splice(0, context.messages.length, ...compacted.messages);
           // 基于当前提示词替换摘要，保留前一步刚刷新的工具和扩展能力信息。
           context.systemPrompt = withActiveRunCompactionSummary(context.systemPrompt, compacted.summary);
-          this.recorder.record({
-            type: "assistant_message",
-            content: "",
-            contextState: this.contextMemory.snapshot()
-          });
           return {
             reason: "context_overflow",
             attempt: contextRecoveryAttempts,
@@ -830,29 +872,30 @@ export class AgentSession {
           };
         },
         transformContext: async (contextMessages) => {
+          const prunedMessages = this.contextMemory.pruneToolResultsForStep(contextMessages);
           const absoluteStep = completedStepsBeforeRun + observedSteps;
           if (!softLimitWarningInjected && absoluteStep >= runBudget.softStepLimit) {
             softLimitWarningInjected = true;
             return [
-              ...contextMessages,
+              ...prunedMessages,
               {
                 role: "user",
                 content: "## Biny run budget\n\nThe soft limit of provider steps has been reached. Review unfinished work, avoid repeated actions, run the necessary checks, and converge without claiming completion early."
               }
             ];
           }
-          return contextMessages;
+          return prunedMessages;
         },
         getSteeringMessages: async () => {
           const next = [
             ...pendingSteering,
-            ...this.takeQueuedRunMessages(messageQueues, "steer", lastAssistant)
+            ...this.takeQueuedRunMessages(messageQueues, "steer", lastAssistant, referenceByMessage)
           ];
           pendingSteering = [];
           return next;
         },
         getFollowUpMessages: async () => {
-          const next = this.takeQueuedRunMessages(messageQueues, "followUp", lastAssistant);
+          const next = this.takeQueuedRunMessages(messageQueues, "followUp", lastAssistant, referenceByMessage);
           if (!next.length) messageQueues.accepting = false;
           return next;
         },
@@ -920,7 +963,10 @@ export class AgentSession {
             stepAssistantContent = agentMessageText(event.message);
             stepReasoningBlocks = reasoningBlocks(event.message);
             if (event.message.stopReason !== "error" && event.message.stopReason !== "aborted") {
-              this.recorder.record({ type: "agent_message", message: event.message });
+              referenceByMessage.set(
+                event.message,
+                this.recordCanonicalMessage({ type: "agent_message", message: event.message })
+              );
             }
           } else if (event.message.role === "user") {
             const queued = messageQueues.delivered.get(event.message);
@@ -935,7 +981,10 @@ export class AgentSession {
           }
         } else if (event.type === "turn_end") {
           for (const toolResult of event.toolResults) {
-            this.recorder.record({ type: "agent_message", message: toolResult });
+            referenceByMessage.set(
+              toolResult,
+              this.recordCanonicalMessage({ type: "agent_message", message: toolResult })
+            );
           }
           observedSteps += 1;
           lastStepReasoningOutput = stepReasoningOutput;
@@ -973,6 +1022,7 @@ export class AgentSession {
           }
         } else if (event.type === "agent_end") {
           newMessages = event.messages;
+          finalContextMessages = event.contextMessages;
         } else if (event.type === "model_retry") {
           yield {
             type: "context.retrying",
@@ -1008,8 +1058,23 @@ export class AgentSession {
       const finalDecision = completionDecision;
       if (!finalDecision || finalDecision.kind === "continue") throw new Error("Native completion gate returned an unconsumed continuation.");
 
-      const finalMessages = [...nativeContext.messages, ...newMessages];
+      const currentUserMessage = messages.at(-1);
+      const finalMessages = runOptions.continueFrom?.length || contextRecoveryAttempts > 0
+        ? finalContextMessages
+        : [
+          ...this.contextMemory.getHistory(),
+          ...(currentUserMessage ? [currentUserMessage] : []),
+          ...newMessages
+        ];
+      const finalReferences = runOptions.continueFrom?.length || contextRecoveryAttempts > 0
+        ? finalMessages.map((message) => referenceByMessage.get(message))
+        : [
+          ...this.contextMessageReferences,
+          ...(currentUserMessage ? [referenceByMessage.get(currentUserMessage)] : []),
+          ...newMessages.map((message) => referenceByMessage.get(message))
+        ];
       this.contextMemory.replaceHistory(finalMessages);
+      this.contextMessageReferences = finalReferences;
       const usageRecord = stepUsageRecords.length ? sumSessionUsage(stepUsageRecords) : undefined;
       const content = lastAssistant ? agentMessageText(lastAssistant) : "";
       await recordNativeTelemetry(this.options.config, this.options.workspaceRoot, {
@@ -1140,8 +1205,15 @@ export class AgentSession {
       this.options.permissionManager.resetSession();
       this.usageRecords = [...replay.usage];
       this.unpersistedRelatedUsage = [];
-      const messages = await this.rehydrateSessionAttachments(replay.messages, replay.events);
+      const messages = await this.rehydrateSessionAttachments(
+        replay.messages,
+        replay.events,
+        replay.contextStartUserMessageIndex
+      );
       this.contextMemory.restore(messages, replay.contextState ?? replay.contextUsage);
+      if (replay.contextCheckpoint) this.contextMemory.setCheckpoint(replay.contextCheckpoint);
+      this.contextMessageReferences = replay.messageReferences.map((reference) => ({ ...reference }));
+      this.nextSessionMessageIndex = replay.totalMessageCount;
       await this.options.todoStore?.useSession(replacementRecorder.sessionId);
       restoreCompletionState(this.options.completionState, replay.events);
       this.recorder = replacementRecorder;
@@ -1161,10 +1233,6 @@ export class AgentSession {
 
   async listSessions(): Promise<SessionSummary[]> {
     return await listSessionSummaries(this.persistenceRoot());
-  }
-
-  async contextReport(): Promise<string> {
-    return await this.contextMemory.describe();
   }
 
   async contextStatus(): Promise<ContextStatus> {
@@ -1221,6 +1289,7 @@ export class AgentSession {
     try {
     const usageBeforeCompaction = this.usageRecords.length;
     const result = await this.contextMemory.compact(hint, signal);
+    if (result.compacted) this.persistContextCheckpoint(result, "manual", this.contextMessageReferences);
     const compactionUsage = this.usageRecords.slice(usageBeforeCompaction).at(-1);
     this.recorder.record({
       type: "assistant_message",
@@ -1233,6 +1302,29 @@ export class AgentSession {
     } finally {
       release();
     }
+  }
+
+  private persistContextCheckpoint(
+    result: CompactionResult,
+    reason: "threshold" | "overflow" | "manual",
+    sourceReferences: Array<SessionMessageReference | undefined>,
+    nextKeptReference?: SessionMessageReference
+  ): SessionContextCheckpoint | undefined {
+    if (!result.compacted || !result.summary) return undefined;
+    const retainedReferences = sourceReferences.slice(result.compactedMessageCount);
+    const firstKept = retainedReferences.find((reference) => reference !== undefined) ?? nextKeptReference;
+    const checkpoint: SessionContextCheckpoint = {
+      summary: result.summary,
+      firstKeptMessageId: firstKept?.id,
+      firstKeptMessageIndex: firstKept?.index ?? this.nextSessionMessageIndex,
+      tokensBefore: Math.max(0, Math.round(result.tokensBefore)),
+      compactedMessages: this.contextMemory.snapshot().compactedMessages,
+      createdAt: new Date().toISOString()
+    };
+    this.recorder.record({ type: "context_checkpoint", reason, ...checkpoint });
+    this.contextMessageReferences = retainedReferences;
+    this.contextMemory.setCheckpoint(checkpoint);
+    return checkpoint;
   }
 
   listModels(): ModelChoice[] {
@@ -1381,24 +1473,39 @@ export class AgentSession {
   private takeQueuedRunMessages(
     queues: ActiveRunMessageQueues,
     delivery: "steer" | "followUp",
-    previousAssistant: AgentAssistantMessage | undefined
+    previousAssistant: AgentAssistantMessage | undefined,
+    referenceByMessage: WeakMap<AgentMessage, SessionMessageReference>
   ): AgentUserMessage[] {
     const pending = delivery === "steer" ? queues.steering : queues.followUps;
     if (!pending.length) return [];
     this.recordIntermediateAssistant(queues, previousAssistant);
     const items = pending.splice(0, pending.length);
     for (const item of items) {
-      this.recorder.record({
+      const reference = this.recordCanonicalMessage({
         type: "user_message",
         content: item.input,
         attachments: sessionAttachments(item.attachments),
         skills: this.skillPaths(),
         contextUsage: this.contextMemory.getBudget(),
-        contextState: this.contextMemory.persistedState()
+        contextState: this.contextMemory.persistedState(),
+        messageId: item.messageId
       });
+      referenceByMessage.set(item.message, reference);
       queues.delivered.set(item.message, item);
     }
     return items.map((item) => item.message);
+  }
+
+  private recordCanonicalMessage(
+    event: Extract<SessionEvent, { type: "user_message" | "agent_message" }>
+  ): SessionMessageReference {
+    const recorded = this.recorder.record(event);
+    const reference = {
+      id: "messageId" in recorded ? recorded.messageId : undefined,
+      index: this.nextSessionMessageIndex
+    };
+    this.nextSessionMessageIndex += 1;
+    return reference;
   }
 
   private recordIntermediateAssistant(
@@ -1535,10 +1642,14 @@ export class AgentSession {
     return native;
   }
 
-  private async rehydrateSessionAttachments(messages: AgentMessage[], events: SessionReplay["events"]): Promise<AgentMessage[]> {
+  private async rehydrateSessionAttachments(
+    messages: AgentMessage[],
+    events: SessionReplay["events"],
+    firstUserEventIndex = 0
+  ): Promise<AgentMessage[]> {
     if (!this.options.attachmentRoot) return messages;
     const userEvents = events.filter((event): event is Extract<typeof event, { type: "user_message" }> => event.type === "user_message" && !event.auditOnly);
-    let userIndex = 0;
+    let userIndex = firstUserEventIndex;
     const hydrated: AgentMessage[] = [];
     for (const message of messages) {
       if (message.role !== "user") {

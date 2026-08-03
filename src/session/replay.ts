@@ -12,15 +12,24 @@ import path from "node:path";
 import type { AgentMessage, AgentReasoningContent } from "../agent/core/types.js";
 import { createToolOperationId, type ToolExecutionState } from "../tools/types.js";
 import { readSessionEvents, readStoredSessionEvents } from "./events.js";
-import type { ReasoningBlock, SessionContextState, SessionContextUsage, SessionEvent, SessionUsage } from "./recorder.js";
+import type { ReasoningBlock, SessionContextCheckpoint, SessionContextState, SessionContextUsage, SessionEvent, SessionUsage } from "./recorder.js";
 
 export interface SessionReplay {
   events: SessionEvent[];
   /** 会话超过大小上限、只回放了最近部分时为 true。 */
   truncated?: boolean;
   messages: AgentMessage[];
+  /** 与 messages 一一对应，index 是完整 session 模型消息流中的绝对位置。 */
+  messageReferences: SessionMessageReference[];
+  /** 当前 checkpoint 之前一共跳过了多少条模型消息。 */
+  contextStartMessageIndex: number;
+  /** 当前 checkpoint 之前一共跳过了多少条 user 消息，用于恢复附件与用户事件的对应关系。 */
+  contextStartUserMessageIndex: number;
+  /** 应用 checkpoint 之前，完整 session 可以重放出的模型消息数。 */
+  totalMessageCount: number;
   contextUsage?: SessionContextUsage;
   contextState?: SessionContextState;
+  contextCheckpoint?: SessionContextCheckpoint;
   usage: SessionUsage[];
   recoveredToolResults: Array<Extract<SessionEvent, { type: "tool_result" }>>;
   discardedToolCalls: SessionDiscardedToolCall[];
@@ -47,6 +56,11 @@ export interface SessionMessageNode {
   message: AgentMessage;
 }
 
+export interface SessionMessageReference {
+  id?: string;
+  index: number;
+}
+
 export async function replaySession(filePath: string): Promise<SessionReplay> {
   return replaySessionEvents(await readSessionEvents(filePath), { sessionId: sessionIdFromPath(filePath) });
 }
@@ -60,14 +74,35 @@ export function replaySessionEvents(recordedEvents: SessionEvent[], options: Ses
   const recovery = interruptedToolResults(recordedEvents, options);
   const recoveredToolResults = recovery.results;
   const events = orderRecoveredToolResults(recordedEvents, recoveredToolResults);
+  const projection = projectSessionConversation(events, {
+    discardedToolCallIds: new Set(recovery.discarded.map((call) => call.toolCallId).filter((id): id is string => id !== undefined)),
+    recoveredToolResults
+  });
+  const contextCheckpoint = latestContextCheckpoint(events);
+  const activeProjection = applyContextCheckpoint(projection, contextCheckpoint);
+  const contextStartMessageIndex = activeProjection.references[0]?.index ?? projection.messages.length;
+  const persistedContextState = latestContextState(events);
+  const contextState = persistedContextState && contextCheckpoint
+    ? {
+      ...persistedContextState,
+      summary: contextCheckpoint.summary,
+      compactedMessages: Math.max(persistedContextState.compactedMessages, contextCheckpoint.compactedMessages),
+      lastCompactedAt: contextCheckpoint.createdAt,
+      checkpoint: contextCheckpoint
+    }
+    : persistedContextState;
   return {
     events,
-    messages: sessionEventsToConversation(events, {
-      discardedToolCallIds: new Set(recovery.discarded.map((call) => call.toolCallId).filter((id): id is string => id !== undefined)),
-      recoveredToolResults
-    }),
+    messages: activeProjection.messages,
+    messageReferences: activeProjection.references,
+    contextStartMessageIndex,
+    contextStartUserMessageIndex: projection.messages
+      .slice(0, contextStartMessageIndex)
+      .filter((message) => message.role === "user").length,
+    totalMessageCount: projection.messages.length,
     contextUsage: latestContextUsage(events),
-    contextState: latestContextState(events),
+    contextState,
+    contextCheckpoint,
     usage: sessionUsage(events),
     recoveredToolResults,
     discardedToolCalls: recovery.discarded,
@@ -382,6 +417,40 @@ function latestContextState(events: SessionEvent[]): SessionContextState | undef
   return undefined;
 }
 
+function latestContextCheckpoint(events: SessionEvent[]): SessionContextCheckpoint | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.type !== "context_checkpoint") continue;
+    return {
+      summary: event.summary,
+      firstKeptMessageId: event.firstKeptMessageId,
+      firstKeptMessageIndex: event.firstKeptMessageIndex,
+      tokensBefore: event.tokensBefore,
+      compactedMessages: event.compactedMessages,
+      createdAt: event.createdAt
+    };
+  }
+  return undefined;
+}
+
+/** 最新 checkpoint 是恢复上下文的真值；旧消息仍保留在 JSONL 中供审计和分支展示。 */
+function applyContextCheckpoint(
+  projection: SessionConversationProjection,
+  checkpoint: SessionContextCheckpoint | undefined
+): SessionConversationProjection {
+  if (!checkpoint) return projection;
+  const idBoundary = checkpoint.firstKeptMessageId === undefined
+    ? -1
+    : projection.references.findIndex((reference) => reference.id === checkpoint.firstKeptMessageId);
+  const start = idBoundary >= 0
+    ? idBoundary
+    : Math.min(checkpoint.firstKeptMessageIndex, projection.messages.length);
+  return {
+    messages: projection.messages.slice(start),
+    references: projection.references.slice(start)
+  };
+}
+
 /**
  * 汇总所有用量记录。一次对话的开销可能挂在三处：assistant 消息本身、user 消息上的准备
  * 阶段（如上下文压缩、记忆检索），以及事件附带的 `relatedUsage`（如子 agent）。
@@ -409,7 +478,23 @@ export function sessionEventsToConversation(
     recoveredToolResults?: ReadonlyArray<Extract<SessionEvent, { type: "tool_result" }>>;
   } = {}
 ): AgentMessage[] {
+  return projectSessionConversation(events, options).messages;
+}
+
+interface SessionConversationProjection {
+  messages: AgentMessage[];
+  references: SessionMessageReference[];
+}
+
+function projectSessionConversation(
+  events: SessionEvent[],
+  options: {
+    discardedToolCallIds?: ReadonlySet<string>;
+    recoveredToolResults?: ReadonlyArray<Extract<SessionEvent, { type: "tool_result" }>>;
+  } = {}
+): SessionConversationProjection {
   const messages: AgentMessage[] = [];
+  const references: SessionMessageReference[] = [];
   const pendingCalls: Array<{ id: string; name: string; args: unknown }> = [];
   const openCalls = new Map<string, { id: string; name: string; args: unknown }>();
   let pendingAssistantContent = "";
@@ -420,10 +505,14 @@ export function sessionEventsToConversation(
   let canonicalTurn = false;
   const recoveredResults = new Set(options.recoveredToolResults ?? []);
   const consumedRecoveredResults = new Set<Extract<SessionEvent, { type: "tool_result" }>>();
+  const appendMessage = (message: AgentMessage, id?: string): void => {
+    references.push({ id, index: messages.length });
+    messages.push(message);
+  };
 
   const flushPendingCalls = (): void => {
     if (!pendingCalls.length || callsFlushed) return;
-    messages.push({
+    appendMessage({
       role: "assistant",
       content: [
         ...replayReasoningParts(pendingReasoningBlocks, pendingReasoningContent, pendingReasoningProviderOptions),
@@ -453,7 +542,7 @@ export function sessionEventsToConversation(
     event: Extract<SessionEvent, { type: "tool_result" }>,
     toolCallId: string
   ): void => {
-    messages.push({
+    appendMessage({
       role: "toolResult",
       toolCallId,
       toolName: event.tool,
@@ -493,7 +582,7 @@ export function sessionEventsToConversation(
       flushPendingCalls();
       appendRecoveredResultsForOpenCalls();
       resetPendingCalls();
-      messages.push({ role: "user", content: event.content });
+      appendMessage({ role: "user", content: event.content }, event.messageId);
       canonicalTurn = false;
       continue;
     }
@@ -502,19 +591,16 @@ export function sessionEventsToConversation(
       flushPendingCalls();
       appendRecoveredResultsForOpenCalls();
       resetPendingCalls();
-      if (event.message.role === "assistant" && options.discardedToolCallIds?.size) {
-        const content = event.message.content.filter((part) => part.type !== "toolCall" || !options.discardedToolCallIds?.has(part.id));
-        if (content.length) messages.push({ ...event.message, content });
-      } else {
-        messages.push(event.message);
-      }
       if (event.message.role === "assistant") {
-        for (const part of event.message.content) {
-          if (part.type === "toolCall" && !options.discardedToolCallIds?.has(part.id)) {
-            openCalls.set(part.id, { id: part.id, name: part.name, args: part.arguments });
-          }
+        const content = event.message.content.filter((part) => part.type !== "toolCall" || !options.discardedToolCallIds?.has(part.id));
+        if (content.length) appendMessage({ ...event.message, content }, event.messageId);
+        for (const part of content) {
+          if (part.type === "toolCall") openCalls.set(part.id, { id: part.id, name: part.name, args: part.arguments });
         }
       } else {
+        appendMessage(event.message, event.messageId);
+      }
+      if (event.message.role !== "assistant") {
         openCalls.delete(event.message.toolCallId);
       }
       canonicalTurn = true;
@@ -527,12 +613,15 @@ export function sessionEventsToConversation(
       appendRecoveredResultsForOpenCalls();
       resetPendingCalls();
       if (!event.content && !event.reasoningContent) continue;
-      messages.push({
+      const content = [
+        ...replayReasoningParts(event.reasoningBlocks, event.reasoningContent, event.reasoningProviderOptions),
+        ...(event.content ? [{ type: "text" as const, text: event.content }] : [])
+      ];
+      // 无签名 reasoning 被丢弃后，旧的 assistant 事件可能不再有任何可回放内容。
+      if (!content.length) continue;
+      appendMessage({
         role: "assistant",
-        content: [
-          ...replayReasoningParts(event.reasoningBlocks, event.reasoningContent, event.reasoningProviderOptions),
-          ...(event.content ? [{ type: "text" as const, text: event.content }] : [])
-        ]
+        content
       });
       continue;
     }
@@ -578,7 +667,7 @@ export function sessionEventsToConversation(
 
   flushPendingCalls();
   appendRecoveredResultsForOpenCalls();
-  return messages;
+  return { messages, references };
 }
 
 /**

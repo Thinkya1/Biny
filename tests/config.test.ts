@@ -108,7 +108,10 @@ async function testProjectOverridesAndGlobalPersistence(): Promise<void> {
       thinking: { enabled: false },
       agent: { softStepLimit: 2 },
       permission: { mode: "read-only" },
-      context: { memory: { maxRecalled: 1 } },
+      context: {
+        compaction: { reserveTokens: 2_048, keepRecentTokens: 8_192, maxSummaryTokens: 1_024 },
+        memory: { maxRecalled: 1 }
+      },
       sandbox: { mode: "workspace-write" }
     }));
 
@@ -117,6 +120,9 @@ async function testProjectOverridesAndGlobalPersistence(): Promise<void> {
     assert.equal(effective.thinking.enabled, false);
     assert.equal(effective.agent.softStepLimit, 2);
     assert.equal(effective.permission.mode, "read-only");
+    assert.equal(effective.context.compaction.reserveTokens, 2_048);
+    assert.equal(effective.context.compaction.keepRecentTokens, 8_192);
+    assert.equal(effective.context.compaction.maxSummaryTokens, 1_024);
     assert.equal(effective.context.memory.maxRecalled, 1);
     assert.equal(effective.sandbox.mode, "workspace-write");
 

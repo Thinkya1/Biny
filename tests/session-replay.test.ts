@@ -68,6 +68,23 @@ function main(): void {
   ]);
   assert.equal(reasoningProviderOptions(unsigned[1]), undefined);
 
+  const emptyAfterReasoningDrop = sessionEventsToConversation([
+    { type: "user_message", content: "resume after interrupted output" },
+    {
+      type: "assistant_message",
+      content: "",
+      reasoningContent: "unsigned reasoning only",
+      reasoningBlocks: [{ text: "unsigned reasoning only" }]
+    }
+  ]);
+  assert.deepEqual(emptyAfterReasoningDrop, [{ role: "user", content: "resume after interrupted output" }]);
+
+  const emptyCanonicalAssistant = sessionEventsToConversation([
+    { type: "user_message", content: "resume after empty canonical message" },
+    { type: "agent_message", message: { role: "assistant", content: [] } }
+  ]);
+  assert.deepEqual(emptyCanonicalAssistant, [{ role: "user", content: "resume after empty canonical message" }]);
+
   // 一步里的多个 reasoning block 各自签名，必须逐块回放，不能拼成一个块共用最后一个签名。
   const firstSignature = { anthropic: { signature: "first-signature" } };
   const secondSignature = { anthropic: { signature: "second-signature" } };
@@ -144,6 +161,47 @@ function main(): void {
     ["a1", "u1", "assistant"],
     ["t1", "a1", "toolResult"]
   ]);
+
+  const checkpointed = replaySessionEvents([
+    { type: "user_message", content: "old request", messageId: "u-old" },
+    { type: "agent_message", message: { role: "assistant", content: [{ type: "text", text: "old answer" }] }, messageId: "a-old", parentMessageId: "u-old" },
+    { type: "user_message", content: "kept request", messageId: "u-kept", parentMessageId: "a-old" },
+    {
+      type: "context_checkpoint",
+      reason: "threshold",
+      summary: "## Goal\n- Continue the kept request.",
+      firstKeptMessageId: "u-kept",
+      firstKeptMessageIndex: 2,
+      tokensBefore: 12_000,
+      compactedMessages: 2,
+      createdAt: "2026-08-02T00:00:00.000Z"
+    },
+    { type: "agent_message", message: { role: "assistant", content: [{ type: "text", text: "kept answer" }] }, messageId: "a-kept", parentMessageId: "u-kept" }
+  ]);
+  assert.deepEqual(checkpointed.messages.map((message) => message.role), ["user", "assistant"]);
+  assert.equal((checkpointed.messages[0] as { content?: unknown }).content, "kept request");
+  assert.deepEqual(checkpointed.messageReferences.map((reference) => [reference.id, reference.index]), [
+    ["u-kept", 2],
+    ["a-kept", 3]
+  ]);
+  assert.equal(checkpointed.contextCheckpoint?.summary.includes("Continue the kept request"), true);
+  assert.equal(checkpointed.messageTree.length, 4, "checkpoint must not delete the auditable message tree");
+
+  const legacyCheckpoint = replaySessionEvents([
+    { type: "user_message", content: "legacy old" },
+    { type: "assistant_message", content: "legacy answer" },
+    {
+      type: "context_checkpoint",
+      reason: "manual",
+      summary: "legacy checkpoint",
+      firstKeptMessageIndex: 2,
+      tokensBefore: 1_000,
+      compactedMessages: 2,
+      createdAt: "2026-08-02T00:00:00.000Z"
+    },
+    { type: "user_message", content: "legacy kept" }
+  ]);
+  assert.deepEqual(legacyCheckpoint.messages, [{ role: "user", content: "legacy kept" }]);
 }
 
 function hasToolCall(message: AgentMessage, toolCallId: string): boolean {

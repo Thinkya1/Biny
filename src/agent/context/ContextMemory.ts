@@ -1,20 +1,34 @@
-import { z } from "zod";
 import type { AgentMessage, AgentModel, AgentToolResultMessage, AgentUsage } from "../core/types.js";
-import { generateNativeText, nativeJsonMessages, parseNativeJson } from "../../llm/nativeJson.js";
+import { generateNativeText } from "../../llm/nativeJson.js";
 import { cloneAgentMessages, messageReasoning, messageText, messageToolName } from "../modelMessages.js";
 import { formatProjectContext } from "../../project/ProjectContext.js";
 import { formatMemoryMatches, LocalMemory, redactSecrets } from "./LocalMemory.js";
 import { formatRepoMapCandidates, WorkspaceContext } from "./WorkspaceContext.js";
 import type { CompactionResult, CompactionStatus, ContextBudgetStatus, ContextStatus, LoadedInstruction, MemoryMatch, RecentWorkspaceActivity, WorkspaceTurnData } from "./types.js";
 import type { ModelUsageObserver } from "../../observability/usage.js";
-import type { SessionContextState } from "../../session/metadata.js";
+import type { SessionContextCheckpoint, SessionContextState } from "../../session/metadata.js";
 import type { ModelContextBudget } from "../../ai/types.js";
 import type { AgentAttachment } from "../AgentSession.js";
 
-const retainedHistoryTokens = 5_000;
-const summaryTokens = 2_800;
+const piReserveTokens = 16_384;
+const piKeepRecentTokens = 20_000;
+const defaultSummaryTokens = 4_096;
 const memoryShutdownDrainMs = 2_000;
 const memoryAbortDrainMs = 500;
+
+export interface ContextCompactionOptions {
+  enabled?: boolean;
+  reserveTokens?: number;
+  keepRecentTokens?: number;
+  maxSummaryTokens?: number;
+}
+
+interface ResolvedCompactionLimits {
+  enabled: boolean;
+  reserveTokens: number;
+  keepRecentTokens: number;
+  maxSummaryTokens: number;
+}
 
 /**
  * Stateful model context for one agent session. It owns conversation history,
@@ -26,6 +40,7 @@ export class ContextMemory {
   private readonly memoryControllers = new Set<AbortController>();
   private memoryClosed = false;
   private summary: string | undefined;
+  private checkpoint: SessionContextCheckpoint | undefined;
   private compactedMessages = 0;
   private lastCompactedAt: string | undefined;
   private lastBudget: ContextBudgetStatus;
@@ -39,7 +54,8 @@ export class ContextMemory {
     private readonly maxTokens: number,
     private readonly instructionMaxBytes: number,
     private readonly onUsage: ModelUsageObserver = () => undefined,
-    getBudgetLimits?: () => ModelContextBudget
+    getBudgetLimits?: () => ModelContextBudget,
+    private readonly compactionOptions: ContextCompactionOptions = {}
   ) {
     this.resolveBudget = getBudgetLimits ?? (() => ({
       contextWindow: maxTokens,
@@ -54,6 +70,7 @@ export class ContextMemory {
       contextWindow: budget.contextWindow,
       maxOutputTokens: budget.maxOutputTokens,
       modelAlias: budget.modelAlias,
+      reserveTokens: this.compactionLimits().reserveTokens,
       omitted: [],
       autoCompacted: false,
       source: "estimated",
@@ -71,13 +88,13 @@ export class ContextMemory {
     signal?.throwIfAborted();
     await this.workspace.initialize(signal);
     signal?.throwIfAborted();
-    const compaction = await this.compactIfNeeded(signal);
     const workspace = await this.workspace.prepareTurn(input, signal);
     const memoryMatches = await this.findRelevantMemory(input, [...workspace.explicitPaths, ...workspace.recentActivity.paths], signal);
     signal?.throwIfAborted();
     this.memoryTopics = [...new Set(memoryMatches.map((match) => match.topic))];
     const budget = this.currentBudget();
-    const assembly = assembleContext(
+    const limits = this.compactionLimits();
+    let assembly = assembleContext(
       systemPrompt,
       input,
       this.history,
@@ -85,16 +102,45 @@ export class ContextMemory {
       this.summary,
       memoryMatches,
       budget.maxInputTokens,
-      compaction.compacted,
+      limits.reserveTokens,
+      false,
       attachments
     );
+    let compaction = noCompaction(this.summary, estimateMessageTokens(this.history));
+    if (this.shouldCompact(assembly.budget.requestedTokens ?? assembly.budget.usedTokens, limits)) {
+      compaction = await this.compactMessages(
+        this.history,
+        undefined,
+        signal,
+        false,
+        assembly.budget.requestedTokens
+      );
+      if (compaction.compacted) {
+        assembly = assembleContext(
+          systemPrompt,
+          input,
+          this.history,
+          workspace,
+          this.summary,
+          memoryMatches,
+          budget.maxInputTokens,
+          limits.reserveTokens,
+          true,
+          attachments
+        );
+      }
+    }
     this.lastBudget = {
       ...assembly.budget,
       contextWindow: budget.contextWindow,
       maxOutputTokens: budget.maxOutputTokens,
       modelAlias: budget.modelAlias
     };
-    return { systemPrompt: assembly.systemPrompt, messages: assembly.messages };
+    return {
+      systemPrompt: assembly.systemPrompt,
+      messages: assembly.messages,
+      compaction: compaction.compacted ? compaction : undefined
+    };
   }
 
   replaceHistory(messages: AgentMessage[]): void {
@@ -107,8 +153,8 @@ export class ContextMemory {
    *
    * 这里只做一件安全的事 —— 把较早的 tool result 正文替换成一个占位说明，从最旧的
    * 开始，直到估算落回预算内。消息条数、角色、toolCallId 全部不变，配对关系天然保住；
-   * 原文早就在 session JSONL 和 `.biny/tool-results` 里，占位符只影响下一次推理看到
-   * 什么，不影响已记录的事实。
+   * 原文早就在 session JSONL；超出回合预算的结果则有 `.biny/tool-results` 引用。占位符
+   * 会保留可重新读取的 archivePath 或一小段预览，只影响下一次推理，不改写持久化事实。
    *
    * 保留 `keepRecentToolResults` 条最近的结果不动：模型当下正要用的就是它们。
    */
@@ -156,7 +202,8 @@ export class ContextMemory {
       compactedMessages: this.compactedMessages,
       lastCompactedAt: this.lastCompactedAt,
       memoryTopics: [...this.memoryTopics],
-      budget: cloneBudget(this.lastBudget)
+      budget: cloneBudget(this.lastBudget),
+      checkpoint: this.checkpoint === undefined ? undefined : { ...this.checkpoint }
     };
   }
 
@@ -169,6 +216,16 @@ export class ContextMemory {
     return cloneAgentMessages(this.history);
   }
 
+  setCheckpoint(checkpoint: SessionContextCheckpoint): void {
+    this.checkpoint = { ...checkpoint };
+    this.summary = checkpoint.summary;
+    this.compactedMessages = Math.max(this.compactedMessages, checkpoint.compactedMessages);
+    this.lastCompactedAt = checkpoint.createdAt;
+    // checkpoint 之后，压缩前那次 provider usage 已经陈旧；改回当前摘要 + retained history 的估算，
+    // 否则 resume 后会被旧高水位立即触发第二次压缩。
+    this.refreshEstimatedBudget();
+  }
+
   observeToolResult(tool: string, args: unknown, result: unknown): void {
     this.workspace.observeToolResult(tool, args, result);
   }
@@ -177,22 +234,7 @@ export class ContextMemory {
     signal?.throwIfAborted();
     await this.workspace.initialize(signal);
     signal?.throwIfAborted();
-    if (!this.history.length) return { compacted: false, compactedMessageCount: 0, summary: this.summary };
-
-    let retained = takeRecentMessages(this.history, retainedHistoryTokens);
-    let compacted = this.history.slice(0, this.history.length - retained.length);
-    if (!compacted.length) {
-      compacted = [...this.history];
-      retained = [];
-    }
-
-    this.summary = mergeSummaries(this.summary, await this.createSummary(compacted, hint, signal));
-    signal?.throwIfAborted();
-    this.compactedMessages += compacted.length;
-    this.lastCompactedAt = new Date().toISOString();
-    this.replaceHistory(retained);
-    this.refreshEstimatedBudget();
-    return { compacted: true, compactedMessageCount: compacted.length, summary: this.summary };
+    return await this.compactMessages(this.history, hint, signal, true);
   }
 
   /**
@@ -202,24 +244,20 @@ export class ContextMemory {
   async compactRunContext(messages: AgentMessage[], signal?: AbortSignal): Promise<RunContextCompaction | undefined> {
     signal?.throwIfAborted();
     if (messages.length < 2) return undefined;
-    const retainBudget = Math.min(retainedHistoryTokens, Math.max(1_000, Math.floor(this.inputBudget() * 0.25)));
-    let retained = takeRecentRunMessages(messages, retainBudget);
-    let compacted = messages.slice(0, messages.length - retained.length);
-    if (!compacted.length) {
-      compacted = [...messages];
-      retained = [];
-    }
-    const nextSummary = await this.createSummary(compacted, "Recover from a provider context overflow during the active run.", signal);
-    signal?.throwIfAborted();
-    this.summary = mergeSummaries(this.summary, nextSummary);
-    this.compactedMessages += compacted.length;
-    this.lastCompactedAt = new Date().toISOString();
-    this.replaceHistory(retained);
-    this.refreshEstimatedBudget();
+    const compacted = await this.compactMessages(
+      messages,
+      "Recover from a provider context overflow during the active run.",
+      signal,
+      true
+    );
+    if (!compacted.compacted || !compacted.summary) return undefined;
     return {
-      messages: cloneAgentMessages(retained),
-      summary: this.summary,
-      compactedMessageCount: compacted.length
+      compacted: true,
+      messages: this.getHistory(),
+      summary: compacted.summary,
+      compactedMessageCount: compacted.compactedMessageCount,
+      retainedMessageCount: compacted.retainedMessageCount,
+      tokensBefore: compacted.tokensBefore
     };
   }
 
@@ -227,11 +265,13 @@ export class ContextMemory {
     this.replaceHistory(messages);
     const contextState = isContextState(state) ? state : undefined;
     const budget: ContextBudgetStatus | undefined = contextState?.budget ?? (isContextState(state) ? undefined : state);
-    this.summary = contextState?.summary;
+    this.checkpoint = contextState?.checkpoint === undefined ? undefined : { ...contextState.checkpoint };
+    this.summary = contextState?.checkpoint?.summary ?? contextState?.summary;
     this.compactedMessages = contextState?.compactedMessages ?? 0;
     this.lastCompactedAt = contextState?.lastCompactedAt;
     this.memoryTopics = [...(contextState?.memoryTopics ?? [])];
     this.lastBudget = budget === undefined ? estimateRestoredBudget(this.history, this.currentBudget()) : normalizeRestoredBudget(budget, this.currentBudget());
+    if (this.checkpoint) this.refreshEstimatedBudget();
     this.workspace.restoreFromHistory(messages);
   }
 
@@ -281,67 +321,106 @@ export class ContextMemory {
     };
   }
 
-  async describe(): Promise<string> {
-    const status = await this.status();
-    return [
-      "Context",
-      "",
-      `Budget: ${String(status.budget.usedTokens)}/${String(status.budget.maxTokens)} ${status.budget.source === "provider" ? "provider tokens" : "estimated tokens"}`,
-      ...(status.budget.contextWindow ? [`Model context: ${String(status.budget.contextWindow)} tokens${status.budget.modelAlias ? ` (${status.budget.modelAlias})` : ""}`] : []),
-      `Auto compacted this turn: ${status.budget.autoCompacted ? "yes" : "no"}`,
-      `Snapshot: ${status.snapshotRefreshedAt ?? "not loaded"}${status.snapshotDirty ? " (dirty)" : ""}`,
-      `RepoMap: ${String(status.repoMapEntries)} entries, ${status.repoMapRefreshedAt ?? "not loaded"}${status.repoMapDirty ? " (dirty)" : ""}`,
-      `Instructions: ${status.loadedInstructions.length ? status.loadedInstructions.join(", ") : "(none)"}`,
-      `Instruction bytes: ${String(status.instructionBytes)}/${String(status.instructionCapBytes)}`,
-      `Active paths: ${status.activePaths.length ? status.activePaths.join(", ") : "(none)"}`,
-      `Compaction: ${status.compaction.summaryPresent ? `summary active; ${String(status.compaction.compactedMessages)} messages compacted` : "not active"}`,
-      `Memory: ${status.memoryEnabled ? (status.memoryTopics.length ? status.memoryTopics.join(", ") : "enabled, no matching topic") : "disabled"}`,
-      ...(status.budget.omitted.length ? [`Omitted this turn: ${status.budget.omitted.join(", ")}`] : [])
-    ].join("\n");
-  }
-
   formatCompaction(result: CompactionResult): string {
     if (!result.compacted) return "Conversation is already within the compaction threshold.";
     return `Compacted ${String(result.compactedMessageCount)} messages. The next turn will use the handoff summary and recent history.`;
   }
 
-  private async compactIfNeeded(signal?: AbortSignal): Promise<CompactionResult> {
+  private async compactMessages(
+    messages: AgentMessage[],
+    hint: string | undefined,
+    signal: AbortSignal | undefined,
+    force: boolean,
+    requestedTokens?: number
+  ): Promise<CompactionResult> {
     signal?.throwIfAborted();
-    if (estimateMessageTokens(this.history) <= Math.floor(this.inputBudget() * 0.45)) {
-      return { compacted: false, compactedMessageCount: 0, summary: this.summary };
-    }
-    return await this.compact(undefined, signal);
+    const estimatedTokens = requestedTokens
+      ?? estimateMessageTokens(messages) + (this.summary ? estimateTokens(this.summary) + 4 : 0);
+    // provider usage 比本地估算更接近真实请求成本；但旧 usage 可能来自上一轮，所以只取较大值，
+    // 不让它把本轮已经观测到的候选上下文成本压低。
+    const tokensBefore = Math.max(
+      estimatedTokens,
+      this.lastBudget.source === "provider" ? this.lastBudget.usedTokens : 0
+    );
+    if (!messages.length) return noCompaction(this.summary, tokensBefore);
+    const limits = this.compactionLimits();
+    const plan = prepareCompaction(messages, limits.keepRecentTokens, force);
+    if (!plan) return noCompaction(this.summary, tokensBefore);
+
+    const summary = await this.createSummary(plan, hint, limits.maxSummaryTokens, signal);
+    signal?.throwIfAborted();
+    this.summary = summary;
+    this.compactedMessages += plan.compacted.length;
+    this.lastCompactedAt = new Date().toISOString();
+    this.replaceHistory(plan.retained);
+    this.refreshEstimatedBudget();
+    return {
+      compacted: true,
+      compactedMessageCount: plan.compacted.length,
+      retainedMessageCount: plan.retained.length,
+      tokensBefore,
+      summary
+    };
   }
 
-  private async createSummary(messages: AgentMessage[], hint?: string, signal?: AbortSignal): Promise<string> {
-    const transcript = messages.map((message) => {
-      const label = message.role === "toolResult" ? `tool ${messageToolName(message)}` : message.role;
-      return `${label}: ${truncateTextToTokens(messageText(message), 700)}`;
-    }).join("\n\n");
-    const prompt = [
-      "Summarize this coding-agent conversation for future model context.",
-      "Keep only grounded facts. Use exactly these headings: Goal, Decisions, Files, Command Results, Verification, TODO.",
-      "Do not include secrets, credentials, or raw large file contents.",
-      hint ? `Focus hint: ${hint}` : "",
-      "Conversation:",
-      transcript
-    ].filter(Boolean).join("\n\n");
+  private shouldCompact(requestedTokens: number, limits: ResolvedCompactionLimits): boolean {
+    if (!limits.enabled || !this.history.length) return false;
+    const threshold = Math.max(1, this.inputBudget() - limits.reserveTokens);
+    if (requestedTokens > threshold) return true;
+    return this.lastBudget.source === "provider" && this.lastBudget.usedTokens > threshold;
+  }
+
+  private compactionLimits(): ResolvedCompactionLimits {
+    const inputBudget = this.inputBudget();
+    const maximumReserve = Math.max(0, inputBudget - 1);
+    const dynamicReserve = Math.min(piReserveTokens, Math.max(16, Math.floor(inputBudget * 0.15)));
+    const reserveTokens = Math.min(this.compactionOptions.reserveTokens ?? dynamicReserve, maximumReserve);
+    const recentBudget = Math.max(1, inputBudget - reserveTokens);
+    const dynamicKeepRecent = Math.min(piKeepRecentTokens, Math.max(1, Math.floor(recentBudget * 0.55)));
+    const keepRecentTokens = Math.min(this.compactionOptions.keepRecentTokens ?? dynamicKeepRecent, recentBudget);
+    const dynamicSummary = Math.min(defaultSummaryTokens, Math.max(64, Math.floor(inputBudget * 0.25)));
+    const maxSummaryTokens = Math.min(this.compactionOptions.maxSummaryTokens ?? dynamicSummary, Math.max(64, inputBudget));
+    return {
+      enabled: this.compactionOptions.enabled ?? true,
+      reserveTokens,
+      keepRecentTokens,
+      maxSummaryTokens
+    };
+  }
+
+  private async createSummary(
+    plan: CompactionPlan,
+    hint: string | undefined,
+    maxSummaryTokens: number,
+    signal?: AbortSignal
+  ): Promise<string> {
+    const previousSummary = this.summary;
+    const promptOverhead = estimateTokens(buildCompactionPrompt("", previousSummary, hint, plan.splitTurn));
+    const transcriptBudget = Math.max(
+      64,
+      this.inputBudget() - this.compactionLimits().reserveTokens - promptOverhead - 8
+    );
+    const transcript = boundedCompactionTranscript(plan.compacted, transcriptBudget);
+    const prompt = buildCompactionPrompt(transcript, previousSummary, hint, plan.splitTurn);
 
     try {
-      const model = this.getModel();
-      const result = await generateNativeText(model, nativeJsonMessages(
-        "You create compact, factual coding-session handoff notes.",
-        prompt
-      ), { signal, maxOutputTokens: 4_096 });
-      const parsed = summarySchema.safeParse(parseNativeJson(result.text));
+      const result = await generateNativeText(this.getModel(), [{ role: "user", content: prompt }], {
+        signal,
+        maxOutputTokens: maxSummaryTokens
+      });
       if (result.usage) await this.onUsage(result.usage, "compaction");
-      const summary = parsed.success ? formatStructuredSummary(parsed.data) : "";
-      if (summary) return truncateTextToTokens(redactSecrets(summary), summaryTokens);
+      const summary = cleanModelSummary(result.text);
+      if (summary) {
+        return truncateStructuredSummary(
+          appendFileOperationSummary(redactSecrets(summary), plan.compacted, previousSummary),
+          maxSummaryTokens
+        );
+      }
     } catch {
       signal?.throwIfAborted();
-      // A compaction failure must not block the active coding task.
+      // 压缩失败不能阻断当前任务；确定性摘要仍会保留最近目标、文件和工具结果。
     }
-    return deterministicSummary(messages);
+    return deterministicSummary(plan.compacted, previousSummary, hint, maxSummaryTokens);
   }
 
   private async findRelevantMemory(input: string, paths: string[], signal?: AbortSignal): Promise<MemoryMatch[]> {
@@ -372,6 +451,7 @@ export class ContextMemory {
       contextWindow: budget.contextWindow,
       maxOutputTokens: budget.maxOutputTokens,
       modelAlias: budget.modelAlias,
+      reserveTokens: this.compactionLimits().reserveTokens,
       usedTokens,
       source: "estimated",
       measuredAt: undefined
@@ -385,7 +465,8 @@ export class ContextMemory {
       maxTokens: budget.maxInputTokens,
       contextWindow: budget.contextWindow,
       maxOutputTokens: budget.maxOutputTokens,
-      modelAlias: budget.modelAlias
+      modelAlias: budget.modelAlias,
+      reserveTokens: this.compactionLimits().reserveTokens
     };
   }
 
@@ -436,41 +517,249 @@ async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Prom
   }
 }
 
-const summarySchema = z.object({
-  goal: z.string().default(""),
-  decisions: z.array(z.string()).default([]),
-  files: z.array(z.string()).default([]),
-  commandResults: z.array(z.string()).default([]),
-  verification: z.array(z.string()).default([]),
-  todo: z.array(z.string()).default([])
-});
+interface CompactionPlan {
+  compacted: AgentMessage[];
+  retained: AgentMessage[];
+  splitTurn: boolean;
+}
 
-type StructuredSummary = z.infer<typeof summarySchema>;
+function prepareCompaction(messages: AgentMessage[], keepRecentTokens: number, force: boolean): CompactionPlan | undefined {
+  if (!messages.length) return undefined;
+  const validCutPoints = messages
+    .map((message, index) => message.role === "user" || message.role === "assistant" ? index : -1)
+    .filter((index) => index >= 0);
+  const totalTokens = estimateMessageTokens(messages);
+  if (!force && totalTokens <= keepRecentTokens) return undefined;
 
-function formatStructuredSummary(summary: StructuredSummary): string {
+  const suffixTokens = new Array<number>(messages.length).fill(0);
+  let accumulated = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message) continue;
+    accumulated += messageTokenCost(message);
+    suffixTokens[index] = accumulated;
+  }
+  // 取“能落进 recent budget 的最早安全边界”，从而优先保留完整最近回合；如果最后一个
+  // assistant + tool-result 批次本身就超限，也整批保留，绝不把调用和结果拆开。
+  const cutIndex = validCutPoints.find((candidate) => (suffixTokens[candidate] ?? Number.MAX_SAFE_INTEGER) <= keepRecentTokens)
+    ?? validCutPoints.at(-1)
+    ?? 0;
+
+  if (cutIndex <= 0) {
+    return { compacted: [...messages], retained: [], splitTurn: false };
+  }
+  const retained = messages.slice(cutIndex);
+  const turnStart = findTurnStart(messages, cutIndex);
+  return {
+    compacted: messages.slice(0, cutIndex),
+    retained,
+    splitTurn: retained[0]?.role !== "user" && turnStart >= 0 && turnStart < cutIndex
+  };
+}
+
+function findTurnStart(messages: AgentMessage[], beforeIndex: number): number {
+  for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") return index;
+  }
+  return -1;
+}
+
+function buildCompactionPrompt(
+  transcript: string,
+  previousSummary: string | undefined,
+  hint: string | undefined,
+  splitTurn: boolean
+): string {
   return [
-    "Goal",
-    `- ${summary.goal || "(not recorded)"}`,
+    "You create a durable context checkpoint for another coding-agent model.",
+    previousSummary
+      ? "Update the previous checkpoint with the new conversation delta. Preserve still-valid facts, add new progress, and remove obsolete TODO items."
+      : "Summarize the conversation into a new checkpoint.",
+    "Use this exact Markdown structure:",
+    "## Goal\n- ...",
+    "## Constraints & Preferences\n- ...",
+    "## Progress\n### Done\n- [x] ...\n### In Progress\n- [ ] ...\n### Blocked\n- ...",
+    "## Key Decisions\n- **Decision**: rationale",
+    "## Next Steps\n1. ...",
+    "## Critical Context\n- ...",
+    "Keep only grounded facts. Preserve exact paths, identifiers, command results, errors, verification state and unfinished work. Never include credentials or raw large outputs.",
+    splitTurn
+      ? "The compacted delta ends inside a long user turn. Explain the original request and early progress needed to understand the retained suffix."
+      : "",
+    hint ? `Focus hint: ${hint}` : "",
+    previousSummary ? `<previous-summary>\n${previousSummary}\n</previous-summary>` : "",
+    `<conversation-delta>\n${transcript}\n</conversation-delta>`
+  ].filter(Boolean).join("\n\n");
+}
+
+function formatMessageForSummary(message: AgentMessage): string {
+  if (message.role === "toolResult") {
+    return `tool ${messageToolName(message)}: ${truncateTextToTokens(messageText(message), 700)}`;
+  }
+  if (message.role === "assistant") {
+    const calls = message.content
+      .filter((part) => part.type === "toolCall")
+      .map((part) => `${part.name}(${truncateTextToTokens(safeJson(part.arguments), 180)})`);
+    return [
+      `assistant: ${truncateTextToTokens(messageText(message), 700)}`,
+      calls.length ? `tool calls: ${calls.join(", ")}` : ""
+    ].filter(Boolean).join("\n");
+  }
+  return `user: ${truncateTextToTokens(messageText(message), 700)}`;
+}
+
+/** 摘要请求自身也必须有界；同时保留最早目标与最近进展，避免只截头或只截尾。 */
+function boundedCompactionTranscript(messages: AgentMessage[], maxTokens: number): string {
+  const transcript = messages.map(formatMessageForSummary).join("\n\n");
+  if (estimateTokens(transcript) <= maxTokens) return transcript;
+  const marker = `\n\n[${String(messages.length)} compacted messages; middle of transcript omitted]\n\n`;
+  const available = Math.max(1, maxTokens - estimateTokens(marker));
+  const headTokens = Math.max(1, Math.floor(available * 0.3));
+  const tailTokens = Math.max(1, available - headTokens);
+  return `${truncateTextToTokens(transcript, headTokens)}${marker}${truncateTextTailToTokens(transcript, tailTokens)}`;
+}
+
+function cleanModelSummary(value: string): string {
+  const summary = value.trim().replace(/^```(?:markdown|md)?\s*/iu, "").replace(/\s*```$/u, "").trim();
+  return /^## Goal\s*$/mu.test(summary) && /^## Next Steps\s*$/mu.test(summary) ? summary : "";
+}
+
+function deterministicSummary(
+  messages: AgentMessage[],
+  previousSummary: string | undefined,
+  hint: string | undefined,
+  maxTokens: number
+): string {
+  const userMessages = messages.filter((message) => message.role === "user").map(messageText);
+  const assistantMessages = messages.filter((message) => message.role === "assistant").map(messageText);
+  const toolMessages = messages
+    .filter((message): message is AgentToolResultMessage => message.role === "toolResult")
+    .map((message) => `${messageToolName(message)}: ${messageText(message)}`);
+  const delta = [
+    "## Goal",
+    `- ${userMessages.at(-1) ?? "(not recorded)"}`,
     "",
-    "Decisions",
-    ...formatSummaryItems(summary.decisions),
+    "## Constraints & Preferences",
+    `- ${hint ?? "(none recorded)"}`,
     "",
-    "Files",
-    ...formatSummaryItems(summary.files),
+    "## Progress",
+    "### Done",
+    `- [x] ${assistantMessages.at(-1) ?? "(none recorded)"}`,
+    "### In Progress",
+    "- [ ] Continue from the latest user request.",
+    "### Blocked",
+    "- (none recorded)",
     "",
-    "Command Results",
-    ...formatSummaryItems(summary.commandResults),
+    "## Key Decisions",
+    "- Review the original session events before treating inferred decisions as final.",
     "",
-    "Verification",
-    ...formatSummaryItems(summary.verification),
+    "## Next Steps",
+    "1. Continue from the latest retained context.",
     "",
-    "TODO",
-    ...formatSummaryItems(summary.todo)
+    "## Critical Context",
+    `- ${toolMessages.at(-1) ?? "No tool result was recorded."}`
+  ].join("\n");
+  if (!previousSummary) {
+    return truncateStructuredSummary(
+      appendFileOperationSummary(redactSecrets(delta), messages),
+      maxTokens
+    );
+  }
+  const priorBudget = Math.max(1, Math.floor(maxTokens * 0.55));
+  const deltaBudget = Math.max(1, maxTokens - priorBudget - 8);
+  return truncateStructuredSummary(appendFileOperationSummary([
+    truncateTextToTokens(redactSecrets(previousSummary), priorBudget),
+    "\n\n## Recent checkpoint update\n",
+    truncateTextToTokens(redactSecrets(delta), deltaBudget)
+  ].join(""), messages, previousSummary), maxTokens);
+}
+
+function appendFileOperationSummary(
+  summary: string,
+  messages: AgentMessage[],
+  previousSummary?: string
+): string {
+  const readFiles = new Set<string>();
+  const modifiedFiles = new Set<string>();
+  for (const filePath of summaryFileList(previousSummary ?? "", "read-files")) readFiles.add(filePath);
+  for (const filePath of summaryFileList(previousSummary ?? "", "modified-files")) modifiedFiles.add(filePath);
+  for (const filePath of summaryFileList(summary, "read-files")) readFiles.add(filePath);
+  for (const filePath of summaryFileList(summary, "modified-files")) modifiedFiles.add(filePath);
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    for (const part of message.content) {
+      if (part.type !== "toolCall") continue;
+      const target = modifiedToolNames.has(part.name) ? modifiedFiles : readToolNames.has(part.name) ? readFiles : undefined;
+      if (!target) continue;
+      for (const filePath of extractSummaryPaths(part.arguments)) target.add(filePath);
+    }
+  }
+  if (!readFiles.size && !modifiedFiles.size) return summary;
+  return [
+    summary.replace(/\n*<read-files>[\s\S]*?<\/read-files>\s*<modified-files>[\s\S]*?<\/modified-files>/gu, "").trimEnd(),
+    "",
+    "<read-files>",
+    ...[...readFiles].sort().map((filePath) => `- ${filePath}`),
+    "</read-files>",
+    "<modified-files>",
+    ...[...modifiedFiles].sort().map((filePath) => `- ${filePath}`),
+    "</modified-files>"
   ].join("\n");
 }
 
-function formatSummaryItems(items: string[]): string[] {
-  return items.length ? items.map((item) => `- ${item}`) : ["- (none recorded)"];
+function summaryFileList(summary: string, tag: "read-files" | "modified-files"): string[] {
+  const match = summary.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "u"));
+  if (!match?.[1]) return [];
+  return match[1].split("\n").map((line) => line.replace(/^\s*-\s*/u, "").trim()).filter(Boolean);
+}
+
+const readToolNames = new Set(["read_file", "list_files", "search_files", "grep_search", "git_status", "git_diff", "read_tool_result"]);
+const modifiedToolNames = new Set(["write_file", "edit_file", "multi_edit", "delete_file", "apply_patch", "move_file"]);
+
+function extractSummaryPaths(value: unknown): string[] {
+  const serialized = safeJson(value);
+  return [...new Set(serialized.match(/[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|yml|yaml|css|html|py|rs|go|java|kt|swift|sh)/gu) ?? [])].slice(0, 32);
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function truncateStructuredSummary(value: string, maxTokens: number): string {
+  if (estimateTokens(value) <= maxTokens) return value;
+  const marker = "\n\n[checkpoint middle truncated]\n\n";
+  const markerTokens = estimateTokens(marker);
+  const available = Math.max(1, maxTokens - markerTokens);
+  const head = Math.max(1, Math.floor(available * 0.65));
+  const tail = Math.max(1, available - head);
+  return `${truncateTextToTokens(value, head)}${marker}${truncateTextTailToTokens(value, tail)}`;
+}
+
+function truncateTextTailToTokens(value: string, maxTokens: number): string {
+  if (maxTokens <= 0 || !value) return "";
+  if (estimateTokens(value) <= maxTokens) return value;
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (estimateTokens(value.slice(value.length - middle)) <= maxTokens) low = middle;
+    else high = middle - 1;
+  }
+  return value.slice(value.length - low);
+}
+
+function noCompaction(summary: string | undefined, tokensBefore: number): CompactionResult {
+  return {
+    compacted: false,
+    compactedMessageCount: 0,
+    retainedMessageCount: 0,
+    tokensBefore,
+    summary
+  };
 }
 
 function isContextState(value: ContextBudgetStatus | SessionContextState | undefined): value is SessionContextState {
@@ -520,12 +809,16 @@ interface ContextAssembly {
 export interface PreparedAgentContext {
   systemPrompt?: string;
   messages: AgentMessage[];
+  compaction?: CompactionResult;
 }
 
 export interface RunContextCompaction {
+  compacted: true;
   messages: AgentMessage[];
   summary: string;
   compactedMessageCount: number;
+  retainedMessageCount: number;
+  tokensBefore: number;
 }
 
 function assembleContext(
@@ -536,18 +829,32 @@ function assembleContext(
   summary: string | undefined,
   memoryMatches: MemoryMatch[],
   maxTokens: number,
+  reserveTokens: number,
   autoCompacted: boolean,
   attachments: AgentAttachment[]
 ): ContextAssembly {
   const omitted: string[] = [];
+  // reserveTokens 是下一次 provider 输出前的运行时安全余量，不应该在 prompt 组装时重新花掉。
+  const usableTokens = Math.max(1, maxTokens - reserveTokens);
   const task = input.trim() || "(empty task)";
-  const taskBudget = Math.max(1, Math.min(estimateTokens(task), Math.floor(maxTokens * 0.35)));
+  const taskBudget = Math.max(1, Math.min(estimateTokens(task), Math.floor(usableTokens * 0.35)));
   const taskContent = truncateTextToTokens(task, taskBudget);
-  let remaining = Math.max(0, maxTokens - estimateTokens(taskContent) - 4);
+  const userContent = attachments.length
+    ? [
+      { type: "text" as const, text: taskContent },
+      ...attachments.map((attachment) => ({
+        type: attachment.mimeType.startsWith("audio/") ? "audio" as const : "image" as const,
+        data: attachment.data,
+        mimeType: attachment.mimeType
+      }))
+    ]
+    : taskContent;
+  const userMessage: AgentMessage = { role: "user", content: userContent };
+  let remaining = Math.max(0, usableTokens - estimateMessageTokens([userMessage]));
   const systemParts: string[] = [];
-  const addSystem = (id: string, content: string, required: boolean): void => {
+  const addSystem = (id: string, content: string, required: boolean, blockCap?: number): void => {
     if (!content) return;
-    const available = Math.max(0, remaining - 4);
+    const available = Math.min(Math.max(0, remaining - 4), blockCap ?? Number.MAX_SAFE_INTEGER);
     if (!available) {
       omitted.push(id);
       return;
@@ -563,35 +870,42 @@ function assembleContext(
     remaining -= estimateTokens(selected) + 4;
   };
 
-  addSystem("system rules", systemPrompt, true);
-  addSystem("project instructions", formatInstructions(workspace.instructions), true);
-  addSystem("project snapshot", `Project snapshot:\n${truncateTextToTokens(formatProjectContext(workspace.snapshot.context), 3_500)}`, false);
-  addSystem("explicit paths", formatExplicitPaths(workspace.explicitPaths), false);
-  addSystem("recent workspace activity", formatRecentActivity(workspace.recentActivity), false);
-  addSystem("conversation summary", summary ? `Conversation handoff summary:\n${summary}` : "", false);
+  const projectInstructions = formatInstructions(workspace.instructions);
+  const conversationSummary = summary ? `Conversation handoff summary:\n${summary}` : "";
+  const explicitPaths = formatExplicitPaths(workspace.explicitPaths);
+  const recentActivity = formatRecentActivity(workspace.recentActivity);
+  const stableMemory = memoryMatches.length
+    ? `Stable project memory (recalled from the global Biny project partition):\n${formatMemoryMatches(memoryMatches)}`
+    : "";
+  const repoMap = `RepoMap candidates:\n${formatRepoMapCandidates(workspace.repoMapCandidates)}`;
+  const projectSnapshot = `Project snapshot:\n${truncateTextToTokens(formatProjectContext(workspace.snapshot.context), 3_500)}`;
+  const requestedTokens = estimateMessageTokens([...history, userMessage]) + [
+    systemPrompt,
+    projectInstructions,
+    conversationSummary,
+    explicitPaths,
+    recentActivity,
+    stableMemory,
+    repoMap,
+    projectSnapshot
+  ].filter(Boolean).reduce((total, content) => total + estimateTokens(content) + 4, 0);
+
+  // 三类真值各有上限，避免超长系统提示把项目约束或压缩 checkpoint 完全挤掉。
+  addSystem("system rules", systemPrompt, true, Math.max(1, Math.floor(usableTokens * 0.45)));
+  addSystem("project instructions", projectInstructions, true, Math.max(1, Math.floor(usableTokens * 0.30)));
+  addSystem("conversation summary", conversationSummary, true, Math.max(1, Math.floor(usableTokens * 0.25)));
+  addSystem("explicit paths", explicitPaths, false);
+  addSystem("recent workspace activity", recentActivity, false);
   // 记忆条目要带上来源说明，模型才知道这是跨会话的项目记忆而不是当前对话内容。
-  addSystem(
-    "stable memory",
-    memoryMatches.length ? `Stable project memory (recalled from the global Biny project partition):\n${formatMemoryMatches(memoryMatches)}` : "",
-    false
-  );
+  addSystem("stable memory", stableMemory, false);
+  addSystem("RepoMap candidates", repoMap, false);
+  addSystem("project snapshot", projectSnapshot, false);
 
   const selectedHistory = selectHistory(history, remaining);
   remaining -= estimateMessageTokens(selectedHistory);
   if (selectedHistory.length < history.length) omitted.push("older conversation messages");
 
-  addSystem("RepoMap candidates", `RepoMap candidates:\n${formatRepoMapCandidates(workspace.repoMapCandidates)}`, false);
-  const userContent = attachments.length
-    ? [
-      { type: "text" as const, text: taskContent },
-      ...attachments.map((attachment) => ({
-        type: attachment.mimeType.startsWith("audio/") ? "audio" as const : "image" as const,
-        data: attachment.data,
-        mimeType: attachment.mimeType
-      }))
-    ]
-    : taskContent;
-  const messages: AgentMessage[] = [...selectedHistory, { role: "user", content: userContent }];
+  const messages: AgentMessage[] = [...selectedHistory, userMessage];
   const assembledSystemPrompt = systemParts.join("\n\n") || undefined;
   return {
     systemPrompt: assembledSystemPrompt,
@@ -599,6 +913,8 @@ function assembleContext(
     budget: {
       maxTokens,
       usedTokens: estimateMessageTokens(messages) + estimateTokens(assembledSystemPrompt ?? ""),
+      requestedTokens,
+      reserveTokens,
       omitted,
       autoCompacted,
       source: "estimated",
@@ -643,36 +959,6 @@ function selectHistory(history: AgentMessage[], maxTokens: number): AgentMessage
   return takeRecentMessages(history, maxTokens);
 }
 
-function deterministicSummary(messages: AgentMessage[]): string {
-  const userMessages = messages.filter((message) => message.role === "user").map(messageText);
-  const assistantMessages = messages.filter((message) => message.role === "assistant").map(messageText);
-  const toolMessages = messages.filter((message) => message.role === "toolResult").map((message) => `${messageToolName(message)}: ${messageText(message)}`);
-  const paths = [...new Set(messages.flatMap((message) => messageText(message).match(/[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json|md|yml|yaml|css|html)/g) ?? []))].slice(0, 12);
-  return truncateTextToTokens(redactSecrets([
-    "Goal",
-    `- ${userMessages.at(-1) ?? "(not recorded)"}`,
-    "",
-    "Decisions",
-    `- ${assistantMessages.at(-1) ?? "(not recorded)"}`,
-    "",
-    "Files",
-    ...(paths.length ? paths.map((filePath) => `- ${filePath}`) : ["- (none recorded)"]),
-    "",
-    "Command Results",
-    `- ${toolMessages.at(-1) ?? "(none recorded)"}`,
-    "",
-    "Verification",
-    "- Review the recorded tool results before relying on this summary.",
-    "",
-    "TODO",
-    "- Continue from the latest user request."
-  ].join("\n")), summaryTokens);
-}
-
-function mergeSummaries(previous: string | undefined, next: string): string {
-  return truncateTextToTokens(previous ? `Earlier summary:\n${previous}\n\nLatest compacted work:\n${next}` : next, summaryTokens);
-}
-
 export function estimateTokens(value: string): number {
   return Math.ceil(Buffer.byteLength(value, "utf8") / 3);
 }
@@ -713,25 +999,6 @@ function takeRecentMessages(messages: AgentMessage[], maxTokens: number): AgentM
   return selected.flat();
 }
 
-function takeRecentRunMessages(messages: AgentMessage[], maxTokens: number): AgentMessage[] {
-  const segments: AgentMessage[][] = [];
-  for (const message of messages) {
-    if (message.role === "user" || message.role === "assistant" || segments.length === 0) segments.push([]);
-    segments.at(-1)?.push(message);
-  }
-  const selected: AgentMessage[][] = [];
-  let used = 0;
-  for (let index = segments.length - 1; index >= 0; index -= 1) {
-    const segment = segments[index];
-    if (!segment) continue;
-    const cost = estimateMessageTokens(segment);
-    if (used + cost > maxTokens) break;
-    selected.unshift(segment);
-    used += cost;
-  }
-  return selected.flat();
-}
-
 function groupConversationTurns(messages: AgentMessage[]): AgentMessage[][] {
   const turns: AgentMessage[][] = [];
   for (const message of messages) {
@@ -743,18 +1010,36 @@ function groupConversationTurns(messages: AgentMessage[]): AgentMessage[][] {
 
 /** 回合内剪枝的触发线：越过输入预算的这个比例就开始把旧工具结果换成占位符。 */
 const midTurnPruneThreshold = 0.7;
-const prunedToolResultMarker = "[earlier tool result elided to fit the context window; the full result is in the session log]";
+const prunedToolResultMarker = "[earlier tool result compacted for this model step]";
+const archivedToolResultPathPattern = /\.biny\/tool-results\/tool-result-[0-9a-f]{64}\.json/u;
 
 type ToolMessage = AgentToolResultMessage;
 
 function isPrunedToolResult(message: ToolMessage): boolean {
-  return message.content.every((part) => part.type === "text" && part.text === prunedToolResultMarker);
+  return message.content.length === 1
+    && message.content[0]?.type === "text"
+    && message.content[0].text.startsWith(prunedToolResultMarker);
 }
 
 function prunedToolResultMessage(message: ToolMessage): ToolMessage {
+  const original = messageText(message);
+  const archivePath = original.match(archivedToolResultPathPattern)?.[0];
+  const replacement = archivePath
+    ? [
+      prunedToolResultMarker,
+      `Tool: ${messageToolName(message)}`,
+      `Archived result: ${archivePath}`,
+      "Use read_tool_result with this archivePath if the full value is needed."
+    ].join("\n")
+    : [
+      prunedToolResultMarker,
+      `Tool: ${messageToolName(message)}`,
+      "The original value remains in durable session history for resume and audit.",
+      `Preview: ${truncateTextToTokens(original, 48)}`
+    ].join("\n");
   return {
     ...message,
-    content: [{ type: "text", text: prunedToolResultMarker }]
+    content: [{ type: "text", text: replacement }]
   };
 }
 

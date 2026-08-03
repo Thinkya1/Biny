@@ -137,7 +137,7 @@ export type ModelStreamEvent =
 
 export type AgentEvent =
   | { type: "agent_start" }
-  | { type: "agent_end"; messages: AgentMessage[] }
+  | { type: "agent_end"; messages: AgentMessage[]; contextMessages: AgentMessage[] }
   | { type: "turn_start" }
   | { type: "turn_end"; message: AgentAssistantMessage; toolResults: AgentToolResultMessage[]; messages: AgentMessage[] }
   | { type: "message_start"; message: AgentMessage }

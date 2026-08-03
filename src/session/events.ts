@@ -135,6 +135,17 @@ const sessionEventSchema = z.discriminatedUnion("type", [
     time: z.string().optional()
   }).passthrough(),
   z.object({
+    type: z.literal("context_checkpoint"),
+    reason: z.enum(["threshold", "overflow", "manual"]),
+    summary: z.string(),
+    firstKeptMessageId: z.string().optional(),
+    firstKeptMessageIndex: z.number().int().nonnegative(),
+    tokensBefore: z.number().int().nonnegative(),
+    compactedMessages: z.number().int().nonnegative(),
+    createdAt: z.string(),
+    time: z.string().optional()
+  }).passthrough(),
+  z.object({
     type: z.literal("turn_status"),
     status: z.enum(["completed", "incomplete", "blocked", "cancelled", "failed", "aborted"]),
     stopReason: z.string(),

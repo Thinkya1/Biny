@@ -52,6 +52,10 @@ export interface ContextBudgetStatus {
   contextWindow?: number;
   maxOutputTokens?: number;
   modelAlias?: string;
+  /** 本轮所有候选上下文都保留时的估算量。 */
+  requestedTokens?: number;
+  /** 在可用输入预算内为下一步增长保留的安全余量。 */
+  reserveTokens?: number;
   omitted: string[];
   autoCompacted: boolean;
   source?: "estimated" | "provider";
@@ -67,6 +71,8 @@ export interface CompactionStatus {
 export interface CompactionResult {
   compacted: boolean;
   compactedMessageCount: number;
+  retainedMessageCount: number;
+  tokensBefore: number;
   summary?: string;
 }
 

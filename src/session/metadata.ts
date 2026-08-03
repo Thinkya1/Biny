@@ -12,10 +12,30 @@ export type ContextBudgetSource = "estimated" | "provider";
 export interface SessionContextUsage {
   maxTokens: number;
   usedTokens: number;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  modelAlias?: string;
+  requestedTokens?: number;
+  reserveTokens?: number;
   omitted: string[];
   autoCompacted: boolean;
   source?: ContextBudgetSource;
   measuredAt?: string;
+}
+
+/**
+ * 一次已经持久化的上下文压缩边界。
+ *
+ * `firstKeptMessageId` 是新 session 的稳定真值；`firstKeptMessageIndex` 让没有消息 ID 的
+ * 历史 session 仍可恢复。索引是压缩发生时、完整 canonical 消息流里的绝对位置。
+ */
+export interface SessionContextCheckpoint {
+  summary: string;
+  firstKeptMessageId?: string;
+  firstKeptMessageIndex: number;
+  tokensBefore: number;
+  compactedMessages: number;
+  createdAt: string;
 }
 
 export interface SessionContextState {
@@ -24,6 +44,7 @@ export interface SessionContextState {
   lastCompactedAt?: string;
   memoryTopics: string[];
   budget: SessionContextUsage;
+  checkpoint?: SessionContextCheckpoint;
 }
 
 export interface SessionUsage {

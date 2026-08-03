@@ -42,10 +42,18 @@ const memoryOverrideSchema = z.object({
   model: z.string().min(1).optional()
 }).strict();
 
+const compactionOverrideSchema = z.object({
+  enabled: z.boolean().optional(),
+  reserveTokens: z.number().int().min(256).max(262_144).optional(),
+  keepRecentTokens: z.number().int().min(256).max(1_000_000).optional(),
+  maxSummaryTokens: z.number().int().min(256).max(32_768).optional()
+}).strict();
+
 const contextOverrideSchema = z.object({
   maxInputTokens: z.number().int().min(2_048).max(2_000_000).optional(),
   maxTurnToolResultBytes: z.number().int().min(1_024).max(16 * 1024 * 1024).optional(),
   instructionsMaxBytes: z.number().int().min(1_024).max(131_072).optional(),
+  compaction: compactionOverrideSchema.optional(),
   memory: memoryOverrideSchema.optional()
 }).strict();
 

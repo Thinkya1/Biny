@@ -49,5 +49,10 @@ function printEvent(event: SessionEvent): void {
     return;
   }
 
+  if (event.type === "context_checkpoint") {
+    console.log(`${prefix}: context checkpoint (${String(event.compactedMessages)} messages compacted)`);
+    return;
+  }
+
   console.log(`${prefix}: ${event.message}`);
 }

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import type { AgentModel, AgentTool, ModelStreamContext, ModelStreamEvent } from "../src/agent/core/types.js";
+import type { AgentAssistantMessage, AgentModel, AgentTool, ModelStreamContext, ModelStreamEvent } from "../src/agent/core/types.js";
 import { agentLoop } from "../src/agent/core/agentLoop.js";
 
 async function main(): Promise<void> {
   await testAssistantDeltasAreForwardedBeforeProviderCompletes();
   await testModelErrorRecoveryRetriesBeforeAnyDelta();
+  await testModelStreamWithoutFinishFails();
   await testNextTurnRefreshesModelAndTools();
   const calls: ModelStreamContext[] = [];
   const model: AgentModel = {
@@ -54,6 +55,30 @@ async function main(): Promise<void> {
   assert.equal(received.includes("tool_execution_end"), true);
   assert.equal(received.filter((type) => type === "turn_end").length, 2);
   console.log("agent core tests passed");
+}
+
+async function testModelStreamWithoutFinishFails(): Promise<void> {
+  const model: AgentModel = {
+    provider: "truncated-test",
+    modelId: "truncated-model",
+    stream: async () => events([
+      { type: "start" },
+      { type: "text-delta", text: "partial answer" }
+    ])
+  };
+  let assistant: AgentAssistantMessage | undefined;
+  let errorMessage = "";
+  for await (const event of agentLoop([{ role: "user", content: "answer" }], { messages: [], tools: [] }, {
+    model,
+    tools: [],
+    maxSteps: 1
+  })) {
+    if (event.type === "error") errorMessage = event.error;
+    if (event.type === "message_end" && event.message.role === "assistant") assistant = event.message;
+  }
+  assert.match(errorMessage, /ended without a finish event/u);
+  assert.equal(assistant?.stopReason, "error");
+  assert.equal(assistant?.content.find((part) => part.type === "text")?.text, "partial answer");
 }
 
 async function testModelErrorRecoveryRetriesBeforeAnyDelta(): Promise<void> {

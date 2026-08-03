@@ -35,10 +35,12 @@ import { resolveWorkspacePath } from "../src/workspace/resolvePath.js";
 
 class ContextTestModel {
   readonly requests: AgentMessage[][] = [];
+  readonly systemPrompts: Array<string | undefined> = [];
   readonly model: AgentModel = createContextTestModel(this);
 
-  respond(messages: AgentMessage[]): string {
+  respond(messages: AgentMessage[], systemPrompt?: string): string {
     this.requests.push(cloneAgentMessages(messages));
+    this.systemPrompts.push(systemPrompt);
     const prompt = messageText(messages.at(-1) ?? { role: "user", content: "" });
     if (prompt.includes("Extract one durable")) {
       return JSON.stringify({
@@ -61,15 +63,31 @@ class ContextTestModel {
         }]
       });
     }
-    if (prompt.includes("Summarize this coding-agent")) {
-      return JSON.stringify({
-        goal: "Keep context bounded.",
-        decisions: ["Use a structured handoff."],
-        files: ["src/agent/context/ContextMemory.ts"],
-        commandResults: ["Tests passed."],
-        verification: ["Review the latest tool result."],
-        todo: ["Continue the requested change."]
-      });
+    if (prompt.includes("durable context checkpoint")) {
+      return [
+        "## Goal",
+        "- Keep context bounded.",
+        "",
+        "## Constraints & Preferences",
+        "- Preserve grounded session facts.",
+        "",
+        "## Progress",
+        "### Done",
+        "- [x] Created a structured handoff.",
+        "### In Progress",
+        "- [ ] Continue the requested change.",
+        "### Blocked",
+        "- (none)",
+        "",
+        "## Key Decisions",
+        "- **Checkpoint**: Keep a stable compaction boundary.",
+        "",
+        "## Next Steps",
+        "1. Continue from retained history.",
+        "",
+        "## Critical Context",
+        "- Tests passed."
+      ].join("\n");
     }
     return "ok";
   }
@@ -80,7 +98,7 @@ function createContextTestModel(provider: ContextTestModel): AgentModel {
     provider: "context-test",
     modelId: "context-test",
     async stream(context: ModelStreamContext, options): Promise<AsyncIterable<ModelStreamEvent>> {
-      const text = provider.respond(context.messages);
+      const text = provider.respond(context.messages, context.systemPrompt);
       return (async function* () {
         options?.signal?.throwIfAborted();
         yield { type: "start" as const };
@@ -105,9 +123,11 @@ async function main(): Promise<void> {
     await testBudgetAndCompaction();
     await testMidTurnToolResultPruning();
     await testActiveRunCompactionPreservesToolBatches();
+    await testIncrementalSplitTurnCompaction();
     await testContextPreparationAbortStopsAutoCompaction();
     await testRestoreWithoutPersistedBudgetUsesHistoryEstimate();
     await testSessionReplayAndAgentResume();
+    await testCheckpointIsResumeTruthSource();
     await testLegacyAgentStateIsIgnored();
     await testSessionPathBoundaries();
     await testGlobalSessionsStayProjectScoped();
@@ -295,6 +315,7 @@ async function testMidTurnToolResultPruning(): Promise<void> {
     const memory = new ContextMemory(() => provider.model, workspace, undefined, 200, 32 * 1024);
 
     const messages: AgentMessage[] = [{ role: "user", content: "inspect the repo" }];
+    const archivedPath = `.biny/tool-results/tool-result-${"a".repeat(64)}.json`;
     for (let index = 0; index < 5; index += 1) {
       messages.push({
         role: "assistant",
@@ -304,7 +325,12 @@ async function testMidTurnToolResultPruning(): Promise<void> {
         role: "toolResult",
         toolCallId: `call-${String(index)}`,
         toolName: "read_file",
-        content: [{ type: "text", text: "body ".repeat(200) }]
+        content: [{
+          type: "text",
+          text: index === 0
+            ? JSON.stringify({ archived: true, archivePath: archivedPath, preview: "body ".repeat(200) })
+            : "body ".repeat(200)
+        }]
       });
     }
 
@@ -326,8 +352,10 @@ async function testMidTurnToolResultPruning(): Promise<void> {
     const lastResult = pruned.at(-1);
     assert.equal(lastResult?.role, "toolResult");
     assert.equal(String(toolResultValue(lastResult)).startsWith("body "), true);
-    // 最早的已被换成占位符。
-    assert.equal(/elided to fit the context window/.test(String(toolResultValue(pruned[2]))), true);
+    // 最早的已被换成可重新读取的归档引用，普通旧结果则保留一个小预览。
+    assert.equal(/compacted for this model step/.test(String(toolResultValue(pruned[2]))), true);
+    assert.equal(String(toolResultValue(pruned[2])).includes(archivedPath), true);
+    assert.equal(/Preview: body/.test(String(toolResultValue(pruned[4]))), true);
 
     // 预算充裕时不动任何东西，且剪枝是幂等的。
     const roomy = new ContextMemory(() => provider.model, workspace, undefined, 1_000_000, 32 * 1024);
@@ -378,6 +406,78 @@ async function testActiveRunCompactionPreservesToolBatches(): Promise<void> {
   });
 }
 
+async function testIncrementalSplitTurnCompaction(): Promise<void> {
+  await withTempWorkspace(async (workspaceRoot) => {
+    const provider = new ContextTestModel();
+    const memory = new ContextMemory(
+      () => provider.model,
+      new WorkspaceContext(workspaceRoot, [], 32 * 1024),
+      undefined,
+      4_000,
+      32 * 1024,
+      undefined,
+      undefined,
+      { keepRecentTokens: 50, maxSummaryTokens: 512 }
+    );
+    const initialHistory: AgentMessage[] = [];
+    for (let index = 0; index < 6; index += 1) {
+      initialHistory.push(
+        { role: "user", content: `initial request ${String(index)} ${"detail ".repeat(700)}` },
+        {
+          role: "assistant",
+          content: [{
+            type: "toolCall",
+            id: `initial-call-${String(index)}`,
+            name: "read_file",
+            arguments: { path: `src/read-${String(index)}.ts`, detail: "detail ".repeat(700) }
+          }]
+        },
+        {
+          role: "toolResult",
+          toolCallId: `initial-call-${String(index)}`,
+          toolName: "read_file",
+          content: [{ type: "text", text: `initial result ${String(index)} ${"detail ".repeat(700)}` }]
+        }
+      );
+    }
+    memory.replaceHistory(initialHistory);
+    assert.equal((await memory.compact()).compacted, true);
+    const initialSummaryRequest = provider.requests.at(-1) ?? [];
+    const initialStatus = await memory.status();
+    assert.equal(
+      estimateMessageTokens(initialSummaryRequest) <= initialStatus.budget.maxTokens - (initialStatus.budget.reserveTokens ?? 0),
+      true,
+      "the compaction request must fit its own input budget"
+    );
+
+    const split = await memory.compactRunContext([
+      { role: "user", content: "preserve the beginning of this long active turn in the checkpoint" },
+      {
+        role: "assistant",
+        content: [{
+          type: "toolCall",
+          id: "split-call",
+          name: "read_file",
+          arguments: { path: "src/large.ts", detail: "large argument ".repeat(120) }
+        }]
+      },
+      {
+        role: "toolResult",
+        toolCallId: "split-call",
+        toolName: "read_file",
+        content: [{ type: "text", text: "recent result" }]
+      }
+    ]);
+    assert.ok(split);
+    assert.equal(split.compactedMessageCount, 1, "long turns may split only at a safe assistant boundary");
+    assert.deepEqual(split.messages.map((message) => message.role), ["assistant", "toolResult"]);
+    assert.match(split.summary, /src\/read-0\.ts/u, "incremental summaries must retain the cumulative file list");
+    const updatePrompt = messageText(provider.requests.at(-1)?.at(-1) ?? { role: "user", content: "" });
+    assert.match(updatePrompt, /<previous-summary>/u);
+    assert.match(updatePrompt, /ends inside a long user turn/u);
+  });
+}
+
 function toolResultValue(message: AgentMessage | undefined): unknown {
   if (!message || message.role !== "toolResult") return undefined;
   return message.content.find((entry) => entry.type === "text")?.text;
@@ -396,6 +496,12 @@ async function testBudgetAndCompaction(): Promise<void> {
     assert.equal(estimateMessageTokens(messages) <= 120, true);
     assert.equal(messages.at(-1)?.role, "user");
     assert.equal(messages.at(-1)?.content.includes("current task"), true);
+    const preparedStatus = await memory.status();
+    assert.equal(
+      preparedStatus.budget.usedTokens <= preparedStatus.budget.maxTokens - (preparedStatus.budget.reserveTokens ?? 0),
+      true,
+      "assembled prompt must leave the configured compaction reserve unused"
+    );
     assert.equal(estimateMessageTokens([{ role: "assistant", content: [{ type: "reasoning", text: "reason ".repeat(20) }] }]) > 4, true);
 
     memory.replaceHistory(Array.from({ length: 8 }, (_, index): AgentMessage => index % 2
@@ -475,6 +581,16 @@ async function testRestoreWithoutPersistedBudgetUsesHistoryEstimate(): Promise<v
     const status = await memory.status();
     assert.equal(status.budget.usedTokens > 0, true);
     assert.equal(status.budget.maxTokens, 120);
+    memory.recordProviderUsage({ inputTokens: 119, outputTokens: 1, totalTokens: 120 });
+    memory.setCheckpoint({
+      summary: "## Goal\n- Continue from a restored checkpoint.",
+      firstKeptMessageIndex: 1,
+      tokensBefore: 119,
+      compactedMessages: 1,
+      createdAt: "2026-08-02T00:00:00.000Z"
+    });
+    const checkpointed = await memory.status();
+    assert.equal(checkpointed.budget.source, "estimated", "provider usage before a checkpoint is stale");
   });
 }
 
@@ -589,6 +705,55 @@ async function testSessionReplayAndAgentResume(): Promise<void> {
   });
 }
 
+async function testCheckpointIsResumeTruthSource(): Promise<void> {
+  await withTempWorkspace(async (workspaceRoot) => {
+    await ensureAgentDirs(workspaceRoot);
+    const config = testConfig();
+    config.context.memory.enabled = false;
+    const firstProvider = new ContextTestModel();
+    const firstRecorder = new SessionRecorder(workspaceRoot, "checkpoint-resume");
+    const firstAgent = new AgentSession({
+      workspaceRoot,
+      config,
+      model: firstProvider.model,
+      toolRegistry: new ToolRegistry(),
+      permissionManager: new PermissionManager({ ...config.permission, source: "test" }),
+      recorder: firstRecorder
+    });
+    await firstAgent.initialize();
+    await firstAgent.runTask("old checkpoint payload that must not be replayed verbatim");
+    assert.match(await firstAgent.compactConversation(), /Compacted 2 messages/u);
+    await firstAgent.close();
+
+    const compactedReplay = await replaySession(firstRecorder.filePath);
+    assert.equal(compactedReplay.messages.length, 0, "checkpoint boundary must exclude compacted messages on replay");
+    assert.equal(compactedReplay.messageTree.length, 2, "compacted messages remain available for audit and branching");
+    assert.equal(compactedReplay.contextCheckpoint?.firstKeptMessageIndex, 2);
+    assert.match(compactedReplay.contextCheckpoint?.summary ?? "", /## Goal/u);
+
+    const resumedProvider = new ContextTestModel();
+    const resumedAgent = new AgentSession({
+      workspaceRoot,
+      config,
+      model: resumedProvider.model,
+      toolRegistry: new ToolRegistry(),
+      permissionManager: new PermissionManager({ ...config.permission, source: "test" }),
+      recorder: new SessionRecorder(workspaceRoot)
+    });
+    await resumedAgent.initialize();
+    await resumedAgent.resume("checkpoint-resume");
+    await resumedAgent.runTask("continue only from the durable checkpoint");
+    const resumedMessages = resumedProvider.requests.at(-1) ?? [];
+    assert.equal(
+      resumedMessages.some((message) => messageText(message).includes("old checkpoint payload")),
+      false,
+      "resume must not reintroduce pre-checkpoint messages"
+    );
+    assert.match(resumedProvider.systemPrompts.at(-1) ?? "", /Conversation handoff summary:[\s\S]*Keep context bounded/u);
+    await resumedAgent.close();
+  });
+}
+
 async function testTruncatedSessionTailAndDanglingToolRecovery(): Promise<void> {
   await withTempWorkspace(async (workspaceRoot) => {
     await ensureAgentDirs(workspaceRoot);
@@ -698,6 +863,7 @@ async function testSessionAndToolDisplayRedaction(): Promise<void> {
     const userSecret = "not-a-real-user-bearer-value";
     const argumentSecret = "opaque-argument-value";
     const resultSecret = "opaque-result-value";
+    const checkpointSecret = "not-a-real-checkpoint-bearer-value";
     const recorder = new SessionRecorder(workspaceRoot, "redacted-session");
     recorder.record({ type: "user_message", content: `Authorization: Bearer ${userSecret}` });
     recorder.record({
@@ -723,18 +889,29 @@ async function testSessionAndToolDisplayRedaction(): Promise<void> {
       toolCallId,
       sequence: 1
     });
+    recorder.record({
+      type: "context_checkpoint",
+      reason: "manual",
+      summary: `## Goal\n- Authorization: Bearer ${checkpointSecret}`,
+      firstKeptMessageIndex: 1,
+      tokensBefore: 1_000,
+      compactedMessages: 1,
+      createdAt: "2026-08-02T00:00:00.000Z"
+    });
     await recorder.close();
 
     const raw = await fs.readFile(recorder.filePath, "utf8");
-    for (const secret of [userSecret, argumentSecret, resultSecret]) assert.equal(raw.includes(secret), false);
+    for (const secret of [userSecret, argumentSecret, resultSecret, checkpointSecret]) assert.equal(raw.includes(secret), false);
     assert.match(raw, /\[redacted\]/);
     const events = parseSessionEvents(raw);
     const call = events.find((event): event is Extract<SessionEvent, { type: "tool_call" }> => event.type === "tool_call");
     const result = events.find((event): event is Extract<SessionEvent, { type: "tool_result" }> => event.type === "tool_result");
+    const checkpoint = events.find((event): event is Extract<SessionEvent, { type: "context_checkpoint" }> => event.type === "context_checkpoint");
     assert.equal(call?.toolCallId, toolCallId);
     assert.equal((call?.args as { apiKey?: string } | undefined)?.apiKey, "[redacted]");
     assert.equal((call?.args as { webhookSecret?: string } | undefined)?.webhookSecret, "[redacted]");
     assert.equal((result?.result as { safe?: string } | undefined)?.safe, "visible");
+    assert.match(checkpoint?.summary ?? "", /\[redacted\]/u);
 
     const genericSecret = "opaque-generic-value";
     const generic = await createToolPermissionRequest({

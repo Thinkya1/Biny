@@ -37,7 +37,7 @@ export async function* agentLoop(
     yield { type: "message_end", message: prompt };
   }
   for await (const event of runLoop(currentContext, newMessages, config, signal)) yield event;
-  yield { type: "agent_end", messages: newMessages };
+  yield { type: "agent_end", messages: newMessages, contextMessages: [...currentContext.messages] };
   return newMessages;
 }
 
@@ -53,7 +53,7 @@ export async function* agentLoopContinue(
   const newMessages: AgentMessage[] = [];
   yield { type: "agent_start" };
   for await (const event of runLoop(currentContext, newMessages, config, signal)) yield event;
-  yield { type: "agent_end", messages: newMessages };
+  yield { type: "agent_end", messages: newMessages, contextMessages: [...currentContext.messages] };
   return newMessages;
 }
 
@@ -160,6 +160,7 @@ async function* streamAssistant(
         : context.messages;
       const streamModel = config.model.streamSimple?.bind(config.model) ?? config.model.stream.bind(config.model);
       const stream = await streamModel({ ...context, messages, tools: context.tools }, { ...config.modelOptions, signal });
+      let receivedFinish = false;
       for await (const event of stream) {
         signal?.throwIfAborted();
         if (event.type === "text-delta") {
@@ -176,6 +177,7 @@ async function* streamAssistant(
         } else if (event.type === "finish") {
           stopReason = event.reason;
           usage = event.usage;
+          receivedFinish = true;
         } else if (event.type === "error") {
           throw event.error;
         }
@@ -183,6 +185,7 @@ async function* streamAssistant(
           yield { type: "message_update", message: snapshotAssistant(text, reasoning, toolCalls, assistant), event };
         }
       }
+      if (!receivedFinish) throw new Error("Model stream ended without a finish event.");
       break;
     } catch (error) {
       const message = errorMessage(error);

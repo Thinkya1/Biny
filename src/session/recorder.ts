@@ -30,12 +30,12 @@ import { redactSecrets, redactSensitiveValue } from "../utils/secrets.js";
 import { assertSessionFileSize } from "./limits.js";
 import { sessionFilePath } from "./store.js";
 import { projectSessionsDir } from "../config/paths.js";
-import type { SessionContextState, SessionContextUsage, SessionUsage } from "./metadata.js";
+import type { SessionContextCheckpoint, SessionContextState, SessionContextUsage, SessionUsage } from "./metadata.js";
 import type { AttachmentReference } from "../attachments/store.js";
 import type { AgentMessage } from "../agent/core/types.js";
 import type { ToolExecutionResultStatus, ToolExecutionState, ToolRetrySafety } from "../tools/types.js";
 
-export type { SessionContextState, SessionContextUsage, SessionUsage, UsageOperation } from "./metadata.js";
+export type { SessionContextCheckpoint, SessionContextState, SessionContextUsage, SessionUsage, UsageOperation } from "./metadata.js";
 
 /**
  * One provider reasoning block with the opaque metadata that makes it
@@ -76,6 +76,7 @@ export type SessionEvent =
   | { type: "tool_execution"; tool: string; toolCallId: string; sequence: number; operationId: string; state: ToolExecutionState; evidence?: string; retrySafety?: ToolRetrySafety; time?: string }
   | { type: "tool_result"; tool: string; result: unknown; toolCallId?: string; sequence?: number; relatedUsage?: SessionUsage[]; executionStatus?: ToolExecutionResultStatus; recovered?: boolean; operationId?: string; evidence?: string; auditOnly?: boolean; time?: string }
   | { type: "agent_message"; message: Exclude<AgentMessage, { role: "user" }>; messageId?: string; parentMessageId?: string; time?: string }
+  | ({ type: "context_checkpoint"; reason: "threshold" | "overflow" | "manual"; time?: string } & SessionContextCheckpoint)
   | SessionTurnStatusEvent
   | { type: "error"; message: string; detail?: unknown; relatedUsage?: SessionUsage[]; time?: string };
 
@@ -115,7 +116,7 @@ export class SessionRecorder {
     }
   }
 
-  record(event: SessionEvent): void {
+  record(event: SessionEvent): SessionEvent {
     // 每个事件一行 JSON，便于追加写入，也方便后续按行读取和压缩。
     if (this.closed || this.closing) throw new Error(`Session recorder is already closed: ${this.sessionId}`);
     const safeEvent = redactSessionEvent(this.linkCanonicalMessage(event));
@@ -138,6 +139,7 @@ export class SessionRecorder {
     }
     this.stream.write(`${line}\n`);
     this.recordedEvents += 1;
+    return safeEvent;
   }
 
   /** 关键协议事件使用有序屏障，确保 JSONL 已交给文件系统后再推进执行状态。 */
@@ -325,6 +327,9 @@ function redactSessionEvent(event: SessionEvent): SessionEvent {
   }
   if (event.type === "agent_message") {
     return { ...event, message: redactAgentMessage(event.message) };
+  }
+  if (event.type === "context_checkpoint") {
+    return { ...event, summary: redactSecrets(event.summary) };
   }
   if (event.type === "turn_status") {
     return {

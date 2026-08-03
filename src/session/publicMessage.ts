@@ -8,9 +8,18 @@ const verifierAttemptMarker = "\n\nThis is a verifier-driven task.";
 const continuationPrefix = "Continue the same project-level task autonomously.";
 const originalObjectivePrefix = "\n\nOriginal objective: ";
 const previousFeedbackPrefix = "\n\nPrevious attempt feedback:";
+const skillWrapperPattern = /^<skill\b[^>]*\bname="([^"]+)"[^>]*>/u;
+const skillWrapperEnd = "</skill>";
 
 /** 取出消息中面向用户的那一段；识别不出脚手架时原样返回。 */
 export function publicUserMessage(content: string): string {
+  const skillMatch = content.match(skillWrapperPattern);
+  if (skillMatch?.[1]) {
+    const wrapperEnd = content.indexOf(skillWrapperEnd, skillMatch[0].length);
+    const task = wrapperEnd === -1 ? "" : content.slice(wrapperEnd + skillWrapperEnd.length).trim();
+    return task ? `Skill: ${skillMatch[1]}\n\n${task}` : `Skill: ${skillMatch[1]}`;
+  }
+
   // 首次尝试：脚手架追加在用户输入之后，截到标记为止。
   const firstAttemptMarker = content.indexOf(verifierAttemptMarker);
   if (firstAttemptMarker > 0) return content.slice(0, firstAttemptMarker).trimEnd();
