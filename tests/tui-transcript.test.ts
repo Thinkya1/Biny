@@ -34,7 +34,11 @@ import {
   themeColorTokens
 } from "../src/tui/theme/index.js";
 import { slashCommandsForSurface } from "../src/runtime/commandRegistry.js";
+import { formatStatusReport } from "../src/runtime/statusReport.js";
 import type { InteractiveRuntimeSnapshot } from "../src/runtime/agentEvents.js";
+import type { AgentSessionInfo } from "../src/agent/AgentSession.js";
+import type { ContextStatus } from "../src/agent/context/types.js";
+import type { UsageSummary } from "../src/session/metadata.js";
 import { activitySummaryText } from "../src/runtime/activitySummary.js";
 import { modelThinkingOptions } from "../src/tui/modelOptions.js";
 import {
@@ -111,9 +115,11 @@ async function main(): Promise<void> {
   testSessionReplayFinalizesPendingTools();
   testSessionReplayRestoresTurnStatuses();
   testSlashCommandParity();
+  testStatusReportUsesRuntimeAndContextFields();
   testSkillSlashCommandItems();
+  testSkillUserMessageHidesInstructions();
   testDoubleCtrlCGuard();
-  testAutocompleteEnterOnlyConfirmsVisibleSelection();
+  testAutocompleteEnterOnlyConfirmsSkillSelection();
   await testSlashAutocompleteInsertsSingleSlash();
   testThemeTokensResolveToAnsi();
   testTranscriptViewSyncsIncrementally();
@@ -142,6 +148,32 @@ function testSkillSlashCommandItems(): void {
   ]);
 }
 
+function testSkillUserMessageHidesInstructions(): void {
+  const expanded = [
+    '<skill name="ai-slop-taste" location="/Users/think/.cc-switch/skills/ai-slop-taste/SKILL.md">',
+    "A long skill instruction that must stay out of the transcript.",
+    "</skill>"
+  ].join("\n");
+
+  let state = createInitialTuiState("/workspace");
+  state = reduce(state, { type: "message.user", content: expanded });
+  assert.equal(state.transcript.committed[0]?.content, "Skill: ai-slop-taste");
+  assert.equal(renderTranscript(state.transcript, 80).includes("A long skill instruction"), false);
+
+  const replayed = sessionEventsToTranscript([{ type: "user_message", content: expanded }]);
+  assert.equal(replayed[0]?.content, "Skill: ai-slop-taste");
+
+  const withTask = `${expanded}\n\naudit the settings page`;
+  state = createInitialTuiState("/workspace");
+  state = reduce(state, { type: "message.user", content: withTask });
+  assert.equal(state.transcript.committed[0]?.content, "Skill: ai-slop-taste\n\naudit the settings page");
+  const rendered = renderTranscript(state.transcript, 80);
+  assert.equal(rendered.includes("audit the settings page"), true);
+  assert.equal(rendered.includes("A long skill instruction"), false);
+  const replayedWithTask = sessionEventsToTranscript([{ type: "user_message", content: withTask }]);
+  assert.equal(replayedWithTask[0]?.content, "Skill: ai-slop-taste\n\naudit the settings page");
+}
+
 function testDoubleCtrlCGuard(): void {
   assert.equal(isDoubleCtrlC(0, 100), false);
   assert.equal(isDoubleCtrlC(1_000, 1_499), true);
@@ -149,17 +181,20 @@ function testDoubleCtrlCGuard(): void {
   assert.equal(isDoubleCtrlC(1_000, 1_501), false);
 }
 
-function testAutocompleteEnterOnlyConfirmsVisibleSelection(): void {
-  assert.equal(shouldConfirmAutocompleteOnEnter("\r", true), true);
-  assert.equal(shouldConfirmAutocompleteOnEnter("\n", true), true);
-  assert.equal(shouldConfirmAutocompleteOnEnter("\r", false), false);
-  assert.equal(shouldConfirmAutocompleteOnEnter("\t", true), false);
+function testAutocompleteEnterOnlyConfirmsSkillSelection(): void {
+  assert.equal(shouldConfirmAutocompleteOnEnter("\r", true, "/skill:demo"), true);
+  assert.equal(shouldConfirmAutocompleteOnEnter("\n", true, "/skill"), true);
+  assert.equal(shouldConfirmAutocompleteOnEnter("\r", true, "/model"), false);
+  assert.equal(shouldConfirmAutocompleteOnEnter("\r", false, "/skill:demo"), false);
+  assert.equal(shouldConfirmAutocompleteOnEnter("\t", true, "/skill:demo"), false);
 }
 
 function testModelThinkingOptionsUseModelCapabilities(): void {
   const proOptions = modelThinkingOptions({ efforts: ["low", "medium", "high"] });
   assert.deepEqual(proOptions.map((option) => option.value), ["low", "medium", "high"]);
   assert.equal(proOptions[1]?.label, "Medium");
+  const deepseekOptions = modelThinkingOptions({ efforts: ["high", "max"] });
+  assert.deepEqual(deepseekOptions.map((option) => option.label), ["High", "Max"]);
   assert.deepEqual(modelThinkingOptions({ efforts: [] }), []);
 }
 
@@ -216,14 +251,76 @@ function testSlashCommandParity(): void {
   const tuiCommands = slashCommandsForSurface("tui");
   const desktopCommands = slashCommandsForSurface("desktop");
   const desktopNames = new Set(desktopCommands.map((command) => command.name));
-  assert.equal(tuiCommands.length, 23);
-  assert.equal(tuiCommands.find((command) => command.name === "/plan")?.requiresArgs, undefined);
-  assert.ok(tuiCommands.some((command) => command.name === "/mode"));
+  assert.equal(tuiCommands.length, 20);
+  assert.equal(tuiCommands.some((command) => command.name === "/plan"), false);
+  assert.equal(tuiCommands.some((command) => command.name === "/mode"), false);
   assert.ok(tuiCommands.some((command) => command.name === "/memory"));
   assert.ok(tuiCommands.some((command) => command.name === "/undo"));
   assert.equal(tuiCommands.some((command) => command.name === "/continue"), false);
   assert.ok(tuiCommands.some((command) => command.name === "/fork"));
-  assert.ok(["/status", "/context", "/usage", "/memory", "/subagent"].every((name) => desktopNames.has(name)));
+  assert.ok(["/status", "/usage", "/memory", "/subagent"].every((name) => desktopNames.has(name)));
+  assert.equal(desktopNames.has("/context"), false);
+}
+
+function testStatusReportUsesRuntimeAndContextFields(): void {
+  const info: AgentSessionInfo = {
+    workspaceRoot: "/workspace",
+    sessionId: "session-1",
+    sessionFile: "/workspace/.biny/sessions/session-1.jsonl",
+    provider: "deepseek",
+    modelLabel: "deepseek-v4-pro",
+    reasoningLabel: "Max",
+    modelAlias: "deepseek-pro",
+    thinking: "max"
+  };
+  const context: ContextStatus = {
+    loadedInstructions: ["/workspace/AGENTS.md"],
+    instructionBytes: 120,
+    instructionCapBytes: 32_768,
+    snapshotRefreshedAt: "2026-08-02T00:00:00.000Z",
+    snapshotDirty: false,
+    repoMapRefreshedAt: "2026-08-02T00:00:00.000Z",
+    repoMapDirty: false,
+    repoMapEntries: 12,
+    activePaths: [],
+    recentActivity: { paths: [], summaries: [] },
+    compaction: { summaryPresent: false, compactedMessages: 0, lastCompactedAt: undefined },
+    budget: {
+      maxTokens: 981_056,
+      usedTokens: 12_345,
+      contextWindow: 1_000_000,
+      maxOutputTokens: 32_768,
+      modelAlias: "deepseek-pro",
+      omitted: [],
+      autoCompacted: false,
+      source: "provider",
+      measuredAt: "2026-08-02T00:00:00.000Z"
+    },
+    memoryEnabled: false,
+    memoryTopics: []
+  };
+  const usage: UsageSummary = {
+    calls: 2,
+    inputTokens: 20_000,
+    outputTokens: 4_000,
+    totalTokens: 24_000,
+    reasoningTokens: 3_000,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    costUsd: undefined,
+    pricingKnown: false,
+    pricedCalls: 0,
+    unpricedCalls: 2
+  };
+
+  const report = formatStatusReport(info, "ask", context, usage, "Extensions\n\n(none)");
+  assert.match(report, /Model: deepseek-v4-pro \(Max\)/u);
+  assert.match(report, /Model provider: deepseek/u);
+  assert.match(report, /Token usage: 24,000 total/u);
+  assert.match(report, /Context window: 12,345 used \/ 1,000,000/u);
+  assert.match(report, /Input budget: 12,345 \/ 981,056/u);
+  assert.match(report, /Instructions: 1 loaded/u);
+  assert.doesNotMatch(report, /^Context$/mu);
 }
 
 function testTranscriptUsesIndependentItemKinds(): void {

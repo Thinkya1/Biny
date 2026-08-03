@@ -7,6 +7,7 @@
  */
 import type { SessionEvent } from "../session/recorder.js";
 import { activitySummaryText } from "../runtime/activitySummary.js";
+import { publicUserMessage } from "../session/publicMessage.js";
 import { completeToolItem, createRunningToolItem } from "./toolPresentation.js";
 import type { ToolTranscriptItem, TranscriptItem } from "./types.js";
 
@@ -17,7 +18,7 @@ export function sessionEventsToTranscript(events: SessionEvent[]): TranscriptIte
   for (const [index, event] of events.entries()) {
     if (event.type === "tool_result" && event.auditOnly && event.recovered && resultStatus(event.result) !== "skipped") continue;
     if (event.type === "user_message") {
-      items.push({ id: replayId("user", index), kind: "user", content: event.content });
+      items.push({ id: replayId("user", index), kind: "user", content: publicUserMessage(event.content) });
       continue;
     }
 
@@ -85,6 +86,7 @@ export function sessionEventsToTranscript(events: SessionEvent[]): TranscriptIte
     // 权威模型消息只供恢复模型上下文；历史界面继续使用稳定审计事件，避免重复展示。
     if (event.type === "agent_message") continue;
     if (event.type === "tool_execution") continue;
+    if (event.type === "context_checkpoint") continue;
 
     while (pendingTools.length > 0) {
       const pending = pendingTools.shift();

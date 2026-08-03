@@ -13,7 +13,7 @@ const thinkingLabels: Record<ThinkingSelection, string> = {
   medium: "Medium",
   high: "High",
   xhigh: "Extra high",
-  max: "More reasoning…"
+  max: "Max"
 };
 
 const thinkingDescriptions: Record<ThinkingSelection, string> = {
@@ -23,7 +23,7 @@ const thinkingDescriptions: Record<ThinkingSelection, string> = {
   medium: "Balances speed and reasoning depth for everyday tasks",
   high: "Greater reasoning depth for complex problems",
   xhigh: "Extra high reasoning depth for complex problems",
-  max: "Max consumes usage limits faster"
+  max: "Maximum reasoning depth for complex problems"
 };
 
 /**

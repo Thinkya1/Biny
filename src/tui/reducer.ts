@@ -7,6 +7,7 @@
  */
 import type { AgentHostEvent } from "../runtime/agentEvents.js";
 import { activitySummaryText } from "../runtime/activitySummary.js";
+import { publicUserMessage } from "../session/publicMessage.js";
 import {
   completeToolItem,
   createRunningToolItem,
@@ -165,7 +166,7 @@ export function tuiReducer(state: TuiState, event: TuiAction): TuiState {
         transcript: commitItem(state.transcript, {
           id: nextTranscriptId(state.transcript, "user"),
           kind: "user",
-          content: event.content
+          content: publicUserMessage(event.content)
         })
       };
     case "context.retrying":

@@ -141,7 +141,7 @@ export class BinyTui {
     };
     this.ui.setFocus(this.editor);
     this.ui.addInputListener((data) => {
-      if (shouldConfirmAutocompleteOnEnter(data, this.editor.isShowingAutocomplete())) {
+      if (shouldConfirmAutocompleteOnEnter(data, this.editor.isShowingAutocomplete(), this.editor.getText())) {
         // pi-tui 的 Editor 对 slash 补全会在 Enter 确认后继续 fall through 到 submit。
         // 在 TUI 边界把这次 Enter 转成 Tab，只完成插入，下一次 Enter 才是用户发送。
         this.editor.handleInput("\t");
@@ -657,47 +657,6 @@ export class BinyTui {
       return;
     }
 
-    if (command === "/plan") {
-      const task = args.join(" ").trim();
-      if (!task) {
-        this.mode = this.mode === "plan" ? "chat" : "plan";
-        this.refreshChrome();
-        return;
-      }
-      if (runtimeIsBusy(this.runtimeSnapshot)) {
-        this.notify("当前任务仍在运行。按 Esc 停止后再提交 Plan。");
-        return;
-      }
-      this.mode = "plan";
-      await runtime.submitPrompt(task, "plan").completion;
-      await this.refreshContextUsage();
-      return;
-    }
-
-    if (command === "/mode") {
-      const requested = args[0]?.toLowerCase();
-      if (!requested) {
-        this.showSelect({
-          title: "Select run mode",
-          hint: "↑↓ navigate · enter select · esc cancel",
-          selectedIndex: runModes.findIndex((entry) => entry.mode === this.mode),
-          items: runModes.map((entry) => ({ value: entry.mode, label: entry.label, description: entry.description })),
-          onSelect: (item) => {
-            this.mode = item.value as Extract<AgentRunMode, "chat" | "plan">;
-            this.refreshChrome();
-          }
-        });
-        return;
-      }
-      if (requested !== "chat" && requested !== "plan") {
-        this.showTextViewer("Mode", "Usage: /mode [chat|plan]");
-        return;
-      }
-      this.mode = requested;
-      this.refreshChrome();
-      return;
-    }
-
     const sharedResult = await executeRuntimeCommand(runtime, commands, value, "tui");
     if (sharedResult) {
       this.showTextViewer(sharedResult.title, sharedResult.content);
@@ -721,11 +680,7 @@ export class BinyTui {
       "refresh_model",
       async () => await commands.agent.refreshModelFromDisk()
     );
-    // 实时目录只是增强项；离线或未配置凭据时继续展示全局配置中的模型。
-    await runtime.runExclusiveOperation(
-      "model_catalog",
-      async () => await commands.agent.refreshModelCatalog()
-    ).catch(() => undefined);
+    // /model 只读取配置和已恢复的目录缓存，不能因为远程目录请求阻塞模型选择。
     const info = runtime.getSnapshot().info;
     const models = commands.agent.listModels();
     this.showSelect({
@@ -895,9 +850,13 @@ export class BinyTui {
   }
 }
 
-/** 补全弹层存在时，Enter 只能确认候选；没有弹层才允许进入提交路径。 */
-export function shouldConfirmAutocompleteOnEnter(data: string, autocompleteVisible: boolean): boolean {
-  return autocompleteVisible && matchesKey(data, "enter");
+/** Skill 补全沿用两步交互，普通 slash 命令则由 Editor 在同一次 Enter 中提交。 */
+export function shouldConfirmAutocompleteOnEnter(
+  data: string,
+  autocompleteVisible: boolean,
+  inputText: string
+): boolean {
+  return autocompleteVisible && /^\/skill(?::|$)/u.test(inputText.trimStart()) && matchesKey(data, "enter");
 }
 
 /** 判断两次 Ctrl+C 是否处于 pi 的 500ms 退出窗口内。 */
@@ -912,11 +871,6 @@ function sessionLabel(summary: SessionSummary, nowMs: number): string {
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-
-const runModes: Array<{ mode: Extract<AgentRunMode, "chat" | "plan">; label: string; description: string }> = [
-  { mode: "chat", label: "Chat", description: "直接执行一个 Agent 回合" },
-  { mode: "plan", label: "Plan", description: "只读分析与方案，不执行副作用工具" }
-];
 
 export function runtimeStatus(snapshot: InteractiveRuntimeSnapshot | undefined): TuiStatus {
   if (!snapshot || snapshot.state.kind === "idle") return "idle";
