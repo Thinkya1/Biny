@@ -5,6 +5,7 @@
  * 回滚文件等）。整体用 memo 包住，因为流式输出期间父组件会高频重渲染。
  */
 import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { ChatMessage, ChatMessageBubble } from "@astryxdesign/core/Chat";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
 import { splitAttachmentReferences, type AttachmentReference } from "../../../attachmentReferences.js";
 import { activitySummaryText } from "../../../../runtime/activitySummary.js";
@@ -117,7 +118,7 @@ const Turn = memo(function Turn({
     });
   };
   return (
-    <article className={`timeline-turn is-${turn.status}`}>
+    <section className={`timeline-turn is-${turn.status}`}>
       {turn.user ? (
         <UserMessage
           content={turn.user}
@@ -136,7 +137,8 @@ const Turn = memo(function Turn({
           projectId={projectId}
         />
       ) : null}
-      <div className="agent-response">
+      <ChatMessage className="desktop-assistant-message" sender="assistant">
+        <div className="agent-response">
         {executionSteps.length || turn.skills.length ? (
           <ExecutionTimeline
             expandedReasoning={expandedReasoning}
@@ -190,8 +192,9 @@ const Turn = memo(function Turn({
             </div>
           </section>
         ) : null}
-      </div>
-    </article>
+        </div>
+      </ChatMessage>
+    </section>
   );
 });
 
@@ -351,24 +354,26 @@ function UserMessage({
 
   if (editing) {
     return (
-      <div className="user-message is-editing">
-        <InlineUserMessageEditor
-          value={editing.value}
-          onCancel={onCancelEdit}
-          onChange={onChangeEdit}
-          onSubmit={onSubmitEdit}
-        />
-      </div>
+      <ChatMessage className="user-message is-editing" sender="user">
+        <ChatMessageBubble>
+          <InlineUserMessageEditor
+            value={editing.value}
+            onCancel={onCancelEdit}
+            onChange={onChangeEdit}
+            onSubmit={onSubmitEdit}
+          />
+        </ChatMessageBubble>
+      </ChatMessage>
     );
   }
 
   const closeMenu = (): void => setMenuOpen(false);
   return (
-    <div className="user-message">
-      <div className="user-bubble">
+    <ChatMessage className="user-message" sender="user">
+      <ChatMessageBubble className="user-bubble">
         {message.text ? <MarkdownContent content={message.text} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} /> : null}
         {message.attachments.length ? <MessageAttachments attachments={message.attachments} projectId={projectId} /> : null}
-      </div>
+      </ChatMessageBubble>
       <div className={`user-message-actions${menuOpen ? " is-open" : ""}`} ref={actionsRef}>
         <button aria-label="复制消息" className="user-message-action" onClick={() => copyText(message.text)} title="复制消息" type="button"><Icon name="copy" size={13} /></button>
         <button aria-label="重新生成" className="user-message-action" onClick={onRegenerate} title="重新生成" type="button"><Icon name="refresh" size={13} /></button>
@@ -385,7 +390,7 @@ function UserMessage({
           </div>
         ) : null}
       </div>
-    </div>
+    </ChatMessage>
   );
 }
 

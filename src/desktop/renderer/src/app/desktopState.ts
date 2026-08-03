@@ -1,0 +1,236 @@
+/**
+ * Desktop 渲染端的纯状态投影。
+ *
+ * 这里只处理 IPC 快照、实时事件和会话文档之间的合并，不订阅事件、不调用 IPC，也不包含
+ * React 状态。把这些规则集中后，App 与事件桥都不需要各自推算项目、会话和运行状态。
+ */
+import type { ContextStatus } from "../../../../agent/context/types.js";
+import type { ModelRuntimeInfo } from "../../../../llm/ModelManager.js";
+import { isTerminalRunEvent, type AgentHostEvent } from "../../../../runtime/agentEvents.js";
+import type { SessionEvent } from "../../../../session/recorder.js";
+import { publicUserMessage } from "../../../../session/publicMessage.js";
+import type {
+  DesktopAgentEventEnvelope,
+  DesktopProject,
+  DesktopSessionDocument,
+  DesktopSessionSummary,
+  DesktopWorkspaceSnapshot
+} from "../../../protocol.js";
+
+export function applyUpdatesToWorkspace(
+  workspace: DesktopWorkspaceSnapshot,
+  updates: DesktopAgentEventEnvelope[]
+): DesktopWorkspaceSnapshot {
+  const projectUpdates = updates.filter((update) => update.projectId === workspace.project.id);
+  const sessions = applyUpdatesToProjectSessions(workspace.project.id, workspace.sessions, projectUpdates);
+  const runtime = projectUpdates.at(-1)?.snapshot ?? workspace.runtime;
+  return { ...workspace, sessions, runtime };
+}
+
+/** 把所有项目共用的事件流投影到侧栏任务摘要，并保留未受影响项目的任务。 */
+export function applyUpdatesToSidebarSessions(
+  sessions: DesktopSessionSummary[],
+  updates: DesktopAgentEventEnvelope[]
+): DesktopSessionSummary[] {
+  const sessionsByProject = new Map<string, DesktopSessionSummary[]>();
+  for (const session of sessions) {
+    const group = sessionsByProject.get(session.projectId) ?? [];
+    group.push(session);
+    sessionsByProject.set(session.projectId, group);
+  }
+  const updatesByProject = new Map<string, DesktopAgentEventEnvelope[]>();
+  for (const update of updates) {
+    const group = updatesByProject.get(update.projectId) ?? [];
+    group.push(update);
+    updatesByProject.set(update.projectId, group);
+  }
+  for (const [projectId, projectUpdates] of updatesByProject) {
+    sessionsByProject.set(projectId, applyUpdatesToProjectSessions(
+      projectId,
+      sessionsByProject.get(projectId) ?? [],
+      projectUpdates
+    ));
+  }
+  return [...sessionsByProject.values()].flat();
+}
+
+/** 用项目快照中的完整任务列表替换侧栏里该项目的旧投影。 */
+export function replaceProjectSessions(
+  sessions: DesktopSessionSummary[],
+  projectId: string,
+  projectSessions: DesktopSessionSummary[]
+): DesktopSessionSummary[] {
+  const firstProjectIndex = sessions.findIndex((session) => session.projectId === projectId);
+  const remaining = sessions.filter((session) => session.projectId !== projectId);
+  const insertAt = firstProjectIndex < 0 ? remaining.length : Math.min(firstProjectIndex, remaining.length);
+  return [
+    ...remaining.slice(0, insertAt),
+    ...[...projectSessions].sort(sessionSort),
+    ...remaining.slice(insertAt)
+  ];
+}
+
+function applyUpdatesToProjectSessions(
+  projectId: string,
+  currentSessions: DesktopSessionSummary[],
+  updates: DesktopAgentEventEnvelope[]
+): DesktopSessionSummary[] {
+  const sessions = [...currentSessions];
+  const sessionIndexes = new Map(sessions.map((session, index) => [session.id, index]));
+  const upsert = (session: DesktopSessionSummary): void => {
+    const index = sessionIndexes.get(session.id);
+    if (index === undefined) {
+      sessionIndexes.set(session.id, sessions.length);
+      sessions.push(session);
+      return;
+    }
+    sessions[index] = session;
+  };
+  for (const update of updates) {
+    const event = update.event;
+    if (!event) continue;
+    const visibleInput = event.type === "message.user" ? publicUserMessage(event.content) : "";
+    let session = sessions[sessionIndexes.get(event.sessionId) ?? -1];
+    if (!session && event.type === "message.user") {
+      session = syntheticSession(projectId, event.sessionId, visibleInput);
+      upsert(session);
+    }
+    if (session && event.type === "message.user") {
+      session = {
+        ...session,
+        title: session.title === "新任务" ? titleFromInput(visibleInput) : session.title,
+        firstUserMessage: session.firstUserMessage || visibleInput,
+        status: "running",
+        updatedAt: event.timestamp
+      };
+      upsert(session);
+    }
+    if (session && event.type === "run.started") {
+      session = { ...session, status: "running", updatedAt: event.timestamp };
+      upsert(session);
+    }
+    if (session && event.type === "permission.requested") {
+      session = { ...session, status: "waiting_permission", updatedAt: event.timestamp };
+      upsert(session);
+    }
+    if (session && event.type === "permission.resolved") {
+      session = { ...session, status: "running", updatedAt: event.timestamp };
+      upsert(session);
+    }
+    if (session && isTerminalRunEvent(event)) {
+      upsert({
+        ...session,
+        status: event.type === "run.failed"
+          ? "failed"
+          : event.type === "run.blocked"
+            ? "blocked"
+            : event.type === "run.incomplete"
+              ? "incomplete"
+              : event.type === "run.cancelled"
+                ? "cancelled"
+                : event.type === "run.aborted" ? "aborted" : "completed",
+        resumable: event.type === "run.incomplete" || event.type === "run.blocked"
+          ? event.resumable
+          : undefined,
+        updatedAt: event.timestamp
+      });
+    }
+  }
+  return sessions.sort(sessionSort);
+}
+
+export function lastReportedInputTokens(document?: DesktopSessionDocument): number | undefined {
+  if (!document) return undefined;
+  let latest: number | undefined;
+  for (const event of document.events) {
+    if (event.type !== "assistant_message" || event.auditOnly) continue;
+    if (event.usage?.inputTokens !== undefined) latest = event.usage.inputTokens;
+  }
+  return latest;
+}
+
+export function hasContextStatus(event: AgentHostEvent): event is AgentHostEvent & { context: ContextStatus } {
+  return event.type === "context.updated" || event.type === "compact.completed";
+}
+
+export function updateRuntimeInfo(
+  workspace: DesktopWorkspaceSnapshot | undefined,
+  info: ModelRuntimeInfo
+): DesktopWorkspaceSnapshot | undefined {
+  if (!workspace?.runtime) return workspace;
+  return {
+    ...workspace,
+    runtime: {
+      ...workspace.runtime,
+      info: {
+        ...workspace.runtime.info,
+        modelAlias: info.modelAlias,
+        provider: info.provider,
+        modelLabel: info.modelLabel,
+        reasoningLabel: info.reasoningLabel,
+        thinking: info.thinking
+      }
+    }
+  };
+}
+
+export function syntheticSession(projectId: string, sessionId: string, input: string): DesktopSessionSummary {
+  const now = new Date().toISOString();
+  return {
+    id: sessionId,
+    projectId,
+    fileName: `${sessionId}.jsonl`,
+    title: titleFromInput(input),
+    firstUserMessage: input,
+    lastAssistantMessage: "",
+    eventCount: 0,
+    createdAt: now,
+    updatedAt: now,
+    pinned: false,
+    status: "running",
+    resumable: undefined
+  };
+}
+
+export function mergeProject(projects: DesktopProject[], next: DesktopProject): DesktopProject[] {
+  const index = projects.findIndex((project) => project.id === next.id);
+  if (index < 0) return [next, ...projects];
+  const copy = [...projects];
+  copy[index] = next;
+  return copy;
+}
+
+export function applyProjectOrder(projects: DesktopProject[], projectIds: string[]): DesktopProject[] {
+  const byId = new Map(projects.map((project) => [project.id, project]));
+  const seen = new Set<string>();
+  const ordered: DesktopProject[] = [];
+  for (const projectId of projectIds) {
+    const project = byId.get(projectId);
+    if (!project || seen.has(projectId)) continue;
+    ordered.push(project);
+    seen.add(projectId);
+  }
+  for (const project of projects) {
+    if (!seen.has(project.id)) ordered.push(project);
+  }
+  return ordered;
+}
+
+export function eventsBeforeUserMessage(events: SessionEvent[], userMessageIndex: number): SessionEvent[] {
+  let seen = 0;
+  for (const [index, event] of events.entries()) {
+    if (event.type !== "user_message") continue;
+    if (seen === userMessageIndex) return events.slice(0, index);
+    seen += 1;
+  }
+  return events;
+}
+
+function sessionSort(left: DesktopSessionSummary, right: DesktopSessionSummary): number {
+  if (left.pinned !== right.pinned) return left.pinned ? -1 : 1;
+  return Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
+}
+
+function titleFromInput(input: string): string {
+  return input.replace(/\s+/g, " ").trim().slice(0, 64) || "新任务";
+}

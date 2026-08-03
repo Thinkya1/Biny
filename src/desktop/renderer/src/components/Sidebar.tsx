@@ -1,32 +1,50 @@
 /**
- * 侧栏：项目列表（可拖动排序、置顶）和当前项目的会话列表。
+ * 桌面端主侧栏。
  *
- * 右键菜单等浮层用 portal 挂到 body 上，避免被侧栏的滚动容器裁掉。
- * 宽度拖动同样只回调，实际持久化由上层负责。
+ * 侧栏的数据仍由 App 投影，组件只负责把项目、会话和菜单动作组织成置顶项目、普通项目
+ * 和未归类对话三段树。项目与会话的业务操作通过回调返回上层，避免把 IPC 和持久化状态
+ * 复制到视觉组件中。
  */
 import { createPortal } from "react-dom";
-import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { clampSidebarWidth, isCompactSidebarWidth, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH } from "../../../sidebarSizing.js";
 import type { DesktopProject, DesktopSessionSummary } from "../../../protocol.js";
-import { AppIcon } from "./AppIcon.js";
-import { Icon } from "./Icon.js";
+import { Icon, type IconName } from "./Icon.js";
+
+// 收起时侧栏主体要完全退出 flex 布局；顶部 chrome 会在 CSS 中独立浮在窗口左上角。
+const CINDY_COLLAPSED_SIDEBAR_WIDTH = 0;
+const PROJECT_SESSION_COLLAPSE_LIMIT = 5;
+const DIALOGUE_SESSION_COLLAPSE_LIMIT = 10;
+
+type SidebarSectionName = "pinned" | "projects" | "dialogue";
+type ProjectSort = "priority" | "recent" | "manual";
+type ProjectDragPlacement = "before" | "after";
+type FloatingMenuAnchor = { readonly current: HTMLElement | null };
+
+interface ProjectDragState {
+  sourceId: string;
+  targetId?: string;
+  placement?: ProjectDragPlacement;
+  section: "pinned" | "projects";
+}
 
 interface SidebarProps {
   visible: boolean;
   width: number;
-  resizing: boolean;
   projects: DesktopProject[];
   sessions: DesktopSessionSummary[];
   activeProjectId?: string;
   selectedSessionId?: string;
+  onVisibleChange(visible: boolean): void;
   onWidthChange(width: number): void;
-  onResizeStart(): void;
-  onResizeEnd(): void;
   onOpenProject(): void;
   onCreateEmptyProject(): void;
   onSelectProject(projectId: string): void;
-  onSelectSession(sessionId: string): void;
+  onSelectSession(projectId: string, sessionId: string): void;
+  onSessionMenu(session: DesktopSessionSummary): void;
   onProjectPinned(projectId: string, pinned: boolean): void;
   onReorderProjects(projectIds: string[]): void;
+  onRefreshProject(projectId: string): void;
   onRevealProject(projectId: string): void;
   onOpenTerminalProject(projectId: string): void;
   onRenameProject(projectId: string): void;
@@ -34,55 +52,48 @@ interface SidebarProps {
   onRemoveProject(projectId: string): void;
   onSearch(): void;
   onSettings(): void;
+  onWidthCommit(width: number): void;
+  version?: string;
 }
-
-type ProjectDragPlacement = "before" | "after";
-
-type ProjectDragState = {
-  sourceId: string;
-  targetId?: string;
-  placement?: ProjectDragPlacement;
-  section: "pinned" | "projects";
-};
-
-type SidebarSectionName = "pinned" | "projects";
-type ProjectGrouping = "by-project" | "list";
-type ProjectSort = "priority" | "recent" | "manual";
-type FloatingMenuAnchor = { readonly current: HTMLElement | null };
 
 export const Sidebar = memo(function Sidebar({
   visible,
   width,
-  resizing,
   projects,
   sessions,
   activeProjectId,
   selectedSessionId,
+  onVisibleChange,
   onWidthChange,
-  onResizeStart,
-  onResizeEnd,
   onOpenProject,
   onCreateEmptyProject,
   onSelectProject,
   onSelectSession,
+  onSessionMenu,
   onProjectPinned,
   onReorderProjects,
+  onRefreshProject,
   onRevealProject,
   onOpenTerminalProject,
   onRenameProject,
   onNewTask,
   onRemoveProject,
   onSearch,
-  onSettings
+  onSettings,
+  onWidthCommit,
+  version
 }: SidebarProps): React.JSX.Element {
-  const [expandedSections, setExpandedSections] = useState<Record<SidebarSectionName, boolean>>({ pinned: true, projects: true });
+  const [expandedSections, setExpandedSections] = useState<Record<SidebarSectionName, boolean>>({
+    pinned: true,
+    projects: true,
+    dialogue: true
+  });
+  const [collapsedProjectIds, setCollapsedProjectIds] = useState<Set<string>>(() => new Set());
   const [projectMenuOpen, setProjectMenuOpen] = useState<string>();
   const [projectOrganizationMenuOpen, setProjectOrganizationMenuOpen] = useState(false);
   const [projectCreateMenuOpen, setProjectCreateMenuOpen] = useState(false);
-  const [projectGrouping, setProjectGrouping] = useState<ProjectGrouping>("by-project");
   const [projectSort, setProjectSort] = useState<ProjectSort>("priority");
-  const [collapsedProjectIds, setCollapsedProjectIds] = useState(() => new Set<string>());
-  const [dragState, setDragState] = useState<ProjectDragState | undefined>();
+  const [dragState, setDragState] = useState<ProjectDragState | undefined>(undefined);
   const dragStateRef = useRef<ProjectDragState | undefined>(undefined);
   const projectOrganizationButtonRef = useRef<HTMLButtonElement>(null);
   const projectCreateButtonRef = useRef<HTMLButtonElement>(null);
@@ -91,17 +102,16 @@ export const Sidebar = memo(function Sidebar({
     if (!projectMenuOpen && !projectOrganizationMenuOpen && !projectCreateMenuOpen) return;
     const closeOnPointerDown = (event: PointerEvent): void => {
       const target = event.target;
-      if (target instanceof Element && target.closest(".sidebar-menu-anchor, .project-row-actions, .project-menu")) return;
+      if (target instanceof Element && target.closest(".cindy-sidebar-menu-anchor, .cindy-sidebar-menu")) return;
       setProjectMenuOpen(undefined);
       setProjectOrganizationMenuOpen(false);
       setProjectCreateMenuOpen(false);
     };
     const closeOnEscape = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") {
-        setProjectMenuOpen(undefined);
-        setProjectOrganizationMenuOpen(false);
-        setProjectCreateMenuOpen(false);
-      }
+      if (event.key !== "Escape") return;
+      setProjectMenuOpen(undefined);
+      setProjectOrganizationMenuOpen(false);
+      setProjectCreateMenuOpen(false);
     };
     window.addEventListener("pointerdown", closeOnPointerDown);
     window.addEventListener("keydown", closeOnEscape);
@@ -116,11 +126,55 @@ export const Sidebar = memo(function Sidebar({
     setProjectMenuOpen(undefined);
     setProjectOrganizationMenuOpen(false);
     setProjectCreateMenuOpen(false);
+    setDragState(undefined);
+    dragStateRef.current = undefined;
   }, [visible]);
 
-  const orderedProjects = sortProjects(projects, projectSort);
+  const sessionsByProject = useMemo(() => {
+    const grouped = new Map<string, DesktopSessionSummary[]>();
+    for (const session of sessions) {
+      const group = grouped.get(session.projectId) ?? [];
+      group.push(session);
+      grouped.set(session.projectId, group);
+    }
+    return grouped;
+  }, [sessions]);
+
+  const dialogueSessions = useMemo(() => {
+    const projectIds = new Set(projects.map((project) => project.id));
+    return sessions.filter((session) => !session.pinned && !projectIds.has(session.projectId));
+  }, [projects, sessions]);
+
+  const pinnedSessions = useMemo(() => sessions.filter((session) => session.pinned), [sessions]);
+
+  const orderedProjects = useMemo(() => sortProjects(projects, projectSort), [projects, projectSort]);
   const pinnedProjects = orderedProjects.filter((project) => project.pinned);
   const unpinnedProjects = orderedProjects.filter((project) => !project.pinned);
+  const resolvedWidth = clampSidebarWidth(width);
+  const compact = visible && isCompactSidebarWidth(resolvedWidth);
+
+  const toggleSection = (section: SidebarSectionName): void => {
+    setExpandedSections((current) => ({ ...current, [section]: !current[section] }));
+  };
+
+  const selectOrToggleProject = (projectId: string): void => {
+    if (projectId !== activeProjectId) {
+      setCollapsedProjectIds((current) => {
+        if (!current.has(projectId)) return current;
+        const next = new Set(current);
+        next.delete(projectId);
+        return next;
+      });
+      onSelectProject(projectId);
+      return;
+    }
+    setCollapsedProjectIds((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) next.delete(projectId);
+      else next.add(projectId);
+      return next;
+    });
+  };
 
   const setProjectDragState = (next: ProjectDragState | undefined): void => {
     dragStateRef.current = next;
@@ -162,126 +216,153 @@ export const Sidebar = memo(function Sidebar({
     onReorderProjects(nextIds);
   };
 
-  const endProjectDrag = (): void => {
-    // Commit only on drop; dragend without drop cancels quietly.
-    setProjectDragState(undefined);
-  };
-
-  const cancelProjectDrag = (): void => {
-    setProjectDragState(undefined);
-  };
-
   const projectDropClass = (projectId: string, section: "pinned" | "projects"): string => {
     if (!dragState || dragState.section !== section || dragState.targetId !== projectId || !dragState.placement) return "";
     return dragState.placement === "before" ? " is-drop-before" : " is-drop-after";
   };
 
-  const toggleSection = (section: SidebarSectionName): void => {
-    setExpandedSections((current) => ({ ...current, [section]: !current[section] }));
+  const createTask = (): void => {
+    if (activeProjectId) onNewTask(activeProjectId);
+    else onOpenProject();
   };
 
-  const openProjectMenu = (menuKey: string): void => {
-    setProjectOrganizationMenuOpen(false);
-    setProjectCreateMenuOpen(false);
-    setProjectMenuOpen((current) => current === menuKey ? undefined : menuKey);
-  };
-
-  const toggleProjectOrganizationMenu = (): void => {
-    setProjectMenuOpen(undefined);
-    setProjectCreateMenuOpen(false);
-    setProjectOrganizationMenuOpen((current) => !current);
-  };
-
-  const toggleProjectCreateMenu = (): void => {
-    setProjectMenuOpen(undefined);
-    setProjectOrganizationMenuOpen(false);
-    setProjectCreateMenuOpen((current) => !current);
-  };
-
-  const selectOrToggleProject = (projectId: string): void => {
-    if (projectId !== activeProjectId) {
-      setCollapsedProjectIds((current) => {
-        if (!current.has(projectId)) return current;
-        const next = new Set(current);
-        next.delete(projectId);
-        return next;
-      });
-      onSelectProject(projectId);
-      return;
-    }
-    setCollapsedProjectIds((current) => {
-      const next = new Set(current);
-      if (next.has(projectId)) next.delete(projectId);
-      else next.add(projectId);
-      return next;
-    });
+  const renderProject = (project: DesktopProject, section: "pinned" | "projects"): React.JSX.Element => {
+    const projectSessions = sessionsByProject.get(project.id) ?? [];
+    const displaySessions = projectSessions.filter((session) => !session.pinned);
+    const expanded = project.id === activeProjectId && !collapsedProjectIds.has(project.id);
+    return (
+      <div
+        className={`cindy-project-group${dragState?.sourceId === project.id ? " is-dragging" : ""}${projectDropClass(project.id, section)}`}
+        key={`${section}:${project.id}`}
+        onDragOver={(event) => {
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "move";
+          updateProjectDragTarget(project.id, section, event.clientY, event.currentTarget.getBoundingClientRect());
+        }}
+        onDrop={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          dropProjectDrag(project.id, event.clientY, event.currentTarget.getBoundingClientRect());
+        }}
+      >
+        <ProjectRow
+          dragActive={dragState?.sourceId === project.id}
+          menuOpen={projectMenuOpen === `${section}:${project.id}`}
+          onDragCancel={() => setProjectDragState(undefined)}
+          onDragEnd={() => setProjectDragState(undefined)}
+          onDragStart={() => beginProjectDrag(project.id, section)}
+          onMenu={() => {
+            setProjectOrganizationMenuOpen(false);
+            setProjectCreateMenuOpen(false);
+            setProjectMenuOpen((current) => current === `${section}:${project.id}` ? undefined : `${section}:${project.id}`);
+          }}
+          onNewTask={() => { setProjectMenuOpen(undefined); onNewTask(project.id); }}
+          onOpenTerminal={() => { setProjectMenuOpen(undefined); onOpenTerminalProject(project.id); }}
+          onPin={() => { setProjectMenuOpen(undefined); onProjectPinned(project.id, !project.pinned); }}
+          onRefresh={() => { setProjectMenuOpen(undefined); onRefreshProject(project.id); }}
+          onRemove={() => { setProjectMenuOpen(undefined); onRemoveProject(project.id); }}
+          onRename={() => { setProjectMenuOpen(undefined); onRenameProject(project.id); }}
+          onReveal={() => { setProjectMenuOpen(undefined); onRevealProject(project.id); }}
+          onSelect={selectOrToggleProject}
+          project={project}
+          running={project.id === activeProjectId && hasRunningSession(projectSessions)}
+          selected={project.id === activeProjectId && !selectedSessionId}
+          sessionsExpanded={expanded}
+        />
+        {expanded ? (
+          <ProjectSessions
+            onSelectSession={onSelectSession}
+            onSessionMenu={onSessionMenu}
+            projectId={project.id}
+            selectedSessionId={selectedSessionId}
+            sessions={displaySessions}
+          />
+        ) : null}
+      </div>
+    );
   };
 
   return (
-    <aside className={`sidebar t-resize${visible ? "" : " is-hidden"}${resizing ? " is-resizing" : ""}`} style={{ width: visible ? width : 0 }}>
-      <div aria-hidden={!visible} className="sidebar-surface" inert={!visible}>
-        <div className="sidebar-titlebar-drag" />
-        <div className="sidebar-brand">
-          <div className="sidebar-brand-name"><AppIcon size={24} /><span>Biny</span></div>
-          <button aria-label="搜索" className="icon-button" onClick={onSearch} type="button"><Icon name="search" /></button>
-        </div>
+    <>
+      <aside
+        aria-label="主导航"
+        aria-hidden={visible ? undefined : true}
+        className={`cindy-sidebar${visible ? "" : " is-hidden"}${compact ? " is-compact" : ""}`}
+        style={{ width: visible ? resolvedWidth : CINDY_COLLAPSED_SIDEBAR_WIDTH }}
+      >
+        {visible ? <div aria-hidden="true" className="cindy-sidebar-topbar-spacer" /> : null}
 
-        <div className="sidebar-scroll">
-          {pinnedProjects.length ? (
-            <SidebarFolder
-              expanded={expandedSections.pinned}
-              label="置顶"
-              onToggle={() => toggleSection("pinned")}
-            >
-              {pinnedProjects.map((project) => (
-                <div
-                  className={`project-group${dragState?.sourceId === project.id ? " is-dragging" : ""}${projectDropClass(project.id, "pinned")}`}
-                  key={`pinned-${project.id}`}
-                  onDragOver={(event) => {
-                    event.preventDefault();
-                    event.dataTransfer.dropEffect = "move";
-                    const bounds = event.currentTarget.getBoundingClientRect();
-                    updateProjectDragTarget(project.id, "pinned", event.clientY, bounds);
-                  }}
-                  onDrop={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    dropProjectDrag(project.id, event.clientY, event.currentTarget.getBoundingClientRect());
-                  }}
-                >
-                  <ProjectRow
-                    dragActive={Boolean(dragState)}
-                    menuOpen={projectMenuOpen === `pinned-${project.id}`}
-                    onDragCancel={cancelProjectDrag}
-                    onDragEnd={endProjectDrag}
-                    onDragStart={() => beginProjectDrag(project.id, "pinned")}
-                    onMenu={() => openProjectMenu(`pinned-${project.id}`)}
-                    onPin={() => { setProjectMenuOpen(undefined); onProjectPinned(project.id, !project.pinned); }}
-                    onReveal={() => { setProjectMenuOpen(undefined); onRevealProject(project.id); }}
-                    onOpenTerminal={() => { setProjectMenuOpen(undefined); onOpenTerminalProject(project.id); }}
-                    onRename={() => { setProjectMenuOpen(undefined); onRenameProject(project.id); }}
-                    onNewTask={() => { setProjectMenuOpen(undefined); onNewTask(project.id); }}
-                    onRemove={() => { setProjectMenuOpen(undefined); onRemoveProject(project.id); }}
-                    onSelect={selectOrToggleProject}
-                    project={project}
-                    running={project.id === activeProjectId && hasRunningSession(sessions)}
-                    selected={project.id === activeProjectId && !selectedSessionId}
-                    sessionsExpanded={project.id === activeProjectId && !collapsedProjectIds.has(project.id)}
-                  />
-                  {project.id === activeProjectId ? <ProjectSessions expanded={!collapsedProjectIds.has(project.id)} onSelectSession={onSelectSession} selectedSessionId={selectedSessionId} sessions={sessions} /> : null}
-                </div>
-              ))}
-            </SidebarFolder>
+      <div className="cindy-sidebar-body">
+        <div className="cindy-sidebar-scroll">
+          <nav aria-label="功能导航" className="cindy-sidebar-nav">
+            <button aria-label="新建" className="cindy-sidebar-nav-item" onClick={createTask} type="button">
+              <Icon name="circle-add" size={16} />
+              <span>新建</span>
+            </button>
+            <button aria-label="自动化" className="cindy-sidebar-nav-item" onClick={onSearch} type="button">
+              <Icon name="timer" size={16} />
+              <span>自动化</span>
+            </button>
+            <button aria-label="插件" className="cindy-sidebar-nav-item" onClick={onSettings} type="button">
+              <Icon name="plug" size={16} />
+              <span>插件</span>
+            </button>
+            <button aria-label="搜索" className="cindy-sidebar-nav-item" onClick={onSearch} type="button">
+              <Icon name="search" size={16} />
+              <span>搜索</span>
+            </button>
+          </nav>
+
+          {pinnedProjects.length || pinnedSessions.length ? (
+            <SidebarSection expanded={expandedSections.pinned} label="置顶" onToggle={() => toggleSection("pinned")}>
+              {pinnedProjects.map((project) => renderProject(project, "pinned"))}
+              <SessionList
+                onSelectSession={onSelectSession}
+                onSessionMenu={onSessionMenu}
+                selectedSessionId={selectedSessionId}
+                sessions={pinnedSessions}
+              />
+            </SidebarSection>
           ) : null}
 
-          <SidebarFolder
+          <SidebarSection
             actions={(
-              <div className="folder-section-actions sidebar-menu-anchor">
-                <button ref={projectOrganizationButtonRef} aria-label="项目整理和排序" className="section-action" onClick={toggleProjectOrganizationMenu} type="button"><Icon name="more" size={14} /></button>
-                <button ref={projectCreateButtonRef} aria-label="添加项目" className="section-action" onClick={toggleProjectCreateMenu} type="button"><Icon name="add" size={15} /></button>
-                {projectOrganizationMenuOpen ? <ProjectOrganizationMenu anchorRef={projectOrganizationButtonRef} grouping={projectGrouping} onGroupingChange={(value) => { setProjectGrouping(value); setProjectOrganizationMenuOpen(false); }} onSortChange={(value) => { setProjectSort(value); setProjectOrganizationMenuOpen(false); }} sort={projectSort} /> : null}
+              <div className="cindy-sidebar-section-actions cindy-sidebar-menu-anchor">
+                <button
+                  ref={projectOrganizationButtonRef}
+                  aria-label="项目排序"
+                  className="cindy-sidebar-section-action"
+                  onClick={() => {
+                    setProjectMenuOpen(undefined);
+                    setProjectCreateMenuOpen(false);
+                    setProjectOrganizationMenuOpen((current) => !current);
+                  }}
+                  type="button"
+                >
+                  <Icon name="more" size={14} />
+                </button>
+                <button
+                  ref={projectCreateButtonRef}
+                  aria-label="添加项目"
+                  className="cindy-sidebar-section-action"
+                  onClick={() => {
+                    setProjectMenuOpen(undefined);
+                    setProjectOrganizationMenuOpen(false);
+                    setProjectCreateMenuOpen((current) => !current);
+                  }}
+                  type="button"
+                >
+                  <Icon name="add" size={15} />
+                </button>
+                {projectOrganizationMenuOpen ? (
+                  <SidebarOrganizationMenu
+                    anchorRef={projectOrganizationButtonRef}
+                    onSortChange={(value) => { setProjectSort(value); setProjectOrganizationMenuOpen(false); }}
+                    sort={projectSort}
+                  />
+                ) : null}
                 {projectCreateMenuOpen ? (
-                  <ProjectCreationMenu
+                  <SidebarCreationMenu
                     anchorRef={projectCreateButtonRef}
                     onCreateEmptyProject={() => { setProjectCreateMenuOpen(false); onCreateEmptyProject(); }}
                     onOpenProject={() => { setProjectCreateMenuOpen(false); onOpenProject(); }}
@@ -290,90 +371,178 @@ export const Sidebar = memo(function Sidebar({
               </div>
             )}
             expanded={expandedSections.projects}
+            icon="folder"
             label="项目"
+            compactDivider
             onToggle={() => toggleSection("projects")}
           >
-            {unpinnedProjects.map((project) => {
-              return (
-                <div
-                  className={`project-group${dragState?.sourceId === project.id ? " is-dragging" : ""}${projectDropClass(project.id, "projects")}`}
-                  key={project.id}
-                  onDragOver={(event) => {
-                    event.preventDefault();
-                    event.dataTransfer.dropEffect = "move";
-                    const bounds = event.currentTarget.getBoundingClientRect();
-                    updateProjectDragTarget(project.id, "projects", event.clientY, bounds);
-                  }}
-                  onDrop={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    dropProjectDrag(project.id, event.clientY, event.currentTarget.getBoundingClientRect());
-                  }}
-                >
-                  <ProjectRow
-                    dragActive={Boolean(dragState)}
-                    menuOpen={projectMenuOpen === `project-${project.id}`}
-                    onDragCancel={cancelProjectDrag}
-                    onDragEnd={endProjectDrag}
-                    onDragStart={() => beginProjectDrag(project.id, "projects")}
-                    onMenu={() => openProjectMenu(`project-${project.id}`)}
-                    onPin={() => { setProjectMenuOpen(undefined); onProjectPinned(project.id, !project.pinned); }}
-                    onReveal={() => { setProjectMenuOpen(undefined); onRevealProject(project.id); }}
-                    onOpenTerminal={() => { setProjectMenuOpen(undefined); onOpenTerminalProject(project.id); }}
-                    onRename={() => { setProjectMenuOpen(undefined); onRenameProject(project.id); }}
-                    onNewTask={() => { setProjectMenuOpen(undefined); onNewTask(project.id); }}
-                    onRemove={() => { setProjectMenuOpen(undefined); onRemoveProject(project.id); }}
-                    onSelect={selectOrToggleProject}
-                    project={project}
-                    running={project.id === activeProjectId && hasRunningSession(sessions)}
-                    selected={project.id === activeProjectId && !selectedSessionId}
-                    sessionsExpanded={project.id === activeProjectId && !collapsedProjectIds.has(project.id)}
-                  />
-                  {project.id === activeProjectId ? <ProjectSessions expanded={!collapsedProjectIds.has(project.id)} onSelectSession={onSelectSession} selectedSessionId={selectedSessionId} sessions={sessions} /> : null}
-                </div>
-              );
-            })}
-            {!projects.length ? <div className="empty-folder-row">暂无项目，点击 + 添加</div> : null}
-          </SidebarFolder>
-        </div>
+            {unpinnedProjects.length ? unpinnedProjects.map((project) => renderProject(project, "projects")) : <div className="cindy-sidebar-empty-row">暂无项目，点击 + 添加</div>}
+          </SidebarSection>
 
-        <div className="sidebar-footer">
-          <button className="sidebar-settings-button" onClick={onSettings} type="button"><Icon name="settings" size={15} /><span>设置</span></button>
+          <SidebarSection expanded={expandedSections.dialogue} icon="message" label="对话" onToggle={() => toggleSection("dialogue")}>
+            <CollapsibleSessionList
+              limit={DIALOGUE_SESSION_COLLAPSE_LIMIT}
+              onSelectSession={onSelectSession}
+              onSessionMenu={onSessionMenu}
+              selectedSessionId={selectedSessionId}
+              sessions={dialogueSessions}
+            />
+            {!dialogueSessions.length ? <p className="cindy-sidebar-empty-row">暂无未归类对话</p> : null}
+          </SidebarSection>
         </div>
-        <SidebarResizer onResizeEnd={onResizeEnd} onResizeStart={onResizeStart} onWidthChange={onWidthChange} width={width} />
       </div>
-    </aside>
+
+      <div className="cindy-sidebar-footer">
+        <button aria-label="账户设置" className="cindy-user-card" onClick={onSettings} type="button">
+          <span className="cindy-account-placeholder"><Icon name="person" size={15} /></span>
+          <span className="cindy-user-copy">
+            <strong>未登录</strong>
+            <small>{version ?? "0.1.26"}</small>
+          </span>
+          <span className="cindy-user-action cindy-user-action-primary" aria-hidden="true"><Icon name="remote" size={14} /></span>
+          <span className="cindy-user-action cindy-user-action-secondary" aria-hidden="true"><Icon name="spark" size={14} /></span>
+        </button>
+      </div>
+      {visible ? (
+        <div
+          aria-label="调整侧栏宽度"
+          aria-orientation="vertical"
+          aria-valuemax={MAX_SIDEBAR_WIDTH}
+          aria-valuemin={MIN_SIDEBAR_WIDTH}
+          aria-valuenow={Math.round(clampSidebarWidth(width))}
+          className="cindy-sidebar-resizer"
+          onKeyDown={(event) => {
+            if (event.key === "ArrowLeft") {
+              event.preventDefault();
+              const nextWidth = clampSidebarWidth(width - 16);
+              onWidthChange(nextWidth);
+              onWidthCommit(nextWidth);
+            }
+            if (event.key === "ArrowRight") {
+              event.preventDefault();
+              const nextWidth = clampSidebarWidth(width + 16);
+              onWidthChange(nextWidth);
+              onWidthCommit(nextWidth);
+            }
+          }}
+          onPointerDown={startSidebarResize(width, onWidthChange, onWidthCommit)}
+          role="separator"
+          tabIndex={0}
+        />
+      ) : null}
+      </aside>
+      <SidebarChrome
+        collapsed={!visible}
+        floating
+        onNewTask={createTask}
+        onToggle={() => onVisibleChange(!visible)}
+      />
+    </>
   );
 });
 
-function SidebarFolder({ label, expanded, actions, onToggle, children }: { label: string; expanded: boolean; actions?: React.ReactNode; onToggle(): void; children: React.ReactNode }): React.JSX.Element {
+function SidebarChrome({ collapsed, floating = false, onNewTask, onToggle }: { collapsed: boolean; floating?: boolean; onNewTask(): void; onToggle(): void }): React.JSX.Element {
   return (
-    <section className={`sidebar-section folder-section${expanded ? " is-expanded" : ""}`}>
-      <div className="folder-section-heading">
-        <button aria-expanded={expanded} className="folder-section-trigger" onClick={onToggle} type="button">
-          <span>{label}</span>
-          <span className="folder-section-chevron"><Icon name="chevron" size={13} /></span>
+    <div className={`cindy-sidebar-topbar${floating ? " cindy-sidebar-topbar-floating" : ""}`}>
+      <button
+        aria-expanded={!collapsed}
+        aria-label={collapsed ? "展开侧栏" : "收起侧栏"}
+        className="cindy-chrome-button"
+        onClick={onToggle}
+        type="button"
+      >
+        <Icon name="sidebar" size={15} />
+      </button>
+      <button
+        aria-label="新建对话"
+        className="cindy-chrome-button cindy-sidebar-new-button"
+        onClick={onNewTask}
+        type="button"
+      >
+        <Icon name="menu" size={16} />
+      </button>
+    </div>
+  );
+}
+
+function SidebarSection({ label, icon, compactDivider, expanded, actions, onToggle, children }: { label: string; icon?: IconName; compactDivider?: boolean; expanded: boolean; actions?: React.ReactNode; onToggle(): void; children: React.ReactNode }): React.JSX.Element {
+  return (
+    <section aria-label={label} className={`cindy-sidebar-section${expanded ? " is-expanded" : ""}${icon ? " has-compact-icon" : ""}${compactDivider ? " has-compact-divider" : ""}`}>
+      <div className="cindy-sidebar-section-header">
+        <button aria-expanded={expanded} aria-label={label} className="cindy-sidebar-section-trigger" onClick={onToggle} type="button">
+          {icon ? <span aria-hidden="true" className="cindy-sidebar-section-icon"><Icon name={icon} size={17} /></span> : null}
+          <span className="cindy-sidebar-section-label">{label}</span>
+          <span className="cindy-sidebar-section-chevron"><Icon name="chevron" size={13} /></span>
         </button>
         {actions}
       </div>
-      <div className="folder-section-content t-resize"><div className="folder-section-content-inner">{children}</div></div>
+      <div className="cindy-sidebar-section-content"><div>{children}</div></div>
     </section>
   );
 }
 
-function ProjectSessions({ sessions, selectedSessionId, expanded, onSelectSession }: { sessions: DesktopSessionSummary[]; selectedSessionId?: string; expanded: boolean; onSelectSession(sessionId: string): void }): React.JSX.Element | null {
+function ProjectSessions({ projectId, sessions, selectedSessionId, onSelectSession, onSessionMenu }: { projectId: string; sessions: DesktopSessionSummary[]; selectedSessionId?: string; onSelectSession(projectId: string, sessionId: string): void; onSessionMenu(session: DesktopSessionSummary): void }): React.JSX.Element | null {
   if (!sessions.length) return null;
   return (
-    <div aria-hidden={!expanded} aria-label="项目会话" className={`project-sessions t-resize${expanded ? " is-expanded" : ""}`} inert={!expanded}>
-      <div>
-        {sessions.map((session) => (
-          <div className={`session-row${session.id === selectedSessionId ? " is-selected" : ""}`} key={session.id}>
-            <button aria-current={session.id === selectedSessionId ? "page" : undefined} className="session-main" onClick={() => onSelectSession(session.id)} title={session.firstUserMessage || session.title} type="button">
-              <span className="row-label">{session.title}</span>
-            </button>
-          </div>
-        ))}
-      </div>
+    <CollapsibleSessionList
+      limit={PROJECT_SESSION_COLLAPSE_LIMIT}
+      onSelectSession={onSelectSession}
+      onSessionMenu={onSessionMenu}
+      projectId={projectId}
+      selectedSessionId={selectedSessionId}
+      sessions={sessions}
+    />
+  );
+}
+
+interface SessionListProps {
+  projectId?: string;
+  sessions: DesktopSessionSummary[];
+  selectedSessionId?: string;
+  onSelectSession(projectId: string, sessionId: string): void;
+  onSessionMenu(session: DesktopSessionSummary): void;
+}
+
+function CollapsibleSessionList({ limit, ...props }: SessionListProps & { limit: number }): React.JSX.Element {
+  const [expanded, setExpanded] = useState(false);
+  const shouldCollapse = props.sessions.length > limit;
+  useEffect(() => {
+    if (!shouldCollapse) setExpanded(false);
+  }, [shouldCollapse]);
+  const visibleSessions = expanded ? props.sessions : props.sessions.slice(0, limit);
+  return (
+    <>
+      <SessionList {...props} sessions={visibleSessions} />
+      {shouldCollapse ? (
+        <button className="cindy-sidebar-session-expand" onClick={() => setExpanded((current) => !current)} type="button">
+          {expanded ? "收起" : `显示全部 ${props.sessions.length} 项`}
+        </button>
+      ) : null}
+    </>
+  );
+}
+
+function SessionList({ projectId, sessions, selectedSessionId, onSelectSession, onSessionMenu }: SessionListProps): React.JSX.Element {
+  return (
+    <div className={`cindy-sidebar-session-list${projectId ? " is-indented" : ""}`}>
+      {sessions.map((session) => (
+        <button
+          aria-current={session.id === selectedSessionId ? "page" : undefined}
+          className={`cindy-sidebar-session-item${session.id === selectedSessionId ? " is-selected" : ""}`}
+          key={`${session.projectId}:${session.id}`}
+          onClick={() => onSelectSession(projectId ?? session.projectId, session.id)}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            onSessionMenu(session);
+          }}
+          title={session.firstUserMessage || session.title}
+          type="button"
+        >
+          <span className={`cindy-session-dot is-${session.status}`} />
+          <span>{session.title || session.firstUserMessage || "新对话"}</span>
+          <time>{formatRelativeTime(session.updatedAt)}</time>
+        </button>
+      ))}
     </div>
   );
 }
@@ -384,14 +553,15 @@ const ProjectRow = memo(function ProjectRow({
   sessionsExpanded,
   running,
   dragActive,
-  onSelect,
   menuOpen,
+  onSelect,
   onMenu,
-  onRename,
   onNewTask,
   onPin,
+  onRefresh,
   onReveal,
   onOpenTerminal,
+  onRename,
   onRemove,
   onDragStart,
   onDragEnd,
@@ -402,14 +572,15 @@ const ProjectRow = memo(function ProjectRow({
   sessionsExpanded: boolean;
   running: boolean;
   dragActive: boolean;
-  onSelect(projectId: string): void;
   menuOpen: boolean;
+  onSelect(projectId: string): void;
   onMenu(): void;
-  onRename(): void;
   onNewTask(): void;
   onPin(): void;
+  onRefresh(): void;
   onReveal(): void;
   onOpenTerminal(): void;
+  onRename(): void;
   onRemove(): void;
   onDragStart(): void;
   onDragEnd(): void;
@@ -417,22 +588,18 @@ const ProjectRow = memo(function ProjectRow({
 }): React.JSX.Element {
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const suppressClickRef = useRef(false);
-
   return (
     <div
-      className={`project-row-wrap${selected ? " is-active" : ""}${dragActive ? " is-drag-active" : ""}`}
+      className={`cindy-project-row-wrap${selected ? " is-active" : ""}${dragActive ? " is-drag-active" : ""}`}
       draggable
       onDragEnd={(event) => {
         event.preventDefault();
-        // Suppress the trailing click that browsers emit after a drag gesture.
         suppressClickRef.current = true;
-        window.setTimeout(() => {
-          suppressClickRef.current = false;
-        }, 0);
+        window.setTimeout(() => { suppressClickRef.current = false; }, 0);
         onDragEnd();
       }}
       onDragStart={(event) => {
-        if (event.target instanceof Element && event.target.closest(".project-row-actions, button, a, input, textarea")) {
+        if (event.target instanceof Element && event.target.closest(".cindy-project-row-actions")) {
           event.preventDefault();
           return;
         }
@@ -441,120 +608,88 @@ const ProjectRow = memo(function ProjectRow({
         event.dataTransfer.setData("text/plain", project.id);
         onDragStart();
       }}
-      onKeyDown={(event) => {
-        if (event.key === "Escape" && dragActive) onDragCancel();
-      }}
+      onKeyDown={(event) => { if (event.key === "Escape" && dragActive) onDragCancel(); }}
     >
       <div
         aria-expanded={sessionsExpanded}
-        className={`project-row${selected ? " is-active" : ""}`}
-        onClick={() => {
-          if (suppressClickRef.current) return;
+        className={`cindy-project-row${selected ? " is-active" : ""}`}
+        onClick={() => { if (!suppressClickRef.current) onSelect(project.id); }}
+        onKeyDown={(event) => {
+          if (event.key !== "Enter" && event.key !== " ") return;
+          event.preventDefault();
           onSelect(project.id);
         }}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            onSelect(project.id);
-          }
-        }}
+        title={project.path}
         role="button"
         tabIndex={0}
-        title={project.path}
       >
         <Icon name="folder" size={15} />
-        <span className="row-label">{project.name}</span>
-        {project.missing ? <span className="status-dot is-failed" title="路径不可用" /> : running ? <span className="status-dot is-running" title="正在运行" /> : null}
+        <span className="cindy-project-row-label">{project.name}</span>
+        {project.missing ? <span className="cindy-project-status is-failed" title="路径不可用" /> : running ? <span className="cindy-project-status is-running" title="正在运行" /> : null}
+        <span className={`cindy-project-disclosure${sessionsExpanded ? " is-expanded" : ""}`}><Icon name="chevron" size={12} /></span>
       </div>
-      <div className={`project-row-actions${menuOpen ? " is-open" : ""}`}>
-        <button ref={menuButtonRef} aria-label={`${project.name} 项目操作`} className="project-row-action" onClick={onMenu} type="button"><Icon name="more" size={14} /></button>
-        <button aria-label={`新建任务 ${project.name}`} className="project-row-action" onClick={onNewTask} title="新建任务" type="button"><Icon name="edit" size={14} /></button>
-        {menuOpen ? <ProjectMenu anchorRef={menuButtonRef} onOpenTerminal={onOpenTerminal} onPin={onPin} onRemove={onRemove} onRename={onRename} onReveal={onReveal} project={project} /> : null}
+      <div className={`cindy-project-row-actions${menuOpen ? " is-open" : ""} cindy-sidebar-menu-anchor`}>
+        <button aria-label={`新建任务 ${project.name}`} className="cindy-project-row-action" onClick={onNewTask} title="新建任务" type="button"><Icon name="edit" size={14} /></button>
+        <button ref={menuButtonRef} aria-label={`${project.name} 项目操作`} className="cindy-project-row-action" onClick={onMenu} title="项目操作" type="button"><Icon name="more" size={14} /></button>
+        {menuOpen ? <ProjectMenu anchorRef={menuButtonRef} onOpenTerminal={onOpenTerminal} onPin={onPin} onRefresh={onRefresh} onRemove={onRemove} onRename={onRename} onReveal={onReveal} project={project} /> : null}
       </div>
     </div>
   );
 });
 
-function ProjectMenu({ anchorRef, project, onPin, onReveal, onOpenTerminal, onRename, onRemove }: { anchorRef: FloatingMenuAnchor; project: DesktopProject; onPin(): void; onReveal(): void; onOpenTerminal(): void; onRename(): void; onRemove(): void }): React.JSX.Element {
+function ProjectMenu({ anchorRef, project, onPin, onRefresh, onReveal, onOpenTerminal, onRename, onRemove }: { anchorRef: FloatingMenuAnchor; project: DesktopProject; onPin(): void; onRefresh(): void; onReveal(): void; onOpenTerminal(): void; onRename(): void; onRemove(): void }): React.JSX.Element {
   return (
-    <FloatingProjectMenu anchorRef={anchorRef} ariaLabel="项目操作菜单">
+    <FloatingSidebarMenu anchorRef={anchorRef} ariaLabel="项目操作菜单">
       <button onClick={onPin} role="menuitem" type="button"><Icon name="pin" size={15} /><span>{project.pinned ? "取消置顶项目" : "置顶项目"}</span></button>
+      <button onClick={onRefresh} role="menuitem" type="button"><Icon name="refresh" size={15} /><span>刷新项目状态</span></button>
       <button onClick={onReveal} role="menuitem" type="button"><Icon name="external" size={15} /><span>在 Finder 中显示</span></button>
       <button onClick={onOpenTerminal} role="menuitem" type="button"><Icon name="terminal" size={15} /><span>在终端中打开</span></button>
       <button onClick={onRename} role="menuitem" type="button"><Icon name="edit" size={15} /><span>重命名项目</span></button>
-      <div className="project-menu-separator" />
-      <button className="is-danger" onClick={onRemove} role="menuitem" type="button"><Icon name="trash" size={15} /><span>移除</span></button>
-    </FloatingProjectMenu>
+      <div className="cindy-sidebar-menu-separator" />
+      <button className="is-danger" onClick={onRemove} role="menuitem" type="button"><Icon name="trash" size={15} /><span>移除项目</span></button>
+    </FloatingSidebarMenu>
   );
 }
 
-function ProjectOrganizationMenu({ anchorRef, grouping, sort, onGroupingChange, onSortChange }: { anchorRef: FloatingMenuAnchor; grouping: ProjectGrouping; sort: ProjectSort; onGroupingChange(value: ProjectGrouping): void; onSortChange(value: ProjectSort): void }): React.JSX.Element {
+function SidebarOrganizationMenu({ anchorRef, sort, onSortChange }: { anchorRef: FloatingMenuAnchor; sort: ProjectSort; onSortChange(value: ProjectSort): void }): React.JSX.Element {
   return (
-    <FloatingProjectMenu anchorRef={anchorRef} ariaLabel="项目整理和排序菜单" className="project-organization-menu">
-      <div className="project-menu-heading">整理</div>
-      <button aria-checked={grouping === "by-project"} onClick={() => onGroupingChange("by-project")} role="menuitemradio" type="button"><MenuCheck checked={grouping === "by-project"} /><span>按项目</span></button>
-      <button aria-checked={grouping === "list"} onClick={() => onGroupingChange("list")} role="menuitemradio" type="button"><MenuCheck checked={grouping === "list"} /><span>在一个列表中</span></button>
-      <div className="project-menu-separator" />
-      <div className="project-menu-heading">排序方式</div>
-      <button aria-checked={sort === "priority"} onClick={() => onSortChange("priority")} role="menuitemradio" type="button"><MenuCheck checked={sort === "priority"} /><span>优先级</span></button>
-      <button aria-checked={sort === "recent"} onClick={() => onSortChange("recent")} role="menuitemradio" type="button"><MenuCheck checked={sort === "recent"} /><span>最近更新</span></button>
-      <button aria-checked={sort === "manual"} onClick={() => onSortChange("manual")} role="menuitemradio" type="button"><MenuCheck checked={sort === "manual"} /><span>手动排序</span></button>
-    </FloatingProjectMenu>
+    <FloatingSidebarMenu anchorRef={anchorRef} ariaLabel="项目排序菜单" className="is-narrow">
+      <div className="cindy-sidebar-menu-heading">排序方式</div>
+      {([
+        ["priority", "优先级"],
+        ["recent", "最近打开"],
+        ["manual", "手动排序"]
+      ] as const).map(([value, label]) => (
+        <button aria-checked={sort === value} key={value} onClick={() => onSortChange(value)} role="menuitemradio" type="button">
+          <span className="cindy-sidebar-menu-check">{sort === value ? <Icon name="check" size={14} /> : null}</span>
+          <span>{label}</span>
+        </button>
+      ))}
+    </FloatingSidebarMenu>
   );
 }
 
-function MenuCheck({ checked }: { checked: boolean }): React.JSX.Element {
-  return <span aria-hidden="true" className="project-menu-check">{checked ? <Icon name="check" size={14} /> : null}</span>;
-}
-
-function sortProjects(projects: DesktopProject[], sort: ProjectSort): DesktopProject[] {
-  const ordered = [...projects];
-  if (sort === "manual") return ordered;
-  if (sort === "priority") {
-    // Pinned first; keep existing relative order within each group so selecting a project never reorders the list.
-    return ordered.sort((left, right) => {
-      if (left.pinned === right.pinned) return 0;
-      return left.pinned ? -1 : 1;
-    });
-  }
-  return ordered.sort((left, right) => right.lastOpenedAt.localeCompare(left.lastOpenedAt) || left.name.localeCompare(right.name));
-}
-
-function reorderSectionProjectIds(
-  fullIds: string[],
-  sectionIds: string[],
-  sourceId: string,
-  targetId: string,
-  placement: ProjectDragPlacement
-): string[] {
-  const nextSection = sectionIds.filter((projectId) => projectId !== sourceId);
-  const targetIndex = nextSection.indexOf(targetId);
-  if (targetIndex < 0) return fullIds;
-  nextSection.splice(placement === "after" ? targetIndex + 1 : targetIndex, 0, sourceId);
-
-  const sectionMembers = new Set(sectionIds);
-  let sectionIndex = 0;
-  return fullIds.map((projectId) => sectionMembers.has(projectId) ? nextSection[sectionIndex++]! : projectId);
-}
-
-function ProjectCreationMenu({ anchorRef, onCreateEmptyProject, onOpenProject }: { anchorRef: FloatingMenuAnchor; onCreateEmptyProject(): void; onOpenProject(): void }): React.JSX.Element {
+function SidebarCreationMenu({ anchorRef, onCreateEmptyProject, onOpenProject }: { anchorRef: FloatingMenuAnchor; onCreateEmptyProject(): void; onOpenProject(): void }): React.JSX.Element {
   return (
-    <FloatingProjectMenu anchorRef={anchorRef} ariaLabel="添加项目菜单" className="project-create-menu">
+    <FloatingSidebarMenu anchorRef={anchorRef} ariaLabel="添加项目菜单">
       <button onClick={onCreateEmptyProject} role="menuitem" type="button"><Icon name="add" size={15} /><span>新建空项目</span></button>
       <button onClick={onOpenProject} role="menuitem" type="button"><Icon name="folder" size={15} /><span>使用现有文件夹</span></button>
-    </FloatingProjectMenu>
+    </FloatingSidebarMenu>
   );
 }
 
-function FloatingProjectMenu({ anchorRef, ariaLabel, className = "", children }: { anchorRef: FloatingMenuAnchor; ariaLabel: string; className?: string; children: React.ReactNode }): React.JSX.Element {
-  const [position, setPosition] = useState<{ top: number; left: number }>();
-
+function FloatingSidebarMenu({ anchorRef, ariaLabel, className = "", children }: { anchorRef: FloatingMenuAnchor; ariaLabel: string; className?: string; children: React.ReactNode }): React.JSX.Element {
+  const [position, setPosition] = useState<{ left: number; top: number }>();
   useLayoutEffect(() => {
     const updatePosition = (): void => {
       const anchor = anchorRef.current;
       if (!anchor) return;
       const rect = anchor.getBoundingClientRect();
-      setPosition({ left: Math.max(8, rect.left), top: rect.bottom + 4 });
+      const width = className === "is-narrow" ? 166 : 222;
+      setPosition({
+        left: Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - width - 8)),
+        top: Math.min(rect.bottom + 4, Math.max(8, window.innerHeight - 300))
+      });
     };
     updatePosition();
     window.addEventListener("resize", updatePosition);
@@ -563,33 +698,71 @@ function FloatingProjectMenu({ anchorRef, ariaLabel, className = "", children }:
       window.removeEventListener("resize", updatePosition);
       document.removeEventListener("scroll", updatePosition, true);
     };
-  }, [anchorRef]);
-
+  }, [anchorRef, className]);
   return createPortal(
-    <div aria-label={ariaLabel} className={`project-menu t-dropdown is-open${className ? ` ${className}` : ""}`} data-origin="top-left" role="menu" style={{ left: position?.left, top: position?.top, visibility: position ? "visible" : "hidden" }}>
+    <div aria-label={ariaLabel} className={`cindy-sidebar-menu${className ? ` ${className}` : ""}`} role="menu" style={{ left: position?.left, top: position?.top, visibility: position ? "visible" : "hidden" }}>
       {children}
     </div>,
     document.body
   );
 }
 
+function sortProjects(projects: DesktopProject[], sort: ProjectSort): DesktopProject[] {
+  const ordered = [...projects];
+  if (sort === "manual") return ordered;
+  if (sort === "priority") return ordered.sort((left, right) => left.pinned === right.pinned ? 0 : left.pinned ? -1 : 1);
+  return ordered.sort((left, right) => right.lastOpenedAt.localeCompare(left.lastOpenedAt) || left.name.localeCompare(right.name));
+}
+
+function reorderSectionProjectIds(fullIds: string[], sectionIds: string[], sourceId: string, targetId: string, placement: ProjectDragPlacement): string[] {
+  const nextSection = sectionIds.filter((projectId) => projectId !== sourceId);
+  const targetIndex = nextSection.indexOf(targetId);
+  if (targetIndex < 0) return fullIds;
+  nextSection.splice(placement === "after" ? targetIndex + 1 : targetIndex, 0, sourceId);
+  const sectionMembers = new Set(sectionIds);
+  let sectionIndex = 0;
+  return fullIds.map((projectId) => sectionMembers.has(projectId) ? nextSection[sectionIndex++]! : projectId);
+}
+
 function hasRunningSession(sessions: DesktopSessionSummary[]): boolean {
   return sessions.some((session) => session.status === "running" || session.status === "waiting_permission");
 }
 
-function SidebarResizer({ width, onWidthChange, onResizeStart, onResizeEnd }: { width: number; onWidthChange(width: number): void; onResizeStart(): void; onResizeEnd(): void }): React.JSX.Element {
-  const startResize = (event: React.PointerEvent<HTMLDivElement>): void => {
-    onResizeStart();
+function formatRelativeTime(value: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "";
+  const minutes = Math.max(0, Math.floor((Date.now() - timestamp) / 60_000));
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时`;
+  const days = Math.floor(hours / 24);
+  return days < 30 ? `${days} 天` : `${Math.floor(days / 30)} 个月`;
+}
+
+function startSidebarResize(width: number, onWidthChange: (nextWidth: number) => void, onWidthCommit: (nextWidth: number) => void): (event: React.PointerEvent<HTMLDivElement>) => void {
+  return (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
     const startX = event.clientX;
-    const startWidth = width;
-    const move = (moveEvent: PointerEvent): void => onWidthChange(Math.min(300, Math.max(188, startWidth + moveEvent.clientX - startX)));
+    const startWidth = clampSidebarWidth(width);
+    let currentWidth = startWidth;
+    let active = true;
+    const move = (moveEvent: PointerEvent): void => {
+      currentWidth = clampSidebarWidth(startWidth + moveEvent.clientX - startX);
+      onWidthChange(currentWidth);
+    };
     const stop = (): void => {
+      if (!active) return;
+      active = false;
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", stop);
-      onResizeEnd();
+      window.removeEventListener("pointercancel", stop);
+      onWidthCommit(currentWidth);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop, { once: true });
+    window.addEventListener("pointercancel", stop, { once: true });
   };
-  return <div aria-label="调整侧边栏宽度" className="sidebar-resizer" onPointerDown={startResize} role="separator" />;
 }

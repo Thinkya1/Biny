@@ -1,63 +1,58 @@
 /**
- * 渲染进程根组件。
+ * Desktop 渲染进程的装配根。
  *
- * 持有全部界面状态（项目、会话、时间线、浮层、布局尺寸），订阅主进程事件流并把状态分发给
- * Sidebar / Workspace / Composer / Overlays。所有 IPC 调用都集中在这里，子组件只通过回调
- * 表达意图。
- *
- * 事件通道是所有项目共用的，因此处理事件时必须先按 `projectId` 过滤，否则后台项目的输出会
- * 串到当前界面上。
+ * 这里只保留跨区域的项目、会话、导航和浮层状态；运行时事件投影、设置命令、Inspector
+ * 与 Composer 本地交互分别下沉到 `app/` 和对应组件。子组件通过回调表达意图，不直接持有
+ * Agent、Session 或 Provider。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { InteractiveAgentRunMode } from "../../../agent/AgentSession.js";
-import type { ContextBudgetStatus, ContextStatus } from "../../../agent/context/types.js";
-import type { ModelRuntimeInfo, ThinkingSelection } from "../../../llm/ModelManager.js";
+import type { ContextBudgetStatus } from "../../../agent/context/types.js";
 import type { PermissionMode, PermissionResult } from "../../../permission/PermissionManager.js";
-import {
-  activeRun,
-  isTerminalRunEvent,
-  pendingPermission,
-  type AgentHostEvent
-} from "../../../runtime/agentEvents.js";
-import type { SessionEvent } from "../../../session/recorder.js";
-import { publicUserMessage } from "../../../session/publicMessage.js";
+import { activeRun, pendingPermission } from "../../../runtime/agentEvents.js";
 import type {
-  DesktopAgentEventEnvelope,
   DesktopAttachment,
   DesktopFontPreference,
-  DesktopMemorySettings,
   DesktopMenuAction,
-  DesktopModelConfigurationInput,
-  DesktopModelLoginProvider,
   DesktopProject,
   DesktopSessionDocument,
   DesktopSessionSummary,
   DesktopSlashResult,
   DesktopThemePreference,
-  DesktopWebSearchSettingsInput,
   DesktopWorkspaceDirectory,
   DesktopWorkspaceSnapshot
 } from "../../protocol.js";
 import { DEFAULT_FILE_PANEL_WIDTH } from "../../filePanelSizing.js";
 import { DEFAULT_FONT_PREFERENCE, SYSTEM_FONT_FAMILY } from "../../fontPreference.js";
+import { clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH } from "../../sidebarSizing.js";
 import {
-  canNavigateBack,
-  canNavigateForward,
   createNavigationState,
-  moveNavigation,
   pushNavigation,
   replaceNavigation,
   type DesktopNavigationState,
   type DesktopNavigationTarget
 } from "./navigationHistory.js";
-import { buildSessionTimeline, listChangedFiles, liveTimelineEvents, type TimelineTurn } from "./sessionTimeline.js";
+import { buildSessionTimeline, listChangedFiles, type TimelineTurn } from "./sessionTimeline.js";
+import { desktopApiVersionMismatchMessage, errorMessage } from "./app/desktopApi.js";
+import {
+  applyProjectOrder,
+  eventsBeforeUserMessage,
+  lastReportedInputTokens,
+  mergeProject,
+  replaceProjectSessions,
+  syntheticSession
+} from "./app/desktopState.js";
+import { useDesktopEventBridge } from "./app/useDesktopEventBridge.js";
+import { useDesktopSettingsActions } from "./app/useDesktopSettingsActions.js";
 import { Composer, type ContextUsage } from "./components/Composer.js";
-import { NavigationControls } from "./components/NavigationControls.js";
-import { RenameOverlay, SearchOverlay, SettingsOverlay, SlashResultOverlay, Toast } from "./components/Overlays.js";
+import { DesktopShell } from "./components/DesktopShell.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { Workspace } from "./components/Workspace.js";
-
-const desktopApiVersionMismatchMessage = "桌面端资源版本不一致，请完全退出 Biny 后重新启动。";
+import { DesktopToast } from "./components/overlays/DesktopToast.js";
+import { RenameOverlay } from "./components/overlays/RenameOverlay.js";
+import { SearchOverlay } from "./components/overlays/SearchOverlay.js";
+import { SlashResultOverlay } from "./components/overlays/SlashResultOverlay.js";
+import { SettingsOverlay, type SettingsTab } from "./components/settings/SettingsOverlay.js";
 
 interface RenameTarget {
   kind: "project" | "session";
@@ -69,13 +64,13 @@ interface RenameTarget {
 export function App(): React.JSX.Element {
   const [version, setVersion] = useState("0.1.0");
   const [projects, setProjects] = useState<DesktopProject[]>([]);
+  const [sidebarSessions, setSidebarSessions] = useState<DesktopSessionSummary[]>([]);
   const [workspace, setWorkspace] = useState<DesktopWorkspaceSnapshot>();
   const [document, setDocument] = useState<DesktopSessionDocument>();
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
   const [loading, setLoading] = useState(true);
   const [sidebarVisible, setSidebarVisible] = useState(true);
-  const [sidebarWidth, setSidebarWidth] = useState(216);
-  const [sidebarResizing, setSidebarResizing] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
   const [filePanelWidth, setFilePanelWidth] = useState(DEFAULT_FILE_PANEL_WIDTH);
   const [filePanelResizing, setFilePanelResizing] = useState(false);
   const [themePreference, setThemePreference] = useState<DesktopThemePreference>("system");
@@ -84,20 +79,27 @@ export function App(): React.JSX.Element {
   const [deletedUserMessages, setDeletedUserMessages] = useState<Set<string>>(() => new Set());
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTargetTab, setSettingsTargetTab] = useState<SettingsTab>();
   const [contextBudget, setContextBudget] = useState<ContextBudgetStatus>();
   const [renameTarget, setRenameTarget] = useState<RenameTarget>();
   const [slashResult, setSlashResult] = useState<DesktopSlashResult>();
   const [toast, setToast] = useState<string>();
-  const [navigation, setNavigation] = useState<DesktopNavigationState>(createNavigationState);
   const selectedRef = useRef<string | undefined>(undefined);
   const projectRef = useRef<string | undefined>(undefined);
-  const navigationRef = useRef(navigation);
+  const navigationRef = useRef<DesktopNavigationState>(createNavigationState());
   const loadRequestRef = useRef(0);
-  const eventQueueRef = useRef<DesktopAgentEventEnvelope[]>([]);
-  const eventFrameRef = useRef<number | undefined>(undefined);
-  const refreshTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const menuActionRef = useRef<(action: DesktopMenuAction) => void>(() => undefined);
   const modelSetupWasRequiredRef = useRef(false);
+
+  const openSettings = useCallback((targetTab?: SettingsTab): void => {
+    setSettingsTargetTab(targetTab);
+    setSettingsOpen(true);
+  }, []);
+
+  const closeSettings = useCallback((): void => {
+    setSettingsOpen(false);
+    setSettingsTargetTab(undefined);
+  }, []);
 
   useEffect(() => {
     selectedRef.current = selectedSessionId;
@@ -108,27 +110,59 @@ export function App(): React.JSX.Element {
     const required = Boolean(workspace?.requiresModelConfiguration);
     if (required) {
       modelSetupWasRequiredRef.current = true;
-      setSettingsOpen(true);
+      openSettings("模型");
     } else if (modelSetupWasRequiredRef.current) {
       modelSetupWasRequiredRef.current = false;
-      setSettingsOpen(false);
+      closeSettings();
     }
-  }, [workspace?.requiresModelConfiguration]);
+  }, [closeSettings, openSettings, workspace?.requiresModelConfiguration]);
 
   const commitNavigation = useCallback((next: DesktopNavigationState): void => {
     navigationRef.current = next;
-    setNavigation(next);
   }, []);
 
   const mergeWorkspaceProject = useCallback((snapshot: DesktopWorkspaceSnapshot): void => {
     setProjects((current) => mergeProject(current, snapshot.project));
+    setSidebarSessions((current) => replaceProjectSessions(current, snapshot.project.id, snapshot.sessions));
     setWorkspace(snapshot);
   }, []);
 
   const mergeProjectSnapshot = useCallback((snapshot: DesktopWorkspaceSnapshot): void => {
     setProjects((current) => mergeProject(current, snapshot.project));
+    setSidebarSessions((current) => replaceProjectSessions(current, snapshot.project.id, snapshot.sessions));
     if (projectRef.current === snapshot.project.id) setWorkspace(snapshot);
   }, []);
+
+  const reportEventError = useCallback((error: unknown): void => {
+    setToast(errorMessage(error));
+  }, []);
+
+  const {
+    addMemoryEntry,
+    cancelModelLogin,
+    clearMemory,
+    compactMemory,
+    completeModelLogin,
+    deleteMemoryEntry,
+    fetchModelCatalog,
+    loadCookieJarStatus,
+    loadMemoryOverview,
+    loadWebSearchSettings,
+    openBrowser,
+    removeModelConfiguration,
+    saveMemorySettings,
+    saveModelConfiguration,
+    saveWebSearchSettings,
+    searchMemory,
+    startModelLogin,
+    switchModel,
+    testModelConfiguration
+  } = useDesktopSettingsActions({
+    mergeProjectSnapshot,
+    mergeWorkspaceProject,
+    projectIdRef: projectRef,
+    setWorkspace
+  });
 
   const openSession = useCallback(async (projectId: string, sessionId: string, showLoader = true): Promise<void> => {
     const request = loadRequestRef.current + 1;
@@ -181,7 +215,8 @@ export function App(): React.JSX.Element {
       if (!active) return;
       setVersion(bootstrap.version);
       setProjects(bootstrap.projects);
-      setSidebarWidth(bootstrap.sidebarWidth);
+      setSidebarSessions(bootstrap.sidebarSessions);
+      setSidebarWidth(clampSidebarWidth(bootstrap.sidebarWidth));
       setFilePanelWidth(bootstrap.filePanelWidth ?? DEFAULT_FILE_PANEL_WIDTH);
       setThemePreference(bootstrap.themePreference ?? "system");
       setFontPreference(bootstrap.fontPreference ?? DEFAULT_FONT_PREFERENCE);
@@ -204,76 +239,16 @@ export function App(): React.JSX.Element {
     return () => { active = false; };
   }, [commitNavigation, mergeWorkspaceProject, openSession]);
 
-  // 事件流处理：事件先入队，按帧批量 flush。流式输出的事件非常密集，逐条 setState 会让界面卡顿。
-  useEffect(() => {
-    const refreshTimers = refreshTimersRef.current;
-    const flushEvents = (): void => {
-      eventFrameRef.current = undefined;
-      const batch = eventQueueRef.current.splice(0);
-      if (!batch.length) return;
-      // 用 ref 而不是闭包里的 state：这个回调只注册一次，闭包里的值会是旧的。
-      const activeProjectId = projectRef.current;
-      const projectBatch = activeProjectId ? batch.filter((envelope) => envelope.projectId === activeProjectId) : [];
-      if (projectBatch.length) {
-        setWorkspace((current) => current && current.project.id === activeProjectId ? applyUpdatesToWorkspace(current, projectBatch) : current);
-        const currentSessionId = selectedRef.current;
-        if (currentSessionId) {
-          const currentEvents = projectBatch
-            .map((envelope) => envelope.event)
-            .filter((event): event is AgentHostEvent => event !== undefined && event.sessionId === currentSessionId);
-          const timelineEvents = liveTimelineEvents(currentEvents);
-          if (timelineEvents.length) {
-            setDocument((current) => current?.session.id === currentSessionId
-              ? { ...current, liveEvents: [...current.liveEvents, ...timelineEvents] }
-              : current);
-          }
-          // 上下文用量只认最后一条：一轮里会多次上报，界面只需要最新值。
-          const contextEvents = currentEvents.filter(hasContextStatus);
-          const latestContext = contextEvents[contextEvents.length - 1];
-          if (latestContext) setContextBudget(latestContext.context.budget);
-        }
-      }
-      // 终态事件要触发一次项目刷新（分支、脏状态、会话摘要都可能变），这里对整批事件都处理，
-      // 包括非当前项目的：后台项目跑完了，侧栏也该更新。
-      const completedProjects = new Map<string, string>();
-      for (const envelope of batch) {
-        const event = envelope.event;
-        if (isTerminalRunEvent(event)) {
-          completedProjects.set(envelope.projectId, event.sessionId);
-        }
-      }
-      for (const [projectId, sessionId] of completedProjects) scheduleRefresh(projectId, sessionId);
-    };
-
-    /** 按项目防抖刷新：一轮结束往往连着来几个事件，没必要各刷一次。 */
-    const scheduleRefresh = (projectId: string, sessionId: string): void => {
-      const existing = refreshTimers.get(projectId);
-      if (existing) clearTimeout(existing);
-      const timer = setTimeout(() => {
-        refreshTimers.delete(projectId);
-        void window.biny.refreshProject(projectId).then(async (snapshot) => {
-          if (projectRef.current !== projectId) return;
-          mergeWorkspaceProject(snapshot);
-          if (selectedRef.current === sessionId) {
-            const refreshedDocument = await window.biny.openSession(projectId, sessionId);
-            if (projectRef.current === projectId && selectedRef.current === sessionId) setDocument(refreshedDocument);
-          }
-        }).catch((error) => setToast(errorMessage(error)));
-      }, 260);
-      refreshTimers.set(projectId, timer);
-    };
-
-    const unsubscribe = window.biny.onAgentEvent((envelope) => {
-      eventQueueRef.current.push(envelope);
-      eventFrameRef.current ??= window.requestAnimationFrame(flushEvents);
-    });
-    return () => {
-      unsubscribe();
-      if (eventFrameRef.current !== undefined) window.cancelAnimationFrame(eventFrameRef.current);
-      for (const timer of refreshTimers.values()) clearTimeout(timer);
-      refreshTimers.clear();
-    };
-  }, [mergeWorkspaceProject]);
+  useDesktopEventBridge({
+    activeProjectIdRef: projectRef,
+    selectedSessionIdRef: selectedRef,
+    mergeProjectSnapshot,
+    onError: reportEventError,
+    setContextBudget,
+    setDocument,
+    setSidebarSessions,
+    setWorkspace
+  });
 
   useEffect(() => window.biny.onMenuAction((action) => menuActionRef.current(action)), []);
 
@@ -343,29 +318,62 @@ export function App(): React.JSX.Element {
     }
   }, [commitNavigation, openNavigationTarget]);
 
-  const navigateHistory = useCallback(async (direction: -1 | 1): Promise<void> => {
-    const previousNavigation = navigationRef.current;
-    const moved = moveNavigation(previousNavigation, direction);
-    if (!moved.target) return;
-    commitNavigation(moved.state);
+  const openSessionMenu = useCallback(async (session: DesktopSessionSummary): Promise<void> => {
     try {
-      await openNavigationTarget(moved.target);
+      const action = await window.biny.showSessionMenu(session.projectId, session.id, session.pinned);
+      if (!action) return;
+      if (action === "rename") {
+        setRenameTarget({ kind: "session", projectId: session.projectId, sessionId: session.id, title: session.title });
+        return;
+      }
+      if (action === "pin" || action === "unpin") {
+        mergeProjectSnapshot(await window.biny.pinSession(session.projectId, session.id, action === "pin"));
+        return;
+      }
+      if (action === "duplicate") {
+        const previousNavigation = navigationRef.current;
+        let snapshot = await window.biny.duplicateSession(session.projectId, session.id);
+        if (projectRef.current !== session.projectId) {
+          snapshot = await window.biny.selectProject(session.projectId);
+        }
+        await adoptWorkspace(snapshot);
+        if (snapshot.selectedSessionId) {
+          commitNavigation(pushNavigation(previousNavigation, {
+            projectId: session.projectId,
+            sessionId: snapshot.selectedSessionId
+          }));
+        }
+        return;
+      }
+      if (action !== "delete") return;
+      const deletingSelectedSession = projectRef.current === session.projectId && selectedRef.current === session.id;
+      const snapshot = await window.biny.deleteSession(session.projectId, session.id);
+      if (projectRef.current === session.projectId) {
+        await adoptWorkspace(snapshot);
+        if (deletingSelectedSession) {
+          commitNavigation(replaceNavigation(navigationRef.current, {
+            projectId: session.projectId,
+            sessionId: snapshot.selectedSessionId
+          }));
+        }
+      } else {
+        mergeProjectSnapshot(snapshot);
+      }
     } catch (error) {
-      commitNavigation(previousNavigation);
       setToast(errorMessage(error));
     }
-  }, [commitNavigation, openNavigationTarget]);
+  }, [adoptWorkspace, commitNavigation, mergeProjectSnapshot]);
 
   useEffect(() => {
     menuActionRef.current = (action) => {
       if (action === "new-task") void newTask();
       if (action === "open-project") void openProject();
       if (action === "search") setSearchOpen(true);
-      if (action === "settings") setSettingsOpen(true);
+      if (action === "settings") openSettings();
       if (action === "toggle-sidebar") setSidebarVisible((value) => !value);
       if (action === "focus-composer") setFocusToken((value) => value + 1);
     };
-  }, [newTask, openProject]);
+  }, [newTask, openProject, openSettings]);
 
   const sendPrompt = useCallback(async (input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[], delivery?: "steer" | "followUp"): Promise<void> => {
     const projectId = projectRef.current;
@@ -518,6 +526,7 @@ export function App(): React.JSX.Element {
     try {
       const bootstrap = await window.biny.removeProject(projectId);
       setProjects(bootstrap.projects);
+      setSidebarSessions(bootstrap.sidebarSessions);
       setWorkspace(bootstrap.workspace);
       setDocument(undefined);
       setSelectedSessionId(bootstrap.selectedSessionId);
@@ -527,142 +536,6 @@ export function App(): React.JSX.Element {
       setToast(errorMessage(error));
     }
   }, [commitNavigation, openSession]);
-
-  const switchModel = useCallback(async (alias: string, thinking: ThinkingSelection): Promise<void> => {
-    const projectId = projectRef.current;
-    if (!projectId) return;
-    const info = await window.biny.switchModel(projectId, alias, thinking);
-    setWorkspace((current) => updateRuntimeInfo(current, info));
-    // 切模型这一步可能刚刚把运行时创建出来，而界面手上的快照里还没有 runtime 字段，
-    // 此时 updateRuntimeInfo 无处可写，界面会继续显示旧模型，直到别的操作（例如改权限模式）
-    // 带回完整快照——看起来就像「一改权限模型就变了」。所以这里补一次完整刷新。
-    mergeProjectSnapshot(await window.biny.refreshProject(projectId));
-  }, [mergeProjectSnapshot]);
-
-  const saveModelConfiguration = useCallback(async (configuration: DesktopModelConfigurationInput): Promise<void> => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    mergeWorkspaceProject(await window.biny.saveModelConfiguration(projectId, configuration));
-  }, [mergeWorkspaceProject]);
-
-  const testModelConfiguration = useCallback(async (configuration: DesktopModelConfigurationInput) => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    return await window.biny.testModelConfiguration(projectId, configuration);
-  }, []);
-
-  const removeModelConfiguration = useCallback(async (alias: string): Promise<void> => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    mergeWorkspaceProject(await window.biny.removeModelConfiguration(projectId, alias));
-  }, [mergeWorkspaceProject]);
-
-  const loadWebSearchSettings = useCallback(async () => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    const webSearchSettings = window.biny.webSearchSettings;
-    if (typeof webSearchSettings !== "function") throw new Error(desktopApiVersionMismatchMessage);
-    return await webSearchSettings(projectId);
-  }, []);
-
-  const saveWebSearchSettings = useCallback(async (input: DesktopWebSearchSettingsInput) => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    return await window.biny.saveWebSearchSettings(projectId, input);
-  }, []);
-
-  // 浏览器与 cookie 是全局能力（登录态不属于某个项目），因此不需要 projectId。
-  const loadCookieJarStatus = useCallback(async () => {
-    const cookieJarStatus = window.biny.cookieJarStatus;
-    if (typeof cookieJarStatus !== "function") throw new Error(desktopApiVersionMismatchMessage);
-    return await cookieJarStatus();
-  }, []);
-
-  const openBrowser = useCallback(async (url?: string) => {
-    const open = window.biny.openBrowser;
-    if (typeof open !== "function") throw new Error(desktopApiVersionMismatchMessage);
-    await open(url);
-  }, []);
-
-  const loadMemoryOverview = useCallback(async () => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    const memoryOverview = window.biny.memoryOverview;
-    if (typeof memoryOverview !== "function") throw new Error(desktopApiVersionMismatchMessage);
-    return await memoryOverview(projectId);
-  }, []);
-
-  const saveMemorySettings = useCallback(async (input: DesktopMemorySettings) => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    return await window.biny.saveMemorySettings(projectId, input);
-  }, []);
-
-  const searchMemory = useCallback(async (query: string) => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    return await window.biny.searchMemory(projectId, query);
-  }, []);
-
-  const addMemoryEntry = useCallback(async (topic: string, note: string) => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    return await window.biny.addMemoryEntry(projectId, topic, note);
-  }, []);
-
-  const deleteMemoryEntry = useCallback(async (topic: string, index: number) => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    return await window.biny.deleteMemoryEntry(projectId, topic, index);
-  }, []);
-
-  const clearMemory = useCallback(async () => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    return await window.biny.clearMemory(projectId);
-  }, []);
-
-  const compactMemory = useCallback(async () => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    return await window.biny.compactMemory(projectId);
-  }, []);
-
-  const fetchModelCatalog = useCallback(async (providerAlias: string) => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    const fetchCatalog = window.biny.fetchModelCatalog;
-    if (typeof fetchCatalog !== "function") throw new Error(desktopApiVersionMismatchMessage);
-    return await fetchCatalog(projectId, providerAlias);
-  }, []);
-
-  const startModelLogin = useCallback(async (provider: DesktopModelLoginProvider) => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    const startLogin = window.biny.startModelLogin;
-    if (typeof startLogin !== "function") {
-      throw new Error(desktopApiVersionMismatchMessage);
-    }
-    return await startLogin(projectId, provider);
-  }, []);
-
-  const completeModelLogin = useCallback(async (provider: DesktopModelLoginProvider, authRequestId: string, pastedAuthorization?: string): Promise<void> => {
-    const projectId = projectRef.current;
-    if (!projectId) throw new Error("请先打开一个项目。");
-    const completeLogin = window.biny.completeModelLogin;
-    if (typeof completeLogin !== "function") {
-      throw new Error(desktopApiVersionMismatchMessage);
-    }
-    mergeWorkspaceProject(await completeLogin(projectId, provider, authRequestId, pastedAuthorization));
-  }, [mergeWorkspaceProject]);
-
-  const cancelModelLogin = useCallback(async (provider: DesktopModelLoginProvider, authRequestId: string): Promise<void> => {
-    const projectId = projectRef.current;
-    if (!projectId) return;
-    const cancelLogin = window.biny.cancelModelLogin;
-    if (typeof cancelLogin !== "function") return;
-    await cancelLogin(projectId, provider, authRequestId);
-  }, []);
 
   const setPermissionMode = useCallback(async (mode: PermissionMode): Promise<void> => {
     const projectId = projectRef.current;
@@ -712,7 +585,7 @@ export function App(): React.JSX.Element {
     const info = workspace?.runtime?.info;
     const models = workspace?.models ?? [];
     const selectedModel = models.find((model) => model.alias === info?.modelAlias) ?? models[0];
-    const maxTokens = contextBudget?.maxTokens ?? info?.maxInputTokens ?? selectedModel?.maxInputTokens;
+    const maxTokens = contextBudget?.maxTokens ?? info?.maxInputTokens ?? selectedModel?.inputBudgetTokens;
     const usedTokens = contextBudget?.usedTokens ?? lastReportedInputTokens(document);
     if (!maxTokens || !usedTokens) return undefined;
     return { usedTokens, maxTokens };
@@ -729,8 +602,8 @@ export function App(): React.JSX.Element {
       focusToken={focusToken}
       modelSetupRequired={Boolean(workspace?.requiresModelConfiguration)}
       models={workspace?.models ?? []}
-      onOpenProject={() => void openProject()}
       onPermissionMode={setPermissionMode}
+      onConfigureModels={() => openSettings("模型")}
       onSaveAttachment={saveAttachment}
       onSend={sendPrompt}
       onSlashCommand={runSlashCommand}
@@ -740,37 +613,113 @@ export function App(): React.JSX.Element {
       project={workspace?.project}
       running={selectedRunning}
       runtimeInfo={workspace?.runtime?.info}
-      sessionId={selectedSessionId}
     />
   );
 
   return (
-    <div className={`app-shell${sidebarVisible ? "" : " is-sidebar-hidden"}`}>
-      <Sidebar
-        activeProjectId={workspace?.project.id}
-        onNewTask={(projectId) => void newTask(projectId)}
-        onCreateEmptyProject={() => void createEmptyProject()}
-        onOpenProject={() => void openProject()}
-        onProjectPinned={(projectId, pinned) => void toggleProjectPinned(projectId, pinned)}
-        onRemoveProject={(projectId) => void removeProject(projectId)}
-        onRenameProject={renameProject}
-        onReorderProjects={(projectIds) => void reorderProjects(projectIds)}
-        onRevealProject={(projectId) => { void window.biny.revealProject(projectId).catch((error) => setToast(errorMessage(error))); }}
-        onOpenTerminalProject={(projectId) => { void window.biny.openProjectTerminal(projectId).catch((error) => setToast(errorMessage(error))); }}
-        onSearch={() => setSearchOpen(true)}
-        onSelectProject={(projectId) => void selectProject(projectId)}
-        onSelectSession={(sessionId) => { const projectId = projectRef.current; if (projectId) void navigateToSession(projectId, sessionId); }}
-        onSettings={() => setSettingsOpen(true)}
-        onResizeEnd={() => setSidebarResizing(false)}
-        onResizeStart={() => setSidebarResizing(true)}
-        onWidthChange={(width) => { setSidebarWidth(width); void window.biny.setSidebarWidth(width); }}
-        projects={projects}
-        resizing={sidebarResizing}
-        selectedSessionId={selectedSessionId}
-        sessions={workspace?.sessions ?? []}
-        visible={sidebarVisible}
-        width={sidebarWidth}
-      />
+    <DesktopShell
+      overlays={(
+        <>
+          <SearchOverlay
+            onClose={() => setSearchOpen(false)}
+            onProject={(projectId) => void selectProject(projectId)}
+            onSession={(projectId, sessionId) => void navigateToSession(projectId, sessionId)}
+            open={searchOpen}
+            projects={projects}
+            sessions={sidebarSessions}
+          />
+          <SettingsOverlay
+            modelSetupRequired={Boolean(workspace?.requiresModelConfiguration)}
+            onAddMemoryEntry={addMemoryEntry}
+            onCancelModelLogin={cancelModelLogin}
+            onClearCookies={async () => await window.biny.clearCookies()}
+            onClearMemory={clearMemory}
+            onClose={closeSettings}
+            onCompactMemory={compactMemory}
+            onCompleteModelLogin={completeModelLogin}
+            onDeleteMemoryEntry={deleteMemoryEntry}
+            onExportCookies={async () => await window.biny.exportCookies()}
+            onFetchModelCatalog={fetchModelCatalog}
+            onFontPreference={changeFontPreference}
+            onImportCookies={async () => await window.biny.importCookies()}
+            onLoadCookieJarStatus={loadCookieJarStatus}
+            onLoadMemoryOverview={loadMemoryOverview}
+            onLoadWebSearchSettings={loadWebSearchSettings}
+            onOpenBrowser={openBrowser}
+            onOpenExternal={async (url) => await window.biny.openExternal(url)}
+            onRemoveModelConfiguration={removeModelConfiguration}
+            onSaveMemorySettings={saveMemorySettings}
+            onSaveModelConfiguration={saveModelConfiguration}
+            onSaveWebSearchSettings={saveWebSearchSettings}
+            onSearchMemory={searchMemory}
+            onSkipModelSetup={closeSettings}
+            onStartModelLogin={startModelLogin}
+            onSwitchModel={switchModel}
+            onTestModelConfiguration={testModelConfiguration}
+            onThemePreference={changeThemePreference}
+            open={settingsOpen}
+            targetTab={settingsTargetTab}
+            themePreference={themePreference}
+            fontPreference={fontPreference}
+            version={version}
+            workspace={workspace}
+          />
+          <RenameOverlay
+            initialValue={renameTarget?.title ?? ""}
+            onClose={() => setRenameTarget(undefined)}
+            onSave={async (title) => {
+              if (!renameTarget) return;
+              if (renameTarget.kind === "project") {
+                mergeProjectSnapshot(await window.biny.renameProject(renameTarget.projectId, title));
+              } else if (renameTarget.sessionId) {
+                mergeProjectSnapshot(await window.biny.renameSession(renameTarget.projectId, renameTarget.sessionId, title));
+                setDocument((current) => {
+                  if (!current || current.session.id !== renameTarget.sessionId) return current;
+                  return { events: current.events, liveEvents: current.liveEvents, session: { ...current.session, title } };
+                });
+              }
+              setRenameTarget(undefined);
+            }}
+            open={Boolean(renameTarget)}
+            title={renameTarget?.kind === "project" ? "重命名项目" : "重命名会话"}
+          />
+          <SlashResultOverlay onClose={() => setSlashResult(undefined)} result={slashResult} />
+          <DesktopToast message={toast} onClose={clearToast} />
+        </>
+      )}
+      sidebarVisible={sidebarVisible}
+      sidebarWidth={sidebarWidth}
+      sideNav={(
+        <Sidebar
+          activeProjectId={workspace?.project.id}
+          onCreateEmptyProject={() => void createEmptyProject()}
+          onNewTask={(projectId) => void newTask(projectId)}
+          onOpenProject={() => void openProject()}
+          onOpenTerminalProject={(projectId) => { void window.biny.openProjectTerminal(projectId).catch((error) => setToast(errorMessage(error))); }}
+          onProjectPinned={(projectId, pinned) => void toggleProjectPinned(projectId, pinned)}
+          onRefreshProject={(projectId) => { void window.biny.refreshProject(projectId).then(mergeProjectSnapshot).catch((error) => setToast(errorMessage(error))); }}
+          onRemoveProject={(projectId) => void removeProject(projectId)}
+          onRenameProject={renameProject}
+          onReorderProjects={(projectIds) => void reorderProjects(projectIds)}
+          onRevealProject={(projectId) => { void window.biny.revealProject(projectId).catch((error) => setToast(errorMessage(error))); }}
+          onSearch={() => setSearchOpen(true)}
+          onSelectProject={(projectId) => void selectProject(projectId)}
+          onSelectSession={(projectId, sessionId) => void navigateToSession(projectId, sessionId)}
+          onSessionMenu={(session) => void openSessionMenu(session)}
+          onSettings={() => openSettings()}
+          onVisibleChange={setSidebarVisible}
+          onWidthChange={setSidebarWidth}
+          onWidthCommit={(width) => { void window.biny.setSidebarWidth(width); }}
+          projects={projects}
+          selectedSessionId={selectedSessionId}
+          sessions={sidebarSessions}
+          visible={sidebarVisible}
+          version={version}
+          width={sidebarWidth}
+        />
+      )}
+      theme={themePreference}
+    >
       <Workspace
         filePanelResizing={filePanelResizing}
         filePanelWidth={filePanelWidth}
@@ -788,9 +737,7 @@ export function App(): React.JSX.Element {
         onOpenExternal={(url) => void window.biny.openExternal(url).catch((error) => setToast(errorMessage(error)))}
         onOpenProject={() => void openProject()}
         onListDirectory={listWorkspaceDirectory}
-        onPanelNotice={setToast}
         onReadFile={readWorkspaceFile}
-        onRefreshProject={() => { const projectId = projectRef.current; if (projectId) void window.biny.refreshProject(projectId).then(mergeWorkspaceProject).catch((error) => setToast(errorMessage(error))); }}
         onResolvePermission={resolvePermission}
         onRollbackFiles={rollbackFiles}
         onRetry={(input) => void sendPrompt(input, "chat", []).catch((error) => setToast(errorMessage(error)))}
@@ -803,243 +750,6 @@ export function App(): React.JSX.Element {
       >
         {composer}
       </Workspace>
-      <div
-        className={`app-navigation${sidebarResizing ? " is-resizing" : ""}`}
-        style={{ left: sidebarVisible ? Math.max(90, sidebarWidth - 93) : 90 }}
-      >
-        <NavigationControls
-          canGoBack={canNavigateBack(navigation)}
-          canGoForward={canNavigateForward(navigation)}
-          onBack={() => void navigateHistory(-1)}
-          onForward={() => void navigateHistory(1)}
-          onToggleSidebar={() => setSidebarVisible((visible) => !visible)}
-          sidebarVisible={sidebarVisible}
-        />
-      </div>
-
-      <SearchOverlay
-        onClose={() => setSearchOpen(false)}
-        onProject={(projectId) => void selectProject(projectId)}
-        onSession={(sessionId) => { const projectId = projectRef.current; if (projectId) void navigateToSession(projectId, sessionId); }}
-        open={searchOpen}
-        projects={projects}
-        sessions={workspace?.sessions ?? []}
-      />
-      <SettingsOverlay
-        modelSetupRequired={Boolean(workspace?.requiresModelConfiguration)}
-        onClose={() => setSettingsOpen(false)}
-        onSkipModelSetup={() => setSettingsOpen(false)}
-        onLoadMemoryOverview={loadMemoryOverview}
-        onSaveMemorySettings={saveMemorySettings}
-        onSearchMemory={searchMemory}
-        onAddMemoryEntry={addMemoryEntry}
-        onDeleteMemoryEntry={deleteMemoryEntry}
-        onClearMemory={clearMemory}
-        onCompactMemory={compactMemory}
-        onOpenExternal={async (url) => await window.biny.openExternal(url)}
-        onRemoveModelConfiguration={removeModelConfiguration}
-        onLoadWebSearchSettings={loadWebSearchSettings}
-        onSaveWebSearchSettings={saveWebSearchSettings}
-        onLoadCookieJarStatus={loadCookieJarStatus}
-        onOpenBrowser={openBrowser}
-        onExportCookies={async () => await window.biny.exportCookies()}
-        onImportCookies={async () => await window.biny.importCookies()}
-        onClearCookies={async () => await window.biny.clearCookies()}
-        onFetchModelCatalog={fetchModelCatalog}
-        onStartModelLogin={startModelLogin}
-        onCompleteModelLogin={completeModelLogin}
-        onCancelModelLogin={cancelModelLogin}
-        onSaveModelConfiguration={saveModelConfiguration}
-        onTestModelConfiguration={testModelConfiguration}
-        onSwitchModel={switchModel}
-        onThemePreference={changeThemePreference}
-        onFontPreference={changeFontPreference}
-        open={settingsOpen}
-        themePreference={themePreference}
-        fontPreference={fontPreference}
-        version={version}
-        workspace={workspace}
-      />
-      <RenameOverlay
-        initialValue={renameTarget?.title ?? ""}
-        title={renameTarget?.kind === "project" ? "重命名项目" : "重命名会话"}
-        onClose={() => setRenameTarget(undefined)}
-        onSave={async (title) => {
-          if (!renameTarget) return;
-          if (renameTarget.kind === "project") {
-            mergeProjectSnapshot(await window.biny.renameProject(renameTarget.projectId, title));
-          } else if (renameTarget.sessionId) {
-            mergeWorkspaceProject(await window.biny.renameSession(renameTarget.projectId, renameTarget.sessionId, title));
-            setDocument((current) => {
-              if (!current || current.session.id !== renameTarget.sessionId) return current;
-              return { events: current.events, liveEvents: current.liveEvents, session: { ...current.session, title } };
-            });
-          }
-          setRenameTarget(undefined);
-        }}
-        open={Boolean(renameTarget)}
-      />
-      <SlashResultOverlay onClose={() => setSlashResult(undefined)} result={slashResult} />
-      <Toast message={toast} onClose={clearToast} />
-    </div>
+    </DesktopShell>
   );
-}
-
-function applyUpdatesToWorkspace(
-  workspace: DesktopWorkspaceSnapshot,
-  updates: DesktopAgentEventEnvelope[]
-): DesktopWorkspaceSnapshot {
-  const sessions = [...workspace.sessions];
-  let runtime = workspace.runtime;
-  for (const update of updates) {
-    runtime = update.snapshot;
-    const event = update.event;
-    if (!event) continue;
-    const visibleInput = event.type === "message.user" ? publicUserMessage(event.content) : "";
-    let session = sessions.find((candidate) => candidate.id === event.sessionId);
-    if (!session && event.type === "message.user") {
-      session = syntheticSession(workspace.project.id, event.sessionId, visibleInput);
-      sessions.unshift(session);
-    }
-    if (session && event.type === "message.user") {
-      session = { ...session, title: session.title === "新任务" ? titleFromInput(visibleInput) : session.title, firstUserMessage: session.firstUserMessage || visibleInput, status: "running", updatedAt: event.timestamp };
-      replaceSession(sessions, session);
-    }
-    if (session && event.type === "run.started") {
-      replaceSession(sessions, { ...session, status: "running", updatedAt: event.timestamp });
-    }
-    if (session && event.type === "permission.requested") {
-      replaceSession(sessions, { ...session, status: "waiting_permission", updatedAt: event.timestamp });
-    }
-    if (session && event.type === "permission.resolved") {
-      replaceSession(sessions, { ...session, status: "running", updatedAt: event.timestamp });
-    }
-    if (session && isTerminalRunEvent(event)) {
-      replaceSession(sessions, {
-        ...session,
-        status: event.type === "run.failed"
-          ? "failed"
-          : event.type === "run.blocked"
-            ? "blocked"
-          : event.type === "run.incomplete"
-            ? "incomplete"
-            : event.type === "run.cancelled"
-              ? "cancelled"
-              : event.type === "run.aborted" ? "aborted" : "completed",
-        resumable: event.type === "run.incomplete" || event.type === "run.blocked"
-          ? event.resumable
-          : undefined,
-        updatedAt: event.timestamp
-      });
-    }
-  }
-  return { ...workspace, sessions: sessions.sort(sessionSort), runtime };
-}
-
-/**
- * 会话里最后一次 provider 报告的输入 token 数。
- *
- * 运行时的 `usedTokens` 也是取自同一个 provider 用量，所以重开会话时用它回填不会算出另一套数字。
- * 内部尝试（`auditOnly`）不算进来：界面展示的是公开对话的上下文。
- */
-function lastReportedInputTokens(document?: DesktopSessionDocument): number | undefined {
-  if (!document) return undefined;
-  let latest: number | undefined;
-  for (const event of document.events) {
-    if (event.type !== "assistant_message" || event.auditOnly) continue;
-    if (event.usage?.inputTokens !== undefined) latest = event.usage.inputTokens;
-  }
-  return latest;
-}
-
-function hasContextStatus(event: AgentHostEvent): event is AgentHostEvent & { context: ContextStatus } {
-  return event.type === "context.updated" || event.type === "compact.completed";
-}
-
-function updateRuntimeInfo(workspace: DesktopWorkspaceSnapshot | undefined, info: ModelRuntimeInfo): DesktopWorkspaceSnapshot | undefined {
-  if (!workspace?.runtime) return workspace;
-  return {
-    ...workspace,
-    runtime: {
-      ...workspace.runtime,
-      info: {
-        ...workspace.runtime.info,
-        modelAlias: info.modelAlias,
-        provider: info.provider,
-        modelLabel: info.modelLabel,
-        reasoningLabel: info.reasoningLabel,
-        thinking: info.thinking
-      }
-    }
-  };
-}
-
-function syntheticSession(projectId: string, sessionId: string, input: string): DesktopSessionSummary {
-  const now = new Date().toISOString();
-  return {
-    id: sessionId,
-    projectId,
-    fileName: `${sessionId}.jsonl`,
-    title: titleFromInput(input),
-    firstUserMessage: input,
-    lastAssistantMessage: "",
-    eventCount: 0,
-    createdAt: now,
-    updatedAt: now,
-    pinned: false,
-    status: "running",
-    resumable: undefined
-  };
-}
-
-function replaceSession(sessions: DesktopSessionSummary[], next: DesktopSessionSummary): void {
-  const index = sessions.findIndex((session) => session.id === next.id);
-  if (index >= 0) sessions[index] = next;
-}
-
-function sessionSort(left: DesktopSessionSummary, right: DesktopSessionSummary): number {
-  if (left.pinned !== right.pinned) return left.pinned ? -1 : 1;
-  return Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
-}
-
-function mergeProject(projects: DesktopProject[], next: DesktopProject): DesktopProject[] {
-  const index = projects.findIndex((project) => project.id === next.id);
-  if (index < 0) return [next, ...projects];
-  const copy = [...projects];
-  copy[index] = next;
-  return copy;
-}
-
-function applyProjectOrder(projects: DesktopProject[], projectIds: string[]): DesktopProject[] {
-  const byId = new Map(projects.map((project) => [project.id, project]));
-  const seen = new Set<string>();
-  const ordered: DesktopProject[] = [];
-  for (const projectId of projectIds) {
-    const project = byId.get(projectId);
-    if (!project || seen.has(projectId)) continue;
-    ordered.push(project);
-    seen.add(projectId);
-  }
-  for (const project of projects) {
-    if (!seen.has(project.id)) ordered.push(project);
-  }
-  return ordered;
-}
-
-function titleFromInput(input: string): string {
-  return input.replace(/\s+/g, " ").trim().slice(0, 64) || "新任务";
-}
-
-function eventsBeforeUserMessage(events: SessionEvent[], userMessageIndex: number): SessionEvent[] {
-  let seen = 0;
-  for (const [index, event] of events.entries()) {
-    if (event.type !== "user_message") continue;
-    if (seen === userMessageIndex) return events.slice(0, index);
-    seen += 1;
-  }
-  return events;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

@@ -13,11 +13,13 @@ export type IconName =
   | "arrow-left"
   | "arrow-right"
   | "arrow-up"
+  | "bell"
   | "branch"
   | "brain"
   | "calendar"
   | "chart"
   | "check"
+  | "circle-add"
   | "chevron"
   | "close"
   | "code"
@@ -36,6 +38,7 @@ export type IconName =
   | "help"
   | "home"
   | "menu"
+  | "message"
   | "mic"
   | "moon"
   | "more"
@@ -98,17 +101,19 @@ function pathFor(name: IconName): React.JSX.Element {
   const common = { stroke: "currentColor", strokeLinecap: "round" as const, strokeLinejoin: "round" as const, strokeWidth: 1.7 };
   switch (name) {
     case "activity": return <path {...common} d="M3.5 12h3.1l2.1-5.5 4.3 11 2.2-5.5h5.3" />;
-    case "add": return <path {...common} d="M12 5v14M5 12h14" />;
+    case "add": return <><path {...common} d="M5 12h14" /><path {...common} d="M12 5v14" /></>;
     case "archive": return <><rect {...common} height="14" rx="1.5" width="17" x="3.5" y="6.5" /><path {...common} d="M3.5 9h17M9 13h6" /></>;
     case "arrow-left": return <path {...common} d="M19 12H5m7-7-7 7 7 7" />;
     case "arrow-right": return <path {...common} d="M5 12h14m-7-7 7 7-7 7" />;
     case "arrow-up": return <path {...common} d="m6 11 6-6 6 6M12 5v14" />;
+    case "bell": return <><path {...common} d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9Z" /><path {...common} d="M10 21h4" /></>;
     case "branch": return <><circle {...common} cx="7" cy="5" r="2" /><circle {...common} cx="17" cy="19" r="2" /><path {...common} d="M7 7v5c0 3.9 3.1 7 7 7h1M17 5v4c0 2.2-1.8 4-4 4H7" /></>;
     case "brain": return <><path {...common} d="M9.5 5.2A3 3 0 0 0 6 7.8a3.2 3.2 0 0 0 .2 5.9A3 3 0 0 0 9 18.5c.8 1.2 2.2 2 3 2V5.1a3.5 3.5 0 0 0-2.5.1Z" /><path {...common} d="M14.5 5.2A3 3 0 0 1 18 7.8a3.2 3.2 0 0 1-.2 5.9 3 3 0 0 1-2.8 4.8c-.8 1.2-2.2 2-3 2V5.1a3.5 3.5 0 0 1 2.5.1ZM7 9.5h2M15 9.5h2M7.5 14h2M14.5 14h2" /></>;
     case "calendar": return <><rect {...common} height="16" rx="2" width="16" x="4" y="5" /><path {...common} d="M8 3v4M16 3v4M4 10h16M8 14h3" /></>;
     case "chart": return <><path {...common} d="M4 20V5M4 20h17" /><path {...common} d="M8 17v-5M12 17V7M16 17v-8" /></>;
     case "check": return <path {...common} d="m5 12 4.2 4.2L19 6.5" />;
-    case "chevron": return <path {...common} d="m8 10 4 4 4-4" />;
+    case "circle-add": return <><circle {...common} cx="12" cy="12" r="10" /><path {...common} d="M8 12h8" /><path {...common} d="M12 8v8" /></>;
+    case "chevron": return <path {...common} d="m6 9 6 6 6-6" />;
     case "close": return <path {...common} d="m6 6 12 12M18 6 6 18" />;
     case "code": return <path {...common} d="m8.5 8-4 4 4 4M15.5 8l4 4-4 4M14 5l-4 14" />;
     case "copy": return <><rect {...common} height="12" rx="2" width="12" x="8" y="8" /><path {...common} d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" /></>;
@@ -116,38 +121,39 @@ function pathFor(name: IconName): React.JSX.Element {
     case "database": return <><ellipse {...common} cx="12" cy="5.5" rx="7.5" ry="2.8" /><path {...common} d="M4.5 5.5v6.5c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V5.5M4.5 12v6.5c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V12" /></>;
     case "diff": return <><path {...common} d="M7 4v16M17 4v16M4 8h6M14 16h6" /><path {...common} d="m17 6 2 2-2 2M17 14l-2 2 2 2" /></>;
     case "display": return <><rect {...common} height="13" rx="2" width="18" x="3" y="4" /><path {...common} d="M9 21h6M12 17v4" /></>;
-    case "edit": return <path {...common} d="m4 16.5-.8 3.8 3.8-.8L18.8 7.7a2.1 2.1 0 0 0-3-3L4 16.5ZM14.5 6.5l3 3" />;
+    case "edit": return <><path {...common} d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" /><path {...common} d="m15 5 4 4" /></>;
     case "external": return <><path {...common} d="M14 5h5v5M19 5l-8 8" /><path {...common} d="M19 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5" /></>;
     case "eye": return <><path {...common} d="M2.5 12s3.5-6.5 9.5-6.5S21.5 12 21.5 12s-3.5 6.5-9.5 6.5S2.5 12 2.5 12Z" /><circle {...common} cx="12" cy="12" r="3" /></>;
     case "eye-off": return <><path {...common} d="m4 4 16 16M9.9 9.9A3 3 0 0 0 12 15a3 3 0 0 0 2.1-.9M7 7.4C4.4 8.8 2.5 12 2.5 12s3.5 6.5 9.5 6.5c1.6 0 3-.3 4.3-.9M14.1 9A3 3 0 0 0 12 9c-.4 0-.7.1-1 .2M10.6 5.2C11.1 5.1 11.5 5 12 5c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-2.1 2.8" /></>;
     case "file": return <path {...common} d="M7 3.5h6l4 4V20a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1Zm6 0v4h4" />;
-    case "folder": return <path {...common} d="M3.5 7.5h6l2-2h9v13a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5v-11Z" />;
+    case "folder": return <path {...common} d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />;
     case "folder-panel": return <><path {...common} d="M7.5 5h4l2 2H19a1.5 1.5 0 0 1 1.5 1.5V16" /><path {...common} d="M3.5 9h6l2-2h7v11.5A1.5 1.5 0 0 1 17 20H5a1.5 1.5 0 0 1-1.5-1.5V9Z" /></>;
     case "help": return <><circle {...common} cx="12" cy="12" r="9" /><path {...common} d="M9.8 9a2.3 2.3 0 0 1 4.5.7c0 1.8-2.3 2-2.3 3.8M12 17.4h.01" /></>;
     case "home": return <path {...common} d="m4 10 8-6 8 6v9a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1v-9Z" />;
     case "menu": return <path {...common} d="M5 7h14M5 12h14M5 17h14" />;
+    case "message": return <path {...common} d="M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z" />;
     case "mic": return <><rect {...common} height="11" rx="3.5" width="7" x="8.5" y="3" /><path {...common} d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M8.5 21h7" /></>;
     case "moon": return <path {...common} d="M20.5 13.2A8 8 0 1 1 10.8 3.5a6.8 6.8 0 0 0 9.7 9.7Z" />;
-    case "more": return <><circle cx="6" cy="12" fill="currentColor" r="1.2" /><circle cx="12" cy="12" fill="currentColor" r="1.2" /><circle cx="18" cy="12" fill="currentColor" r="1.2" /></>;
+    case "more": return <><circle cx="5" cy="12" fill="currentColor" r="1" /><circle cx="12" cy="12" fill="currentColor" r="1" /><circle cx="19" cy="12" fill="currentColor" r="1" /></>;
     case "network": return <><circle {...common} cx="5" cy="12" r="2" /><circle {...common} cx="19" cy="6" r="2" /><circle {...common} cx="19" cy="18" r="2" /><path {...common} d="m6.8 11.2 10.4-4.4M6.8 12.8l10.4 4.4" /></>;
     case "paperclip": return <path {...common} d="m9 12.5 5.9-5.9a3 3 0 0 1 4.2 4.2l-7.4 7.4a5 5 0 0 1-7.1-7.1l7.2-7.2M7.5 14l6.4-6.4" />;
     case "panel-right": return <><rect {...common} height="16" rx="2" width="19" x="2.5" y="4" /><path {...common} d="M16 4v16" /></>;
     case "pin": return <><path {...common} d="m15 4 5 5-3 1-3.5 3.5 2 2-1.5 1.5-3.5-3.5-4 4" /><path {...common} d="m5 19 4-4" /></>;
-    case "person": return <><circle {...common} cx="12" cy="8" r="3.2" /><path {...common} d="M5.5 20c.6-4.1 2.8-6.2 6.5-6.2s5.9 2.1 6.5 6.2" /></>;
-    case "plug": return <path {...common} d="M8 3v5M16 3v5M6 8h12v2a6 6 0 0 1-5 5.9V21h-2v-5.1A6 6 0 0 1 6 10V8Z" />;
+    case "person": return <><circle {...common} cx="12" cy="8" r="5" /><path {...common} d="M20 21a8 8 0 0 0-16 0" /></>;
+    case "plug": return <><path {...common} d="M12 22v-5" /><path {...common} d="M15 8V2" /><path {...common} d="M17 8a1 1 0 0 1 1 1v4a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1z" /><path {...common} d="M9 8V2" /></>;
     case "pull-request": return <><circle {...common} cx="7" cy="5" r="2" /><circle {...common} cx="7" cy="19" r="2" /><circle {...common} cx="17" cy="19" r="2" /><path {...common} d="M7 7v10M14 5h1a2 2 0 0 1 2 2v10M14 2l-3 3 3 3" /></>;
     case "refresh": return <><path {...common} d="M20 11a8 8 0 1 0 1 4" /><path {...common} d="M20 5v6h-6" /></>;
-    case "remote": return <><rect {...common} height="12" rx="2" width="17" x="3.5" y="4" /><path {...common} d="M8 20h8M12 16v4M17 11h.01" /></>;
-    case "search": return <><circle {...common} cx="10.5" cy="10.5" r="6.5" /><path {...common} d="m15.5 15.5 4 4" /></>;
+    case "remote": return <><rect {...common} height="14" rx="2" width="20" x="2" y="3" /><path {...common} d="M8 21h8M12 17v4" /></>;
+    case "search": return <><path {...common} d="m21 21-4.34-4.34" /><circle {...common} cx="11" cy="11" r="8" /></>;
     case "shield": return <path {...common} d="M12 3.5 5 6.5v5c0 4.6 2.9 7.8 7 9.5 4.1-1.7 7-4.9 7-9.5v-5L12 3.5Z" />;
-    case "sidebar": return <><rect {...common} height="16" rx="2" width="19" x="2.5" y="4" /><path {...common} d="M8 4v16" /></>;
+    case "sidebar": return <><rect {...common} height="18" rx="2" width="18" x="3" y="3" /><path {...common} d="M9 3v18" /></>;
     case "settings": return <><circle {...common} cx="12" cy="12" r="3" /><path {...common} d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z" /></>;
     case "site": return <><circle {...common} cx="12" cy="12" r="9" /><path {...common} d="M3.5 12h17M12 3c2.4 2.5 3.5 5.5 3.5 9S14.4 18.5 12 21c-2.4-2.5-3.5-5.5-3.5-9S9.6 5.5 12 3Z" /></>;
-    case "spark": return <path {...common} d="m12 3 1.5 5.5L19 10l-5.5 1.5L12 17l-1.5-5.5L5 10l5.5-1.5L12 3Zm6 13 .6 2.4L21 19l-2.4.6L18 22l-.6-2.4L15 19l2.4-.6L18 16Z" />;
+    case "spark": return <><path {...common} d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z" /><path {...common} d="M20 2v4M22 4h-4" /><circle {...common} cx="4" cy="20" r="2" /></>;
     case "stop": return <rect fill="currentColor" height="9" rx="2" width="9" x="7.5" y="7.5" />;
     case "sun": return <><circle {...common} cx="12" cy="12" r="4" /><path {...common} d="M12 2.5V5M12 19v2.5M2.5 12H5M19 12h2.5M5.3 5.3 7 7M17 17l1.7 1.7M18.7 5.3 17 7M7 17l-1.7 1.7" /></>;
     case "terminal": return <><rect {...common} height="16" rx="2" width="19" x="2.5" y="4" /><path {...common} d="m6 9 3 3-3 3M12 15h5" /></>;
-    case "timer": return <><circle {...common} cx="12" cy="13" r="8" /><path {...common} d="M9 2h6M12 5V2M12 13l3-3" /></>;
+    case "timer": return <><line {...common} x1="10" x2="14" y1="2" y2="2" /><line {...common} x1="12" x2="15" y1="14" y2="11" /><circle {...common} cx="12" cy="14" r="8" /></>;
     case "trash": return <><path {...common} d="M5 7h14M10 4h4l1 3H9l1-3ZM8 7l.7 13h6.6L16 7M10 10v7M14 10v7" /></>;
     case "volume": return <><path {...common} d="M11 5 6.5 9H3.5v6h3L11 19V5Z" /><path {...common} d="M14.5 9.5a3.5 3.5 0 0 1 0 5M17 7a7 7 0 0 1 0 10" /></>;
     case "volume-off": return <><path {...common} d="M11 5 6.5 9H3.5v6h3L11 19V5Z" /><path {...common} d="m15 10 5 4M20 10l-5 4" /></>;

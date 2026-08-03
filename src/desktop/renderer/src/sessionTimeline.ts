@@ -297,6 +297,7 @@ function buildHistoricalTurns(events: SessionEvent[]): TimelineTurn[] {
     }
     if (event.type === "agent_message") continue;
     if (event.type === "tool_execution") continue;
+    if (event.type === "context_checkpoint") continue;
     const turn = ensureTurn(event.time);
     turn.error = event.message;
     turn.durationMs = elapsedMs(turn.timestamp, event.time) ?? turn.durationMs;

@@ -20,7 +20,7 @@ export function TerminalView({ projectId }: { projectId: string }): React.JSX.El
     if (!container) return;
     setError(undefined);
     setExitCode(undefined);
-    const styles = getComputedStyle(document.documentElement);
+    const styles = getComputedStyle(container);
     const pick = (name: string, fallback: string): string => styles.getPropertyValue(name).trim() || fallback;
     const term = new Terminal({
       cursorBlink: true,
@@ -29,10 +29,10 @@ export function TerminalView({ projectId }: { projectId: string }): React.JSX.El
       lineHeight: 1.25,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
       theme: {
-        background: pick("--code", "#14171c"),
-        foreground: pick("--text", "#e8eaed"),
-        cursor: pick("--accent", "#339cff"),
-        selectionBackground: pick("--surface-selected", "#2a3441")
+        background: pick("--code", "#242222"),
+        foreground: pick("--text", "#d4d4d4"),
+        cursor: pick("--accent", "#79a9ff"),
+        selectionBackground: pick("--surface-selected", "#393737")
       }
     });
     const fit = new FitAddon();

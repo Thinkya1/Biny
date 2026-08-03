@@ -4,6 +4,7 @@
  * 只负责渲染和回调，前进/后退是否可用由上层的导航历史决定。按钮只有图标，因此必须带
  * `aria-label`。
  */
+import { IconButton } from "@astryxdesign/core/IconButton";
 import { Icon } from "./Icon.js";
 
 interface NavigationControlsProps {
@@ -18,9 +19,9 @@ interface NavigationControlsProps {
 export function NavigationControls({ sidebarVisible, canGoBack, canGoForward, onToggleSidebar, onBack, onForward }: NavigationControlsProps): React.JSX.Element {
   return (
     <div className="navigation-controls">
-      <button aria-label={sidebarVisible ? "收起侧栏" : "展开侧栏"} className="navigation-button" onClick={onToggleSidebar} type="button"><Icon name="sidebar" size={15} /></button>
-      <button aria-label="后退" className="navigation-button" disabled={!canGoBack} onClick={onBack} type="button"><Icon name="arrow-left" size={15} /></button>
-      <button aria-label="前进" className="navigation-button" disabled={!canGoForward} onClick={onForward} type="button"><Icon name="arrow-right" size={15} /></button>
+      <IconButton icon={<Icon name="sidebar" size={15} />} label={sidebarVisible ? "收起侧栏" : "展开侧栏"} onClick={onToggleSidebar} size="sm" tooltip={sidebarVisible ? "收起侧栏" : "展开侧栏"} variant="ghost" />
+      <IconButton icon={<Icon name="arrow-left" size={15} />} isDisabled={!canGoBack} label="后退" onClick={onBack} size="sm" tooltip="后退" variant="ghost" />
+      <IconButton icon={<Icon name="arrow-right" size={15} />} isDisabled={!canGoForward} label="前进" onClick={onForward} size="sm" tooltip="前进" variant="ghost" />
     </div>
   );
 }

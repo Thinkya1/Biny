@@ -37,8 +37,11 @@
     "prepack": "pnpm build:cli"
   },
   "dependencies": {
+    "@astryxdesign/core": "0.2.0",
+    "@astryxdesign/theme-neutral": "0.2.0",
     "@earendil-works/pi-tui": "0.82.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@stylexjs/stylex": "0.19.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "commander": "^13.1.0",

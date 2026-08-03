@@ -2,13 +2,14 @@
  * Provider catalog for the desktop renderer: the built-in vendor list plus the
  * helpers that map a *saved* connection back onto a catalog entry.
  *
- * This lives outside `components/Overlays.tsx` because two surfaces need the
+ * This lives outside `components/settings/SettingsOverlay.tsx` because two surfaces need the
  * same answer — the settings model page and the composer's model menu. When
  * the composer resolved branding on its own (from `providerType`) every
  * `openai-compatible` vendor rendered the same placeholder glyph, because
  * brand marks are keyed by `iconTone`, not by provider type.
  */
 import type { DesktopModelConfigurationInput, DesktopModelLoginProvider } from "../../protocol.js";
+import type { ModelLimits } from "../../../config/schema.js";
 import type { ModelChoice } from "../../../llm/ModelManager.js";
 
 export type ProviderCategory = "推荐" | "账号" | "模型计划" | "API" | "聚合服务" | "本地";
@@ -17,10 +18,15 @@ export interface CatalogModel {
   id: string;
   displayName: string;
   supportsThinking: boolean;
+  parallelToolCalls?: boolean;
+  reasoningStream?: boolean;
+  reasoningSummary?: boolean;
   supportsVision?: boolean;
   supportsAudio?: boolean;
   contextWindow?: number;
+  maxInputTokens?: number;
   maxOutputTokens?: number;
+  limits?: ModelLimits;
   thinkingLevelMap?: DesktopModelConfigurationInput["thinkingLevelMap"];
   apiBackend?: DesktopModelConfigurationInput["apiBackend"];
 }
@@ -260,9 +266,15 @@ export function customCatalogEntry(
       id: model.model,
       displayName: model.displayName,
       supportsThinking: model.efforts.length > 0,
+      parallelToolCalls: model.capabilities?.parallelToolCalls,
+      reasoningStream: model.capabilities?.reasoningStream,
+      reasoningSummary: model.capabilities?.reasoningSummary,
       supportsVision: model.capabilities?.vision,
       supportsAudio: model.capabilities?.audio,
-      contextWindow: model.contextWindow
+      contextWindow: model.contextWindow,
+      maxInputTokens: model.maxInputTokens,
+      maxOutputTokens: model.maxOutputTokens,
+      limits: model.limits
     }))
   };
 }

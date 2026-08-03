@@ -1,18 +1,13 @@
 /**
- * 各类浮层：快速搜索、设置（通用/模型/权限/外观/联网搜索/项目/关于）、重命名、slash 结果、Toast。
+ * Desktop 设置中心。
  *
- * 都通过 portal 挂到 body 上，并配合 `useClosingPresence` 播放关闭动画后再卸载。
- * 设置里的每个分页是本文件内的独立组件，状态各自持有；真正的保存动作一律通过 props 回调上抛，
- * 这里不直接调 IPC。
- *
- * 文件偏大，是因为设置面板的各分页彼此共用样式与交互约定，拆开反而要重复大量约定。
+ * 每个设置分页持有自己的表单状态，保存动作通过 props 上抛；本模块不直接调用 preload API。
  */
-import { useCallback, useDeferredValue, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { Dialog } from "@astryxdesign/core/Dialog";
 import { createPortal } from "react-dom";
-import { inferReasoningEfforts } from "../../../../ai/capabilities.js";
-import type { ModelChoice, ThinkingSelection } from "../../../../llm/ModelManager.js";
-import type { DesktopCookieJarStatus, DesktopFontPreference, DesktopMemoryCompactionResult, DesktopMemoryOverview, DesktopMemorySearchMatch, DesktopMemorySettings, DesktopModelCatalogResult, DesktopModelConfigurationInput, DesktopModelConnection, DesktopModelConnectionTestResult, DesktopModelLoginProvider, DesktopModelLoginStartResult, DesktopProject, DesktopSessionSummary, DesktopSlashResult, DesktopThemePreference, DesktopWebSearchProvider, DesktopWebSearchSettings, DesktopWebSearchSettingsInput, DesktopWorkspaceSnapshot } from "../../../protocol.js";
-import { clampFontSize, MAX_FONT_SIZE, MIN_FONT_SIZE, SYSTEM_FONT_FAMILY } from "../../../fontPreference.js";
+import type { ModelChoice, ThinkingSelection } from "../../../../../llm/ModelManager.js";
+import type { DesktopCookieJarStatus, DesktopFontPreference, DesktopMemoryCompactionResult, DesktopMemoryOverview, DesktopMemorySearchMatch, DesktopMemorySettings, DesktopModelCatalogResult, DesktopModelConfigurationInput, DesktopModelConnection, DesktopModelConnectionTestResult, DesktopModelLoginProvider, DesktopModelLoginStartResult, DesktopThemePreference, DesktopWebSearchProvider, DesktopWebSearchSettings, DesktopWebSearchSettingsInput, DesktopWorkspaceSnapshot } from "../../../../protocol.js";
 import {
   catalogForConnection,
   customCatalogEntry,
@@ -23,59 +18,18 @@ import {
   type CatalogModel,
   type ProviderCatalogItem,
   type ProviderCategory
-} from "../providerCatalog.js";
-import { useClosingPresence } from "../useClosingPresence.js";
-import { AppIcon } from "./AppIcon.js";
-import { Icon, type IconName } from "./Icon.js";
-import { ProviderBrandGlyph } from "./ProviderBrandGlyph.js";
-
-interface SearchOverlayProps {
-  open: boolean;
-  projects: DesktopProject[];
-  sessions: DesktopSessionSummary[];
-  onClose(): void;
-  onProject(projectId: string): void;
-  onSession(sessionId: string): void;
-}
-
-/** 快速搜索浮层（Cmd+K）：在项目名/路径和会话标题/首条消息里做子串匹配。 */
-export function SearchOverlay({ open, projects, sessions, onClose, onProject, onSession }: SearchOverlayProps): React.JSX.Element | null {
-  const presence = useClosingPresence(open);
-  const [query, setQuery] = useState("");
-  // 过滤用 deferred 值：输入很快时先保证输入框不掉帧，结果列表可以晚一帧。
-  const deferredQuery = useDeferredValue(query.trim().toLocaleLowerCase());
-  const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (open) {
-      setQuery("");
-      // 等一帧再聚焦：此刻节点刚挂载，直接 focus 可能落空。
-      window.requestAnimationFrame(() => inputRef.current?.focus());
-    }
-  }, [open]);
-  if (!presence.present) return null;
-  const filteredProjects = projects.filter((project) => !deferredQuery || `${project.name} ${project.path}`.toLocaleLowerCase().includes(deferredQuery));
-  const filteredSessions = sessions.filter((session) => !deferredQuery || `${session.title} ${session.firstUserMessage}`.toLocaleLowerCase().includes(deferredQuery));
-  return (
-    <ModalBackdrop onClose={onClose}>
-      <section aria-label="搜索" className={`t-modal command-palette ${presenceClass(presence.phase)}`} role="dialog">
-        <div className="search-input-wrap"><Icon name="search" /><input onChange={(event) => setQuery(event.target.value)} placeholder="搜索项目或会话" ref={inputRef} value={query} /><kbd>esc</kbd></div>
-        <div className="search-results">
-          {filteredProjects.length ? <h3>项目</h3> : null}
-          {filteredProjects.map((project) => <button key={project.id} onClick={() => { onProject(project.id); onClose(); }} type="button"><Icon name="folder" /><span><strong>{project.name}</strong><small>{project.path}</small></span></button>)}
-          {filteredSessions.length ? <h3>会话</h3> : null}
-          {filteredSessions.map((session) => <button key={session.id} onClick={() => { onSession(session.id); onClose(); }} type="button"><Icon name="home" /><span><strong>{session.title}</strong><small>{session.firstUserMessage || "空会话"}</small></span></button>)}
-          {!filteredProjects.length && !filteredSessions.length ? <div className="search-empty">没有匹配结果</div> : null}
-        </div>
-      </section>
-    </ModalBackdrop>
-  );
-}
+} from "../../providerCatalog.js";
+import { Icon } from "../Icon.js";
+import { ProviderBrandGlyph } from "../ProviderBrandGlyph.js";
+import { SettingsAbout } from "./SettingsAbout.js";
+import { SettingsAppearance } from "./SettingsAppearance.js";
 
 interface SettingsOverlayProps {
   open: boolean;
   version: string;
   workspace?: DesktopWorkspaceSnapshot;
   modelSetupRequired: boolean;
+  targetTab?: SettingsTab;
   themePreference: DesktopThemePreference;
   onThemePreference(theme: DesktopThemePreference): void;
   fontPreference: DesktopFontPreference;
@@ -107,19 +61,27 @@ interface SettingsOverlayProps {
   onCancelModelLogin(provider: DesktopModelLoginProvider, authRequestId: string): Promise<void>;
 }
 
-type SettingsTab = "外观" | "模型" | "记忆" | "联网搜索" | "关于";
+export type SettingsTab = "外观" | "模型" | "记忆" | "联网搜索" | "关于";
 
-const settingsNav: Array<{ badge?: string; group?: string; tab: SettingsTab; icon: React.ComponentProps<typeof Icon>["name"]; label: string }> = [
-  { group: "通用", tab: "外观", icon: "spark", label: "外观" },
-  { group: "AI 与集成", tab: "模型", icon: "cpu", label: "模型" },
-  { tab: "记忆", icon: "brain", label: "记忆" },
-  { badge: "Beta", tab: "联网搜索", icon: "search", label: "联网搜索" },
-  { group: "系统", tab: "关于", icon: "help", label: "关于" }
+const settingsNav: Array<{ badge?: string; tab: SettingsTab; label: string }> = [
+  { tab: "外观", label: "外观" },
+  { tab: "模型", label: "模型供应商" },
+  { tab: "记忆", label: "记忆" },
+  { badge: "Beta", tab: "联网搜索", label: "联网搜索" },
+  { tab: "关于", label: "关于" }
 ];
+
+const settingsTitles: Record<SettingsTab, string> = {
+  外观: "外观",
+  模型: "模型供应商",
+  记忆: "记忆",
+  联网搜索: "联网搜索",
+  关于: "关于"
+};
 
 const settingsSubtitles: Record<SettingsTab, string> = {
   模型: "模型连接、API key 与默认模型管理。",
-  外观: "主题偏好。",
+  外观: "显示模式、界面字体和字号。",
   记忆: "记忆检索、自动总结、整理与条目管理。",
   联网搜索: "配置联网搜索与数据来源。",
   关于: "版本与产品信息。"
@@ -130,6 +92,7 @@ export function SettingsOverlay({
   version,
   workspace,
   modelSetupRequired,
+  targetTab,
   themePreference,
   onThemePreference,
   fontPreference,
@@ -160,18 +123,19 @@ export function SettingsOverlay({
   onCompleteModelLogin,
   onCancelModelLogin
 }: SettingsOverlayProps): React.JSX.Element | null {
-  const presence = useClosingPresence(open);
-  const [tab, setTab] = useState<SettingsTab>("模型");
+  const [tab, setTab] = useState<SettingsTab>("外观");
   const [message, setMessage] = useState<string>();
   useEffect(() => {
     if (!message) return;
     const timer = window.setTimeout(() => setMessage(undefined), 1_000);
     return () => window.clearTimeout(timer);
   }, [message]);
-  useEffect(() => {
+  // 由 Composer 直达模型设置时，在浏览器绘制前同步分页，避免先闪过上次打开的内容。
+  useLayoutEffect(() => {
+    if (!open) return;
     if (modelSetupRequired) setTab("模型");
-  }, [modelSetupRequired]);
-  if (!presence.present) return null;
+    else if (targetTab) setTab(targetTab);
+  }, [modelSetupRequired, open, targetTab]);
   const runtime = workspace?.runtime;
   const execute = async (operation: () => Promise<void>, success: string): Promise<void> => {
     setMessage(undefined);
@@ -184,8 +148,16 @@ export function SettingsOverlay({
   };
   const dismiss = modelSetupRequired ? () => undefined : onClose;
   return (
-    <ModalBackdrop onClose={dismiss} variant="settings">
-      <section aria-label="Biny 设置" className={`t-modal settings-modal is-full-page ${presenceClass(presence.phase)}`} role="dialog">
+    <Dialog
+      aria-label="Biny 设置"
+      className="desktop-settings-dialog"
+      isOpen={open}
+      onOpenChange={(isOpen) => { if (!isOpen) dismiss(); }}
+      padding={0}
+      purpose={modelSetupRequired ? "required" : "info"}
+      variant="fullscreen"
+    >
+      <section className="settings-modal is-full-page">
         <aside className="settings-tabs">
           {modelSetupRequired ? (
             <div className="settings-setup-notice">
@@ -198,24 +170,22 @@ export function SettingsOverlay({
           ) : (
             <button aria-label="返回应用" className="settings-back-button" onClick={onClose} type="button">
               <Icon name="arrow-left" size={16} />
-              <span>返回应用</span>
+              <strong>设置</strong>
             </button>
           )}
-          {settingsNav.filter((item) => !modelSetupRequired || item.tab === "模型").map((item, index, visibleSettingsNav) => (
-            <div key={item.tab}>
-              {item.group && (index === 0 || visibleSettingsNav[index - 1]?.group !== item.group) ? <div className="settings-nav-group">{item.group}</div> : null}
-              <button aria-current={tab === item.tab ? "page" : undefined} className={tab === item.tab ? "is-selected" : ""} onClick={() => setTab(item.tab)} type="button">
-                <Icon name={item.icon} size={14} />
+          <nav aria-label="设置分类" className="settings-nav-list">
+            {settingsNav.filter((item) => !modelSetupRequired || item.tab === "模型").map((item) => (
+              <button aria-current={tab === item.tab ? "page" : undefined} className={tab === item.tab ? "is-selected" : ""} key={item.tab} onClick={() => setTab(item.tab)} type="button">
                 <span>{item.label}</span>
                 {item.badge ? <em className="settings-nav-badge">{item.badge}</em> : null}
               </button>
-            </div>
-          ))}
+            ))}
+          </nav>
         </aside>
         <main className="settings-content">
           <header>
             <div className="settings-heading">
-              <h2>{modelSetupRequired ? "配置模型" : tab}</h2>
+              <h2>{modelSetupRequired ? "配置模型" : settingsTitles[tab]}</h2>
               <p>{modelSetupRequired ? "开始使用前，请先连接一个可用模型。" : settingsSubtitles[tab]}</p>
             </div>
           </header>
@@ -286,76 +256,8 @@ export function SettingsOverlay({
           {message ? <div className="settings-message">{message}</div> : null}
         </main>
       </section>
-    </ModalBackdrop>
+    </Dialog>
   );
-}
-
-export function RenameOverlay({ open, initialValue, title = "重命名会话", onClose, onSave }: { open: boolean; initialValue: string; title?: string; onClose(): void; onSave(value: string): Promise<void> }): React.JSX.Element | null {
-  const presence = useClosingPresence(open);
-  const [value, setValue] = useState(initialValue);
-  const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    setValue(initialValue);
-    window.requestAnimationFrame(() => inputRef.current?.select());
-  }, [initialValue, open]);
-  if (!presence.present) return null;
-  return (
-    <ModalBackdrop onClose={onClose}>
-      <form className={`t-modal rename-modal ${presenceClass(presence.phase)}`} onSubmit={(event) => { event.preventDefault(); if (value.trim()) void onSave(value.trim()); }}>
-        <h2>{title}</h2>
-        <input maxLength={120} onChange={(event) => setValue(event.target.value)} ref={inputRef} value={value} />
-        <div><button onClick={onClose} type="button">取消</button><button className="is-primary" disabled={!value.trim()} type="submit">保存</button></div>
-      </form>
-    </ModalBackdrop>
-  );
-}
-
-export function SlashResultOverlay({ result, onClose }: { result?: DesktopSlashResult; onClose(): void }): React.JSX.Element | null {
-  const presence = useClosingPresence(Boolean(result));
-  // 关闭动画期间 result 已被清空，保留上一次内容直到 presence 退场结束。
-  const [lastResult, setLastResult] = useState<DesktopSlashResult>();
-  useEffect(() => {
-    if (result) setLastResult(result);
-  }, [result]);
-  const shown = result ?? lastResult;
-  if (!presence.present || !shown) return null;
-  return (
-    <ModalBackdrop onClose={onClose}>
-      <section aria-label={shown.title} className={`t-modal slash-result-modal ${presenceClass(presence.phase)}`}>
-        <header>
-          <h2>{shown.title}</h2>
-          <span className="slash-result-command">{shown.command}</span>
-          <button aria-label="关闭" onClick={onClose} type="button"><Icon name="close" size={13} /></button>
-        </header>
-        <pre>{shown.content}</pre>
-      </section>
-    </ModalBackdrop>
-  );
-}
-
-
-export function Toast({ message, onClose }: { message?: string; onClose(): void }): React.JSX.Element | null {
-  useEffect(() => {
-    if (!message) return;
-    const timer = setTimeout(onClose, 1_000);
-    return () => clearTimeout(timer);
-  }, [message, onClose]);
-  return message ? <div className="toast" role="status"><span>{message}</span><button onClick={onClose} type="button"><Icon name="close" size={12} /></button></div> : null;
-}
-
-/**
- * 浮层背板：统一处理 Esc 关闭和点击遮罩关闭。
- * 判断 `event.target === event.currentTarget` 才关，避免点击浮层内部区域时误关。
- */
-function ModalBackdrop({ children, onClose, variant }: { children: React.ReactNode; onClose(): void; variant?: "settings" }): React.JSX.Element {
-  useEffect(() => {
-    const escape = (event: KeyboardEvent): void => { if (event.key === "Escape") onClose(); };
-    window.addEventListener("keydown", escape);
-    return () => window.removeEventListener("keydown", escape);
-  }, [onClose]);
-  const className = variant === "settings" ? "modal-backdrop is-settings" : "modal-backdrop";
-  return <div className={className} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>{children}</div>;
 }
 
 /** 把模型列表按 provider 归组，设置页里按「连接」为单位展示而不是罗列所有模型。 */
@@ -397,10 +299,15 @@ function mergeAvailableModels(
       id: model.model,
       displayName: live?.displayName ?? model.displayName,
       supportsThinking: model.efforts.length > 0 || Boolean(live?.supportsThinking),
+      parallelToolCalls: model.capabilities?.parallelToolCalls ?? live?.parallelToolCalls,
+      reasoningStream: model.capabilities?.reasoningStream ?? live?.reasoningStream,
+      reasoningSummary: model.capabilities?.reasoningSummary ?? live?.reasoningSummary,
       supportsVision: model.capabilities?.vision ?? live?.supportsVision,
       supportsAudio: model.capabilities?.audio ?? live?.supportsAudio,
       contextWindow: model.contextWindow ?? live?.contextWindow,
-      maxOutputTokens: live?.maxOutputTokens,
+      maxInputTokens: model.maxInputTokens,
+      maxOutputTokens: model.maxOutputTokens ?? live?.maxOutputTokens,
+      limits: model.limits ?? live?.limits,
       thinkingLevelMap: model.thinkingLevelMap ?? live?.thinkingLevelMap,
       apiBackend: model.apiBackend ?? live?.apiBackend
     });
@@ -419,10 +326,15 @@ function catalogModelFromEntry(entry: DesktopModelCatalogResult["models"][number
     id: entry.id,
     displayName: entry.displayName,
     supportsThinking: entry.reasoningEfforts.length > 0 || entry.capabilities.reasoning === true,
+    parallelToolCalls: entry.capabilities.parallelToolCalls,
+    reasoningStream: entry.capabilities.reasoningStream,
+    reasoningSummary: entry.capabilities.reasoningSummary,
     supportsVision: entry.capabilities.vision,
     supportsAudio: entry.capabilities.audio,
     contextWindow: entry.contextWindow,
+    maxInputTokens: entry.maxInputTokens,
     maxOutputTokens: entry.maxOutputTokens,
+    limits: entry.limits,
     thinkingLevelMap: entry.thinkingLevelMap,
     apiBackend: entry.apiBackend
   };
@@ -623,16 +535,18 @@ function SettingsModels({ models, connections: connectionInfos, runtime, onChang
       apiKeyEnv: undefined,
       requiresApiKey: provider.requiresApiKey,
       supportsTools: true,
-      // A hand-typed model ID (custom endpoint) never matches a static catalog
-      // entry, so `catalogModel` is undefined and thinking silently defaulted
-      // to off for every model — including well-known reasoning models routed
-      // through a relay. Infer from the ID as a fallback, same as the live
-      // catalog fetch does.
-      supportsThinking: catalogModel?.supportsThinking ?? inferReasoningEfforts(modelId).length > 0,
+      // 手填模型 ID 没有可靠的能力来源，保持 undefined，由 ProviderRuntime 按 provider
+      // 默认值补齐；未知 OpenAI-compatible 模型不会在渲染层猜测 reasoning 参数。
+      supportsThinking: catalogModel?.supportsThinking,
+      parallelToolCalls: catalogModel?.parallelToolCalls,
+      reasoningStream: catalogModel?.reasoningStream,
+      reasoningSummary: catalogModel?.reasoningSummary,
       supportsVision: catalogModel?.supportsVision,
       supportsAudio: catalogModel?.supportsAudio,
       contextWindow: catalogModel?.contextWindow,
+      maxInputTokens: catalogModel?.maxInputTokens,
       maxOutputTokens: catalogModel?.maxOutputTokens,
+      limits: catalogModel?.limits,
       thinkingLevelMap: catalogModel?.thinkingLevelMap,
       apiBackend: catalogModel?.apiBackend,
       makeDefault: options.makeDefault ?? false
@@ -759,8 +673,15 @@ function SettingsModels({ models, connections: connectionInfos, runtime, onChang
       apiKeyEnv: undefined,
       supportsTools: active.supportsTools !== false,
       supportsThinking: active.efforts.length > 0,
+      parallelToolCalls: active.capabilities?.parallelToolCalls,
+      reasoningStream: active.capabilities?.reasoningStream,
+      reasoningSummary: active.capabilities?.reasoningSummary,
       supportsVision: active.capabilities?.vision,
       supportsAudio: active.capabilities?.audio,
+      contextWindow: active.contextWindow,
+      maxInputTokens: active.maxInputTokens,
+      maxOutputTokens: active.maxOutputTokens,
+      limits: active.limits,
       thinkingLevelMap: active.thinkingLevelMap,
       apiBackend: active.apiBackend
     });
@@ -785,8 +706,15 @@ function SettingsModels({ models, connections: connectionInfos, runtime, onChang
       apiKeyEnv: undefined,
       supportsTools: active.supportsTools !== false,
       supportsThinking: active.efforts.length > 0,
+      parallelToolCalls: active.capabilities?.parallelToolCalls,
+      reasoningStream: active.capabilities?.reasoningStream,
+      reasoningSummary: active.capabilities?.reasoningSummary,
       supportsVision: active.capabilities?.vision,
       supportsAudio: active.capabilities?.audio,
+      contextWindow: active.contextWindow,
+      maxInputTokens: active.maxInputTokens,
+      maxOutputTokens: active.maxOutputTokens,
+      limits: active.limits,
       thinkingLevelMap: active.thinkingLevelMap,
       apiBackend: active.apiBackend
     });
@@ -806,10 +734,15 @@ function SettingsModels({ models, connections: connectionInfos, runtime, onChang
       apiKeyEnv: undefined,
       supportsTools: true,
       supportsThinking: catalogModel.supportsThinking,
+      parallelToolCalls: catalogModel.parallelToolCalls,
+      reasoningStream: catalogModel.reasoningStream,
+      reasoningSummary: catalogModel.reasoningSummary,
       supportsVision: catalogModel.supportsVision,
       supportsAudio: catalogModel.supportsAudio,
       contextWindow: catalogModel.contextWindow,
+      maxInputTokens: catalogModel.maxInputTokens,
       maxOutputTokens: catalogModel.maxOutputTokens,
+      limits: catalogModel.limits,
       thinkingLevelMap: catalogModel.thinkingLevelMap,
       apiBackend: catalogModel.apiBackend
     });
@@ -837,8 +770,17 @@ function SettingsModels({ models, connections: connectionInfos, runtime, onChang
     apiKeyEnv: undefined,
     supportsTools: detailActive.supportsTools !== false,
     supportsThinking: detailActive.efforts.length > 0,
+    parallelToolCalls: detailActive.capabilities?.parallelToolCalls,
+    reasoningStream: detailActive.capabilities?.reasoningStream,
+    reasoningSummary: detailActive.capabilities?.reasoningSummary,
     supportsVision: detailActive.capabilities?.vision,
-    supportsAudio: detailActive.capabilities?.audio
+    supportsAudio: detailActive.capabilities?.audio,
+    contextWindow: detailActive.contextWindow,
+    maxInputTokens: detailActive.maxInputTokens,
+    maxOutputTokens: detailActive.maxOutputTokens,
+    limits: detailActive.limits,
+    thinkingLevelMap: detailActive.thinkingLevelMap,
+    apiBackend: detailActive.apiBackend
   } : undefined;
 
   const deleteConnection = async (): Promise<void> => {
@@ -1027,7 +969,19 @@ function SettingsModels({ models, connections: connectionInfos, runtime, onChang
 type ConnectionGroup = ReturnType<typeof connectionLabel>[number];
 
 function ModelDialogBackdrop({ children, onClose }: { children: React.ReactNode; onClose(): void }): React.JSX.Element {
-  return <div className="model-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>{children}</div>;
+  return (
+    <Dialog
+      className="desktop-model-dialog"
+      isOpen
+      maxHeight="min(820px, calc(100vh - 48px))"
+      onOpenChange={(isOpen) => { if (!isOpen) onClose(); }}
+      padding={0}
+      purpose="form"
+      width="min(560px, calc(100vw - 48px))"
+    >
+      {children}
+    </Dialog>
+  );
 }
 
 /**
@@ -1454,111 +1408,6 @@ function ConnectionTestResult({ result }: { result: DesktopModelConnectionTestRe
     <div className={`connection-test-result${result.ok ? " is-ok" : " is-error"}`} role="status">
       <Icon name={result.ok ? "check" : "warning"} size={13} />
       <span>{text}</span>
-    </div>
-  );
-}
-
-/** 字体下拉的候选项。值为 CSS 字体族名，未安装的字体会自然落回默认字体栈。 */
-const fontFamilyOptions: Array<{ value: string; title: string }> = [
-  { value: SYSTEM_FONT_FAMILY, title: "系统默认" },
-  { value: "PingFang SC", title: "苹方" },
-  { value: "Hiragino Sans GB", title: "冬青黑体" },
-  { value: "Noto Sans SC", title: "思源黑体" },
-  { value: "Songti SC", title: "宋体" },
-  { value: "Kaiti SC", title: "楷体" },
-  { value: "Yuanti SC", title: "圆体" }
-];
-
-function SettingsAppearance({ theme, onThemeChange, font, onFontChange }: {
-  theme: DesktopThemePreference;
-  onThemeChange(theme: DesktopThemePreference): void;
-  font: DesktopFontPreference;
-  onFontChange(font: DesktopFontPreference): void;
-}): React.JSX.Element {
-  const options: Array<{ value: DesktopThemePreference; title: string; icon: IconName }> = [
-    { value: "light", title: "浅色", icon: "sun" },
-    { value: "dark", title: "深色", icon: "moon" },
-    { value: "system", title: "跟随系统", icon: "display" }
-  ];
-  // 字号输入允许中间态（比如清空后再输入），失焦或回车时才夹取并提交。
-  const [sizeText, setSizeText] = useState(String(font.size));
-  useEffect(() => {
-    setSizeText(String(font.size));
-  }, [font.size]);
-  const commitSize = (): void => {
-    const parsed = Number(sizeText);
-    const next = Number.isFinite(parsed) && sizeText.trim() !== "" ? clampFontSize(parsed) : font.size;
-    setSizeText(String(next));
-    if (next !== font.size) onFontChange({ ...font, size: next });
-  };
-  const changeSize = (value: string): void => {
-    setSizeText(value);
-    // 步进按钮或直接输入合法值时即时生效，便于所见即所得地预览。
-    const parsed = Number(value);
-    if (Number.isInteger(parsed) && parsed >= MIN_FONT_SIZE && parsed <= MAX_FONT_SIZE && parsed !== font.size) {
-      onFontChange({ ...font, size: parsed });
-    }
-  };
-  // 落盘的字体可能来自旧版本或手改配置，不在候选里也要能正常显示当前值。
-  const familyOptions = fontFamilyOptions.some((option) => option.value === font.family)
-    ? fontFamilyOptions
-    : [...fontFamilyOptions, { value: font.family, title: font.family }];
-  return (
-    <div className="settings-sections">
-      <section>
-        <h3>主题</h3>
-        <div className="theme-option-grid" role="radiogroup" aria-label="主题">
-          {options.map((option) => (
-            <button
-              aria-checked={theme === option.value}
-              className={`theme-option${theme === option.value ? " is-selected" : ""}`}
-              key={option.value}
-              onClick={() => onThemeChange(option.value)}
-              role="radio"
-              type="button"
-            >
-              <Icon name={option.icon} size={19} />
-              <span className="theme-option-label">{option.title}</span>
-            </button>
-          ))}
-        </div>
-      </section>
-      <section>
-        <h3>字体设置</h3>
-        <div className="font-field">
-          <label className="font-field-label" htmlFor="appearance-font-family">字体</label>
-          <select
-            className="font-select"
-            id="appearance-font-family"
-            onChange={(event) => onFontChange({ ...font, family: event.target.value })}
-            value={font.family}
-          >
-            {familyOptions.map((option) => <option key={option.value} value={option.value}>{option.title}</option>)}
-          </select>
-          <small className="font-field-hint">选择应用界面的字体。保留系统默认将使用操作系统字体。</small>
-        </div>
-        <div className="font-field">
-          <label className="font-field-label" htmlFor="appearance-font-size">字体大小</label>
-          <div className="font-size-row">
-            <input
-              className="font-size-input"
-              id="appearance-font-size"
-              max={MAX_FONT_SIZE}
-              min={MIN_FONT_SIZE}
-              onBlur={commitSize}
-              onChange={(event) => changeSize(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") commitSize();
-              }}
-              step={1}
-              type="number"
-              value={sizeText}
-            />
-            <span className="font-size-unit">px</span>
-          </div>
-          <small className="font-field-hint">{MIN_FONT_SIZE} – {MAX_FONT_SIZE} px</small>
-        </div>
-      </section>
     </div>
   );
 }
@@ -2105,14 +1954,4 @@ function formatMemoryDate(value?: string): string {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) return value;
   return new Date(parsed).toLocaleString(undefined, { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-}
-
-function SettingsAbout({ version }: { version: string }): React.JSX.Element {
-  return <div className="about-settings"><AppIcon className="about-mark" size={66} /><h3>Biny</h3><p>版本 {version}</p><p>基于现有 Biny Agent 核心的 macOS 桌面交互层。</p></div>;
-}
-
-function presenceClass(phase: "closed" | "opening" | "open" | "closing"): string {
-  if (phase === "open") return "is-open";
-  if (phase === "closing") return "is-closing";
-  return "";
 }
