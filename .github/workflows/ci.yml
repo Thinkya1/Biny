@@ -15,9 +15,58 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Validate
+  static:
+    name: Static checks
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check changed patch
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+              git diff --check HEAD^ HEAD
+            else
+              git diff-tree --check --no-commit-id -r HEAD
+            fi
+          elif [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+            git diff-tree --check --no-commit-id -r "$CURRENT_SHA"
+          else
+            git diff --check "$BEFORE_SHA" "$CURRENT_SHA"
+          fi
+
+      - name: Audit production dependencies
+        run: pnpm audit --prod --audit-level high
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Lint
+        run: pnpm lint
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -33,20 +82,51 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Audit production dependencies
-        run: pnpm audit --prod --audit-level high
-
-      - name: Typecheck
-        run: pnpm typecheck
-
-      - name: Lint
-        run: pnpm lint
-
       - name: Test
         run: pnpm test
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Build CLI
         run: pnpm build:cli
 
       - name: Build desktop
         run: pnpm build:desktop
+
+  validate:
+    name: Validate
+    if: ${{ always() }}
+    needs: [static, test, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all validation lanes to pass
+        env:
+          STATIC_RESULT: ${{ needs.static.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          if [[ "$STATIC_RESULT" != "success" || "$TEST_RESULT" != "success" || "$BUILD_RESULT" != "success" ]]; then
+            echo "Static checks: $STATIC_RESULT"
+            echo "Tests: $TEST_RESULT"
+            echo "Build: $BUILD_RESULT"
+            exit 1
+          fi
+          echo "Static checks, tests, and builds all passed."
