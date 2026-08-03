@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { formatSubagentAgentList } from "../extensions/report.js";
 import { redactSecrets } from "../utils/secrets.js";
 import { formatSubagentTaskReport } from "./subagentTaskReport.js";
+import { formatStatusReport } from "./statusReport.js";
 import type { CommandRuntime } from "./CommandRuntime.js";
 import type { InteractiveAgentRuntime } from "./InteractiveAgentRuntime.js";
 import type { CommandSurface } from "./commandRegistry.js";
@@ -31,14 +32,15 @@ export async function executeRuntimeCommand(
   if (command === "/status") {
     const snapshot = runtime.getSnapshot();
     const info = snapshot.info;
-    return result(command, "Status", [
-      `Model: ${info.modelLabel} (${info.reasoningLabel})`,
-      `Permissions: ${snapshot.permissionMode}`,
-      "",
+    const context = await services.agent.contextStatus();
+    return result(command, "Status", formatStatusReport(
+      info,
+      snapshot.permissionMode,
+      context,
+      services.agent.usageSummary(),
       services.extensionReport()
-    ].join("\n"));
+    ));
   }
-  if (command === "/context") return result(command, "Context", await services.agent.contextReport());
   if (command === "/usage") return result(command, "Usage", services.agent.usageReport());
   if (command === "/mcp") {
     if (args[0]?.toLowerCase() !== "reconnect") {

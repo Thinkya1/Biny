@@ -52,6 +52,7 @@ await testSubagentQueueLimitAndNumericValidation();
 await testQueuedSubagentCancellationAndListenerIsolation();
 await testSubagentListenerReentrancyIsSafe();
 await testSubagentInspectionControls();
+await testStatusCommandUsesStructuredContextStatus();
 await testCliBackgroundSubagentIsReachable();
 await testSubagentParentCancellationAndTimeout();
 await testSubagentCloseWaitsForExecution();
@@ -366,6 +367,19 @@ async function testSubagentInspectionControls(): Promise<void> {
     { taskId: "task-visible", reason: "interactive cancellation" },
     { taskId: "task-visible", reason: "Cancelled from the tui." }
   ]);
+  await runtime.close();
+}
+
+async function testStatusCommandUsesStructuredContextStatus(): Promise<void> {
+  const commandRuntime = fakeCommandRuntime();
+  const runtime = new InteractiveAgentRuntime(commandRuntime);
+  const result = await executeRuntimeCommand(runtime, commandRuntime, "/status", "tui");
+
+  assert.equal(result?.title, "Status");
+  assert.match(result?.content ?? "", /Model: test\/model \(Off\)/u);
+  assert.match(result?.content ?? "", /Context window:/u);
+  assert.match(result?.content ?? "", /Input budget:/u);
+  assert.doesNotMatch(result?.content ?? "", /^Context$/mu);
   await runtime.close();
 }
 
@@ -1236,8 +1250,20 @@ function fakeCommandRuntime(options: FakeRuntimeOptions = {}): CommandRuntime {
     refreshModelFromDisk: async () => modelInfo(),
     resume: async () => ({ filePath: info.sessionFile, sessionId: info.sessionId, events: [], messages: [], usage: [] }),
     listSessions: async () => [],
-    contextReport: async () => "",
     usageReport: () => "",
+    usageSummary: () => ({
+      calls: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      reasoningTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: undefined,
+      pricingKnown: false,
+      pricedCalls: 0,
+      unpricedCalls: 0
+    }),
     contextStatus: async () => context,
     compactConversation: options.compactConversation ?? (async () => "summary"),
     prompt: options.run ?? defaultRun,

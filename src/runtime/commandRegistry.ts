@@ -16,11 +16,10 @@ const allInteractive = ["tui", "desktop"] as const;
 export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   { name: "/help", description: "Show available commands", category: "system", surfaces: terminalOnly },
   { name: "/clear", description: "Clear visible messages", category: "system", surfaces: terminalOnly },
-  { name: "/context", description: "Show loaded context and budget", category: "system", surfaces: allInteractive },
   { name: "/usage", description: "Show model token usage and cost", category: "system", surfaces: allInteractive },
   { name: "/compact", description: "Compact older conversation history", category: "system", acceptsArgs: true, surfaces: allInteractive },
   { name: "/model", description: "Choose a model and its supported thinking effort", category: "system", surfaces: terminalOnly },
-  { name: "/status", description: "Show model, permissions and extensions", category: "system", surfaces: allInteractive },
+  { name: "/status", description: "Show model, context, permissions and extensions", category: "system", surfaces: allInteractive },
   { name: "/mcp", description: "List MCP servers and tools, or reconnect a server", category: "extension", acceptsArgs: true, surfaces: allInteractive },
   { name: "/skills", description: "List available project and global skills", category: "extension", surfaces: allInteractive },
   { name: "/plugins", description: "List loaded plugins", category: "extension", surfaces: allInteractive },
@@ -33,8 +32,6 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   { name: "/approvals", description: "Alias for /permissions", category: "system", surfaces: terminalOnly },
   { name: "/undo", description: "Restore the workspace from a Biny checkpoint", category: "system", acceptsArgs: true, surfaces: allInteractive },
   { name: "/fork", description: "Fork a session into a new one", category: "session", surfaces: terminalOnly },
-  { name: "/plan", description: "Toggle Plan mode or plan the next task", category: "plan", surfaces: terminalOnly },
-  { name: "/mode", description: "Choose Chat or read-only Plan mode", category: "plan", surfaces: terminalOnly },
   { name: "/exit", description: "Exit Biny", category: "system", surfaces: terminalOnly },
   { name: "/quit", description: "Exit Biny", category: "system", surfaces: terminalOnly }
 ];
