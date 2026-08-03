@@ -21,6 +21,14 @@ import { DesktopProjectService } from "../src/desktop/electron/main/DesktopProje
 import { DesktopStateStore } from "../src/desktop/electron/main/DesktopStateStore.js";
 import { DesktopUserDataStore } from "../src/desktop/electron/main/DesktopUserDataStore.js";
 import { clampFilePanelWidth, DEFAULT_FILE_PANEL_WIDTH, MAX_FILE_PANEL_WIDTH, MIN_FILE_PANEL_WIDTH } from "../src/desktop/filePanelSizing.js";
+import { clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH, isCompactSidebarWidth, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH } from "../src/desktop/sidebarSizing.js";
+import type { DesktopAgentEventEnvelope, DesktopProject, DesktopSessionSummary, DesktopWorkspaceSnapshot } from "../src/desktop/protocol.js";
+import {
+  applyProjectOrder,
+  applyUpdatesToSidebarSessions,
+  applyUpdatesToWorkspace,
+  replaceProjectSessions
+} from "../src/desktop/renderer/src/app/desktopState.js";
 import {
   canNavigateBack,
   canNavigateForward,
@@ -68,6 +76,7 @@ await testInlineImageReading();
 testCommandHighlighting();
 testWorkspaceFileMarkers();
 await testFilePanelSizing();
+testSidebarSizing();
 await testDesktopThemePreference();
 await testDesktopModelConfiguration();
 await testDesktopSubagentSlashCommands();
@@ -77,6 +86,7 @@ await testDesktopWebSearchSettings();
 await testDesktopRequiresModelConfiguration();
 await testDesktopConnectionMetadata();
 await testWorkspaceSnapshotDoesNotReorderProjects();
+await testDesktopSidebarListsEveryProjectSession();
 await testDesktopProjectReorder();
 testProviderCatalogResolution();
 testModelChoicesDeduplicateEquivalentAliases();
@@ -100,6 +110,9 @@ testLiveReasoningAndSkillProjection();
 testReasoningDetailDoesNotUseCompletionStatusAsContent();
 testDesktopNavigationHistory();
 testPendingPermissionToolSelection();
+testDesktopRendererStateProjection();
+testDesktopRendererSidebarProjection();
+testDesktopRendererProjectOrder();
 
 async function testInteractiveRuntimeProtocol(): Promise<void> {
   const runtime = new InteractiveAgentRuntime(fakeCommandRuntime());
@@ -135,6 +148,149 @@ async function testInteractiveRuntimeProtocol(): Promise<void> {
   ]);
   assert.ok(events.every((event) => event.sessionId === "session-1" && event.runId && event.timestamp));
   await runtime.close();
+}
+
+function testDesktopRendererStateProjection(): void {
+  const project = desktopRendererProject("project-a", "Project A");
+  const workspace: DesktopWorkspaceSnapshot = {
+    project,
+    sessions: [],
+    selectedSessionId: undefined,
+    runtime: undefined,
+    runtimeError: undefined,
+    requiresModelConfiguration: false,
+    models: [],
+    connections: []
+  };
+  const timestamp = "2026-08-03T10:00:00.000Z";
+  const runningSnapshot: DesktopAgentEventEnvelope["snapshot"] = {
+    revision: 1,
+    info: {} as DesktopAgentEventEnvelope["snapshot"]["info"],
+    permissionMode: "ask",
+    state: {
+      kind: "runs",
+      activeRun: {
+        sessionId: "session-a",
+        runId: "run-a",
+        messageId: "message-a",
+        input: "Refactor the desktop renderer",
+        mode: "chat",
+        status: "thinking",
+        startedAt: timestamp
+      }
+    }
+  };
+  const idleSnapshot: DesktopAgentEventEnvelope["snapshot"] = {
+    ...runningSnapshot,
+    revision: 2,
+    state: { kind: "idle" }
+  };
+  const projected = applyUpdatesToWorkspace(workspace, [
+    {
+      projectId: project.id,
+      snapshot: runningSnapshot,
+      event: {
+        type: "message.user",
+        sessionId: "session-a",
+        runId: "run-a",
+        timestamp,
+        messageId: "message-a",
+        content: "Refactor the desktop renderer"
+      }
+    },
+    {
+      projectId: project.id,
+      snapshot: idleSnapshot,
+      event: {
+        type: "run.blocked",
+        sessionId: "session-a",
+        runId: "run-a",
+        timestamp: "2026-08-03T10:00:05.000Z",
+        durationMs: 5_000,
+        reason: "missing_user_input",
+        summary: "Need a target",
+        resumable: true
+      }
+    }
+  ]);
+
+  assert.equal(projected.sessions.length, 1);
+  assert.equal(projected.sessions[0]?.title, "Refactor the desktop renderer");
+  assert.equal(projected.sessions[0]?.status, "blocked");
+  assert.equal(projected.sessions[0]?.resumable, true);
+  assert.equal(projected.runtime?.revision, 2);
+}
+
+function testDesktopRendererSidebarProjection(): void {
+  const existing = desktopRendererSession("project-a", "session-a", "Existing task");
+  const timestamp = "2026-08-03T10:10:00.000Z";
+  const snapshot: DesktopAgentEventEnvelope["snapshot"] = {
+    revision: 1,
+    info: {} as DesktopAgentEventEnvelope["snapshot"]["info"],
+    permissionMode: "ask",
+    state: { kind: "idle" }
+  };
+  const projected = applyUpdatesToSidebarSessions([existing], [{
+    projectId: "project-b",
+    snapshot,
+    event: {
+      type: "message.user",
+      sessionId: "session-b",
+      runId: "run-b",
+      timestamp,
+      messageId: "message-b",
+      content: "Task in another project"
+    }
+  }]);
+
+  assert.strictEqual(projected.find((session) => session.id === existing.id), existing);
+  const otherProjectSession = projected.find((session) => session.projectId === "project-b");
+  assert.equal(otherProjectSession?.title, "Task in another project");
+  assert.equal(otherProjectSession?.status, "running");
+
+  const replacement = { ...otherProjectSession!, title: "Renamed task", pinned: true };
+  const replaced = replaceProjectSessions(projected, "project-b", [replacement]);
+  assert.equal(replaced.filter((session) => session.projectId === "project-b").length, 1);
+  assert.equal(replaced.find((session) => session.projectId === "project-b")?.title, "Renamed task");
+  assert.ok(replaced.includes(existing));
+}
+
+function testDesktopRendererProjectOrder(): void {
+  const first = desktopRendererProject("project-a", "Project A");
+  const second = desktopRendererProject("project-b", "Project B");
+  const ordered = applyProjectOrder([first, second], [second.id, second.id, "missing"]);
+  assert.deepEqual(ordered.map((project) => project.id), [second.id, first.id]);
+}
+
+function desktopRendererProject(id: string, name: string): DesktopProject {
+  return {
+    id,
+    path: `/tmp/${id}`,
+    name,
+    branch: "main",
+    dirty: false,
+    missing: false,
+    pinned: false,
+    addedAt: "2026-08-03T09:00:00.000Z",
+    lastOpenedAt: "2026-08-03T09:00:00.000Z"
+  };
+}
+
+function desktopRendererSession(projectId: string, id: string, title: string): DesktopSessionSummary {
+  return {
+    id,
+    projectId,
+    fileName: `${id}.jsonl`,
+    title,
+    firstUserMessage: title,
+    lastAssistantMessage: "",
+    eventCount: 1,
+    createdAt: "2026-08-03T09:00:00.000Z",
+    updatedAt: "2026-08-03T09:00:00.000Z",
+    pinned: false,
+    status: "idle",
+    resumable: undefined
+  };
 }
 
 async function testInteractiveRuntimePublishesStatusSnapshot(): Promise<void> {
@@ -603,6 +759,15 @@ async function testFilePanelSizing(): Promise<void> {
   }
 }
 
+function testSidebarSizing(): void {
+  assert.equal(DEFAULT_SIDEBAR_WIDTH, 260);
+  assert.equal(clampSidebarWidth(MIN_SIDEBAR_WIDTH - 1), MIN_SIDEBAR_WIDTH);
+  assert.equal(clampSidebarWidth(MAX_SIDEBAR_WIDTH + 1), MAX_SIDEBAR_WIDTH);
+  assert.equal(clampSidebarWidth(287.6), 288);
+  assert.equal(isCompactSidebarWidth(MIN_SIDEBAR_WIDTH), true);
+  assert.equal(isCompactSidebarWidth(100), false);
+}
+
 async function testDesktopThemePreference(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-theme-"));
   try {
@@ -690,6 +855,7 @@ async function testDesktopModelConfiguration(): Promise<void> {
     });
     const cleanedConfig = await configStore.load();
     assert.equal(cleanedConfig.models["deepseek-deepseek-v4-flash"], undefined);
+    assert.equal(cleanedConfig.models["deepseek-v4-flash"]?.contextWindow, undefined);
     assert.deepEqual(cleanedConfig.providers.deepseek?.headers, { "X-Provider-Route": "stable" });
     assert.equal(cleanedConfig.providers.deepseek?.modelsEndpoint, "https://api.deepseek.com/models");
     assert.deepEqual(cleanedConfig.models["deepseek-v4-flash"]?.headers, { "X-Model-Route": "flash" });
@@ -975,6 +1141,35 @@ async function testWorkspaceSnapshotDoesNotReorderProjects(): Promise<void> {
     assert.equal(state.project(first.id)?.lastOpenedAt, firstOpenedAt);
     assert.equal(state.project(second.id)?.lastOpenedAt, secondOpenedAt);
     assert.deepEqual(state.projects().map((project) => project.id), [first.id, second.id]);
+  } finally {
+    await rm(firstRoot, { recursive: true, force: true });
+    await rm(secondRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
+  }
+}
+
+async function testDesktopSidebarListsEveryProjectSession(): Promise<void> {
+  const firstRoot = await mkdtemp(path.join(os.tmpdir(), "biny-sidebar-a-"));
+  const secondRoot = await mkdtemp(path.join(os.tmpdir(), "biny-sidebar-b-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-sidebar-data-"));
+  try {
+    const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
+    const first = await projects.createProject(firstRoot);
+    const second = await projects.createProject(secondRoot);
+    for (const [project, sessionId] of [[first, "first-session"], [second, "second-session"]] as const) {
+      const dataRoot = await projects.dataRoot(project);
+      await ensureAgentDirs(dataRoot);
+      const recorder = new SessionRecorder(dataRoot, sessionId);
+      recorder.record({ type: "user_message", content: `Task for ${project.name}` });
+      await recorder.close();
+    }
+
+    const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
+    const workspace = await agents.workspaceSnapshot(first.id);
+    const sessions = await agents.sidebarSessions(workspace);
+    assert.deepEqual(new Set(sessions.map((session) => session.projectId)), new Set([first.id, second.id]));
+    assert.deepEqual(new Set(sessions.map((session) => session.id)), new Set(["first-session", "second-session"]));
+    await agents.closeAll();
   } finally {
     await rm(firstRoot, { recursive: true, force: true });
     await rm(secondRoot, { recursive: true, force: true });

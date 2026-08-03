@@ -14,7 +14,6 @@
 import type { AgentAttachment, InteractiveAgentRunMode } from "../../../agent/AgentSession.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { thinkingLevelMapForModel } from "../../../ai/capabilities.js";
 import { providerDefinition } from "../../../ai/provider.js";
 import { loadProjectSettings } from "../../../config/projectSettings.js";
 import { configSchema, type AgentConfig, type ProviderConfig } from "../../../config/schema.js";
@@ -49,6 +48,7 @@ import type {
   DesktopModelLoginStartResult,
   DesktopRunReceipt,
   DesktopSessionDocument,
+  DesktopSessionSummary,
   DesktopSlashResult,
   DesktopWebSearchSettings,
   DesktopWebSearchSettingsInput,
@@ -106,6 +106,20 @@ export class DesktopAgentManager {
       models,
       connections: config ? describeModelConnections(config) : []
     };
+  }
+
+  /**
+   * 侧栏需要一次展示所有项目的任务，但不应该因此初始化每个项目的 runtime。
+   * 当前项目复用已经加载的 workspace，其余项目只读取落盘会话摘要。
+   */
+  async sidebarSessions(workspace?: DesktopWorkspaceSnapshot): Promise<DesktopSessionSummary[]> {
+    const sessionGroups = await Promise.all(this.state.projects().map(async (storedProject) => {
+      if (workspace?.project.id === storedProject.id) return workspace.sessions;
+      const project = await this.projects.inspectProject(storedProject);
+      const runtime = this.runtimes.get(project.id)?.runtime;
+      return await this.projects.listSessions(project, runtime?.getSnapshot(), this.projectEvents(project.id));
+    }));
+    return sessionGroups.flat();
   }
 
   async startDraft(projectId: string): Promise<DesktopWorkspaceSnapshot> {
@@ -601,7 +615,7 @@ export class DesktopAgentManager {
     // the de-dup above can still strip the previous default out from under us.
     const keepsCurrentDefault = input.alias === current.defaultModel || Boolean(models[current.defaultModel]);
     const defaultModel = input.makeDefault || !keepsCurrentDefault ? input.alias : current.defaultModel;
-    return configSchema.parse({
+    const parsed = configSchema.parse({
       ...current,
       defaultModel,
       providers: { ...current.providers, [input.providerAlias]: provider },
@@ -615,15 +629,22 @@ export class DesktopAgentManager {
           capabilities: {
             tools: input.supportsTools,
             reasoning: input.supportsThinking,
+            parallelToolCalls: input.parallelToolCalls,
+            reasoningStream: input.reasoningStream,
+            reasoningSummary: input.reasoningSummary,
             vision: input.supportsVision,
             audio: input.supportsAudio
           },
-          contextWindow: input.contextWindow,
-          maxOutputTokens: input.maxOutputTokens,
+          // 目录元数据只参与当前运行时解析，不自动写成用户覆盖；已有同模型配置中的
+          // 限制字段则继续保留，用户可以在 config.json 中显式维护它们。
+          contextWindow: sameModel ? existingModel.contextWindow : undefined,
+          maxInputTokens: sameModel ? existingModel.maxInputTokens : undefined,
+          maxOutputTokens: sameModel ? existingModel.maxOutputTokens : undefined,
+          limits: sameModel ? existingModel.limits : undefined,
           apiBackend: input.apiBackend,
           baseUrl: sameModel ? existingModel.baseUrl : undefined,
           headers: sameModel ? existingModel.headers : undefined,
-          thinkingLevelMap: input.thinkingLevelMap ?? thinkingLevelMapForModel(input.model, input.supportsThinking),
+          thinkingLevelMap: input.thinkingLevelMap,
           compatibility: input.compatibility ?? (sameModel ? existingModel.compatibility : undefined),
           pricing: sameModel ? existingModel.pricing : undefined
         }
@@ -632,6 +653,7 @@ export class DesktopAgentManager {
       // reset when the default actually moves to a freshly configured model.
       thinking: defaultModel === current.defaultModel ? current.thinking : { enabled: false, effort: current.thinking.effort }
     });
+    return parsed;
   }
 
   async compact(projectId: string, hint?: string): Promise<string> {
@@ -646,7 +668,7 @@ export class DesktopAgentManager {
   async runSlashCommand(projectId: string, sessionId: string | undefined, input: string): Promise<DesktopSlashResult> {
     await this.requireConfiguredModel(projectId);
     const { runtime, commands } = await this.ensureRuntime(projectId);
-    // /context、/usage 依赖当前会话：用户查看的会话与 runtime 不一致且空闲时先切换。
+    // /status、/usage 依赖当前会话：用户查看的会话与 runtime 不一致且空闲时先切换。
     if (sessionId && runtime.getSnapshot().info.sessionId !== sessionId) {
       const snapshot = runtime.getSnapshot();
       if (!runtimeIsBusy(snapshot)) await runtime.resumeSession(sessionId);
@@ -673,7 +695,9 @@ export class DesktopAgentManager {
       this.runtimes.delete(projectId);
     }
     await this.projects.deleteSession(this.projects.requireProject(projectId), sessionId);
-    await this.state.setSelectedSession(projectId, undefined);
+    if (this.state.selectedSessionId(projectId) === sessionId) {
+      await this.state.setSelectedSession(projectId, undefined);
+    }
     return await this.workspaceSnapshot(projectId);
   }
 
@@ -824,7 +848,7 @@ export class DesktopAgentManager {
         model: model.id,
         displayName: model.displayName,
         supportsTools: true,
-        thinkingLevelMap: thinkingLevelMapForModel(model.id, model.supportsThinking)
+        capabilities: { tools: true, reasoning: model.supportsThinking }
       }] as const;
     });
     const defaultModel = configuredModels[0]?.[0];

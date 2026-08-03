@@ -85,10 +85,12 @@ async function startDesktopApplication(): Promise<void> {
     activeProjectId ??= allProjects.at(0)?.id;
     if (activeProjectId !== state.activeProjectId()) await state.setActiveProject(activeProjectId);
     const workspace = activeProjectId ? await agents.workspaceSnapshot(activeProjectId) : undefined;
+    const sidebarSessions = await agents.sidebarSessions(workspace);
     return {
       version: app.getVersion(),
       platform: process.platform,
       projects: state.projects(),
+      sidebarSessions,
       activeProjectId,
       selectedSessionId: activeProjectId ? state.selectedSessionId(activeProjectId) : undefined,
       workspace,

@@ -9,7 +9,7 @@
  */
 import type { InteractiveAgentRunMode } from "../agent/AgentSession.js";
 import type { ModelCatalogEntry } from "../ai/types.js";
-import type { ModelApiBackend, ModelCompatibility, ModelProvider, ThinkingLevelMap, WebSearchConfig } from "../config/schema.js";
+import type { ModelApiBackend, ModelCompatibility, ModelLimits, ModelProvider, ThinkingLevelMap, WebSearchConfig } from "../config/schema.js";
 import type { ModelChoice, ModelRuntimeInfo, ThinkingSelection } from "../llm/ModelManager.js";
 import type { PermissionMode, PermissionResult } from "../permission/PermissionManager.js";
 import type { AgentHostEvent, AgentRuntimeUpdate, InteractiveRuntimeSnapshot } from "../runtime/agentEvents.js";
@@ -157,6 +157,8 @@ export interface DesktopBootstrap {
   version: string;
   platform: NodeJS.Platform;
   projects: DesktopProject[];
+  /** 所有项目的任务摘要，供侧栏和全局搜索按项目分组展示。 */
+  sidebarSessions: DesktopSessionSummary[];
   activeProjectId?: string;
   selectedSessionId?: string;
   workspace?: DesktopWorkspaceSnapshot;
@@ -216,11 +218,16 @@ export interface DesktopModelConfigurationInput {
   apiKeyEnv?: string;
   requiresApiKey?: boolean;
   supportsTools: boolean;
-  supportsThinking: boolean;
+  supportsThinking?: boolean;
+  parallelToolCalls?: boolean;
+  reasoningStream?: boolean;
+  reasoningSummary?: boolean;
   supportsVision?: boolean;
   supportsAudio?: boolean;
   contextWindow?: number;
+  maxInputTokens?: number;
   maxOutputTokens?: number;
+  limits?: ModelLimits;
   apiBackend?: ModelApiBackend;
   thinkingLevelMap?: ThinkingLevelMap;
   compatibility?: ModelCompatibility;

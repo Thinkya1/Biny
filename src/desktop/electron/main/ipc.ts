@@ -20,7 +20,7 @@ import {
   type SaveDialogOptions
 } from "electron";
 import { z } from "zod";
-import { modelApiBackendSchema, modelCompatibilitySchema, modelProviderSchema, providerProtocolSchema, reasoningEffortSchema } from "../../../config/schema.js";
+import { modelApiBackendSchema, modelCompatibilitySchema, modelLimitsSchema, modelProviderSchema, providerProtocolSchema, reasoningEffortSchema } from "../../../config/schema.js";
 import { clampFontSize } from "../../fontPreference.js";
 import type { DesktopBootstrap, DesktopSessionMenuAction, DesktopThemePreference } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
@@ -63,11 +63,16 @@ const modelConfigurationSchema = z.object({
   apiKeyEnv: z.string().trim().min(1).max(120).optional(),
   requiresApiKey: z.boolean().optional(),
   supportsTools: z.boolean(),
-  supportsThinking: z.boolean(),
+  supportsThinking: z.boolean().optional(),
+  parallelToolCalls: z.boolean().optional(),
+  reasoningStream: z.boolean().optional(),
+  reasoningSummary: z.boolean().optional(),
   supportsVision: z.boolean().optional(),
   supportsAudio: z.boolean().optional(),
   contextWindow: z.number().int().min(4_096).max(2_000_000).optional(),
+  maxInputTokens: z.number().int().min(2_048).max(2_000_000).optional(),
   maxOutputTokens: z.number().int().min(1).max(384_000).optional(),
+  limits: modelLimitsSchema.optional(),
   apiBackend: modelApiBackendSchema.optional(),
   thinkingLevelMap: z.record(z.string().min(1), z.string().min(1).nullable()).optional(),
   compatibility: modelCompatibilitySchema.optional(),

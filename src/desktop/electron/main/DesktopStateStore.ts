@@ -9,6 +9,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { clampStoredFilePanelWidth, DEFAULT_FILE_PANEL_WIDTH } from "../../filePanelSizing.js";
 import { DEFAULT_FONT_PREFERENCE, normalizeFontPreference } from "../../fontPreference.js";
+import { clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH } from "../../sidebarSizing.js";
 import type { DesktopFontPreference, DesktopProject, DesktopThemePreference } from "../../protocol.js";
 
 interface DesktopSessionMetadata {
@@ -42,7 +43,7 @@ const defaultState: PersistedDesktopState = {
   activeProjectId: undefined,
   selectedSessionIds: {},
   sessionMetadata: {},
-  sidebarWidth: 216,
+  sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
   filePanelWidth: DEFAULT_FILE_PANEL_WIDTH,
   themePreference: "system",
   fontPreference: { ...DEFAULT_FONT_PREFERENCE },
@@ -64,7 +65,7 @@ export class DesktopStateStore {
         activeProjectId: typeof raw.activeProjectId === "string" ? raw.activeProjectId : undefined,
         selectedSessionIds: isRecord(raw.selectedSessionIds) ? stringRecord(raw.selectedSessionIds) : {},
         sessionMetadata: isRecord(raw.sessionMetadata) ? metadataRecord(raw.sessionMetadata) : {},
-        sidebarWidth: typeof raw.sidebarWidth === "number" ? clampSidebarWidth(raw.sidebarWidth) : 216,
+        sidebarWidth: typeof raw.sidebarWidth === "number" ? clampSidebarWidth(raw.sidebarWidth) : DEFAULT_SIDEBAR_WIDTH,
         filePanelWidth: typeof raw.filePanelWidth === "number" ? clampStoredFilePanelWidth(raw.filePanelWidth) : DEFAULT_FILE_PANEL_WIDTH,
         themePreference: validThemePreference(raw.themePreference) ? raw.themePreference : "system",
         fontPreference: normalizeFontPreference(raw.fontPreference),
@@ -247,10 +248,6 @@ export class DesktopStateStore {
 
 function metadataKey(projectId: string, sessionId: string): string {
   return `${projectId}:${sessionId}`;
-}
-
-function clampSidebarWidth(width: number): number {
-  return Math.min(320, Math.max(190, Math.round(width)));
 }
 
 function validThemePreference(value: unknown): value is DesktopThemePreference {
