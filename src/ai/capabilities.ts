@@ -5,10 +5,14 @@
  * 能力集合、上下文预算和思考档位，让上层不必到处写兜底判断。
  */
 import type { ModelAliasConfig, ModelThinkingConfig, ReasoningEffort, ThinkingLevelMap } from "../config/schema.js";
-import type { ModelCapabilities, ModelContextBudget } from "./types.js";
+import type { ModelCapabilities, ModelContextBudget, ModelLimits, ProviderModelDefaults } from "./types.js";
 
 export const defaultModelContextWindow = 32_768;
 export const defaultModelOutputTokens = 8_192;
+const defaultToolSchemaReserveTokens = 1_024;
+const defaultSystemPromptReserveTokens = 1_024;
+const defaultProtocolSafetyMarginTokens = 512;
+const minimumUsableInputTokens = 2_048;
 
 /**
  * 模型级 canonical map。它表达的是 provider 可接受的参数，而不是模型真实“思考程度”。
@@ -25,6 +29,7 @@ export function modelThinkingLevelMap(model: ModelAliasConfig): ThinkingLevelMap
 
 /** 从 canonical `reasoning` 配置推导 UI 和 provider 使用的档位。 */
 export function modelReasoningConfig(model: ModelAliasConfig): ModelThinkingConfig | undefined {
+  if (model.capabilities?.reasoning === false || model.compatibility?.supportsReasoning === false) return undefined;
   const map = modelThinkingLevelMap(model);
   const efforts = Object.entries(map)
     .filter(([level, native]) => level !== "off" && native !== null)
@@ -35,9 +40,8 @@ export function modelReasoningConfig(model: ModelAliasConfig): ModelThinkingConf
   const defaultEffort = reasoning?.defaultEffort && efforts.includes(reasoning.defaultEffort)
     ? reasoning.defaultEffort
     : efforts.includes("high") ? "high" : efforts[0]!;
-  const mapping = Object.fromEntries(
-    efforts.map((effort) => [effort, map[effort] ?? effort])
-  ) as Partial<Record<ReasoningEffort, string>>;
+  const mapping: Partial<Record<ReasoningEffort, string>> = {};
+  for (const effort of efforts) mapping[effort] = map[effort] ?? effort;
   return {
     efforts,
     defaultEffort,
@@ -99,14 +103,18 @@ export function inferReasoningEfforts(modelId: string): ReasoningEffort[] {
 }
 
 /** 把目录/桌面配置里的支持提示转换成模型级 canonical map。 */
-export function thinkingLevelMapForModel(modelId: string, supportsThinking = true): ThinkingLevelMap {
+export function thinkingLevelMapForModel(
+  modelId: string,
+  supportsThinking = true,
+  declaredEfforts: ReasoningEffort[] = []
+): ThinkingLevelMap {
   if (!supportsThinking) {
     return { off: "none" };
   }
   if (isKimiK3Model(modelId)) {
     return { low: "low", high: "high", max: "max" };
   }
-  const efforts = inferReasoningEfforts(modelId);
+  const efforts = declaredEfforts.length ? declaredEfforts : inferReasoningEfforts(modelId);
   const resolved = efforts.length ? efforts : ["high", "max"] as ReasoningEffort[];
   return {
     off: "none",
@@ -120,9 +128,13 @@ export function thinkingLevelMapForModel(modelId: string, supportsThinking = tru
  */
 export function modelCapabilities(model: ModelAliasConfig): ModelCapabilities {
   const reasoning = modelReasoningConfig(model);
+  const reasoningEnabled = model.capabilities?.reasoning ?? reasoning !== undefined;
   return {
     tools: model.capabilities?.tools ?? model.supportsTools ?? true,
-    reasoning: model.capabilities?.reasoning ?? reasoning !== undefined,
+    parallelToolCalls: model.capabilities?.parallelToolCalls ?? false,
+    reasoning: reasoningEnabled,
+    reasoningStream: reasoningEnabled ? model.capabilities?.reasoningStream ?? true : false,
+    reasoningSummary: reasoningEnabled ? model.capabilities?.reasoningSummary ?? false : false,
     vision: model.capabilities?.vision ?? false,
     audio: model.capabilities?.audio ?? false,
     streaming: model.capabilities?.streaming ?? true
@@ -130,33 +142,135 @@ export function modelCapabilities(model: ModelAliasConfig): ModelCapabilities {
 }
 
 /**
- * 上下文预算以模型自身的上下文窗口为准：窗口减去输出预留就是可用输入预算。
- * `configuredMaxInputTokens` 只是可选的额外上限，没配就完全按模型能力走。
+ * 在 ProviderRuntime 边界把用户、内置、插件和动态目录的缺省字段合并成一份模型元数据。
+ * 只有 Provider 明确允许按 ID 推断时才启用 reasoning 家族规则；未知模型保持保守关闭。
+ */
+export function normalizeModelMetadata(
+  model: ModelAliasConfig,
+  defaults: ProviderModelDefaults = { capabilities: {} }
+): ModelAliasConfig {
+  const explicitCapabilities = model.capabilities ?? {};
+  const reasoningDisabled = explicitCapabilities.reasoning === false || model.compatibility?.supportsReasoning === false;
+  const declaredEfforts = modelReasoningConfigWithoutCapabilityGate(model)?.efforts ?? [];
+  const inferredEfforts = !reasoningDisabled && defaults.inferReasoningFromId === true
+    ? inferReasoningEfforts(model.model)
+    : [];
+  const defaultEfforts = !reasoningDisabled
+    ? defaults.reasoningEfforts ?? []
+    : [];
+  const fallbackEfforts: ReasoningEffort[] = ["high", "max"];
+  const reasoningEfforts: ReasoningEffort[] = declaredEfforts.length
+    ? declaredEfforts
+    : inferredEfforts.length
+      ? inferredEfforts
+      : explicitCapabilities.reasoning === true
+        ? defaultEfforts.length ? defaultEfforts : fallbackEfforts
+        : [];
+  const reasoning = reasoningDisabled
+    ? undefined
+    : model.reasoning ?? createReasoningConfig(reasoningEfforts, defaults.thinkingLevelMap);
+  const hasReasoning = !reasoningDisabled && (reasoning !== undefined || explicitCapabilities.reasoning === true);
+  const capabilities: ModelCapabilities = {
+    tools: explicitCapabilities.tools ?? model.supportsTools ?? defaults.capabilities.tools ?? true,
+    parallelToolCalls: explicitCapabilities.parallelToolCalls ?? defaults.capabilities.parallelToolCalls ?? false,
+    reasoning: explicitCapabilities.reasoning ?? hasReasoning,
+    reasoningStream: (explicitCapabilities.reasoning ?? hasReasoning)
+      ? explicitCapabilities.reasoningStream ?? (hasReasoning ? defaults.capabilities.reasoningStream ?? true : true)
+      : false,
+    reasoningSummary: (explicitCapabilities.reasoning ?? hasReasoning)
+      ? explicitCapabilities.reasoningSummary ?? (hasReasoning ? defaults.capabilities.reasoningSummary ?? false : false)
+      : false,
+    vision: explicitCapabilities.vision ?? defaults.capabilities.vision ?? false,
+    audio: explicitCapabilities.audio ?? defaults.capabilities.audio ?? false,
+    streaming: explicitCapabilities.streaming ?? defaults.capabilities.streaming ?? true
+  };
+  const limits = mergeLimits(defaults.limits, model.limits);
+  const thinkingLevelMap = reasoningDisabled
+    ? { off: "none" }
+    : model.thinkingLevelMap
+      ?? (reasoning ? reasoningConfigToMap(reasoning, model.model) : defaults.thinkingLevelMap);
+  return {
+    ...model,
+    capabilities,
+    contextWindow: model.contextWindow ?? defaults.contextWindow,
+    maxInputTokens: model.maxInputTokens ?? defaults.maxInputTokens,
+    maxOutputTokens: model.maxOutputTokens ?? defaults.maxOutputTokens,
+    limits,
+    thinkingLevelMap,
+    reasoning
+  };
+}
+
+/**
+ * 上下文预算以模型自身窗口为基准，再扣除输出、reasoning、工具 schema、system prompt
+ * 和协议安全边界；`configuredMaxInputTokens` 只是用户额外设置的输入上限。
  */
 export function modelContextBudget(
   model: ModelAliasConfig,
   configuredMaxInputTokens: number | undefined,
-  modelAlias?: string
+  modelAlias?: string,
+  options: {
+    reasoning?: "off" | ReasoningEffort;
+    toolSchemaTokens?: number;
+    systemPromptTokens?: number;
+  } = {}
 ): ModelContextBudget {
+  const capabilities = modelCapabilities(model);
   const maxOutputTokens = model.maxOutputTokens;
+  const modelLimits = model.limits;
+  const outputReserveTokens = Math.min(
+    maxOutputTokens ?? defaultModelOutputTokens,
+    Math.max(2_048, Math.floor((model.contextWindow ?? defaultModelContextWindow) * 0.25))
+  );
+  const reasoningReserveTokens = options.reasoning !== undefined && options.reasoning !== "off" && capabilities.reasoning
+    ? Math.max(
+      modelLimits?.reasoningReserveTokens ?? 0,
+      reasoningBudgetTokens(model, options.reasoning)
+    )
+    : 0;
+  const toolSchemaReserveTokens = options.toolSchemaTokens
+    ?? modelLimits?.toolSchemaReserveTokens
+    ?? (capabilities.tools ? defaultToolSchemaReserveTokens : 0);
+  const systemPromptReserveTokens = options.systemPromptTokens
+    ?? modelLimits?.systemPromptReserveTokens
+    ?? defaultSystemPromptReserveTokens;
+  const protocolSafetyMarginTokens = modelLimits?.protocolSafetyMarginTokens ?? defaultProtocolSafetyMarginTokens;
+  const fixedReserveTokens = outputReserveTokens
+    + reasoningReserveTokens
+    + toolSchemaReserveTokens
+    + systemPromptReserveTokens
+    + protocolSafetyMarginTokens;
   // 没声明窗口时按「输入上限 + 输出预留」反推，至少给到默认窗口。
   const contextWindow = model.contextWindow
-    ?? Math.max(defaultModelContextWindow, (configuredMaxInputTokens ?? 0) + (maxOutputTokens ?? defaultModelOutputTokens));
-  // 输出预留最多占窗口的 1/4：模型声明的 maxOutputTokens 可能很大（如 64k），
-  // 全额预留会把输入预算压到不可用。
-  const outputReserve = Math.min(
-    maxOutputTokens ?? defaultModelOutputTokens,
-    Math.max(2_048, Math.floor(contextWindow * 0.25))
+    ?? Math.max(
+      defaultModelContextWindow,
+      (model.maxInputTokens ?? configuredMaxInputTokens ?? 0) + fixedReserveTokens
+    );
+  // maxInputTokens 是 provider 的硬上限；configuredMaxInputTokens 是用户额外上限，
+  // 两者都要在扣除输出、reasoning、工具 schema、system prompt 和协议安全边界后再取最小值。
+  const availableInputTokens = Math.max(minimumUsableInputTokens, contextWindow - fixedReserveTokens);
+  const providerInputLimit = model.maxInputTokens ?? modelLimits?.maxInputTokens;
+  const cappedInputTokens = Math.min(
+    availableInputTokens,
+    providerInputLimit ?? Number.MAX_SAFE_INTEGER,
+    configuredMaxInputTokens ?? Number.MAX_SAFE_INTEGER
   );
-  // 无论怎么算都至少留 2k 输入，否则一次对话都发不出去。
-  const availableInputTokens = Math.max(2_048, contextWindow - outputReserve);
+  const inputFloor = Math.min(
+    minimumUsableInputTokens,
+    contextWindow,
+    providerInputLimit ?? Number.MAX_SAFE_INTEGER,
+    configuredMaxInputTokens ?? Number.MAX_SAFE_INTEGER
+  );
   return {
     modelAlias,
     contextWindow,
-    maxInputTokens: configuredMaxInputTokens === undefined
-      ? availableInputTokens
-      : Math.max(2_048, Math.min(configuredMaxInputTokens, availableInputTokens)),
-    maxOutputTokens
+    maxInputTokens: Math.min(contextWindow, Math.max(inputFloor, cappedInputTokens)),
+    maxOutputTokens,
+    outputReserveTokens,
+    reasoningReserveTokens,
+    toolSchemaReserveTokens,
+    systemPromptReserveTokens,
+    protocolSafetyMarginTokens
   };
 }
 
@@ -176,4 +290,57 @@ export function reasoningBudgetTokens(
 ): number {
   return modelReasoningConfig(model)?.budgetTokens?.[effort]
     ?? (effort === "max" || effort === "xhigh" ? 8_192 : effort === "high" ? 4_096 : 2_048);
+}
+
+function modelReasoningConfigWithoutCapabilityGate(model: ModelAliasConfig): ModelThinkingConfig | undefined {
+  const map = model.thinkingLevelMap ?? (model.reasoning ? modelThinkingLevelMap(model) : {});
+  const efforts = Object.entries(map)
+    .filter(([level, native]) => level !== "off" && native !== null)
+    .map(([level]) => level)
+    .filter(isReasoningEffort);
+  if (!efforts.length && !model.reasoning) return undefined;
+  const defaultEffort = model.reasoning?.defaultEffort && efforts.includes(model.reasoning.defaultEffort)
+    ? model.reasoning.defaultEffort
+    : efforts.includes("high") ? "high" : efforts[0];
+  if (!defaultEffort) return undefined;
+  const mapping: Partial<Record<ReasoningEffort, string>> = {};
+  for (const effort of efforts) mapping[effort] = map[effort] ?? effort;
+  return {
+    efforts,
+    defaultEffort,
+    mapping,
+    budgetTokens: model.reasoning?.budgetTokens
+  };
+}
+
+function createReasoningConfig(
+  efforts: ReasoningEffort[],
+  defaultMap: ThinkingLevelMap | undefined
+): ModelThinkingConfig | undefined {
+  if (!efforts.length) return undefined;
+  const mapping: Partial<Record<ReasoningEffort, string>> = {};
+  for (const effort of efforts) mapping[effort] = defaultMap?.[effort] ?? effort;
+  const defaultEffort = efforts.includes("high") ? "high" : efforts[0]!;
+  return { efforts, defaultEffort, mapping, budgetTokens: undefined };
+}
+
+function reasoningConfigToMap(reasoning: ModelThinkingConfig, modelId: string): ThinkingLevelMap {
+  const map: ThinkingLevelMap = isKimiK3Model(modelId) ? {} : { off: "none" };
+  for (const effort of reasoning.efforts) map[effort] = reasoning.mapping?.[effort] ?? effort;
+  return map;
+}
+
+function mergeLimits(base: ModelLimits | undefined, override: ModelLimits | undefined): ModelLimits | undefined {
+  if (!base && !override) return undefined;
+  return {
+    maxInputTokens: override?.maxInputTokens ?? base?.maxInputTokens,
+    reasoningReserveTokens: override?.reasoningReserveTokens ?? base?.reasoningReserveTokens,
+    toolSchemaReserveTokens: override?.toolSchemaReserveTokens ?? base?.toolSchemaReserveTokens,
+    systemPromptReserveTokens: override?.systemPromptReserveTokens ?? base?.systemPromptReserveTokens,
+    protocolSafetyMarginTokens: override?.protocolSafetyMarginTokens ?? base?.protocolSafetyMarginTokens
+  };
+}
+
+function isReasoningEffort(value: string): value is ReasoningEffort {
+  return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max";
 }

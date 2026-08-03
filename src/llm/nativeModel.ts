@@ -25,7 +25,7 @@ export interface NativeModelConfig {
   supportsDeveloperRole?: boolean;
   supportsTools?: boolean;
   anthropicAuthMode?: "api-key" | "bearer";
-  reasoningProtocol?: "deepseek" | "openai" | "anthropic" | "alibaba" | "moonshotai";
+  reasoningProtocol?: "deepseek" | "openai" | "google" | "anthropic" | "alibaba" | "moonshotai";
   providerOptions?: Record<string, unknown>;
   apiAdapters?: ApiAdapterRegistry;
 }

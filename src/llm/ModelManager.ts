@@ -67,7 +67,7 @@ export class ModelManager {
   }
 
   getInfo(): ModelRuntimeInfo {
-    return modelRuntimeInfo(this.config);
+    return modelRuntimeInfoFromRuntime(this.config, this.runtime);
   }
 
   getModel(): AgentModel {
@@ -79,8 +79,14 @@ export class ModelManager {
   }
 
   getContextBudget(): ReturnType<typeof modelContextBudget> {
-    const resolved = resolveModelConfig(this.config);
-    return modelContextBudget(resolved.model, this.config.context.maxInputTokens, resolved.alias);
+    const resolved = this.runtime.resolve(this.config.defaultModel);
+    const thinking = effectiveThinkingSelection(this.config, resolved.model);
+    return modelContextBudget(
+      resolved.model,
+      this.config.context.maxInputTokens,
+      resolved.alias,
+      { reasoning: thinking }
+    );
   }
 
   /**
@@ -128,6 +134,12 @@ export class ModelManager {
     const resolved = persistedRuntime.resolve(alias);
     const modelAlias = resolved.alias;
     const model = resolved.model;
+    // 只保存原始配置或动态模型的最小 alias；`resolved.model` 已包含目录/Provider 补齐的
+    // 元数据，直接写回会把自动推导的 contextWindow 伪装成用户覆盖。
+    const persistedModel = persisted.models[modelAlias] ?? {
+      provider: resolved.providerAlias,
+      model: model.model
+    };
     const selection = resolveThinkingSelection({ ...persisted, models: { ...persisted.models, [modelAlias]: model } }, modelAlias, thinking);
     const effort = selection === "off"
       ? modelReasoningConfig(model)?.defaultEffort ?? persisted.thinking.effort
@@ -135,7 +147,7 @@ export class ModelManager {
     const candidate = configSchema.parse({
       ...persisted,
       defaultModel: modelAlias,
-      models: { ...persisted.models, [modelAlias]: model },
+      models: { ...persisted.models, [modelAlias]: persistedModel },
       thinking: { enabled: selection !== "off", effort }
     });
 
@@ -186,24 +198,37 @@ export function hasUsableModelConfiguration(config: AgentConfig, alias = config.
 }
 
 export function modelRuntimeInfo(config: AgentConfig): ModelRuntimeInfo {
-  const resolved = resolveModelConfig(config);
-  const reasoning = modelReasoningConfig(resolved.model);
-  const levelMap = modelThinkingLevelMap(resolved.model);
-  const canDisableThinking = levelMap.off !== undefined && levelMap.off !== null;
-  const thinking: ThinkingSelection = reasoning && !canDisableThinking
-    ? reasoning.defaultEffort
-    : config.thinking.enabled && reasoning?.efforts.includes(config.thinking.effort)
-      ? config.thinking.effort
-      : "off";
+  return modelRuntimeInfoFromRuntime(config, new ModelRuntime(config));
+}
+
+function modelRuntimeInfoFromRuntime(config: AgentConfig, runtime: ModelRuntime): ModelRuntimeInfo {
+  const resolved = runtime.resolve(config.defaultModel);
+  const thinking = effectiveThinkingSelection(config, resolved.model);
+  const providerType = config.providers[resolved.providerAlias]?.type ?? resolved.providerAlias;
   return {
     modelAlias: resolved.alias,
-    provider: resolved.provider.type,
-    modelLabel: formatModelLabel(resolved.provider.type, resolved.model.model),
+    provider: providerType,
+    modelLabel: formatModelLabel(providerType, resolved.model.model),
     reasoningLabel: thinking === "off" ? "Off" : formatReasoningLabel(thinking),
     thinking,
     contextWindow: resolved.model.contextWindow,
-    maxInputTokens: modelContextBudget(resolved.model, config.context.maxInputTokens, resolved.alias).maxInputTokens
+    maxInputTokens: modelContextBudget(
+      resolved.model,
+      config.context.maxInputTokens,
+      resolved.alias,
+      { reasoning: thinking }
+    ).maxInputTokens
   };
+}
+
+function effectiveThinkingSelection(config: AgentConfig, model: AgentConfig["models"][string]): ThinkingSelection {
+  const reasoning = modelReasoningConfig(model);
+  if (!reasoning) return "off";
+  const levelMap = modelThinkingLevelMap(model);
+  if (levelMap.off === undefined || levelMap.off === null) return reasoning.defaultEffort;
+  return config.thinking.enabled && reasoning.efforts.includes(config.thinking.effort)
+    ? config.thinking.effort
+    : "off";
 }
 
 export function resolveThinkingSelection(
@@ -211,8 +236,8 @@ export function resolveThinkingSelection(
   alias: string,
   requested?: ThinkingSelection
 ): ThinkingSelection {
-  const model = config.models[alias];
-  if (!model) throw new Error(`Unknown model alias: ${alias}`);
+  const resolved = new ModelRuntime(config).resolve(alias);
+  const model = resolved.model;
   if (requested === undefined) {
     const reasoning = modelReasoningConfig(model);
     if (!reasoning) return "off";
@@ -223,7 +248,7 @@ export function resolveThinkingSelection(
   }
   const levelMap = modelThinkingLevelMap(model);
   if (requested === "off") {
-    if (model.thinkingLevelMap && levelMap.off === undefined || levelMap.off === null) {
+    if (modelReasoningConfig(model) && (levelMap.off === undefined || levelMap.off === null)) {
       throw new Error(`Model ${alias} does not support disabling thinking.`);
     }
     return "off";

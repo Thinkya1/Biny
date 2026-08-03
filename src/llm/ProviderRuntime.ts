@@ -5,7 +5,7 @@
  * API 协议的 HTTP/SSE 实现由 ApiAdapterRegistry 负责，两层不互相冒充。
  */
 import type { AgentModel, ModelStreamContext, ModelStreamEvent, ModelStreamOptions } from "../agent/core/types.js";
-import { isKimiK3Model, modelCapabilities, modelReasoningConfig, modelThinkingLevelMap, nativeReasoningEffort, reasoningBudgetTokens } from "../ai/capabilities.js";
+import { modelCapabilities, modelReasoningConfig, modelThinkingLevelMap, nativeReasoningEffort, normalizeModelMetadata, reasoningBudgetTokens, thinkingLevelMapForModel } from "../ai/capabilities.js";
 import { fetchModelCatalogSnapshot } from "../ai/modelCatalog.js";
 import { providerDefinition, providerProtocol } from "../ai/provider.js";
 import { createRetryFetch } from "../ai/retry.js";
@@ -32,6 +32,7 @@ export interface ProviderRuntime {
   readonly definition: ProviderDefinition;
   readonly config: ProviderConfig;
   getModels(): ModelCatalogEntry[];
+  resolveModel(model: ModelAliasConfig): ModelAliasConfig;
   restoreModels(models: readonly ModelCatalogEntry[]): void;
   refreshModels(signal?: AbortSignal): Promise<ModelCatalogEntry[]>;
   isConfigured(model?: ModelAliasConfig): boolean;
@@ -63,9 +64,7 @@ export class ConfiguredProviderRuntime implements ProviderRuntime {
   }
 
   getModels(): ModelCatalogEntry[] {
-    const combined = new Map(this.baselineModels.map((model) => [model.id, model]));
-    for (const model of this.liveModels) combined.set(model.id, model);
-    const models = [...combined.values()];
+    const models = this.mergedCatalog().map((model) => this.normalizeCatalogEntry(model));
     try {
       const filtered = this.definition.filterModels?.(models, {
         configured: this.isConfigured(),
@@ -79,7 +78,9 @@ export class ConfiguredProviderRuntime implements ProviderRuntime {
   }
 
   restoreModels(models: readonly ModelCatalogEntry[]): void {
-    this.liveModels = models.map((model) => ({ ...model, provider: this.id }));
+    // `/models` 与旧缓存都属于不可信元数据源。目录只能补充能力和 token 限制，
+    // 不能改变请求地址、鉴权头或 API 协议；这些传输字段只接受用户配置和本地注册基线。
+    this.liveModels = models.map((model) => liveCatalogMetadata(model, this.id));
   }
 
   async refreshModels(signal?: AbortSignal): Promise<ModelCatalogEntry[]> {
@@ -106,7 +107,7 @@ export class ConfiguredProviderRuntime implements ProviderRuntime {
     signal?.throwIfAborted();
     this.restoreModels(models);
     await this.modelsStore?.write(this.id, {
-      models: this.liveModels,
+      models: this.liveModels.map((model) => this.normalizeCatalogEntry(model)),
       checkedAt: Date.now(),
       etag,
       lastModified
@@ -119,6 +120,15 @@ export class ConfiguredProviderRuntime implements ProviderRuntime {
     if (!endpoint || !isHttpEndpoint(endpoint)) return false;
     if (!(this.config.requiresApiKey ?? this.definition.requiresApiKey)) return true;
     return this.resolveApiKey() !== undefined;
+  }
+
+  resolveModel(model: ModelAliasConfig): ModelAliasConfig {
+    const catalog = this.mergedCatalog().find((entry) => entry.id === model.model);
+    const catalogModel = catalog ? catalogEntryToModel(catalog) : undefined;
+    return normalizeModelMetadata(
+      catalogModel ? mergeModelMetadata(catalogModel, model) : model,
+      this.definition.modelDefaults
+    );
   }
 
   validate(model?: ModelAliasConfig): void {
@@ -142,41 +152,51 @@ export class ConfiguredProviderRuntime implements ProviderRuntime {
   }
 
   createModelSettings(agentConfig: AgentConfig, model: ModelAliasConfig): NativeModelSettings {
-    this.validate(model);
+    const normalizedModel = this.resolveModel(model);
+    this.validate(normalizedModel);
     const apiKey = this.resolveApiKey();
-    const baseUrl = model.baseUrl ?? this.config.baseUrl ?? this.definition.baseUrl;
+    const baseUrl = normalizedModel.baseUrl ?? this.config.baseUrl ?? this.definition.baseUrl;
     if (!baseUrl) throw new Error(`No model endpoint configured. Set providers.${this.id}.baseUrl.`);
-    const protocol = nativeProtocolForModel(model, this.config, this.definition);
-    const api = model.apiBackend
+    const protocol = nativeProtocolForModel(normalizedModel, this.config, this.definition);
+    const api = normalizedModel.apiBackend
       ?? this.config.apiBackend
       ?? this.definition.api
       ?? (this.config.type === "openai-codex"
         ? "responses"
         : protocol === "anthropic" ? "anthropic_messages" : "chat_completions");
-    const capabilities = modelCapabilities(model);
-    const enabled = agentConfig.thinking.enabled && capabilities.reasoning && modelReasoningConfig(model) !== undefined;
+    const reasoningProtocol = this.definition.reasoningProtocol
+      ?? (api === "anthropic_messages"
+        ? "anthropic"
+        : api === "responses" || this.config.type === "openai-compatible" ? "openai" : undefined);
+    const capabilities = modelCapabilities(normalizedModel);
+    const compatibility = mergeCompatibility(this.config.compatibility, normalizedModel.compatibility);
+    const reasoning = modelReasoningConfig(normalizedModel);
+    const enabled = agentConfig.thinking.enabled
+      && capabilities.reasoning
+      && compatibility?.supportsReasoning !== false
+      && reasoning !== undefined
+      && reasoning.efforts.includes(agentConfig.thinking.effort);
     const effort = enabled ? agentConfig.thinking.effort : undefined;
     const retry = this.config.retry ?? { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0 };
-    const compatibility = mergeCompatibility(this.config.compatibility, model.compatibility);
-    const providerOptions = createProviderOptions(this.config.type, this.config, model, enabled, effort);
+    const providerOptions = createProviderOptions(reasoningProtocol, this.config, normalizedModel, api, enabled, effort);
 
     const transport = createNativeModel({
       provider: this.config.type,
-      modelId: model.model,
+      modelId: normalizedModel.model,
       api,
       baseUrl,
       apiKey,
       headers: {
         ...(this.config.type === "openai-codex" ? openAiCodexHeaders(apiKey) : {}),
         ...this.config.headers,
-        ...model.headers
+        ...normalizedModel.headers
       },
       fetch: createRetryFetch(retry),
       maxTokensField: compatibility?.maxTokensField === "max_completion_tokens" ? "max_completion_tokens" : "max_tokens",
       supportsDeveloperRole: compatibility?.supportsDeveloperRole === true,
       supportsTools: capabilities.tools,
       anthropicAuthMode: this.config.type === "anthropic" && this.config.authMode !== "oauth-bearer" ? "api-key" : "bearer",
-      reasoningProtocol: this.definition.reasoningProtocol,
+      reasoningProtocol,
       providerOptions,
       apiAdapters: this.ai.adapters
     });
@@ -189,8 +209,8 @@ export class ConfiguredProviderRuntime implements ProviderRuntime {
       providerOptions,
       reasoning: enabled ? agentConfig.thinking.effort : "off",
       timeoutMs: this.config.timeoutMs,
-      maxOutputTokens: model.maxOutputTokens,
-      contextWindow: model.contextWindow
+      maxOutputTokens: normalizedModel.maxOutputTokens,
+      contextWindow: normalizedModel.contextWindow
     };
   }
 
@@ -200,8 +220,9 @@ export class ConfiguredProviderRuntime implements ProviderRuntime {
     context: ModelStreamContext,
     options: ModelStreamOptions = {}
   ): Promise<AsyncIterable<ModelStreamEvent>> {
-    const thinking = resolveSimpleThinking(agentConfig, model, options.reasoning);
-    const settings = this.createModelSettings({ ...agentConfig, thinking }, model);
+    const normalizedModel = this.resolveModel(model);
+    const thinking = resolveSimpleThinking(agentConfig, normalizedModel, options.reasoning);
+    const settings = this.createModelSettings({ ...agentConfig, thinking }, normalizedModel);
     return await settings.model.stream(context, {
       signal: options.signal,
       maxOutputTokens: options.maxOutputTokens ?? settings.maxOutputTokens,
@@ -246,6 +267,38 @@ export class ConfiguredProviderRuntime implements ProviderRuntime {
     const envName = this.config.apiKeyEnv ?? this.definition.apiKeyEnv;
     return envName ? process.env[envName] : undefined;
   }
+
+  private normalizeCatalogEntry(entry: ModelCatalogEntry): ModelCatalogEntry {
+    const model = catalogEntryToModel(entry);
+    const normalized = normalizeModelMetadata(model, this.definition.modelDefaults);
+    const reasoning = modelReasoningConfig(normalized);
+    return {
+      ...entry,
+      id: normalized.model,
+      displayName: normalized.displayName ?? normalized.model,
+      provider: this.id,
+      contextWindow: normalized.contextWindow,
+      maxInputTokens: normalized.maxInputTokens,
+      maxOutputTokens: normalized.maxOutputTokens,
+      limits: normalized.limits,
+      capabilities: modelCapabilities(normalized),
+      reasoningEfforts: reasoning?.efforts ?? [],
+      thinkingLevelMap: modelThinkingLevelMap(normalized),
+      apiBackend: normalized.apiBackend,
+      baseUrl: normalized.baseUrl,
+      headers: normalized.headers,
+      compatibility: normalized.compatibility
+    };
+  }
+
+  private mergedCatalog(): ModelCatalogEntry[] {
+    const combined = new Map(this.baselineModels.map((model) => [model.id, model]));
+    for (const model of this.liveModels) {
+      const existing = combined.get(model.id);
+      combined.set(model.id, existing ? mergeCatalogMetadata(existing, model) : model);
+    }
+    return [...combined.values()];
+  }
 }
 
 export class ProviderRegistry {
@@ -277,7 +330,8 @@ export class ProviderRegistry {
   forModel(alias: string): { provider: ProviderRuntime; model: ModelAliasConfig } {
     const model = this.config.models[alias];
     if (!model) throw new Error(`Unknown model alias: ${alias}`);
-    return { provider: this.require(model.provider), model };
+    const provider = this.require(model.provider);
+    return { provider, model: provider.resolveModel(model) };
   }
 
   createModelSettings(alias = this.config.defaultModel): NativeModelSettings {
@@ -326,28 +380,36 @@ function mergeCompatibility(provider: ModelCompatibility | undefined, model: Mod
 }
 
 function createProviderOptions(
-  providerType: ProviderConfig["type"],
+  reasoningProtocol: ProviderDefinition["reasoningProtocol"],
   provider: ProviderConfig,
   model: ModelAliasConfig,
+  api: ModelApiBackend,
   enabled: boolean,
   effort: AgentConfig["thinking"]["effort"] | undefined
 ): Record<string, unknown> | undefined {
   if (mergeCompatibility(provider.compatibility, model.compatibility)?.supportsReasoning === false) return undefined;
+  if (!modelCapabilities(model).reasoning || modelReasoningConfig(model) === undefined) return undefined;
   const nativeEffort = effort === undefined ? undefined : nativeReasoningEffort(model, effort);
   const budgetTokens = effort === undefined ? 4_096 : reasoningBudgetTokens(model, effort);
-  const api: ModelApiBackend = model.apiBackend
-    ?? provider.apiBackend
-    ?? (providerType === "openai-codex"
-      ? "responses"
-      : provider.protocol === "anthropic" || providerType === "anthropic" || providerType === "claude-subscription"
-        ? "anthropic_messages"
-        : "chat_completions");
-  if (api === "anthropic_messages") return { anthropic: { thinking: enabled ? { type: "enabled", budgetTokens } : { type: "disabled" } } };
-  if (providerType === "deepseek") return { deepseek: { thinking: { type: enabled ? "enabled" : "disabled" }, reasoningEffort: enabled ? nativeEffort : undefined } };
-  if (providerType === "openai") return { openai: { reasoningEffort: enabled ? nativeEffort : "none" } };
-  if (providerType === "qwen") return { alibaba: { enableThinking: enabled, thinkingBudget: enabled ? budgetTokens : undefined } };
-  if (providerType === "kimi") {
-    if (isKimiK3Model(model.model)) return { moonshotai: { reasoningEffort: enabled ? nativeEffort ?? "high" : "low" } };
+  if (api === "anthropic_messages" || reasoningProtocol === "anthropic") {
+    return { anthropic: { thinking: enabled ? { type: "enabled", budgetTokens } : { type: "disabled" } } };
+  }
+  if (reasoningProtocol === "deepseek") return { deepseek: { thinking: { type: enabled ? "enabled" : "disabled" }, reasoningEffort: enabled ? nativeEffort : undefined } };
+  if (reasoningProtocol === "openai") return { openai: { reasoningEffort: enabled ? nativeEffort : "none" } };
+  if (reasoningProtocol === "google") {
+    return {
+      google: {
+        reasoningEffort: enabled ? nativeEffort : "none",
+        thinkingBudget: enabled ? budgetTokens : 0,
+        includeThoughts: enabled
+      }
+    };
+  }
+  if (reasoningProtocol === "alibaba") return { alibaba: { enableThinking: enabled, thinkingBudget: enabled ? budgetTokens : undefined } };
+  if (reasoningProtocol === "moonshotai") {
+    if (modelThinkingLevelMap(model).off === undefined) {
+      return { moonshotai: { reasoningEffort: enabled ? nativeEffort ?? "high" : "low" } };
+    }
     return { moonshotai: { thinking: { type: enabled ? "enabled" : "disabled" } } };
   }
   return undefined;
@@ -368,10 +430,166 @@ function resolveSimpleThinking(
   requested: ModelStreamOptions["reasoning"]
 ): AgentConfig["thinking"] {
   if (requested === undefined) return config.thinking;
-  if (requested === "off") return { enabled: false, effort: config.thinking.effort };
+  if (requested === "off") {
+    const off = modelThinkingLevelMap(model).off;
+    if (modelCapabilities(model).reasoning && (off === undefined || off === null)) {
+      throw new Error(`Model ${model.model} does not support disabling thinking.`);
+    }
+    return { enabled: false, effort: config.thinking.effort };
+  }
   const native = modelThinkingLevelMap(model)[requested];
   if (native === undefined || native === null || !modelReasoningConfig(model)?.efforts.includes(requested)) {
     throw new Error(`Model ${model.model} does not support ${requested} thinking effort.`);
   }
   return { enabled: true, effort: requested };
+}
+
+function catalogEntryToModel(entry: ModelCatalogEntry): ModelAliasConfig {
+  const thinkingLevelMap = entry.thinkingLevelMap
+    ?? (entry.reasoningEfforts.length
+      ? thinkingLevelMapForModel(entry.id, true, entry.reasoningEfforts)
+      : undefined);
+  return {
+    provider: entry.provider,
+    model: entry.id,
+    displayName: entry.displayName,
+    capabilities: entry.capabilities,
+    contextWindow: entry.contextWindow,
+    maxInputTokens: entry.maxInputTokens,
+    maxOutputTokens: entry.maxOutputTokens,
+    limits: entry.limits,
+    apiBackend: entry.apiBackend,
+    baseUrl: entry.baseUrl,
+    headers: entry.headers,
+    compatibility: entry.compatibility,
+    thinkingLevelMap
+  };
+}
+
+function liveCatalogMetadata(entry: ModelCatalogEntry, provider: string): ModelCatalogEntry {
+  return {
+    id: entry.id,
+    displayName: entry.displayName,
+    provider,
+    contextWindow: entry.contextWindow,
+    maxInputTokens: entry.maxInputTokens,
+    maxOutputTokens: entry.maxOutputTokens,
+    limits: entry.limits ? { ...entry.limits } : undefined,
+    capabilities: { ...entry.capabilities },
+    reasoningEfforts: [...entry.reasoningEfforts],
+    thinkingLevelMap: entry.thinkingLevelMap ? { ...entry.thinkingLevelMap } : undefined,
+    apiBackend: undefined,
+    baseUrl: undefined,
+    headers: undefined,
+    compatibility: undefined
+  };
+}
+
+function mergeCatalogMetadata(base: ModelCatalogEntry, overlay: ModelCatalogEntry): ModelCatalogEntry {
+  return {
+    ...overlay,
+    ...base,
+    displayName: base.displayName || overlay.displayName,
+    contextWindow: base.contextWindow ?? overlay.contextWindow,
+    maxInputTokens: base.maxInputTokens ?? overlay.maxInputTokens,
+    maxOutputTokens: base.maxOutputTokens ?? overlay.maxOutputTokens,
+    limits: mergeCatalogLimits(base.limits, overlay.limits),
+    capabilities: mergeCatalogCapabilities(base.capabilities, overlay.capabilities),
+    reasoningEfforts: base.reasoningEfforts.length ? base.reasoningEfforts : overlay.reasoningEfforts,
+    thinkingLevelMap: base.thinkingLevelMap ?? overlay.thinkingLevelMap,
+    apiBackend: base.apiBackend ?? overlay.apiBackend,
+    baseUrl: base.baseUrl ?? overlay.baseUrl,
+    headers: mergeHeaders(base.headers, overlay.headers),
+    compatibility: mergeCompatibility(overlay.compatibility, base.compatibility)
+  };
+}
+
+function mergeModelMetadata(base: ModelAliasConfig, override: ModelAliasConfig): ModelAliasConfig {
+  return {
+    ...base,
+    ...override,
+    displayName: override.displayName ?? base.displayName,
+    description: override.description ?? base.description,
+    supportsTools: override.supportsTools ?? base.supportsTools,
+    capabilities: mergeUserCapabilities(base.capabilities, override.capabilities),
+    contextWindow: override.contextWindow ?? base.contextWindow,
+    maxInputTokens: override.maxInputTokens ?? base.maxInputTokens,
+    maxOutputTokens: override.maxOutputTokens ?? base.maxOutputTokens,
+    limits: mergeUserLimits(base.limits, override.limits),
+    thinkingLevelMap: override.thinkingLevelMap ?? base.thinkingLevelMap,
+    reasoning: override.reasoning ?? base.reasoning,
+    apiBackend: override.apiBackend ?? base.apiBackend,
+    baseUrl: override.baseUrl ?? base.baseUrl,
+    headers: mergeHeaders(override.headers, base.headers),
+    compatibility: mergeCompatibility(base.compatibility, override.compatibility),
+    pricing: override.pricing ?? base.pricing
+  };
+}
+
+function mergeCatalogCapabilities(
+  base: ModelAliasConfig["capabilities"],
+  override: ModelAliasConfig["capabilities"]
+): NonNullable<ModelAliasConfig["capabilities"]> {
+  return {
+    tools: base?.tools ?? override?.tools,
+    parallelToolCalls: base?.parallelToolCalls ?? override?.parallelToolCalls,
+    reasoning: base?.reasoning ?? override?.reasoning,
+    reasoningStream: base?.reasoningStream ?? override?.reasoningStream,
+    reasoningSummary: base?.reasoningSummary ?? override?.reasoningSummary,
+    vision: base?.vision ?? override?.vision,
+    audio: base?.audio ?? override?.audio,
+    streaming: base?.streaming ?? override?.streaming
+  };
+}
+
+function mergeUserCapabilities(
+  base: ModelAliasConfig["capabilities"],
+  override: ModelAliasConfig["capabilities"]
+): NonNullable<ModelAliasConfig["capabilities"]> {
+  return {
+    tools: override?.tools ?? base?.tools,
+    parallelToolCalls: override?.parallelToolCalls ?? base?.parallelToolCalls,
+    reasoning: override?.reasoning ?? base?.reasoning,
+    reasoningStream: override?.reasoningStream ?? base?.reasoningStream,
+    reasoningSummary: override?.reasoningSummary ?? base?.reasoningSummary,
+    vision: override?.vision ?? base?.vision,
+    audio: override?.audio ?? base?.audio,
+    streaming: override?.streaming ?? base?.streaming
+  };
+}
+
+function mergeHeaders(
+  base: Record<string, string> | undefined,
+  overlay: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  if (!base && !overlay) return undefined;
+  return { ...overlay, ...base };
+}
+
+function mergeCatalogLimits(
+  base: ModelCatalogEntry["limits"],
+  overlay: ModelCatalogEntry["limits"]
+): ModelCatalogEntry["limits"] {
+  if (!base && !overlay) return undefined;
+  return {
+    maxInputTokens: base?.maxInputTokens ?? overlay?.maxInputTokens,
+    reasoningReserveTokens: base?.reasoningReserveTokens ?? overlay?.reasoningReserveTokens,
+    toolSchemaReserveTokens: base?.toolSchemaReserveTokens ?? overlay?.toolSchemaReserveTokens,
+    systemPromptReserveTokens: base?.systemPromptReserveTokens ?? overlay?.systemPromptReserveTokens,
+    protocolSafetyMarginTokens: base?.protocolSafetyMarginTokens ?? overlay?.protocolSafetyMarginTokens
+  };
+}
+
+function mergeUserLimits(
+  base: ModelCatalogEntry["limits"],
+  override: ModelCatalogEntry["limits"]
+): ModelCatalogEntry["limits"] {
+  if (!base && !override) return undefined;
+  return {
+    maxInputTokens: override?.maxInputTokens ?? base?.maxInputTokens,
+    reasoningReserveTokens: override?.reasoningReserveTokens ?? base?.reasoningReserveTokens,
+    toolSchemaReserveTokens: override?.toolSchemaReserveTokens ?? base?.toolSchemaReserveTokens,
+    systemPromptReserveTokens: override?.systemPromptReserveTokens ?? base?.systemPromptReserveTokens,
+    protocolSafetyMarginTokens: override?.protocolSafetyMarginTokens ?? base?.protocolSafetyMarginTokens
+  };
 }

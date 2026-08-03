@@ -10,14 +10,17 @@ import type { ModelCatalogEntry } from "./types.js";
 type BuiltinModelOptions = Partial<Omit<ModelCatalogEntry, "id" | "displayName" | "provider" | "reasoningEfforts">>;
 
 function model(id: string, displayName = id, options: BuiltinModelOptions = {}): ModelCatalogEntry {
+  const reasoningEfforts = options.capabilities?.reasoning === true ? inferReasoningEfforts(id) : [];
   return {
     id,
     displayName,
     provider: "",
     contextWindow: options.contextWindow,
+    maxInputTokens: options.maxInputTokens,
     maxOutputTokens: options.maxOutputTokens,
+    limits: options.limits,
     capabilities: { streaming: true, ...options.capabilities },
-    reasoningEfforts: inferReasoningEfforts(id),
+    reasoningEfforts,
     thinkingLevelMap: options.thinkingLevelMap,
     apiBackend: options.apiBackend,
     baseUrl: options.baseUrl,
@@ -27,7 +30,16 @@ function model(id: string, displayName = id, options: BuiltinModelOptions = {}):
 }
 
 export const builtinProviderModels: Record<string, ModelCatalogEntry[]> = {
-  deepseek: [],
+  deepseek: [
+    model("deepseek-v4-flash", "DeepSeek V4 Flash", {
+      contextWindow: 1_000_000,
+      capabilities: { tools: true, reasoning: true, reasoningStream: true }
+    }),
+    model("deepseek-v4-pro", "DeepSeek V4 Pro", {
+      contextWindow: 1_000_000,
+      capabilities: { tools: true, reasoning: true, reasoningStream: true }
+    })
+  ],
   openai: [
     model("gpt-5.2", "GPT-5.2", { capabilities: { tools: true, reasoning: true, vision: true } }),
     model("gpt-5-mini", "GPT-5 Mini", { capabilities: { tools: true, reasoning: true, vision: true } }),
@@ -40,28 +52,28 @@ export const builtinProviderModels: Record<string, ModelCatalogEntry[]> = {
   ],
   gemini: [
     model("gemini-3.5-pro", "Gemini 3.5 Pro", { capabilities: { tools: true, reasoning: true, vision: true, audio: true } }),
-    model("gemini-3.5-flash", "Gemini 3.5 Flash", { capabilities: { tools: true, vision: true, audio: true } })
+    model("gemini-3.5-flash", "Gemini 3.5 Flash", { capabilities: { tools: true, reasoning: false, vision: true, audio: true } })
   ],
   "google-native": [
     model("gemini-3.5-pro", "Gemini 3.5 Pro", { apiBackend: "google_generative_ai", capabilities: { tools: true, reasoning: true, vision: true, audio: true } }),
-    model("gemini-3.5-flash", "Gemini 3.5 Flash", { apiBackend: "google_generative_ai", capabilities: { tools: true, vision: true, audio: true } })
+    model("gemini-3.5-flash", "Gemini 3.5 Flash", { apiBackend: "google_generative_ai", capabilities: { tools: true, reasoning: false, vision: true, audio: true } })
   ],
-  kimi: [model("kimi-k3", "Kimi K3"), model("kimi-k2.5", "Kimi K2.5")],
-  qwen: [model("qwen3.5-plus", "Qwen 3.5 Plus"), model("qwen3-coder-plus", "Qwen 3 Coder Plus")],
-  xai: [model("grok-4.5", "Grok 4.5"), model("grok-4", "Grok 4")],
+  kimi: [model("kimi-k3", "Kimi K3", { capabilities: { reasoning: true } }), model("kimi-k2.5", "Kimi K2.5", { capabilities: { reasoning: true } })],
+  qwen: [model("qwen3.5-plus", "Qwen 3.5 Plus", { capabilities: { reasoning: true } }), model("qwen3-coder-plus", "Qwen 3 Coder Plus", { capabilities: { reasoning: true } })],
+  xai: [model("grok-4.5", "Grok 4.5", { capabilities: { reasoning: true } }), model("grok-4", "Grok 4", { capabilities: { reasoning: true } })],
   mistral: [model("mistral-large-latest", "Mistral Large"), model("codestral-latest", "Codestral")],
-  groq: [model("openai/gpt-oss-120b", "GPT OSS 120B"), model("llama-3.3-70b-versatile", "Llama 3.3 70B")],
+  groq: [model("openai/gpt-oss-120b", "GPT OSS 120B", { capabilities: { reasoning: true } }), model("llama-3.3-70b-versatile", "Llama 3.3 70B")],
   openrouter: [],
   cerebras: [model("gpt-oss-120b", "GPT OSS 120B"), model("llama3.1-8b", "Llama 3.1 8B")],
   togetherai: [model("meta-llama/Llama-3.3-70B-Instruct-Turbo", "Llama 3.3 70B")],
-  "fireworks-ai": [model("accounts/fireworks/models/kimi-k2p5", "Kimi K2.5")],
-  nvidia: [model("nvidia/nemotron-3-super-120b-a12b", "NVIDIA Nemotron")],
+  "fireworks-ai": [model("accounts/fireworks/models/kimi-k2p5", "Kimi K2.5", { capabilities: { reasoning: true } })],
+  nvidia: [model("nvidia/nemotron-3-super-120b-a12b", "NVIDIA Nemotron", { capabilities: { reasoning: true } })],
   deepinfra: [model("meta-llama/Llama-3.3-70B-Instruct", "Llama 3.3 70B")],
   siliconflow: [model("deepseek-ai/DeepSeek-V3", "DeepSeek V3"), model("Qwen/Qwen3-Coder-480B-A35B-Instruct", "Qwen3 Coder")],
-  zai: [model("glm-5", "GLM-5"), model("glm-4.7", "GLM-4.7")],
-  minimax: [model("MiniMax-M2.5", "MiniMax M2.5")],
-  "minimax-cn": [model("MiniMax-M2.5", "MiniMax M2.5")],
-  stepfun: [model("step-3.5-flash", "Step 3.5 Flash")],
+  zai: [model("glm-5", "GLM-5", { capabilities: { reasoning: true } }), model("glm-4.7", "GLM-4.7", { capabilities: { reasoning: true } })],
+  minimax: [model("MiniMax-M2.5", "MiniMax M2.5", { capabilities: { reasoning: true } })],
+  "minimax-cn": [model("MiniMax-M2.5", "MiniMax M2.5", { capabilities: { reasoning: true } })],
+  stepfun: [model("step-3.5-flash", "Step 3.5 Flash", { capabilities: { reasoning: true } })],
   volcengine: [],
   cohere: [model("command-a-03-2025", "Command A")],
   huggingface: [],

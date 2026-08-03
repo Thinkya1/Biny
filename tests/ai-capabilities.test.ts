@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { inferReasoningEfforts, modelCapabilities, modelContextBudget, modelThinkingLevelMap, nativeReasoningEffort, reasoningBudgetTokens, thinkingLevelMapForModel } from "../src/ai/capabilities.js";
+import { inferReasoningEfforts, modelCapabilities, modelContextBudget, modelReasoningConfig, modelThinkingLevelMap, nativeReasoningEffort, reasoningBudgetTokens, thinkingLevelMapForModel } from "../src/ai/capabilities.js";
 import { parseModelCatalog } from "../src/ai/modelCatalog.js";
 import { createRetryFetch } from "../src/ai/retry.js";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
 import { ModelRegistry } from "../src/llm/ModelRegistry.js";
 import { ModelResolver } from "../src/llm/ModelResolver.js";
+import { ProviderRegistry } from "../src/llm/ProviderRuntime.js";
 
 const config = configSchema.parse({
   ...structuredClone(defaultConfig),
@@ -30,12 +31,59 @@ const config = configSchema.parse({
 const model = config.models.small!;
 const budget = modelContextBudget(model, config.context.maxInputTokens, "small");
 assert.equal(budget.contextWindow, 16_384);
-assert.equal(budget.maxInputTokens, 12_288);
+assert.equal(budget.maxInputTokens, 9_728);
 assert.equal(budget.maxOutputTokens, 4_096);
+assert.equal(budget.reasoningReserveTokens, 0);
+assert.equal(budget.toolSchemaReserveTokens, 1_024);
+assert.equal(budget.systemPromptReserveTokens, 1_024);
+assert.equal(budget.protocolSafetyMarginTokens, 512);
 assert.equal(budget.modelAlias, "small");
 assert.equal(modelCapabilities(model).vision, true);
 assert.equal(nativeReasoningEffort(model, "high"), "high");
 assert.equal(reasoningBudgetTokens(model, "high"), 3_072);
+
+const reasoningBudget = modelContextBudget(model, undefined, "small", { reasoning: "high" });
+assert.equal(reasoningBudget.maxInputTokens, 6_656);
+assert.equal(reasoningBudget.reasoningReserveTokens, 3_072);
+
+const deepseekUnknownAliasConfig = configSchema.parse({
+  ...defaultConfig,
+  defaultModel: "flash-alias",
+  models: { "flash-alias": { provider: "deepseek", model: "deepseek-v4-flash" } }
+});
+const deepseekRuntime = new ProviderRegistry(deepseekUnknownAliasConfig);
+const normalizedFlash = deepseekRuntime.forModel("flash-alias").model;
+assert.deepEqual(modelReasoningConfig(normalizedFlash)?.efforts, ["high", "max"]);
+assert.deepEqual(modelThinkingLevelMap(normalizedFlash), { off: "none", high: "high", max: "max" });
+assert.equal(modelCapabilities(normalizedFlash).reasoningStream, true);
+assert.equal(normalizedFlash.contextWindow, 1_000_000);
+
+const explicitContextConfig = configSchema.parse({
+  ...deepseekUnknownAliasConfig,
+  models: { "flash-alias": { ...deepseekUnknownAliasConfig.models["flash-alias"], contextWindow: 128_000 } }
+});
+assert.equal(new ProviderRegistry(explicitContextConfig).forModel("flash-alias").model.contextWindow, 128_000);
+
+const geminiFlashConfig = configSchema.parse({
+  ...defaultConfig,
+  defaultModel: "gemini-flash",
+  providers: { gemini: { type: "gemini", apiKey: "test-key" } },
+  models: { "gemini-flash": { provider: "gemini", model: "gemini-3.5-flash" } }
+});
+const normalizedGeminiFlash = new ProviderRegistry(geminiFlashConfig).forModel("gemini-flash").model;
+assert.equal(modelCapabilities(normalizedGeminiFlash).reasoning, false);
+
+const unknownModelConfig = configSchema.parse({
+  ...defaultConfig,
+  defaultModel: "unknown",
+  providers: { relay: { type: "openai-compatible", baseUrl: "https://relay.example/v1", apiKey: "test-key" } },
+  models: { unknown: { provider: "relay", model: "future-model" } },
+  thinking: { enabled: true, effort: "high" }
+});
+const unknownRuntime = new ProviderRegistry(unknownModelConfig);
+const unknownModel = unknownRuntime.forModel("unknown").model;
+assert.equal(modelCapabilities(unknownModel).reasoning, false);
+assert.equal(unknownRuntime.createModelSettings().providerOptions, undefined);
 
 assert.deepEqual(modelThinkingLevelMap(defaultConfig.models["deepseek-v4-flash"]!), { off: "none", high: "high", max: "max" });
 assert.deepEqual(modelThinkingLevelMap(defaultConfig.models["deepseek-v4-pro"]!), { off: "none", high: "high", max: "max" });
@@ -78,6 +126,35 @@ assert.deepEqual(catalog[0], {
   capabilities: { tools: true, reasoning: undefined, vision: true, audio: undefined, streaming: true },
   reasoningEfforts: ["low", "high"]
 });
+
+const completeCatalog = parseModelCatalog({
+  data: [{
+    id: "complete-model",
+    context_window: 262_144,
+    max_input_tokens: 240_000,
+    output_token_limit: 32_768,
+    supports_thinking: true,
+    supports_reasoning_stream: true,
+    supports_reasoning_summary: true,
+    supports_parallel_tool_calls: true,
+    tool_schema_reserve_tokens: 2_048,
+    base_url: "http://127.0.0.1:9/private",
+    apiBackend: "responses",
+    headers: { Authorization: "Bearer catalog-key", "x-catalog": "untrusted" },
+    compatibility: { supportsDeveloperRole: true, maxTokensField: "max_completion_tokens" }
+  }]
+}, "gateway", "openai-compatible", false);
+assert.equal(completeCatalog[0]?.maxInputTokens, 240_000);
+assert.equal(completeCatalog[0]?.maxOutputTokens, 32_768);
+assert.equal(completeCatalog[0]?.capabilities.reasoning, true);
+assert.equal(completeCatalog[0]?.capabilities.reasoningStream, true);
+assert.equal(completeCatalog[0]?.capabilities.reasoningSummary, true);
+assert.equal(completeCatalog[0]?.capabilities.parallelToolCalls, true);
+assert.equal(completeCatalog[0]?.limits?.toolSchemaReserveTokens, 2_048);
+assert.equal(completeCatalog[0]?.baseUrl, undefined);
+assert.equal(completeCatalog[0]?.apiBackend, undefined);
+assert.equal(completeCatalog[0]?.headers, undefined);
+assert.equal(completeCatalog[0]?.compatibility, undefined);
 
 let attempts = 0;
 const retryingFetch = createRetryFetch({ maxAttempts: 3, initialDelayMs: 0, maxDelayMs: 0 }, async () => {

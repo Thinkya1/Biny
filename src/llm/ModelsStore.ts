@@ -29,10 +29,21 @@ const modelSchema = z.object({
   displayName: z.string().min(1),
   provider: z.string(),
   contextWindow: z.number().int().positive().optional(),
+  maxInputTokens: z.number().int().positive().optional(),
   maxOutputTokens: z.number().int().positive().optional(),
+  limits: z.object({
+    maxInputTokens: z.number().int().positive().optional(),
+    reasoningReserveTokens: z.number().int().nonnegative().optional(),
+    toolSchemaReserveTokens: z.number().int().nonnegative().optional(),
+    systemPromptReserveTokens: z.number().int().nonnegative().optional(),
+    protocolSafetyMarginTokens: z.number().int().nonnegative().optional()
+  }).optional(),
   capabilities: z.object({
     tools: z.boolean().optional(),
+    parallelToolCalls: z.boolean().optional(),
     reasoning: z.boolean().optional(),
+    reasoningStream: z.boolean().optional(),
+    reasoningSummary: z.boolean().optional(),
     vision: z.boolean().optional(),
     audio: z.boolean().optional(),
     streaming: z.boolean().optional()

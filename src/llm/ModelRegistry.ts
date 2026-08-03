@@ -4,7 +4,7 @@
  * 配置模型是稳定来源，provider `/models` 是可刷新来源。两者在这里合并成同一份模型视图；
  * 注册表只保存模型元数据，不保存 API key，也不会把实时目录自动写回项目配置。
  */
-import { modelCapabilities, modelContextBudget, modelReasoningConfig, modelThinkingLevelMap } from "../ai/capabilities.js";
+import { modelCapabilities, modelContextBudget, modelReasoningConfig, modelThinkingLevelMap, thinkingLevelMapForModel } from "../ai/capabilities.js";
 import type { ModelCatalogEntry } from "../ai/types.js";
 import type {
   AgentConfig,
@@ -31,7 +31,11 @@ export interface ModelChoice {
   supportsTools?: boolean;
   capabilities?: ReturnType<typeof modelCapabilities>;
   contextWindow?: number;
+  /** Provider 声明的输入硬上限；实际可发预算见 `inputBudgetTokens`。 */
   maxInputTokens?: number;
+  inputBudgetTokens?: number;
+  maxOutputTokens?: number;
+  limits?: ModelAliasConfig["limits"];
   efforts: ReasoningEffort[];
   defaultThinking: "off" | ReasoningEffort;
   thinkingLevelMap: ThinkingLevelMap;
@@ -84,9 +88,10 @@ export class ModelRegistry {
     for (const alias of aliases) {
       const model = this.config.models[alias];
       if (!model) continue;
-      if (configuredKeys.has(modelKey(model.provider, model.model))) continue;
-      configuredKeys.add(modelKey(model.provider, model.model));
-      choices.push(this.toChoice(alias, model, "configured"));
+      const normalized = this.providers.get(model.provider)?.resolveModel(model) ?? model;
+      if (configuredKeys.has(modelKey(normalized.provider, normalized.model))) continue;
+      configuredKeys.add(modelKey(normalized.provider, normalized.model));
+      choices.push(this.toChoice(alias, normalized, "configured"));
     }
 
     for (const [providerAlias, entries] of this.catalogs) {
@@ -109,10 +114,16 @@ export class ModelRegistry {
 
   resolve(aliasOrReference: string): RegisteredModel | undefined {
     const configured = this.config.models[aliasOrReference];
-    if (configured) return { alias: aliasOrReference, model: configured, providerAlias: configured.provider, source: "configured" };
+    if (configured) {
+      const provider = this.providers.get(configured.provider);
+      return { alias: aliasOrReference, model: provider?.resolveModel(configured) ?? configured, providerAlias: configured.provider, source: "configured" };
+    }
 
     const exactAlias = this.config.models[aliasOrReference.toLowerCase()];
-    if (exactAlias) return { alias: aliasOrReference.toLowerCase(), model: exactAlias, providerAlias: exactAlias.provider, source: "configured" };
+    if (exactAlias) {
+      const provider = this.providers.get(exactAlias.provider);
+      return { alias: aliasOrReference.toLowerCase(), model: provider?.resolveModel(exactAlias) ?? exactAlias, providerAlias: exactAlias.provider, source: "configured" };
+    }
 
     const slash = aliasOrReference.indexOf("/");
     if (slash > 0) {
@@ -122,13 +133,16 @@ export class ModelRegistry {
         model.provider === providerAlias && model.model === modelId
       ));
       if (configuredEntry) {
-        return { alias: configuredEntry[0], model: configuredEntry[1], providerAlias, source: "configured" };
+        const provider = this.providers.get(providerAlias);
+        return { alias: configuredEntry[0], model: provider?.resolveModel(configuredEntry[1]) ?? configuredEntry[1], providerAlias, source: "configured" };
       }
       const catalogEntry = this.catalogs.get(providerAlias)?.find((entry) => entry.id === modelId);
       if (catalogEntry) {
+        const provider = this.providers.get(providerAlias);
+        const model = catalogEntryToModel(catalogEntry);
         return {
           alias: catalogModelAlias(providerAlias, modelId),
-          model: catalogEntryToModel(catalogEntry),
+          model: provider?.resolveModel(model) ?? model,
           providerAlias,
           source: "catalog"
         };
@@ -137,7 +151,11 @@ export class ModelRegistry {
 
     for (const [providerAlias, entries] of this.catalogs) {
       const entry = entries.find((candidate) => catalogModelAlias(providerAlias, candidate.id) === aliasOrReference);
-      if (entry) return { alias: catalogModelAlias(providerAlias, entry.id), model: catalogEntryToModel(entry), providerAlias, source: "catalog" };
+      if (entry) {
+        const provider = this.providers.get(providerAlias);
+        const model = catalogEntryToModel(entry);
+        return { alias: catalogModelAlias(providerAlias, entry.id), model: provider?.resolveModel(model) ?? model, providerAlias, source: "catalog" };
+      }
     }
     return undefined;
   }
@@ -145,28 +163,32 @@ export class ModelRegistry {
   private toChoice(alias: string, model: ModelAliasConfig, source: ModelSource): ModelChoice {
     const provider = this.config.providers[model.provider];
     const providerRuntime = this.providers.get(model.provider);
-    const capabilities = modelCapabilities(model);
-    const reasoning = modelReasoningConfig(model);
-    const thinkingLevelMap = modelThinkingLevelMap(model);
+    const normalized = providerRuntime?.resolveModel(model) ?? model;
+    const capabilities = modelCapabilities(normalized);
+    const reasoning = modelReasoningConfig(normalized);
+    const thinkingLevelMap = modelThinkingLevelMap(normalized);
     return {
       alias,
-      displayName: model.displayName ?? model.model,
-      description: model.description,
-      provider: model.provider,
+      displayName: normalized.displayName ?? normalized.model,
+      description: normalized.description,
+      provider: normalized.provider,
       providerType: provider?.type ?? model.provider,
-      model: model.model,
-      modelKey: modelKey(model.provider, model.model),
+      model: normalized.model,
+      modelKey: modelKey(normalized.provider, normalized.model),
       supportsTools: capabilities.tools,
       capabilities,
-      contextWindow: model.contextWindow,
-      maxInputTokens: modelContextBudget(model, this.config.context.maxInputTokens, alias).maxInputTokens,
+      contextWindow: normalized.contextWindow,
+      maxInputTokens: normalized.maxInputTokens ?? normalized.limits?.maxInputTokens,
+      inputBudgetTokens: modelContextBudget(normalized, this.config.context.maxInputTokens, alias, { reasoning: this.config.thinking.enabled ? this.config.thinking.effort : "off" }).maxInputTokens,
+      maxOutputTokens: normalized.maxOutputTokens,
+      limits: normalized.limits,
       efforts: [...(reasoning?.efforts ?? [])],
       defaultThinking: reasoning?.defaultEffort ?? "off",
       thinkingLevelMap,
-      apiBackend: model.apiBackend,
-      baseUrl: model.baseUrl ?? provider?.baseUrl ?? providerRuntime?.definition.baseUrl ?? (provider ? providerDefinition(provider.type).baseUrl : undefined),
-      compatibility: model.compatibility ?? provider?.compatibility,
-      available: providerRuntime?.isConfigured(model) ?? false,
+      apiBackend: normalized.apiBackend,
+      baseUrl: normalized.baseUrl ?? provider?.baseUrl ?? providerRuntime?.definition.baseUrl ?? (provider ? providerDefinition(provider.type).baseUrl : undefined),
+      compatibility: normalized.compatibility ?? provider?.compatibility,
+      available: providerRuntime?.isConfigured(normalized) ?? false,
       source
     };
   }
@@ -183,24 +205,23 @@ export function hasUsableModelConfiguration(config: AgentConfig, alias: string, 
 }
 
 function catalogEntryToModel(entry: ModelCatalogEntry): ModelAliasConfig {
-  const levelMap = entry.thinkingLevelMap ?? reasoningEffortsToMap(entry.reasoningEfforts);
+  const levelMap = entry.thinkingLevelMap
+    ?? (entry.reasoningEfforts.length
+      ? thinkingLevelMapForModel(entry.id, true, entry.reasoningEfforts)
+      : undefined);
   return {
     provider: entry.provider,
     model: entry.id,
     displayName: entry.displayName,
     capabilities: entry.capabilities,
     contextWindow: entry.contextWindow,
+    maxInputTokens: entry.maxInputTokens,
     maxOutputTokens: entry.maxOutputTokens,
+    limits: entry.limits,
     apiBackend: entry.apiBackend,
     baseUrl: entry.baseUrl,
     headers: entry.headers,
     compatibility: entry.compatibility,
     thinkingLevelMap: levelMap
   };
-}
-
-function reasoningEffortsToMap(efforts: ReasoningEffort[]): ThinkingLevelMap {
-  const map: ThinkingLevelMap = { off: "none" };
-  for (const effort of efforts) map[effort] = effort;
-  return map;
 }

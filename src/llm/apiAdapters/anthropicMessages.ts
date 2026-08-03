@@ -88,6 +88,7 @@ export async function* streamAnthropic(
   const blocks = new Map<number, { type: string; id?: string; name?: string; input: string; signature?: string }>();
   let finishReason: AgentModelFinishReason = "stop";
   let usage: AgentUsage | undefined;
+  let receivedTerminalEvent = false;
   for await (const event of readSse(response.body)) {
     const payload = parseJson(event.data, "Anthropic stream event");
     const eventType = readString(payload.type);
@@ -130,11 +131,18 @@ export async function* streamAnthropic(
       }
     } else if (eventType === "message_delta") {
       const delta = isRecord(payload.delta) ? payload.delta : {};
-      finishReason = mapAnthropicStopReason(readString(delta.stop_reason));
+      const rawStopReason = readString(delta.stop_reason);
+      if (rawStopReason) {
+        finishReason = mapAnthropicStopReason(rawStopReason);
+        receivedTerminalEvent = true;
+      }
       if (isRecord(payload.usage)) {
         usage = { ...usage, outputTokens: readNumber(payload.usage.output_tokens), totalTokens: sumUsage(usage, readNumber(payload.usage.output_tokens)) };
       }
+    } else if (eventType === "message_stop") {
+      receivedTerminalEvent = true;
     }
   }
+  if (!receivedTerminalEvent) throw new Error("Anthropic stream ended before message_stop or a stop reason.");
   yield { type: "finish", reason: finishReason, usage };
 }

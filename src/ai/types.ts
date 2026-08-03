@@ -11,10 +11,22 @@ export type AiAuthMode = "api-key" | "oauth-bearer";
 
 export interface ModelCapabilities {
   tools: boolean;
+  parallelToolCalls: boolean;
   reasoning: boolean;
+  reasoningStream: boolean;
+  reasoningSummary: boolean;
   vision: boolean;
   audio: boolean;
   streaming: boolean;
+}
+
+/** 模型/协议限制。缺失的字段由 ProviderRuntime 用保守默认值补齐。 */
+export interface ModelLimits {
+  maxInputTokens?: number;
+  reasoningReserveTokens?: number;
+  toolSchemaReserveTokens?: number;
+  systemPromptReserveTokens?: number;
+  protocolSafetyMarginTokens?: number;
 }
 
 export interface ModelContextBudget {
@@ -22,6 +34,23 @@ export interface ModelContextBudget {
   contextWindow: number;
   maxInputTokens: number;
   maxOutputTokens: number | undefined;
+  outputReserveTokens?: number;
+  reasoningReserveTokens?: number;
+  toolSchemaReserveTokens?: number;
+  systemPromptReserveTokens?: number;
+  protocolSafetyMarginTokens?: number;
+}
+
+/** Provider 对未知模型的保守默认值，以及动态目录缺字段时的补全规则。 */
+export interface ProviderModelDefaults {
+  capabilities: Partial<ModelCapabilities>;
+  contextWindow?: number;
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
+  limits?: ModelLimits;
+  reasoningEfforts?: ReasoningEffort[];
+  thinkingLevelMap?: ThinkingLevelMap;
+  inferReasoningFromId?: boolean;
 }
 
 /**
@@ -37,7 +66,8 @@ export interface ProviderDefinition {
   apiKeyEnv?: string;
   requiresApiKey: boolean;
   authModes: AiAuthMode[];
-  reasoningProtocol?: "deepseek" | "openai" | "anthropic" | "alibaba" | "moonshotai";
+  reasoningProtocol?: "deepseek" | "openai" | "google" | "anthropic" | "alibaba" | "moonshotai";
+  modelDefaults?: ProviderModelDefaults;
   fetchModels?: (context: {
     providerAlias: string;
     config: ProviderConfig;
@@ -54,7 +84,9 @@ export interface ModelCatalogEntry {
   displayName: string;
   provider: string;
   contextWindow: number | undefined;
+  maxInputTokens?: number;
   maxOutputTokens: number | undefined;
+  limits?: ModelLimits;
   capabilities: Partial<ModelCapabilities>;
   reasoningEfforts: ReasoningEffort[];
   thinkingLevelMap?: ThinkingLevelMap;

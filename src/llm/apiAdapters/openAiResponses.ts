@@ -57,13 +57,14 @@ export async function* streamOpenAiResponses(
 
   yield { type: "start" };
   if (!response.headers.get("content-type")?.includes("text/event-stream")) {
-    yield* responsesPayloadEvents(await response.json() as Record<string, any>);
+    yield* responsesPayloadEvents(await response.json() as Record<string, unknown>);
     return;
   }
 
-  const calls = new Map<string, { id: string; name: string; arguments: string; emitted: boolean }>();
+  const calls = new Map<string, ResponsesToolCall>();
   let finishReason: AgentModelFinishReason = "stop";
   let usage: AgentUsage | undefined;
+  let receivedTerminalEvent = false;
   for await (const event of readSse(response.body)) {
     const payload = parseJson(event.data, "OpenAI Responses stream event");
     const eventType = readString(event.event) ?? readString(payload.type);
@@ -72,53 +73,94 @@ export async function* streamOpenAiResponses(
       if (text) yield { type: "text-delta", text };
     } else if (eventType === "response.reasoning_summary_text.delta" || eventType === "response.reasoning_text.delta") {
       const text = readString(payload.delta);
-      if (text) yield { type: "reasoning-delta", id: "reasoning-0", text };
+      if (text) yield {
+        type: "reasoning-delta",
+        id: "reasoning-0",
+        text,
+        providerMetadata: eventType === "response.reasoning_summary_text.delta"
+          ? { openai: { summary: true } }
+          : undefined
+      };
     } else if (eventType === "response.output_item.added" || eventType === "response.output_item.done") {
       const item = isRecord(payload.item) ? payload.item : undefined;
       if (item?.type === "function_call") {
-        const key = readString(item.call_id) ?? readString(item.id) ?? randomToolCallId();
-        const call = calls.get(key) ?? { id: key, name: "", arguments: "", emitted: false };
+        const call = resolveResponsesToolCall(calls, readString(item.id), readString(item.call_id));
         call.name = readString(item.name) ?? call.name;
         call.arguments = readString(item.arguments) ?? call.arguments;
-        calls.set(key, call);
         if (eventType === "response.output_item.done") {
-          const parsed = parseToolArguments(call.arguments);
-          call.emitted = true;
-          yield { type: "tool-call", id: call.id, name: call.name || "unknown", arguments: parsed.args, invalid: parsed.invalid };
+          const toolCall = responsesToolCallEvent(call);
+          if (toolCall) yield toolCall;
         }
       }
     } else if (eventType === "response.function_call_arguments.delta") {
-      const key = readString(payload.call_id) ?? readString(payload.item_id) ?? "";
-      if (key) {
-        const call = calls.get(key) ?? { id: key, name: "", arguments: "", emitted: false };
+      const itemId = readString(payload.item_id);
+      const callId = readString(payload.call_id);
+      if (itemId || callId) {
+        const call = resolveResponsesToolCall(calls, itemId, callId);
         call.arguments += readString(payload.delta) ?? "";
-        calls.set(key, call);
       }
     } else if (eventType === "response.function_call_arguments.done") {
-      const key = readString(payload.call_id) ?? readString(payload.item_id) ?? "";
-      if (key) {
-        const call = calls.get(key) ?? { id: key, name: readString(payload.name) ?? "", arguments: "", emitted: false };
+      const itemId = readString(payload.item_id);
+      const callId = readString(payload.call_id);
+      if (itemId || callId) {
+        const call = resolveResponsesToolCall(calls, itemId, callId);
         call.arguments = readString(payload.arguments) ?? call.arguments;
         call.name = readString(payload.name) ?? call.name;
-        if (!call.emitted) {
-          const parsed = parseToolArguments(call.arguments);
-          call.emitted = true;
-          yield { type: "tool-call", id: call.id, name: call.name || "unknown", arguments: parsed.args, invalid: parsed.invalid };
-        }
-        calls.set(key, call);
+        // 标准事件只在 output_item.added 里携带函数名和 call_id；若 added 丢失，
+        // 等 output_item.done 补齐身份后再发，不能先用 item_id 生成错误的工具结果引用。
+        const toolCall = call.name ? responsesToolCallEvent(call) : undefined;
+        if (toolCall) yield toolCall;
       }
-    } else if (eventType === "response.completed" || eventType === "response.done") {
+    } else if (eventType === "response.completed" || eventType === "response.done" || eventType === "response.incomplete") {
       const result = isRecord(payload.response) ? payload.response : payload;
       finishReason = mapResponsesStopReason(result.status, result.incomplete_details);
       usage = isRecord(result.usage) ? mapResponsesUsage(result.usage) : usage;
+      receivedTerminalEvent = true;
+    } else if (eventType === "response.failed") {
+      const result = isRecord(payload.response) ? payload.response : payload;
+      throw new Error(providerPayloadError(result, "OpenAI Responses provider"));
     } else if (eventType === "error") {
       throw new Error(providerPayloadError(payload, "OpenAI Responses provider"));
     }
   }
+  if (!receivedTerminalEvent) {
+    throw new Error("OpenAI Responses stream ended before a terminal response event.");
+  }
   yield { type: "finish", reason: finishReason, usage };
 }
 
-function* responsesPayloadEvents(payload: Record<string, any>): Generator<ModelStreamEvent, void, void> {
+interface ResponsesToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+  emitted: boolean;
+}
+
+/** 同一调用在不同 Responses 事件里分别使用 item_id 与 call_id，需要映射到同一状态。 */
+function resolveResponsesToolCall(
+  calls: Map<string, ResponsesToolCall>,
+  itemId: string | undefined,
+  callId: string | undefined
+): ResponsesToolCall {
+  const call = (callId ? calls.get(callId) : undefined)
+    ?? (itemId ? calls.get(itemId) : undefined)
+    ?? { id: callId ?? itemId ?? randomToolCallId(), name: "", arguments: "", emitted: false };
+  if (callId) {
+    call.id = callId;
+    calls.set(callId, call);
+  }
+  if (itemId) calls.set(itemId, call);
+  return call;
+}
+
+function responsesToolCallEvent(call: ResponsesToolCall): ModelStreamEvent | undefined {
+  if (call.emitted) return undefined;
+  const parsed = parseToolArguments(call.arguments);
+  call.emitted = true;
+  return { type: "tool-call", id: call.id, name: call.name || "unknown", arguments: parsed.args, invalid: parsed.invalid };
+}
+
+function* responsesPayloadEvents(payload: Record<string, unknown>): Generator<ModelStreamEvent, void, void> {
   if (payload.error !== undefined) {
     yield { type: "error", error: providerPayloadError(payload, "OpenAI Responses provider") };
     return;
@@ -139,7 +181,12 @@ function* responsesPayloadEvents(payload: Record<string, any>): Generator<ModelS
     } else if (item.type === "reasoning") {
       const summary = Array.isArray(item.summary) ? item.summary : [];
       for (const part of summary) {
-        if (isRecord(part) && typeof part.text === "string") yield { type: "reasoning-delta", id: "reasoning-0", text: part.text };
+        if (isRecord(part) && typeof part.text === "string") yield {
+          type: "reasoning-delta",
+          id: "reasoning-0",
+          text: part.text,
+          providerMetadata: { openai: { summary: true } }
+        };
       }
     }
   }

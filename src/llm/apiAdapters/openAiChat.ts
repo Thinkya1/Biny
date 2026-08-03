@@ -85,8 +85,12 @@ export async function* streamOpenAi(
   const toolCalls = new Map<number, { id: string; name: string; arguments: string }>();
   let finishReason: AgentModelFinishReason = "stop";
   let usage: AgentUsage | undefined;
+  let receivedTerminalEvent = false;
   for await (const event of readSse(response.body)) {
-    if (event.data === "[DONE]") break;
+    if (event.data === "[DONE]") {
+      receivedTerminalEvent = true;
+      break;
+    }
     const payload = parseJson(event.data, "OpenAI-compatible stream event");
     throwPayloadError(payload, "OpenAI-compatible provider");
     const choice = firstRecord(payload.choices)?.value;
@@ -112,12 +116,19 @@ export async function* streamOpenAi(
       }
     }
     if (isRecord(choice)) {
-      finishReason = mapOpenAiStopReason(readString(choice.finish_reason));
+      const rawFinishReason = readString(choice.finish_reason);
+      if (rawFinishReason) {
+        finishReason = mapOpenAiStopReason(rawFinishReason);
+        receivedTerminalEvent = true;
+      }
     }
     if (isRecord(payload.usage)) usage = mapOpenAiUsage(payload.usage);
   }
+  if (!receivedTerminalEvent) {
+    throw new Error("OpenAI-compatible stream ended before a finish reason or [DONE].");
+  }
   for (const call of [...toolCalls.values()]) {
-      const parsed = parseToolArguments(call.arguments);
+    const parsed = parseToolArguments(call.arguments);
     yield { type: "tool-call", id: call.id || randomToolCallId(), name: call.name, arguments: parsed.args, invalid: parsed.invalid };
   }
   yield { type: "finish", reason: finishReason, usage };

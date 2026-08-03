@@ -39,7 +39,7 @@ async function* streamGoogle(
     tools: context.tools.length ? [{ functionDeclarations: context.tools.map(googleTool) }] : undefined,
     generationConfig: {
       maxOutputTokens: options.maxOutputTokens,
-      thinkingConfig: googleThinking(options.reasoning)
+      thinkingConfig: googleThinking(options.reasoning, request.providerOptions)
     }
   };
   const baseUrl = request.baseUrl.replace(/\/+$/u, "");
@@ -61,15 +61,27 @@ async function* streamGoogle(
   yield { type: "start" };
   if (!response.headers.get("content-type")?.includes("text/event-stream")) {
     const payload = await response.json() as unknown;
-    for (const item of Array.isArray(payload) ? payload : [payload]) yield* googlePayloadEvents(item);
+    let receivedFinish = false;
+    for (const item of Array.isArray(payload) ? payload : [payload]) {
+      for (const event of googlePayloadEvents(item, true)) {
+        if (event.type === "finish") receivedFinish = true;
+        yield event;
+      }
+    }
+    if (!receivedFinish) throw new Error("Google Generative AI response did not contain a finish reason.");
     return;
   }
+  let receivedFinish = false;
   for await (const event of readSse(response.body)) {
-    yield* googlePayloadEvents(parseJson(event.data, "Google Generative AI stream event"));
+    for (const modelEvent of googlePayloadEvents(parseJson(event.data, "Google Generative AI stream event"), false)) {
+      if (modelEvent.type === "finish") receivedFinish = true;
+      yield modelEvent;
+    }
   }
+  if (!receivedFinish) throw new Error("Google Generative AI stream ended before a finish reason.");
 }
 
-function* googlePayloadEvents(value: unknown): Generator<ModelStreamEvent, void, void> {
+function* googlePayloadEvents(value: unknown, completeResponse: boolean): Generator<ModelStreamEvent, void, void> {
   if (!isRecord(value)) return;
   if (isRecord(value.error)) throw new Error(`Google Generative AI provider returned an error: ${readString(value.error.message) ?? "unknown error"}`);
   const candidate = Array.isArray(value.candidates) && isRecord(value.candidates[0]) ? value.candidates[0] : undefined;
@@ -95,7 +107,7 @@ function* googlePayloadEvents(value: unknown): Generator<ModelStreamEvent, void,
   }
   const finishReason = readString(candidate?.finishReason);
   const usage = isRecord(value.usageMetadata) ? value.usageMetadata : undefined;
-  if (finishReason || usage) {
+  if (finishReason || (completeResponse && usage)) {
     yield {
       type: "finish",
       reason: mapGoogleStopReason(finishReason),
@@ -144,9 +156,21 @@ function googleTool(tool: AgentTool): unknown {
   return { name: tool.name, description: tool.description, parameters: tool.parameters };
 }
 
-function googleThinking(reasoning: ModelStreamOptions["reasoning"]): Record<string, unknown> | undefined {
+function googleThinking(
+  reasoning: ModelStreamOptions["reasoning"],
+  providerOptions: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  const google = isRecord(providerOptions?.google) ? providerOptions.google : undefined;
+  const configuredBudget = readNumber(google?.thinkingBudget);
+  const configuredIncludeThoughts = typeof google?.includeThoughts === "boolean" ? google.includeThoughts : undefined;
+  if (configuredBudget !== undefined || configuredIncludeThoughts !== undefined) {
+    return {
+      thinkingBudget: configuredBudget,
+      includeThoughts: configuredIncludeThoughts
+    };
+  }
   if (reasoning === undefined) return undefined;
-  if (reasoning === "off") return { thinkingBudget: 0 };
+  if (reasoning === "off") return { thinkingBudget: 0, includeThoughts: false };
   const budgets = { minimal: 512, low: 1_024, medium: 4_096, high: 8_192, xhigh: 16_384, max: 24_576 };
   return { thinkingBudget: budgets[reasoning], includeThoughts: true };
 }

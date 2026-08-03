@@ -6,6 +6,7 @@ import { z } from "zod";
 import { AgentSession } from "../src/agent/AgentSession.js";
 import { defaultConfig, configSchema } from "../src/config/schema.js";
 import { ModelManager } from "../src/llm/ModelManager.js";
+import type { AgentConfigStore } from "../src/config/store.js";
 import { createNativeModelSettings } from "../src/llm/nativeFactory.js";
 import { createNativeModel } from "../src/llm/nativeModel.js";
 import { ApiAdapterRegistry } from "../src/llm/ApiAdapterRegistry.js";
@@ -24,6 +25,9 @@ import type { AgentSessionEvent } from "../src/agent/types.js";
 async function main(): Promise<void> {
   await testApiAdapterDispatch();
   await testProviderRuntimeCatalog();
+  await testProviderRuntimeMetadata();
+  await testModelSwitchRecalculatesBudget();
+  await testModelSwitchDoesNotPersistInferredMetadata();
   await testPersistedProviderCatalog();
   await testGoogleProviderCatalog();
   await testExtensibleProviderRuntime();
@@ -31,8 +35,10 @@ async function main(): Promise<void> {
   await testFactoryProviderDefaults();
   await testAnthropicSubscriptionAndHistory();
   await testCompatibleReasoningPayloads();
+  await testCompatibleEmptyAssistantHistory();
   await testNativeTimeout();
   await testOpenAiResponsesTransport();
+  await testStreamingProtocolsRequireTerminalEvents();
   await testGoogleGenerativeAiTransport();
   await testAudioPayloads();
   await testQueuedFollowUp();
@@ -149,7 +155,8 @@ async function testGoogleProviderCatalog(): Promise<void> {
     });
     const models = await new ProviderRegistry(config).refreshModels("google");
     assert.equal(requestHeaders?.get("x-goog-api-key"), "google-key");
-    assert.equal(models.find((model) => model.id === "gemini-catalog-test")?.apiBackend, "google_generative_ai");
+    // 动态目录不能决定传输协议；Google 的 adapter 来自本地 ProviderDefinition。
+    assert.equal(models.find((model) => model.id === "gemini-catalog-test")?.apiBackend, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -241,7 +248,7 @@ async function testExtensibleProviderRuntime(): Promise<void> {
   const liveModels = [catalogEntry("visible", "Live Visible"), catalogEntry("live-only", "Live Only")];
   const runtime = new ModelRuntime(config, [["custom", liveModels]], ai);
   const choices = runtime.listModels();
-  assert.equal(choices.find((choice) => choice.alias === "custom/visible")?.displayName, "Live Visible");
+  assert.equal(choices.find((choice) => choice.alias === "custom/visible")?.displayName, "Extension Visible");
   assert.equal(choices.some((choice) => choice.alias === "custom/hidden"), false);
   assert.equal(choices.some((choice) => choice.alias === "custom/live-only"), true);
 
@@ -300,7 +307,16 @@ async function testProviderRuntimeCatalog(): Promise<void> {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (input) => {
     assert.equal(String(input), "https://catalog.example/v1/models");
-    return new Response(JSON.stringify({ data: [{ id: "catalog-model", context_window: 32_000 }] }), {
+    return new Response(JSON.stringify({ data: [{
+      id: "catalog-model",
+      context_window: 32_000,
+      max_input_tokens: 30_000,
+      max_output_tokens: 8_000,
+      supports_reasoning: true,
+      supports_reasoning_stream: true,
+      supports_reasoning_summary: true,
+      supports_parallel_tool_calls: true
+    }] }), {
       status: 200,
       headers: { "content-type": "application/json" }
     });
@@ -324,10 +340,221 @@ async function testProviderRuntimeCatalog(): Promise<void> {
     assert.equal(providers.require("catalog").isConfigured(config.models["configured-model"]), true);
     const models = await providers.refreshModels("catalog");
     assert.equal(models[0]?.id, "catalog-model");
+    assert.equal(models[0]?.maxInputTokens, 30_000);
+    assert.equal(models[0]?.maxOutputTokens, 8_000);
+    assert.equal(models[0]?.capabilities.reasoningStream, true);
+    assert.equal(models[0]?.capabilities.reasoningSummary, true);
+    assert.equal(models[0]?.capabilities.parallelToolCalls, true);
+    assert.deepEqual(models[0]?.reasoningEfforts, ["high", "max"]);
+    assert.deepEqual(models[0]?.thinkingLevelMap, { off: "none", high: "high", max: "max" });
     assert.equal(providers.catalogsSnapshot()[0]?.[1][0]?.provider, "catalog");
   } finally {
     globalThis.fetch = originalFetch;
   }
+}
+
+async function testProviderRuntimeMetadata(): Promise<void> {
+  const config = configSchema.parse({
+    ...defaultConfig,
+    defaultModel: "flash-alias",
+    providers: {
+      deepseek: { type: "deepseek", apiKey: "test-key" },
+      openai: { type: "openai", apiKey: "test-key" },
+      gemini: { type: "gemini", apiKey: "test-key" },
+      unknown: { type: "openai-compatible", baseUrl: "https://unknown.example/v1", apiKey: "test-key" }
+    },
+    models: {
+      "flash-alias": { provider: "deepseek", model: "deepseek-v4-flash" },
+      "pro-alias": { provider: "deepseek", model: "deepseek-v4-pro" },
+      "gpt-alias": { provider: "openai", model: "gpt-5.2" },
+      "gemini-flash": { provider: "gemini", model: "gemini-3.5-flash" },
+      "gemini-pro": { provider: "gemini", model: "gemini-3.5-pro" },
+      unknown: { provider: "unknown", model: "future-model" }
+    }
+  });
+  const providers = new ProviderRegistry(config);
+  assert.deepEqual(providers.forModel("flash-alias").model.reasoning?.efforts, ["high", "max"]);
+  assert.deepEqual(providers.forModel("pro-alias").model.reasoning?.efforts, ["high", "max"]);
+  assert.equal(providers.forModel("gemini-flash").model.capabilities?.reasoning, false);
+  assert.equal(providers.forModel("unknown").model.capabilities?.reasoning, false);
+  assert.equal(providers.forModel("unknown").model.thinkingLevelMap, undefined);
+  assert.equal(providers.createModelSettings("unknown").providerOptions, undefined);
+  const untrustedCatalog = new ProviderRegistry(config, [["unknown", [{
+    id: "future-model",
+    displayName: "Untrusted transport",
+    provider: "unknown",
+    contextWindow: 64_000,
+    maxOutputTokens: 8_000,
+    capabilities: { tools: true, streaming: true },
+    reasoningEfforts: [],
+    apiBackend: "responses",
+    baseUrl: "http://127.0.0.1:9/private",
+    headers: { Authorization: "Bearer catalog-key", "x-catalog": "untrusted" },
+    compatibility: { supportsDeveloperRole: true }
+  }]]]);
+  const untrustedResolved = untrustedCatalog.forModel("unknown").model;
+  assert.equal(untrustedResolved.apiBackend, undefined);
+  assert.equal(untrustedResolved.baseUrl, undefined);
+  assert.equal(untrustedResolved.headers, undefined);
+  assert.equal(untrustedResolved.compatibility, undefined);
+  assert.equal(new ModelRuntime(config, [["unknown", [{
+    id: "future-model",
+    displayName: "Untrusted transport",
+    provider: "unknown",
+    contextWindow: 64_000,
+    maxOutputTokens: 8_000,
+    capabilities: { tools: true, streaming: true },
+    reasoningEfforts: [],
+    baseUrl: "http://127.0.0.1:9/private"
+  }]]]).listModels().find((choice) => choice.alias === "unknown")?.baseUrl, "https://unknown.example/v1");
+  const staleGeminiCatalog = new ProviderRegistry(config, [["gemini", [{
+    id: "gemini-3.5-flash",
+    displayName: "Gemini Flash (目录)",
+    provider: "gemini",
+    contextWindow: undefined,
+    maxOutputTokens: undefined,
+    capabilities: { reasoning: true },
+    reasoningEfforts: ["high", "max"]
+  }]]]);
+  assert.equal(staleGeminiCatalog.forModel("gemini-flash").model.capabilities?.reasoning, false);
+
+  const catalogRuntime = new ProviderRegistry(config, [["openai", [{
+    id: "gpt-5.2",
+    displayName: "GPT-5.2 (目录)",
+    provider: "openai",
+    contextWindow: 128_000,
+    maxInputTokens: 120_000,
+    maxOutputTokens: 16_384,
+    capabilities: { reasoning: true },
+    reasoningEfforts: ["high", "max"]
+  }]]]);
+  const catalogResolved = catalogRuntime.forModel("gpt-alias").model;
+  assert.equal(catalogResolved.contextWindow, 128_000);
+  assert.equal(catalogResolved.maxInputTokens, 120_000);
+  assert.equal(catalogResolved.maxOutputTokens, 16_384);
+  const catalogChoice = new ModelRuntime(config, [["openai", [{
+    id: "gpt-5.2",
+    displayName: "GPT-5.2 (目录)",
+    provider: "openai",
+    contextWindow: 128_000,
+    maxInputTokens: 120_000,
+    maxOutputTokens: 16_384,
+    capabilities: { reasoning: true },
+    reasoningEfforts: ["high", "max"]
+  }]]]).listModels().find((choice) => choice.alias === "gpt-alias");
+  assert.equal(catalogChoice?.maxInputTokens, 120_000);
+  assert.ok((catalogChoice?.inputBudgetTokens ?? 0) < 120_000);
+
+  const openaiSettings = providers.require("openai").createModelSettings({ ...config, defaultModel: "gpt-alias", thinking: { enabled: true, effort: "high" } }, config.models["gpt-alias"]!);
+  assert.deepEqual(openaiSettings.providerOptions, { openai: { reasoningEffort: "high" } });
+  const geminiSettings = providers.require("gemini").createModelSettings({ ...config, defaultModel: "gemini-pro", thinking: { enabled: true, effort: "high" } }, config.models["gemini-pro"]!);
+  assert.deepEqual(geminiSettings.providerOptions, { google: { reasoningEffort: "high", thinkingBudget: 4_096, includeThoughts: true } });
+
+  const liveConfig = configSchema.parse({
+    ...defaultConfig,
+    defaultModel: "live",
+    providers: { relay: { type: "openai-compatible", baseUrl: "https://relay.example/v1", apiKey: "test-key" } },
+    models: { live: { provider: "relay", model: "live-reasoning-model" } },
+    thinking: { enabled: true, effort: "high" }
+  });
+  const liveCatalog: ConstructorParameters<typeof ModelManager>[5] = [["relay", [{
+    id: "live-reasoning-model",
+    displayName: "Live Reasoning Model",
+    provider: "relay",
+    contextWindow: 131_072,
+    maxInputTokens: 120_000,
+    maxOutputTokens: 16_384,
+    capabilities: { tools: true, reasoning: true, streaming: true },
+    reasoningEfforts: ["high", "max"]
+  }]]];
+  const infoStore: AgentConfigStore = {
+    load: async () => structuredClone(liveConfig),
+    save: async () => undefined
+  };
+  const manager = new ModelManager(
+    "/tmp/biny-live-model-info-test",
+    liveConfig,
+    infoStore,
+    new AiRegistry(),
+    undefined,
+    liveCatalog
+  );
+  const info = manager.getInfo();
+  assert.equal(info.contextWindow, 131_072);
+  assert.equal(info.maxInputTokens, manager.getContextBudget().maxInputTokens);
+  assert.equal(info.thinking, "high");
+  assert.equal(info.reasoningLabel, "High");
+}
+
+async function testModelSwitchRecalculatesBudget(): Promise<void> {
+  const config = configSchema.parse({
+    ...defaultConfig,
+    defaultModel: "large",
+    providers: {
+      relay: {
+        type: "openai-compatible",
+        baseUrl: "https://relay.example/v1",
+        apiKey: "test-key"
+      }
+    },
+    models: {
+      large: { provider: "relay", model: "large-model", contextWindow: 1_000_000, maxOutputTokens: 32_768 },
+      small: { provider: "relay", model: "small-model", contextWindow: 8_192, maxOutputTokens: 2_048 }
+    },
+    thinking: { enabled: false, effort: "high" }
+  });
+  let stored = structuredClone(config);
+  let revision = 0;
+  const configStore: AgentConfigStore = {
+    load: async () => structuredClone(stored),
+    save: async (next) => {
+      stored = structuredClone(next);
+      revision += 1;
+    },
+    revision: () => revision
+  };
+  const manager = new ModelManager("/tmp/biny-model-switch-test", config, configStore);
+  const largeBudget = manager.getContextBudget();
+  assert.equal(largeBudget.contextWindow, 1_000_000);
+  assert.ok(largeBudget.maxInputTokens > 8_192);
+
+  await manager.switchModel("small", "off");
+  const smallBudget = manager.getContextBudget();
+  assert.equal(smallBudget.contextWindow, 8_192);
+  assert.ok(smallBudget.maxInputTokens < largeBudget.maxInputTokens);
+  assert.equal(manager.getInfo().modelAlias, "small");
+
+  await manager.switchModel("large", "off");
+  assert.equal(manager.getContextBudget().contextWindow, 1_000_000);
+}
+
+async function testModelSwitchDoesNotPersistInferredMetadata(): Promise<void> {
+  const config = configSchema.parse({
+    ...defaultConfig,
+    defaultModel: "flash",
+    providers: { deepseek: { ...defaultConfig.providers.deepseek, apiKey: "test-key" } },
+    models: {
+      flash: { provider: "deepseek", model: "deepseek-v4-flash" },
+      pro: { provider: "deepseek", model: "deepseek-v4-pro" }
+    },
+    thinking: { enabled: false, effort: "high" }
+  });
+  let stored = structuredClone(config);
+  let revision = 0;
+  const configStore: AgentConfigStore = {
+    load: async () => structuredClone(stored),
+    save: async (next) => {
+      stored = structuredClone(next);
+      revision += 1;
+    },
+    revision: () => revision
+  };
+  const manager = new ModelManager("/tmp/biny-model-switch-metadata-test", config, configStore);
+
+  assert.equal(manager.getContextBudget().contextWindow, 1_000_000);
+  await manager.switchModel("pro", "off");
+  assert.equal(stored.models.pro?.contextWindow, undefined);
+  assert.equal(manager.getContextBudget().contextWindow, 1_000_000);
 }
 
 async function testPersistedProviderCatalog(): Promise<void> {
@@ -341,7 +568,9 @@ async function testPersistedProviderCatalog(): Promise<void> {
     provider: "catalog",
     contextWindow: 64_000,
     maxOutputTokens: 8_000,
-    capabilities: { tools: true, streaming: true },
+    maxInputTokens: 60_000,
+    limits: { toolSchemaReserveTokens: 2_048, protocolSafetyMarginTokens: 1_024 },
+    capabilities: { tools: true, parallelToolCalls: true, reasoning: true, reasoningStream: true, reasoningSummary: true, streaming: true },
     reasoningEfforts: [],
     headers: { Authorization: "Bearer secret", "x-model-feature": "safe" }
   };
@@ -353,6 +582,9 @@ async function testPersistedProviderCatalog(): Promise<void> {
     const restored = await new FileModelsStore(filePath).read("catalog");
     assert.equal(restored?.models[0]?.headers?.Authorization, undefined);
     assert.equal(restored?.models[0]?.headers?.["x-model-feature"], "safe");
+    assert.equal(restored?.models[0]?.maxInputTokens, 60_000);
+    assert.equal(restored?.models[0]?.limits?.toolSchemaReserveTokens, 2_048);
+    assert.equal(restored?.models[0]?.capabilities.reasoningSummary, true);
     assert.equal((await secondStore.read("other"))?.models[0]?.id, "other-model");
     if (process.platform !== "win32") assert.equal((await stat(filePath)).mode & 0o777, 0o600);
 
@@ -640,6 +872,75 @@ async function testCompatibleReasoningPayloads(): Promise<void> {
   }
   assert.equal(bodies[2]?.reasoning_effort, "max");
   assert.equal(bodies[2]?.thinking, undefined);
+
+  const originalFetch = globalThis.fetch;
+  let relayBody: Record<string, unknown> | undefined;
+  globalThis.fetch = (async (_input, init) => {
+    relayBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    return response();
+  }) as typeof fetch;
+  try {
+    const relayConfig = configSchema.parse({
+      ...defaultConfig,
+      defaultModel: "grok",
+      providers: { relay: { type: "openai-compatible", baseUrl: "https://relay.example/v1", apiKey: "test-key" } },
+      models: {
+        grok: {
+          provider: "relay",
+          model: "grok-4.5",
+          capabilities: { tools: true, reasoning: true, streaming: true },
+          thinkingLevelMap: { off: "none", high: "high", max: "max" }
+        }
+      },
+      thinking: { enabled: true, effort: "high" }
+    });
+    const settings = new ProviderRegistry(relayConfig).createModelSettings();
+    assert.deepEqual(settings.providerOptions, { openai: { reasoningEffort: "high" } });
+    for await (const _event of await settings.model.stream({ messages: [{ role: "user", content: "think" }], tools: [] })) {
+      // Drain the transport so the final Chat Completions request body is captured.
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(relayBody?.reasoning_effort, "high");
+}
+
+async function testCompatibleEmptyAssistantHistory(): Promise<void> {
+  let requestBody: Record<string, unknown> | undefined;
+  const model = createNativeModel({
+    provider: "deepseek",
+    modelId: "deepseek-test",
+    api: "chat_completions",
+    reasoningProtocol: "deepseek",
+    baseUrl: "https://example.test/v1",
+    fetch: async (_input, init) => {
+      requestBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+  });
+  for await (const _event of await model.stream({
+    messages: [
+      { role: "user", content: "continue" },
+      { role: "assistant", content: [{ type: "reasoning", text: "orphan reasoning" }] },
+      { role: "assistant", content: [] },
+      { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "lookup", arguments: { query: "value" } }] },
+      { role: "toolResult", toolCallId: "call-1", toolName: "lookup", content: [{ type: "text", text: "result" }] }
+    ],
+    tools: []
+  })) {
+    // Drain the response so the request path is fully exercised.
+  }
+  const messages = requestBody?.messages as Array<Record<string, unknown>>;
+  assert.deepEqual(messages.map((message) => message.role), ["user", "assistant", "tool"]);
+  assert.equal(messages[1]?.content, undefined);
+  assert.deepEqual(messages[1]?.tool_calls, [{
+    id: "call-1",
+    type: "function",
+    function: { name: "lookup", arguments: JSON.stringify({ query: "value" }) }
+  }]);
 }
 
 async function testCompatibleSystemRole(): Promise<void> {
@@ -678,6 +979,10 @@ async function testOpenAiResponsesTransport(): Promise<void> {
       requestUrl = String(input);
       requestBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
       const body = [
+        'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"lookup"}}\n\n',
+        'event: response.function_call_arguments.done\ndata: {"type":"response.function_call_arguments.done","item_id":"item-1","arguments":"{\\"query\\":\\"value\\"}"}\n\n',
+        'event: response.output_item.done\ndata: {"type":"response.output_item.done","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"lookup","arguments":"{\\"query\\":\\"value\\"}"}}\n\n',
+        'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","delta":"brief reasoning"}\n\n',
         'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"responses ok"}\n\n',
         'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}\n\n'
       ].join("");
@@ -693,11 +998,71 @@ async function testOpenAiResponsesTransport(): Promise<void> {
   assert.equal(requestUrl, "https://example.test/backend-api/codex/responses");
   assert.deepEqual(requestBody?.input, [{ role: "user", content: [{ type: "input_text", text: "hello" }] }]);
   assert.equal(events.some((event) => event.type === "text-delta" && event.text === "responses ok"), true);
+  assert.deepEqual(events.find((event) => event.type === "reasoning-delta")?.providerMetadata, { openai: { summary: true } });
+  assert.deepEqual(events.filter((event) => event.type === "tool-call"), [{
+    type: "tool-call",
+    id: "call-1",
+    name: "lookup",
+    arguments: { query: "value" },
+    invalid: false
+  }]);
   assert.deepEqual(events.find((event) => event.type === "finish"), {
     type: "finish",
     reason: "stop",
     usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5, reasoningTokens: undefined }
   });
+}
+
+async function testStreamingProtocolsRequireTerminalEvents(): Promise<void> {
+  const cases: AgentModel[] = [
+    createNativeModel({
+      provider: "openai-compatible",
+      modelId: "truncated-chat",
+      api: "chat_completions",
+      baseUrl: "https://example.test/v1",
+      fetch: async () => new Response(
+        'data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } }
+      )
+    }),
+    createNativeModel({
+      provider: "openai-codex",
+      modelId: "truncated-responses",
+      api: "responses",
+      baseUrl: "https://example.test/v1",
+      fetch: async () => new Response(
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } }
+      )
+    }),
+    createNativeModel({
+      provider: "anthropic",
+      modelId: "truncated-anthropic",
+      api: "anthropic_messages",
+      baseUrl: "https://example.test",
+      fetch: async () => new Response(
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } }
+      )
+    }),
+    createNativeModel({
+      provider: "google-native",
+      modelId: "truncated-google",
+      api: "google_generative_ai",
+      baseUrl: "https://example.test/v1beta",
+      fetch: async () => new Response(
+        'data: {"usageMetadata":{"promptTokenCount":1,"totalTokenCount":1}}\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } }
+      )
+    })
+  ];
+  for (const model of cases) {
+    await assert.rejects(async () => {
+      for await (const _event of await model.stream({ messages: [{ role: "user", content: "hello" }], tools: [] })) {
+        // Drain until the adapter detects the missing protocol terminator.
+      }
+    }, /stream ended/iu);
+  }
 }
 
 async function testAudioPayloads(): Promise<void> {

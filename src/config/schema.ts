@@ -45,6 +45,13 @@ const contextSchema = z.object({
   // results are archived under .biny/tool-results with a bounded preview.
   maxTurnToolResultBytes: z.number().int().min(1_024).max(16 * 1024 * 1024).default(128 * 1024),
   instructionsMaxBytes: z.number().int().min(1_024).max(131_072).default(32 * 1024),
+  compaction: z.object({
+    enabled: z.boolean().default(true),
+    // reserve/keep 缺省时按当前模型可用输入预算动态缩放；显式配置时作为额外上限。
+    reserveTokens: z.number().int().min(256).max(262_144).optional(),
+    keepRecentTokens: z.number().int().min(256).max(1_000_000).optional(),
+    maxSummaryTokens: z.number().int().min(256).max(32_768).default(4_096)
+  }).default({ enabled: true, reserveTokens: undefined, keepRecentTokens: undefined, maxSummaryTokens: 4_096 }),
   memory: z.object({
     enabled: z.boolean().default(false),
     // 任务成功后是否自动抽取一条记忆；关闭后仍可检索与手动 save_memory。
@@ -57,6 +64,7 @@ const contextSchema = z.object({
 }).default({
   maxTurnToolResultBytes: 128 * 1024,
   instructionsMaxBytes: 32 * 1024,
+  compaction: { enabled: true, reserveTokens: undefined, keepRecentTokens: undefined, maxSummaryTokens: 4_096 },
   memory: { enabled: false, autoRemember: false, maxRecalled: 3, model: undefined }
 });
 
@@ -373,6 +381,14 @@ const modelThinkingSchema = z.object({
   }
 });
 
+export const modelLimitsSchema = z.object({
+  maxInputTokens: z.number().int().min(2_048).max(2_000_000).optional(),
+  reasoningReserveTokens: z.number().int().min(0).max(131_072).optional(),
+  toolSchemaReserveTokens: z.number().int().min(0).max(131_072).optional(),
+  systemPromptReserveTokens: z.number().int().min(0).max(131_072).optional(),
+  protocolSafetyMarginTokens: z.number().int().min(0).max(131_072).optional()
+}).strict();
+
 const modelAliasSchema = z.object({
   provider: z.string().min(1),
   model: z.string().min(1),
@@ -381,13 +397,18 @@ const modelAliasSchema = z.object({
   supportsTools: z.boolean().optional(),
   capabilities: z.object({
     tools: z.boolean().optional(),
+    parallelToolCalls: z.boolean().optional(),
     reasoning: z.boolean().optional(),
+    reasoningStream: z.boolean().optional(),
+    reasoningSummary: z.boolean().optional(),
     vision: z.boolean().optional(),
     audio: z.boolean().optional(),
     streaming: z.boolean().optional()
   }).optional(),
   contextWindow: z.number().int().min(4_096).max(2_000_000).optional(),
+  maxInputTokens: z.number().int().min(2_048).max(2_000_000).optional(),
   maxOutputTokens: z.number().int().min(1).max(384_000).optional(),
+  limits: modelLimitsSchema.optional(),
   /** Model-level API and compatibility override the provider defaults. */
   apiBackend: modelApiBackendSchema.optional(),
   baseUrl: z.string().url().optional(),
@@ -450,18 +471,15 @@ const canonicalConfigSchema = z.object({
   const activeSupportsReasoning = activeThinkingLevels
     ? Object.entries(activeThinkingLevels).some(([level, native]) => level !== "off" && native !== null)
     : activeReasoning !== undefined;
-  if (config.thinking.enabled && !activeSupportsReasoning) {
+  // ProviderRuntime 还会根据 provider 默认值补齐动态目录/未知模型的能力；配置层不能因为
+  // alias 没有携带完整 metadata 就提前拒绝。只有明确声明不支持时才在这里报错。
+  const activeReasoningDisabled = activeModel?.capabilities?.reasoning === false
+    || activeModel?.compatibility?.supportsReasoning === false;
+  if (config.thinking.enabled && activeReasoningDisabled) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["thinking", "enabled"],
-      message: `Model ${config.defaultModel} does not support thinking controls.`
-    });
-  }
-  if (config.thinking.enabled && activeModel?.capabilities?.reasoning === false) {
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ["thinking", "enabled"],
-      message: `Model ${config.defaultModel} does not expose reasoning capability metadata.`
+      message: `Model ${config.defaultModel} explicitly disables thinking controls.`
     });
   }
   const activeEfforts = activeThinkingLevels
@@ -469,7 +487,7 @@ const canonicalConfigSchema = z.object({
       .filter(([level, native]) => level !== "off" && native !== null)
       .map(([level]) => level)
     : activeReasoning?.efforts ?? [];
-  if (config.thinking.enabled && !activeEfforts.includes(config.thinking.effort)) {
+  if (config.thinking.enabled && activeSupportsReasoning && !activeEfforts.includes(config.thinking.effort)) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["thinking", "effort"],
@@ -536,6 +554,7 @@ export type ModelCompatibility = z.infer<typeof modelCompatibilitySchema>;
 export type ModelThinkingConfig = z.infer<typeof modelThinkingSchema>;
 export type ModelReasoningConfig = z.infer<typeof thinkingSchema>;
 export type ModelPricing = z.infer<typeof modelPricingSchema>;
+export type ModelLimits = z.infer<typeof modelLimitsSchema>;
 export type McpServerConfig = z.infer<typeof mcpServerSchema>;
 export type ExtensionsConfig = z.infer<typeof extensionsSchema>;
 export type HookConfig = z.infer<typeof hookSchema>;
@@ -579,7 +598,6 @@ export const defaultConfig: AgentConfig = {
       description: "Fast and affordable model for everyday work.",
       supportsTools: true,
       capabilities: { tools: true, reasoning: true, streaming: true },
-      contextWindow: 1_000_000,
       thinkingLevelMap: { off: "none", high: "high", max: "max" },
       reasoning: { efforts: ["high", "max"], defaultEffort: "high", mapping: { high: "high", max: "max" } }
     },
@@ -590,7 +608,6 @@ export const defaultConfig: AgentConfig = {
       description: "Frontier model for complex coding, research, and real-world work.",
       supportsTools: true,
       capabilities: { tools: true, reasoning: true, streaming: true },
-      contextWindow: 1_000_000,
       thinkingLevelMap: { off: "none", high: "high", max: "max" },
       reasoning: { efforts: ["high", "max"], defaultEffort: "high", mapping: { high: "high", max: "max" } }
     }
@@ -628,6 +645,7 @@ export const defaultConfig: AgentConfig = {
   context: {
     maxTurnToolResultBytes: 128 * 1024,
     instructionsMaxBytes: 32 * 1024,
+    compaction: { enabled: true, reserveTokens: undefined, keepRecentTokens: undefined, maxSummaryTokens: 4_096 },
     memory: { enabled: false, autoRemember: false, maxRecalled: 3, model: undefined }
   },
   web: {

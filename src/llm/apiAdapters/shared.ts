@@ -10,7 +10,6 @@ import type {
   ModelStreamContext,
   ModelStreamOptions
 } from "../../agent/core/types.js";
-import { isKimiK3Model } from "../../ai/capabilities.js";
 import type { ApiAdapterRequest } from "../ApiAdapterRegistry.js";
 import { CLAUDE_SUBSCRIPTION_BETA } from "../subscriptionAuth.js";
 
@@ -29,14 +28,19 @@ export function openAiMessages(
       messages.push({ role: "user", content: openAiUserContent(message.content) });
     } else if (message.role === "assistant") {
       const calls = message.content.filter((part): part is AgentToolCallContent => part.type === "toolCall");
+      const toolCalls = calls.length
+        ? calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } }))
+        : undefined;
+      const text = textContent(message.content);
       const reasoning = reasoningContent(message.content);
+      // reasoning-only 或空 assistant 不是 Chat Completions 的合法历史消息；它们通常来自
+      // 被中断的输出或回放时丢弃了无签名 reasoning 的旧 session。tool call-only assistant 仍要保留。
+      if (!text && toolCalls === undefined) continue;
       messages.push({
         role: "assistant",
-        content: textContent(message.content),
-        ...(reasoning && reasoningProtocol !== "openai" && reasoningProtocol !== "anthropic"
-          ? { reasoning_content: reasoning }
-          : {}),
-        ...(calls.length ? { tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } })) } : {})
+        content: text ?? undefined,
+        reasoning_content: reasoning && reasoningProtocol !== "openai" && reasoningProtocol !== "anthropic" ? reasoning : undefined,
+        tool_calls: toolCalls
       });
     } else {
       messages.push({ role: "tool", tool_call_id: message.toolCallId, content: resultText(message.content) });
@@ -163,12 +167,19 @@ export function applyOpenAiReasoning(body: Record<string, unknown>, config: ApiA
   if (effort && effort !== "none") body.reasoning_effort = effort;
   const deepseekEffort = readString(deepseek?.reasoningEffort);
   if (deepseekEffort) body.reasoning_effort = deepseekEffort;
+  const google = isRecord(configured?.google) ? configured.google : undefined;
+  const googleEffort = readString(google?.reasoningEffort);
+  if (config.reasoningProtocol === "google" && googleEffort && googleEffort !== "none") body.reasoning_effort = googleEffort;
   if (isRecord(deepseek?.thinking)) body.thinking = deepseek.thinking;
   if (config.reasoningProtocol === "deepseek" && options.reasoning === "off") body.thinking = { type: "disabled" };
   applyAlibabaThinking(body, configured);
-  if (config.reasoningProtocol === "moonshotai" && isKimiK3Model(config.modelId)) {
+  if (config.reasoningProtocol === "moonshotai") {
     const moonshot = isRecord(configured?.moonshotai) ? configured.moonshotai : undefined;
     const configuredEffort = readString(moonshot?.reasoningEffort);
+    if (!configuredEffort) {
+      applyMoonshotThinking(body, configured);
+      return;
+    }
     const fallbackEffort = options.reasoning && options.reasoning !== "off" ? options.reasoning : undefined;
     const effort = normalizeKimiReasoningEffort(configuredEffort ?? fallbackEffort);
     if (effort) body.reasoning_effort = effort;

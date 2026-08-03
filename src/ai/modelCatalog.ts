@@ -7,11 +7,11 @@
  *
  * 这里只读取凭据用于请求，不写配置、不落盘 key。
  */
-import type { ModelApiBackend, ModelCompatibility, ReasoningEffort, ThinkingLevelMap } from "../config/schema.js";
+import type { ModelLimits, ReasoningEffort, ThinkingLevelMap } from "../config/schema.js";
 import { inferReasoningEfforts } from "./capabilities.js";
 import { providerProtocol } from "./provider.js";
 import { createRetryFetch } from "./retry.js";
-import type { CatalogProviderRequest, ModelCatalogEntry } from "./types.js";
+import type { CatalogProviderRequest, ModelCapabilities, ModelCatalogEntry } from "./types.js";
 
 const catalogTimeoutMs = 15_000;
 
@@ -70,7 +70,11 @@ export async function fetchModelCatalogSnapshot(
   if (response.status === 304) return { notModified: true, ...responseValidators };
   if (!response.ok) throw new Error(`Model catalog request failed (${String(response.status)}).`);
   const body = await response.json() as unknown;
-  return { models: parseModelCatalog(body, request.alias, protocol), notModified: false, ...responseValidators };
+  return {
+    models: parseModelCatalog(body, request.alias, protocol, request.definition.modelDefaults?.inferReasoningFromId === true),
+    notModified: false,
+    ...responseValidators
+  };
 }
 
 /**
@@ -80,7 +84,8 @@ export async function fetchModelCatalogSnapshot(
 export function parseModelCatalog(
   value: unknown,
   provider: string,
-  protocol: "anthropic" | "openai-compatible"
+  _protocol: "anthropic" | "openai-compatible",
+  inferReasoningFromId = true
 ): ModelCatalogEntry[] {
   const items = Array.isArray(value)
     ? value
@@ -97,9 +102,18 @@ export function parseModelCatalog(
     const contextWindow = numberValue(item.context_window)
       ?? numberValue(item.contextWindow)
       ?? numberValue(item.context_length)
-      ?? numberValue(item.contextLength);
+      ?? numberValue(item.contextLength)
+      ?? numberValue(item.input_token_limit)
+      ?? numberValue(item.inputTokenLimit);
+    const maxInputTokens = numberValue(item.max_input_tokens)
+      ?? numberValue(item.maxInputTokens)
+      ?? numberValue(item.input_token_limit)
+      ?? numberValue(item.inputTokenLimit);
     const maxOutputTokens = numberValue(item.max_tokens)
       ?? numberValue(item.maxOutputTokens)
+      ?? numberValue(item.max_output_tokens)
+      ?? numberValue(item.output_token_limit)
+      ?? numberValue(item.outputTokenLimit)
       ?? numberValue(item.max_completion_tokens)
       ?? numberValue(item.maxCompletionTokens);
     const declaredThinkingLevelMap = parseThinkingLevelMap(item.thinkingLevelMap ?? item.thinking_level_map);
@@ -111,35 +125,46 @@ export function parseModelCatalog(
       ? item.reasoning_efforts.filter(isReasoningEffort)
       : Array.isArray(item.reasoningEfforts)
         ? item.reasoningEfforts.filter(isReasoningEffort)
-      : protocol === "anthropic" ? ["high", "max"] as ReasoningEffort[]
-      // OpenAI 兼容端点基本不返回推理档位字段，只能按模型 ID 兜底推断，
-      // 否则 grok-4.5 / GPT-5 这类模型在界面上只剩一个「默认」档。
-      : inferReasoningEfforts(id);
+      : inferReasoningFromId ? inferReasoningEfforts(id) : [];
     const modalities = Array.isArray(item.modalities) ? item.modalities : [];
+    const supportsThinking = booleanValue(item.thinking)
+      ?? booleanValue(item.supports_thinking)
+      ?? booleanValue(item.supportsThinking);
+    const capabilities: Partial<ModelCapabilities> = {
+      tools: booleanValue(item.supports_tools) ?? booleanValue(item.supportsTools),
+      reasoning: booleanValue(item.supports_reasoning) ?? booleanValue(item.supportsReasoning) ?? supportsThinking,
+      vision: booleanValue(item.supports_vision) ?? booleanValue(item.supportsVision) ?? modalityCapability(modalities, "image"),
+      audio: booleanValue(item.supports_audio) ?? booleanValue(item.supportsAudio) ?? modalityCapability(modalities, "audio"),
+      streaming: booleanValue(item.supports_streaming) ?? booleanValue(item.supportsStreaming) ?? true
+    };
+    const parallelToolCalls = booleanValue(item.parallel_tool_calls)
+      ?? booleanValue(item.parallelToolCalls)
+      ?? booleanValue(item.supports_parallel_tool_calls)
+      ?? booleanValue(item.supportsParallelToolCalls);
+    const reasoningStream = booleanValue(item.reasoning_stream)
+      ?? booleanValue(item.reasoningStream)
+      ?? booleanValue(item.supports_reasoning_stream)
+      ?? booleanValue(item.supportsReasoningStream);
+    const reasoningSummary = booleanValue(item.reasoning_summary)
+      ?? booleanValue(item.reasoningSummary)
+      ?? booleanValue(item.supports_reasoning_summary)
+      ?? booleanValue(item.supportsReasoningSummary);
+    if (parallelToolCalls !== undefined) capabilities.parallelToolCalls = parallelToolCalls;
+    if (reasoningStream !== undefined) capabilities.reasoningStream = reasoningStream;
+    if (reasoningSummary !== undefined) capabilities.reasoningSummary = reasoningSummary;
     const entry: ModelCatalogEntry = {
       id,
       displayName: stringValue(item.display_name) ?? stringValue(item.displayName) ?? stringValue(item.name) ?? id,
       provider,
       contextWindow,
       maxOutputTokens,
-      capabilities: {
-        tools: booleanValue(item.supports_tools) ?? booleanValue(item.supportsTools),
-        reasoning: booleanValue(item.supports_reasoning) ?? booleanValue(item.supportsReasoning),
-        vision: booleanValue(item.supports_vision) ?? booleanValue(item.supportsVision) ?? modalityCapability(modalities, "image"),
-        audio: booleanValue(item.supports_audio) ?? booleanValue(item.supportsAudio) ?? modalityCapability(modalities, "audio"),
-        streaming: true
-      },
+      capabilities,
       reasoningEfforts
     };
-    const apiBackend = parseApiBackend(item.apiBackend ?? item.api ?? item.endpoint_type);
-    const baseUrl = stringValue(item.base_url) ?? stringValue(item.baseUrl);
-    const headers = stringRecord(item.headers);
-    const compatibility = parseCompatibility(item.compatibility);
+    if (maxInputTokens !== undefined) entry.maxInputTokens = maxInputTokens;
+    const limits = parseLimits(item);
+    if (limits) entry.limits = limits;
     if (declaredThinkingLevelMap) entry.thinkingLevelMap = declaredThinkingLevelMap;
-    if (apiBackend) entry.apiBackend = apiBackend;
-    if (baseUrl) entry.baseUrl = baseUrl;
-    if (headers) entry.headers = headers;
-    if (compatibility) entry.compatibility = compatibility;
     return [entry];
   });
 }
@@ -167,6 +192,10 @@ function numberValue(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
+function nonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
 function booleanValue(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
@@ -182,31 +211,16 @@ function parseThinkingLevelMap(value: unknown): ThinkingLevelMap | undefined {
   return Object.keys(map).length ? map : undefined;
 }
 
-function parseApiBackend(value: unknown): ModelApiBackend | undefined {
-  if (value === "openai-responses") return "responses";
-  if (value === "anthropic-messages") return "anthropic_messages";
-  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value) ? value : undefined;
-}
-
-function stringRecord(value: unknown): Record<string, string> | undefined {
-  if (!isRecord(value)) return undefined;
-  const result: Record<string, string> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item === "string") result[key] = item;
-  }
-  return Object.keys(result).length ? result : undefined;
-}
-
-function parseCompatibility(value: unknown): ModelCompatibility | undefined {
-  if (!isRecord(value)) return undefined;
-  return {
-    supportsDeveloperRole: booleanValue(value.supportsDeveloperRole),
-    supportsReasoning: booleanValue(value.supportsReasoning),
-    supportsVision: booleanValue(value.supportsVision),
-    maxTokensField: value.maxTokensField === "max_tokens" || value.maxTokensField === "max_completion_tokens"
-      ? value.maxTokensField
-      : undefined
+function parseLimits(value: Record<string, unknown>): ModelLimits | undefined {
+  const limits = isRecord(value.limits) ? value.limits : value;
+  const parsed: ModelLimits = {
+    maxInputTokens: numberValue(limits.maxInputTokens) ?? numberValue(limits.max_input_tokens),
+    reasoningReserveTokens: nonNegativeInteger(limits.reasoningReserveTokens) ?? nonNegativeInteger(limits.reasoning_reserve_tokens),
+    toolSchemaReserveTokens: nonNegativeInteger(limits.toolSchemaReserveTokens) ?? nonNegativeInteger(limits.tool_schema_reserve_tokens),
+    systemPromptReserveTokens: nonNegativeInteger(limits.systemPromptReserveTokens) ?? nonNegativeInteger(limits.system_prompt_reserve_tokens),
+    protocolSafetyMarginTokens: nonNegativeInteger(limits.protocolSafetyMarginTokens) ?? nonNegativeInteger(limits.protocol_safety_margin_tokens)
   };
+  return Object.values(parsed).some((item) => item !== undefined) ? parsed : undefined;
 }
 
 /**
