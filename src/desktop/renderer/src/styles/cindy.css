@@ -187,7 +187,6 @@
   --cindy-sidebar-chrome-width: 148px;
   --cindy-sidebar-compact-width: 74px;
   --cindy-sidebar-compact-toolbar-offset: calc(var(--cindy-sidebar-chrome-width) - var(--cindy-sidebar-compact-width));
-  --cindy-collapsed-toolbar-offset: var(--cindy-sidebar-chrome-width);
   position: relative;
   display: block;
   width: 100%;
@@ -349,7 +348,7 @@
   left: 0;
   box-sizing: border-box;
   width: var(--cindy-sidebar-chrome-width);
-  background: var(--cindy-surface);
+  background: var(--cindy-sidebar-surface);
   /* chrome 只占用左侧按钮区域，整层直接参与命中，避免 Electron 原生拖拽区吞掉子按钮事件。 */
   pointer-events: auto;
   justify-content: flex-start;
@@ -357,6 +356,17 @@
   padding: 0 12px 0 80px;
   -webkit-app-region: no-drag;
   app-region: no-drag;
+}
+
+/* 收起时 chrome 变为独立的全宽窗口栏，不能继续露出左侧栏底色。 */
+.cindy-root[data-sidebar-collapsed="true"] .cindy-sidebar-topbar-floating {
+  width: 100%;
+  border-bottom: 1px solid var(--cindy-border);
+  background: var(--cindy-surface);
+}
+
+.cindy-root[data-sidebar-collapsed="true"] .cindy-content-shell {
+  padding-top: 46px;
 }
 
 .cindy-sidebar-topbar-floating .cindy-chrome-button {
@@ -1463,16 +1473,16 @@
   align-items: center;
   gap: 14px;
   padding: 0 18px;
-  border-bottom: 1px solid var(--cindy-border);
+  border-bottom: 1px solid transparent;
   background: var(--cindy-surface);
   /* 左侧浮动 chrome 位于这一行上方；工具栏整行不能成为底层拖拽命中区。 */
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
 
-/* 收起侧栏后只留下标题栏 chrome，聊天标题从 chrome 右侧开始排版。 */
+/* 收起侧栏后由全宽 chrome 承担标题栏，内容从其下方开始。 */
 .cindy-root[data-sidebar-collapsed="true"] .cindy-chat-toolbar {
-  padding-left: var(--cindy-collapsed-toolbar-offset);
+  display: none;
 }
 
 .cindy-root[data-sidebar-compact="true"] .cindy-chat-toolbar {
