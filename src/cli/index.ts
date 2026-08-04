@@ -10,7 +10,7 @@ import { createRequire } from "node:module";
 import { Command } from "commander";
 import { initCommand } from "./commands/init.js";
 import { doctorCommand } from "./commands/doctor.js";
-import { runCommand } from "./commands/run.js";
+import { runCommand, type RunCommandOptions } from "./commands/run.js";
 import { chatCommand, type ChatCommandOptions } from "./commands/chat.js";
 import { evalCompareCommand, evalRunCommand } from "./commands/evals.js";
 import { resumeCommand } from "./commands/resume.js";
@@ -21,6 +21,10 @@ import { tuiCommand } from "./commands/tui.js";
 const program = new Command();
 // CLI 的工作区以用户执行 biny 时的当前目录为准。
 const workspaceRoot = process.cwd();
+// `pnpm dev -- <command>` 会把分隔符保留在 tsx 脚本的 argv 中；去掉它，保证开发入口和已安装的 biny 解析一致。
+const cliArgv = process.argv[2] === "--"
+  ? [...process.argv.slice(0, 2), ...process.argv.slice(3)]
+  : process.argv;
 // 版本号来自 package.json，界面头部和 `--version` 用同一个来源。
 const { version: cliVersion } = createRequire(import.meta.url)("../../package.json") as { version: string };
 
@@ -45,8 +49,14 @@ program
 program
   .command("run")
   .description("Run a one-shot agent task")
+  .option("--model <alias>", "override the configured model alias for this run")
+  .option("--max-steps <steps>", "override the hard step limit", parsePositiveInteger)
+  .option("--soft-steps <steps>", "override the soft step limit", parsePositiveInteger)
+  .option("--permission-mode <mode>", "override permission mode: ask, read-only, auto, full-access")
+  .option("--headless", "run without interactive permission prompts")
+  .option("--json", "print one machine-readable JSON result")
   .argument("<input...>", "task text")
-  .action((input: string[]) => wrap(() => runCommand(workspaceRoot, input.join(" ")))());
+  .action((input: string[], options: RunCommandOptions) => wrap(async () => { await runCommand(workspaceRoot, input.join(" "), options); })());
 const evals = program.command("eval").description("Run and compare agent evaluations");
 evals
   .command("run")
@@ -73,10 +83,10 @@ program
   .action((session: string | undefined) => wrap(() => resumeCommand(workspaceRoot, session))());
 
 
-if (process.argv.length <= 2) {
+if (cliArgv.length <= 2) {
   await wrap(() => tuiCommand(workspaceRoot, cliVersion))();
 } else {
-  await program.parseAsync(process.argv);
+  await program.parseAsync(cliArgv);
 }
 
 function wrap(fn: () => Promise<void>): () => Promise<void> {
@@ -90,4 +100,10 @@ function wrap(fn: () => Promise<void>): () => Promise<void> {
       process.exitCode = 1;
     }
   };
+}
+
+function parsePositiveInteger(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`Expected a positive integer, got: ${value}`);
+  return parsed;
 }
