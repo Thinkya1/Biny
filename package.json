@@ -17,7 +17,8 @@
     "biny": "dist/cli/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "benchmarks"
   ],
   "scripts": {
     "clean": "node scripts/clean-dist.mjs",

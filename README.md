@@ -41,6 +41,28 @@ pnpm dev
 
 单次任务：`biny run "总结当前项目并指出最重要的风险"`。`biny chat` 与直接运行 `biny` 都打开 TUI，完整命令见 `biny --help`。
 
+### Harbor/Pier 评测
+
+Biny 提供了 Harbor/Pier `BaseAgent` 适配器，可在隔离任务容器中执行 Biny，并将终态、session 和 token 用量交给外部 verifier。每次运行还会把 `biny-result.json` 和可下载的 `biny-session.jsonl` 放入 Harbor agent logs；session 下载失败不会改变任务评分。适配器源码位于 `benchmarks/harbor_adapter/`；任务容器需要预先提供 Biny、Node.js、配置和 Provider 凭据，适配器不会在 DeepSWE 离线容器中自动下载依赖。
+
+机器化的一次性运行可以使用 `biny run --json --headless`；`--model` 接受已配置的模型 alias，`--max-steps` 和 `--soft-steps` 只覆盖本次运行。
+
+```bash
+harbor run \
+  -p <dataset> \
+  --agent benchmarks.harbor_adapter.biny_agent:BinyAgent \
+  --model deepseek/deepseek-v4-flash \
+  --n-concurrent 1 \
+  --ae BINY_COMMAND=biny \
+  --ae BINY_MODEL_ALIAS=deepseek-v4-flash \
+  --ae BINY_MAX_STEPS=256 \
+  --ae BINY_SOFT_STEPS=192 \
+  --ae BINY_TIMEOUT_SEC=5400 \
+  --ae DEEPSEEK_API_KEY=YOUR_API_KEY
+```
+
+如果 Harbor 传入了 `--model`，必须同时设置匹配的 `BINY_MODEL_ALIAS`，避免报告中的模型和 Biny 实际使用的模型不一致。`BINY_COMMAND` 默认是 `biny`，也可以指定为 `node /opt/biny/dist/cli/index.js`。
+
 ## 配置
 
 桌面端在 **设置 → 模型** 中管理模型。CLI、TUI 和 Desktop 共用全局 `~/.biny/config.json`；项目运行参数可在 `<project>/.biny/settings.json` 中覆盖。API key 不写入 README、代码或示例快照：macOS 使用 Keychain，其他平台使用 `apiKeyEnv` 环境变量。
