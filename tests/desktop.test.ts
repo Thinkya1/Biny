@@ -21,7 +21,7 @@ import { DesktopProjectService } from "../src/desktop/electron/main/DesktopProje
 import { DesktopStateStore } from "../src/desktop/electron/main/DesktopStateStore.js";
 import { DesktopUserDataStore } from "../src/desktop/electron/main/DesktopUserDataStore.js";
 import { clampFilePanelWidth, DEFAULT_FILE_PANEL_WIDTH, MAX_FILE_PANEL_WIDTH, MIN_FILE_PANEL_WIDTH } from "../src/desktop/filePanelSizing.js";
-import { clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH, isCompactSidebarWidth, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH } from "../src/desktop/sidebarSizing.js";
+import { clampSidebarResizeWidth, clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH, isCompactSidebarWidth, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, normalizeSidebarWidth, SIDEBAR_RAIL_THRESHOLD, SIDEBAR_RAIL_WIDTH } from "../src/desktop/sidebarSizing.js";
 import type { DesktopAgentEventEnvelope, DesktopProject, DesktopSessionSummary, DesktopWorkspaceSnapshot } from "../src/desktop/protocol.js";
 import {
   applyProjectOrder,
@@ -77,6 +77,7 @@ testCommandHighlighting();
 testWorkspaceFileMarkers();
 await testFilePanelSizing();
 testSidebarSizing();
+await testSidebarStateNormalizesWidth();
 await testDesktopThemePreference();
 await testDesktopModelConfiguration();
 await testDesktopSubagentSlashCommands();
@@ -761,11 +762,45 @@ async function testFilePanelSizing(): Promise<void> {
 
 function testSidebarSizing(): void {
   assert.equal(DEFAULT_SIDEBAR_WIDTH, 260);
+  assert.equal(SIDEBAR_RAIL_WIDTH, 78);
+  assert.equal(SIDEBAR_RAIL_THRESHOLD, 120);
+  for (const width of [78, 86, 87, 119, 120, 179, 180, 260, 480]) {
+    assert.equal(clampSidebarResizeWidth(width), width, `drag width ${width}`);
+  }
+  assert.equal(clampSidebarResizeWidth(0), SIDEBAR_RAIL_WIDTH);
+  assert.equal(clampSidebarResizeWidth(500), MAX_SIDEBAR_WIDTH);
   assert.equal(clampSidebarWidth(MIN_SIDEBAR_WIDTH - 1), MIN_SIDEBAR_WIDTH);
   assert.equal(clampSidebarWidth(MAX_SIDEBAR_WIDTH + 1), MAX_SIDEBAR_WIDTH);
   assert.equal(clampSidebarWidth(287.6), 288);
-  assert.equal(isCompactSidebarWidth(MIN_SIDEBAR_WIDTH), true);
-  assert.equal(isCompactSidebarWidth(100), false);
+  assert.equal(clampSidebarWidth(120), MIN_SIDEBAR_WIDTH, "提交时才应用普通最小宽度");
+  assert.equal(clampSidebarWidth(179), MIN_SIDEBAR_WIDTH);
+  assert.equal(isCompactSidebarWidth(78), true);
+  assert.equal(isCompactSidebarWidth(86), true);
+  assert.equal(isCompactSidebarWidth(87), true);
+  assert.equal(isCompactSidebarWidth(119), true);
+  assert.equal(isCompactSidebarWidth(120), false);
+  assert.equal(isCompactSidebarWidth(MIN_SIDEBAR_WIDTH), false);
+  for (let width = 74; width <= 86; width += 1) assert.equal(normalizeSidebarWidth(width), DEFAULT_SIDEBAR_WIDTH, `legacy rail width ${width}`);
+  assert.equal(normalizeSidebarWidth(180), MIN_SIDEBAR_WIDTH);
+}
+
+async function testSidebarStateNormalizesWidth(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-sidebar-width-"));
+  try {
+    const statePath = path.join(workspaceRoot, "desktop-state.json");
+    await writeFile(statePath, JSON.stringify({ sidebarWidth: 74 }));
+    const state = new DesktopStateStore(statePath);
+    await state.load();
+    assert.equal(state.sidebarWidth(), DEFAULT_SIDEBAR_WIDTH);
+    await state.setSidebarWidth(179);
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).sidebarWidth, MIN_SIDEBAR_WIDTH);
+    await state.setSidebarWidth(260);
+    assert.equal(state.sidebarWidth(), 260);
+    await state.setSidebarWidth(480);
+    assert.equal(state.sidebarWidth(), MAX_SIDEBAR_WIDTH);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
 }
 
 async function testDesktopThemePreference(): Promise<void> {

@@ -7,8 +7,9 @@
  */
 import { createPortal } from "react-dom";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { clampSidebarWidth, isCompactSidebarWidth, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH } from "../../../sidebarSizing.js";
+import { clampSidebarResizeWidth, clampSidebarWidth, isCompactSidebarWidth, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, SIDEBAR_RAIL_THRESHOLD, SIDEBAR_RAIL_WIDTH } from "../../../sidebarSizing.js";
 import type { DesktopProject, DesktopSessionSummary } from "../../../protocol.js";
+import type { SidebarPeekHandlers, SidebarPeekState } from "../app/useSidebarPeek.js";
 import { Icon, type IconName } from "./Icon.js";
 
 // 收起时侧栏主体要完全退出 flex 布局；顶部 chrome 会在 CSS 中独立浮在窗口左上角。
@@ -30,12 +31,18 @@ interface ProjectDragState {
 
 interface SidebarProps {
   visible: boolean;
+  railMode: boolean;
   width: number;
+  peekState: SidebarPeekState;
+  peekDrawerHandlers: SidebarPeekHandlers;
+  peekDrawerRef: React.RefObject<HTMLElement | null>;
+  peekTriggerHandlers: SidebarPeekHandlers;
   projects: DesktopProject[];
   sessions: DesktopSessionSummary[];
   activeProjectId?: string;
   selectedSessionId?: string;
   onVisibleChange(visible: boolean): void;
+  onPinPeek(): void;
   onWidthChange(width: number): void;
   onOpenProject(): void;
   onCreateEmptyProject(): void;
@@ -50,15 +57,22 @@ interface SidebarProps {
   onRenameProject(projectId: string): void;
   onNewTask(projectId: string): void;
   onRemoveProject(projectId: string): void;
+  onRailModeChange(railMode: boolean): void;
   onSearch(): void;
   onSettings(): void;
+  onResizeStateChange(resizing: boolean): void;
   onWidthCommit(width: number): void;
   version?: string;
 }
 
 export const Sidebar = memo(function Sidebar({
   visible,
+  railMode,
   width,
+  peekState,
+  peekDrawerHandlers,
+  peekDrawerRef,
+  peekTriggerHandlers,
   projects,
   sessions,
   activeProjectId,
@@ -78,8 +92,11 @@ export const Sidebar = memo(function Sidebar({
   onRenameProject,
   onNewTask,
   onRemoveProject,
+  onPinPeek,
+  onRailModeChange,
   onSearch,
   onSettings,
+  onResizeStateChange,
   onWidthCommit,
   version
 }: SidebarProps): React.JSX.Element {
@@ -93,6 +110,7 @@ export const Sidebar = memo(function Sidebar({
   const [projectOrganizationMenuOpen, setProjectOrganizationMenuOpen] = useState(false);
   const [projectCreateMenuOpen, setProjectCreateMenuOpen] = useState(false);
   const [projectSort, setProjectSort] = useState<ProjectSort>("priority");
+  const [isResizing, setIsResizing] = useState(false);
   const [dragState, setDragState] = useState<ProjectDragState | undefined>(undefined);
   const dragStateRef = useRef<ProjectDragState | undefined>(undefined);
   const projectOrganizationButtonRef = useRef<HTMLButtonElement>(null);
@@ -150,8 +168,38 @@ export const Sidebar = memo(function Sidebar({
   const orderedProjects = useMemo(() => sortProjects(projects, projectSort), [projects, projectSort]);
   const pinnedProjects = orderedProjects.filter((project) => project.pinned);
   const unpinnedProjects = orderedProjects.filter((project) => !project.pinned);
-  const resolvedWidth = clampSidebarWidth(width);
-  const compact = visible && isCompactSidebarWidth(resolvedWidth);
+  const expandedWidth = clampSidebarWidth(width);
+  // pinning 期间 visible 会先切为 true，但 fixed 抽屉必须继续冻结到 spacer
+  // 完成 0→展开宽度的流内过渡；只有回到 idle 才能把 aside 放回 flex 流。
+  const peekOpen = peekState !== "idle";
+  const contentVisible = visible || peekOpen;
+  const resolvedWidth = contentVisible
+    ? peekOpen
+      ? expandedWidth
+      : isResizing
+        ? clampSidebarResizeWidth(width)
+        : railMode
+          ? SIDEBAR_RAIL_WIDTH
+          : expandedWidth
+    : CINDY_COLLAPSED_SIDEBAR_WIDTH;
+  const contentWidth = visible && isResizing
+    ? clampSidebarResizeWidth(width)
+    : visible && railMode
+      ? SIDEBAR_RAIL_WIDTH
+      : expandedWidth;
+  const compact = visible && (railMode || (!peekOpen && isCompactSidebarWidth(resolvedWidth)));
+  // peek 抽屉滑出后回到收起态时，aside 的 260→0 不能再触发一段普通 width 动画，
+  // 否则抽屉已经离屏，主区还会被额外推开/拉回一次。只对交换这一帧禁用过渡。
+  const [previousPeekOpen, setPreviousPeekOpen] = useState(peekOpen);
+  const justLeftPeek = previousPeekOpen && !peekOpen;
+  useEffect(() => {
+    setPreviousPeekOpen(peekOpen);
+  }, [peekOpen]);
+
+  const setResizeState = (resizing: boolean): void => {
+    setIsResizing(resizing);
+    onResizeStateChange(resizing);
+  };
 
   const toggleSection = (section: SidebarSectionName): void => {
     setExpandedSections((current) => ({ ...current, [section]: !current[section] }));
@@ -284,18 +332,29 @@ export const Sidebar = memo(function Sidebar({
 
   return (
     <>
+      {!visible ? <div aria-hidden="true" className="cindy-sidebar-peek-trigger" {...peekTriggerHandlers} /> : null}
       <aside
         aria-label="主导航"
-        aria-hidden={visible ? undefined : true}
-        className={`cindy-sidebar${visible ? "" : " is-hidden"}${compact ? " is-compact" : ""}`}
-        style={{ width: visible ? resolvedWidth : CINDY_COLLAPSED_SIDEBAR_WIDTH }}
+        aria-hidden={contentVisible ? undefined : true}
+        className={`cindy-sidebar${contentVisible ? "" : " is-hidden"}${compact ? " is-compact" : ""}${isResizing ? " is-resizing" : ""}${justLeftPeek ? " is-peek-exited" : ""}${peekOpen ? ` is-peek-overlay is-peek-${peekState === "peekClosing" ? "closing" : peekState}` : ""}`}
+        ref={peekOpen ? peekDrawerRef : undefined}
+        style={{
+          "--cindy-sidebar-content-width": `${contentWidth}px`,
+          width: resolvedWidth
+        } as React.CSSProperties}
+        onPointerEnter={peekOpen ? peekDrawerHandlers.onPointerEnter : undefined}
+        onPointerLeave={peekOpen ? peekDrawerHandlers.onPointerLeave : undefined}
+        onPointerMove={peekOpen ? peekDrawerHandlers.onPointerMove : undefined}
+        onPointerDown={peekOpen ? peekDrawerHandlers.onPointerDown : undefined}
+        onPointerUp={peekOpen ? peekDrawerHandlers.onPointerUp : undefined}
       >
-        {visible ? <div aria-hidden="true" className="cindy-sidebar-topbar-spacer" /> : null}
+        {/* 顶部行是侧栏内容的固定锚点；收起时也保留它，避免导航内容向上跳 46px。 */}
+        <div aria-hidden="true" className="cindy-sidebar-topbar-spacer" />
 
       <div className="cindy-sidebar-body">
         <div className="cindy-sidebar-scroll">
           <nav aria-label="功能导航" className="cindy-sidebar-nav">
-            <button aria-label="新建" className="cindy-sidebar-nav-item" onClick={createTask} type="button">
+            <button aria-label="新建" className="cindy-sidebar-nav-item cindy-sidebar-nav-new-button" onClick={createTask} type="button">
               <Icon name="circle-add" size={16} />
               <span>新建</span>
             </button>
@@ -403,29 +462,42 @@ export const Sidebar = memo(function Sidebar({
           <span className="cindy-user-action cindy-user-action-secondary" aria-hidden="true"><Icon name="spark" size={14} /></span>
         </button>
       </div>
-      {visible ? (
+      {contentVisible ? (
         <div
           aria-label="调整侧栏宽度"
           aria-orientation="vertical"
           aria-valuemax={MAX_SIDEBAR_WIDTH}
-          aria-valuemin={MIN_SIDEBAR_WIDTH}
-          aria-valuenow={Math.round(clampSidebarWidth(width))}
+          aria-valuemin={SIDEBAR_RAIL_WIDTH}
+          aria-valuenow={resolvedWidth}
           className="cindy-sidebar-resizer"
           onKeyDown={(event) => {
             if (event.key === "ArrowLeft") {
               event.preventDefault();
-              const nextWidth = clampSidebarWidth(width - 16);
+              const currentWidth = clampSidebarWidth(width);
+              if (railMode || currentWidth === MIN_SIDEBAR_WIDTH) {
+                onRailModeChange(true);
+                onWidthChange(currentWidth);
+                return;
+              }
+              const nextWidth = clampSidebarWidth(currentWidth - 16);
               onWidthChange(nextWidth);
               onWidthCommit(nextWidth);
             }
             if (event.key === "ArrowRight") {
               event.preventDefault();
+              if (railMode) {
+                const nextWidth = MIN_SIDEBAR_WIDTH;
+                onRailModeChange(false);
+                onWidthChange(nextWidth);
+                onWidthCommit(nextWidth);
+                return;
+              }
               const nextWidth = clampSidebarWidth(width + 16);
               onWidthChange(nextWidth);
               onWidthCommit(nextWidth);
             }
           }}
-          onPointerDown={startSidebarResize(width, onWidthChange, onWidthCommit)}
+          onPointerDown={startSidebarResize(width, railMode, onRailModeChange, onWidthChange, onWidthCommit, setResizeState)}
           role="separator"
           tabIndex={0}
         />
@@ -435,7 +507,7 @@ export const Sidebar = memo(function Sidebar({
         collapsed={!visible}
         floating
         onNewTask={createTask}
-        onToggle={() => onVisibleChange(!visible)}
+        onToggle={() => visible ? onVisibleChange(false) : onPinPeek()}
       />
     </>
   );
@@ -740,17 +812,34 @@ function formatRelativeTime(value: string): string {
   return days < 30 ? `${days} 天` : `${Math.floor(days / 30)} 个月`;
 }
 
-function startSidebarResize(width: number, onWidthChange: (nextWidth: number) => void, onWidthCommit: (nextWidth: number) => void): (event: React.PointerEvent<HTMLDivElement>) => void {
+function startSidebarResize(width: number, railMode: boolean, onRailModeChange: (railMode: boolean) => void, onWidthChange: (nextWidth: number) => void, onWidthCommit: (nextWidth: number) => void, onResizeStateChange: (resizing: boolean) => void): (event: React.PointerEvent<HTMLDivElement>) => void {
   return (event) => {
+    if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
-    event.currentTarget.setPointerCapture(event.pointerId);
+    const resizer = event.currentTarget;
+    const pointerId = event.pointerId;
+    resizer.setPointerCapture(pointerId);
     const startX = event.clientX;
-    const startWidth = clampSidebarWidth(width);
+    const expandedWidth = clampSidebarWidth(width);
+    const railActiveAtStart = railMode;
+    const startWidth = railActiveAtStart ? SIDEBAR_RAIL_WIDTH : expandedWidth;
+    let railActive = railActiveAtStart;
     let currentWidth = startWidth;
     let active = true;
+    onResizeStateChange(true);
+    if (railActive) onWidthChange(SIDEBAR_RAIL_WIDTH);
     const move = (moveEvent: PointerEvent): void => {
-      currentWidth = clampSidebarWidth(startWidth + moveEvent.clientX - startX);
+      const rawWidth = startWidth + moveEvent.clientX - startX;
+      if (rawWidth < SIDEBAR_RAIL_THRESHOLD && !railActive) {
+        railActive = true;
+        onRailModeChange(true);
+      } else if (rawWidth >= SIDEBAR_RAIL_THRESHOLD && railActive) {
+        railActive = false;
+        onRailModeChange(false);
+      }
+      // 拖拽态只负责把实际指针位置映射到 78–480px；180px 的普通下限只能在松手时提交。
+      currentWidth = clampSidebarResizeWidth(rawWidth);
       onWidthChange(currentWidth);
     };
     const stop = (): void => {
@@ -759,7 +848,16 @@ function startSidebarResize(width: number, onWidthChange: (nextWidth: number) =>
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", stop);
       window.removeEventListener("pointercancel", stop);
-      onWidthCommit(currentWidth);
+      if (resizer.hasPointerCapture(pointerId)) resizer.releasePointerCapture(pointerId);
+      onResizeStateChange(false);
+      if (railActive) {
+        // rail 宽度只是视觉状态，不覆盖上次展开宽度，也不写入持久化。
+        onWidthChange(expandedWidth);
+        return;
+      }
+      const committedWidth = clampSidebarWidth(currentWidth);
+      onWidthChange(committedWidth);
+      onWidthCommit(committedWidth);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop, { once: true });

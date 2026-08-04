@@ -185,8 +185,12 @@
   --shadow-high: 0 16px 40px var(--cindy-shadow-heavy);
   /* 标题从第二个 chrome 按钮右侧留出 7px，避免收起后被固定层盖住。 */
   --cindy-sidebar-chrome-width: 148px;
-  --cindy-sidebar-compact-width: 74px;
+  --cindy-sidebar-compact-width: 78px;
   --cindy-sidebar-compact-toolbar-offset: calc(var(--cindy-sidebar-chrome-width) - var(--cindy-sidebar-compact-width));
+  --cindy-chat-toolbar-inline-padding: 18px;
+  --cindy-sidebar-transition: 250ms cubic-bezier(0.4, 0, 0.2, 1);
+  --cindy-sidebar-content-fade-duration: 200ms;
+  --cindy-sidebar-content-fade: var(--cindy-sidebar-content-fade-duration) ease;
   position: relative;
   display: block;
   width: 100%;
@@ -280,6 +284,88 @@
   background: var(--cindy-surface);
 }
 
+/*
+ * 侧栏块和聊天主区是两个独立的 flex sibling。DOM 仍把主区放在前面，
+ * 让 floating chrome 位于主区拖拽区之后；order 只负责恢复视觉上的左侧布局。
+ * pin spacer 与 aside 共用这个块，固定 peek 切回流内时不会再产生两套布局边界。
+ */
+.cindy-sidebar-block {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  flex: 0 0 auto;
+  order: -1;
+  overflow: visible;
+}
+
+/* Peek 固定展开时先由这个流内占位条推动主区，避免 fixed 侧栏切回流布局时发生二次回弹。 */
+.cindy-sidebar-pin-spacer {
+  box-sizing: border-box;
+  width: 0;
+  min-width: 0;
+  height: 100%;
+  flex: 0 0 0;
+  order: -2;
+  pointer-events: none;
+  background: var(--cindy-sidebar-surface);
+  transition: width var(--cindy-sidebar-transition), flex-basis var(--cindy-sidebar-transition);
+  will-change: width, flex-basis;
+}
+
+/* pinning 结束时 aside 同帧回到普通流，spacer 只做布局交换快照，不能再播放 200→0。 */
+.cindy-root:not([data-sidebar-pinning="true"]) .cindy-sidebar-pin-spacer {
+  transition: none;
+}
+
+/* 收起后只在窗口左缘保留一个很窄的 hover 命中区，不遮住主区正常交互。 */
+.cindy-sidebar-peek-trigger {
+  position: fixed;
+  z-index: 90;
+  top: 46px;
+  bottom: 0;
+  left: 0;
+  width: 12px;
+  pointer-events: auto;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.cindy-sidebar.is-peek-overlay {
+  position: fixed;
+  z-index: 90;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  box-sizing: border-box;
+  box-shadow: 8px 0 28px var(--cindy-shadow-sidebar);
+  transform: translateX(0);
+  transition: transform var(--cindy-sidebar-content-fade) cubic-bezier(0.4, 0, 0.2, 1), opacity var(--cindy-sidebar-content-fade) cubic-bezier(0.4, 0, 0.2, 1);
+  will-change: width, transform, opacity;
+}
+
+/* Cindy 的 peek 入场不是挂载后瞬间出现，而是用 ease-out 的滑入 keyframe 先从屏外进入。 */
+@keyframes cindy-sidebar-peek-in {
+  from {
+    opacity: 0;
+    transform: translateX(-100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.cindy-sidebar.is-peek-peeking {
+  animation: cindy-sidebar-peek-in var(--cindy-sidebar-content-fade-duration) cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.cindy-sidebar.is-peek-closing {
+  transform: translateX(-100%);
+  opacity: 0;
+  pointer-events: none;
+}
+
 .cindy-content-shell {
   display: flex;
   min-width: 0;
@@ -297,14 +383,14 @@
   min-width: 0;
   height: 100%;
   flex: 0 0 auto;
-  /* chrome 在 DOM 中位于主内容的拖拽区之后，但侧栏仍通过 order 保持在左侧。 */
-  order: -1;
   flex-direction: column;
   overflow: visible;
-  border-right: 1px solid var(--cindy-border);
+  /* 视觉分隔线由独立层绘制；这里保留边框盒尺寸，避免拖拽时布局宽度跳变。 */
+  border-right: 1px solid transparent;
   background: var(--cindy-sidebar-surface);
   color: var(--cindy-text);
-  transition: border-color 160ms ease;
+  transition: width var(--cindy-sidebar-transition);
+  will-change: width;
 }
 
 .cindy-sidebar.is-hidden {
@@ -312,16 +398,32 @@
   border-right-color: transparent;
 }
 
+/* 原生拖拽期间要跟手；松手或键盘/状态切换时再使用 Cindy 风格缓出过渡。 */
+.cindy-sidebar.is-resizing,
+.cindy-root[data-sidebar-resizing="true"] .cindy-sidebar {
+  transition: none;
+}
+
+/* peek 抽屉已经滑出屏幕后，回到流布局的 260→0 只应是快照，不再播放第二段收起动画。 */
+.cindy-sidebar.is-peek-exited {
+  transition: none;
+}
+
 .cindy-sidebar-body,
 .cindy-sidebar-footer {
+  width: var(--cindy-sidebar-content-width);
   -webkit-app-region: no-drag;
   app-region: no-drag;
+  transition: opacity var(--cindy-sidebar-content-fade), visibility 0s linear 0s;
+  will-change: opacity;
 }
 
 .cindy-sidebar.is-hidden > .cindy-sidebar-body,
-.cindy-sidebar.is-hidden > .cindy-sidebar-footer,
-.cindy-sidebar.is-hidden > .cindy-sidebar-resizer {
-  display: none;
+.cindy-sidebar.is-hidden > .cindy-sidebar-footer {
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--cindy-sidebar-content-fade), visibility 0s linear var(--cindy-sidebar-content-fade-duration);
 }
 
 .cindy-sidebar-topbar-spacer {
@@ -347,8 +449,12 @@
   top: 0;
   left: 0;
   box-sizing: border-box;
+  /*
+   * 这是固定的按钮命中层，不再拥有第二份背景。侧栏和主区各自绘制自己的表面，
+   * 也不在这里绘制 divider；这样 pinning 的第一帧不会出现第二条横线。
+   */
   width: var(--cindy-sidebar-chrome-width);
-  background: var(--cindy-sidebar-surface);
+  background: transparent;
   /* chrome 只占用左侧按钮区域，整层直接参与命中，避免 Electron 原生拖拽区吞掉子按钮事件。 */
   pointer-events: auto;
   justify-content: flex-start;
@@ -358,15 +464,25 @@
   app-region: no-drag;
 }
 
-/* 收起时 chrome 变为独立的全宽窗口栏，不能继续露出左侧栏底色。 */
-.cindy-root[data-sidebar-collapsed="true"] .cindy-sidebar-topbar-floating {
-  width: 100%;
-  border-bottom: 1px solid var(--cindy-border);
-  background: var(--cindy-surface);
+/* 分隔线必须压在 floating chrome 上方，但不能参与 Electron 鼠标命中。 */
+.cindy-sidebar-divider {
+  position: absolute;
+  z-index: 120;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  pointer-events: none;
+  background: var(--cindy-border);
+  transition: left var(--cindy-sidebar-transition);
+  will-change: left;
 }
 
-.cindy-root[data-sidebar-collapsed="true"] .cindy-content-shell {
-  padding-top: 46px;
+.cindy-root[data-sidebar-collapsed="true"] .cindy-sidebar-divider {
+  display: none;
+}
+
+.cindy-root[data-sidebar-resizing="true"] .cindy-sidebar-divider {
+  transition: none;
 }
 
 .cindy-sidebar-topbar-floating .cindy-chrome-button {
@@ -623,20 +739,6 @@
   width: 8px;
   pointer-events: auto;
   cursor: col-resize;
-}
-
-.cindy-sidebar-resizer::after {
-  position: absolute;
-  inset: 0 auto 0 3px;
-  width: 1px;
-  background: transparent;
-  content: "";
-  transition: background-color 140ms ease;
-}
-
-.cindy-sidebar-resizer:hover::after,
-.cindy-sidebar-resizer:focus-visible::after {
-  background: var(--cindy-focus);
 }
 
 .cindy-sidebar.is-compact .cindy-sidebar-scroll {
@@ -1012,6 +1114,25 @@
 .cindy-project-row-action:hover {
   color: var(--cindy-text);
   background: var(--cindy-surface-hover);
+}
+
+/* 这些图标按钮跨越不同的布局父级，显式固定基础控制样式，避免主题/浏览器默认样式改变其颜色。 */
+.cindy-chrome-button,
+.cindy-sidebar-nav-new-button,
+.cindy-sidebar-section-action,
+.cindy-project-row-action {
+  border-color: transparent;
+  background: transparent;
+  color: var(--cindy-text-secondary);
+  opacity: 1;
+}
+
+.cindy-chrome-button svg,
+.cindy-sidebar-nav-new-button svg,
+.cindy-sidebar-section-action svg,
+.cindy-project-row-action svg {
+  color: currentColor;
+  stroke: currentColor;
 }
 
 .cindy-sidebar-session-list {
@@ -1472,17 +1593,31 @@
   min-height: 46px;
   align-items: center;
   gap: 14px;
-  padding: 0 18px;
-  border-bottom: 1px solid transparent;
+  padding: 0 var(--cindy-chat-toolbar-inline-padding);
+  border-bottom: 1px solid var(--cindy-border);
   background: var(--cindy-surface);
+  transition: padding-left var(--cindy-sidebar-transition), opacity var(--cindy-sidebar-content-fade);
   /* 左侧浮动 chrome 位于这一行上方；工具栏整行不能成为底层拖拽命中区。 */
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
 
-/* 收起侧栏后由全宽 chrome 承担标题栏，内容从其下方开始。 */
+/*
+ * 收起侧栏后聊天 toolbar 仍是主区自己的 ContentHeader：不卸载、不淡出，
+ * 只把左 padding 让给固定 chrome 按钮。这样标题在切换期间持续可见，底线也
+ * 从窗口左缘贯穿到右侧；下方 chat body/composer 的 46px 顶部锚点保持不变。
+ */
 .cindy-root[data-sidebar-collapsed="true"] .cindy-chat-toolbar {
-  display: none;
+  padding-left: var(--cindy-sidebar-chrome-width);
+}
+
+/* pinning 时 spacer 与 toolbar 同帧开始，标题只走一次连续路径，不在 300ms 后再回弹。 */
+.cindy-root[data-sidebar-pinning="true"] .cindy-chat-toolbar {
+  padding-left: var(--cindy-chat-toolbar-inline-padding);
+}
+
+.cindy-root[data-sidebar-resizing="true"] .cindy-chat-toolbar {
+  transition: none;
 }
 
 .cindy-root[data-sidebar-compact="true"] .cindy-chat-toolbar {
@@ -1783,6 +1918,33 @@
   }
 
   .cindy-chat-toolbar {
-    padding-inline: 10px;
+    --cindy-chat-toolbar-inline-padding: 10px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cindy-sidebar,
+  .cindy-sidebar-divider,
+  .cindy-sidebar-pin-spacer,
+  .cindy-sidebar-body,
+  .cindy-sidebar-footer,
+  .cindy-sidebar-block,
+  .cindy-chat-toolbar {
+    transition: none !important;
+  }
+
+  .cindy-sidebar.is-peek-overlay {
+    transition: none !important;
+  }
+
+  .cindy-sidebar.is-peek-peeking {
+    animation: none !important;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
   }
 }

@@ -24,7 +24,7 @@ import type {
 } from "../../protocol.js";
 import { DEFAULT_FILE_PANEL_WIDTH } from "../../filePanelSizing.js";
 import { DEFAULT_FONT_PREFERENCE, SYSTEM_FONT_FAMILY } from "../../fontPreference.js";
-import { clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH } from "../../sidebarSizing.js";
+import { clampSidebarResizeWidth, clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH, normalizeSidebarWidth } from "../../sidebarSizing.js";
 import {
   createNavigationState,
   pushNavigation,
@@ -44,6 +44,7 @@ import {
 } from "./app/desktopState.js";
 import { useDesktopEventBridge } from "./app/useDesktopEventBridge.js";
 import { useDesktopSettingsActions } from "./app/useDesktopSettingsActions.js";
+import { useSidebarPeek } from "./app/useSidebarPeek.js";
 import { Composer, type ContextUsage } from "./components/Composer.js";
 import { DesktopShell } from "./components/DesktopShell.js";
 import { Sidebar } from "./components/Sidebar.js";
@@ -61,6 +62,16 @@ interface RenameTarget {
   title: string;
 }
 
+const SIDEBAR_RAIL_STORAGE_KEY = "biny.desktop.sidebar-rail";
+
+function readSidebarRailPreference(): boolean {
+  try {
+    return typeof window !== "undefined" && window.localStorage.getItem(SIDEBAR_RAIL_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
 export function App(): React.JSX.Element {
   const [version, setVersion] = useState("0.1.0");
   const [projects, setProjects] = useState<DesktopProject[]>([]);
@@ -71,6 +82,8 @@ export function App(): React.JSX.Element {
   const [loading, setLoading] = useState(true);
   const [sidebarVisible, setSidebarVisible] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
+  const [sidebarRailMode, setSidebarRailMode] = useState(readSidebarRailPreference);
+  const [sidebarResizing, setSidebarResizing] = useState(false);
   const [filePanelWidth, setFilePanelWidth] = useState(DEFAULT_FILE_PANEL_WIDTH);
   const [filePanelResizing, setFilePanelResizing] = useState(false);
   const [themePreference, setThemePreference] = useState<DesktopThemePreference>("system");
@@ -90,6 +103,37 @@ export function App(): React.JSX.Element {
   const loadRequestRef = useRef(0);
   const menuActionRef = useRef<(action: DesktopMenuAction) => void>(() => undefined);
   const modelSetupWasRequiredRef = useRef(false);
+
+  const pinSidebar = useCallback((): void => {
+    setSidebarVisible(true);
+    setSidebarRailMode(false);
+  }, []);
+  const {
+    drawerHandlers: sidebarPeekDrawerHandlers,
+    drawerRef: sidebarPeekDrawerRef,
+    pin: pinSidebarPeek,
+    peekState: sidebarPeekState,
+    triggerHandlers: sidebarPeekTriggerHandlers
+  } = useSidebarPeek({
+    collapsed: !sidebarVisible,
+    onPin: pinSidebar
+  });
+  const requestSidebarExpand = useCallback((): void => {
+    setSidebarRailMode(false);
+    pinSidebarPeek();
+  }, [pinSidebarPeek]);
+  const setSidebarVisibility = useCallback((visible: boolean): void => {
+    if (visible) requestSidebarExpand();
+    else setSidebarVisible(false);
+  }, [requestSidebarExpand]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIDEBAR_RAIL_STORAGE_KEY, String(sidebarRailMode));
+    } catch {
+      // Renderer 本地存储不可用时仍保留本次会话的 Rail 状态。
+    }
+  }, [sidebarRailMode]);
 
   const openSettings = useCallback((targetTab?: SettingsTab): void => {
     setSettingsTargetTab(targetTab);
@@ -216,7 +260,7 @@ export function App(): React.JSX.Element {
       setVersion(bootstrap.version);
       setProjects(bootstrap.projects);
       setSidebarSessions(bootstrap.sidebarSessions);
-      setSidebarWidth(clampSidebarWidth(bootstrap.sidebarWidth));
+      setSidebarWidth(normalizeSidebarWidth(bootstrap.sidebarWidth));
       setFilePanelWidth(bootstrap.filePanelWidth ?? DEFAULT_FILE_PANEL_WIDTH);
       setThemePreference(bootstrap.themePreference ?? "system");
       setFontPreference(bootstrap.fontPreference ?? DEFAULT_FONT_PREFERENCE);
@@ -370,10 +414,13 @@ export function App(): React.JSX.Element {
       if (action === "open-project") void openProject();
       if (action === "search") setSearchOpen(true);
       if (action === "settings") openSettings();
-      if (action === "toggle-sidebar") setSidebarVisible((value) => !value);
+      if (action === "toggle-sidebar") {
+        if (sidebarVisible) setSidebarVisible(false);
+        else requestSidebarExpand();
+      }
       if (action === "focus-composer") setFocusToken((value) => value + 1);
     };
-  }, [newTask, openProject, openSettings]);
+  }, [newTask, openProject, openSettings, requestSidebarExpand, sidebarVisible]);
 
   const sendPrompt = useCallback(async (input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[], delivery?: "steer" | "followUp"): Promise<void> => {
     const projectId = projectRef.current;
@@ -689,6 +736,9 @@ export function App(): React.JSX.Element {
       )}
       sidebarVisible={sidebarVisible}
       sidebarWidth={sidebarWidth}
+      sidebarRailMode={sidebarRailMode}
+      sidebarResizing={sidebarResizing}
+      sidebarPeekState={sidebarPeekState}
       sideNav={(
         <Sidebar
           activeProjectId={workspace?.project.id}
@@ -707,13 +757,21 @@ export function App(): React.JSX.Element {
           onSelectSession={(projectId, sessionId) => void navigateToSession(projectId, sessionId)}
           onSessionMenu={(session) => void openSessionMenu(session)}
           onSettings={() => openSettings()}
-          onVisibleChange={setSidebarVisible}
-          onWidthChange={setSidebarWidth}
-          onWidthCommit={(width) => { void window.biny.setSidebarWidth(width); }}
+          onVisibleChange={setSidebarVisibility}
+          onPinPeek={requestSidebarExpand}
+          onRailModeChange={setSidebarRailMode}
+          onResizeStateChange={setSidebarResizing}
+          onWidthChange={(width) => setSidebarWidth(clampSidebarResizeWidth(width))}
+          onWidthCommit={(width) => { void window.biny.setSidebarWidth(clampSidebarWidth(width)); }}
           projects={projects}
           selectedSessionId={selectedSessionId}
           sessions={sidebarSessions}
           visible={sidebarVisible}
+          railMode={sidebarRailMode}
+          peekDrawerHandlers={sidebarPeekDrawerHandlers}
+          peekDrawerRef={sidebarPeekDrawerRef}
+          peekState={sidebarPeekState}
+          peekTriggerHandlers={sidebarPeekTriggerHandlers}
           version={version}
           width={sidebarWidth}
         />
