@@ -22,9 +22,9 @@
   ],
   "scripts": {
     "clean": "node scripts/clean-dist.mjs",
-    "build": "pnpm build:cli && pnpm build:desktop",
+    "build": "pnpm build:desktop",
     "build:cli": "node scripts/clean-dist.mjs && tsc -p tsconfig.json",
-    "build:desktop": "electron-vite build",
+    "build:desktop": "pnpm build:cli && electron-vite build",
     "desktop:dev": "pnpm desktop:prepare && electron-vite dev",
     "desktop:prepare": "pnpm exec install-electron --no && pnpm exec electron-rebuild -w node-pty",
     "desktop:preview": "electron-vite preview",
@@ -32,7 +32,7 @@
     "desktop:dist": "pnpm build:desktop && electron-builder --mac dmg zip --publish never",
     "dev": "node --import tsx src/cli/index.ts",
     "lint": "eslint electron.vite.config.ts scripts src tests",
-    "test": "tsx tests/agent-core.test.ts && tsx tests/native-agent.test.ts && tsx tests/tools-scheduler.test.ts && tsx tests/tool-cancellation.test.ts && tsx tests/file-tools.test.ts && tsx tests/managed-process.test.ts && tsx tests/completion-gate.test.ts && tsx tests/completion-state.test.ts && tsx tests/tool-coordinator.test.ts && tsx tests/ai-capabilities.test.ts && tsx tests/permission.test.ts && tsx tests/workspace-path.test.ts && tsx tests/session-replay.test.ts && tsx tests/tool-result-archive.test.ts && tsx tests/tui-transcript.test.ts && tsx tests/config.test.ts && tsx tests/desktop.test.ts && tsx tests/context.test.ts && tsx tests/extensions.test.ts && tsx tests/named-agents-memory.test.ts && tsx tests/cookie-jar.test.ts && tsx tests/web-search.test.ts && tsx tests/web-fetch.test.ts && tsx tests/todo-plan.test.ts && tsx tests/diagnostics.test.ts && tsx tests/checkpoint.test.ts && tsx tests/sandbox.test.ts && tsx tests/hooks.test.ts && tsx tests/evals.test.ts && tsx tests/run-command.test.ts && tsx tests/turn-resume.test.ts && tsx tests/session-fork.test.ts && tsx tests/session-limits.test.ts && tsx tests/subagent-runtime.test.ts && tsx tests/session-lease.test.ts && tsx tests/acceptance-verifier.test.ts && tsx tests/execution-service.test.ts && tsx tests/cli-sigint.test.ts",
+    "test": "tsx tests/agent-core.test.ts && tsx tests/native-agent.test.ts && tsx tests/tools-scheduler.test.ts && tsx tests/tool-cancellation.test.ts && tsx tests/file-tools.test.ts && tsx tests/managed-process.test.ts && tsx tests/completion-gate.test.ts && tsx tests/completion-state.test.ts && tsx tests/tool-coordinator.test.ts && tsx tests/ai-capabilities.test.ts && tsx tests/permission.test.ts && tsx tests/workspace-path.test.ts && tsx tests/session-replay.test.ts && tsx tests/session-catalog.test.ts && tsx tests/session-run-ledger.test.ts && tsx tests/session-cleanup.test.ts && tsx tests/runtime-host.test.ts && tsx tests/tool-result-archive.test.ts && tsx tests/tui-transcript.test.ts && tsx tests/config.test.ts && tsx tests/desktop.test.ts && tsx tests/context.test.ts && tsx tests/extensions.test.ts && tsx tests/named-agents-memory.test.ts && tsx tests/cookie-jar.test.ts && tsx tests/web-search.test.ts && tsx tests/web-fetch.test.ts && tsx tests/todo-plan.test.ts && tsx tests/diagnostics.test.ts && tsx tests/checkpoint.test.ts && tsx tests/sandbox.test.ts && tsx tests/hooks.test.ts && tsx tests/evals.test.ts && tsx tests/run-command.test.ts && tsx tests/turn-resume.test.ts && tsx tests/session-fork.test.ts && tsx tests/session-limits.test.ts && tsx tests/subagent-runtime.test.ts && tsx tests/session-lease.test.ts && tsx tests/acceptance-verifier.test.ts && tsx tests/execution-service.test.ts && tsx tests/cli-sigint.test.ts",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.desktop.json",
     "start": "node dist/cli/index.js",
     "prepack": "pnpm build:cli"
@@ -52,6 +52,7 @@
     "react-dom": "^19.2.8",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
+    "thinking-orbs": "0.2.0",
     "yaml": "^2.8.1",
     "zod": "^3.25.76"
   },

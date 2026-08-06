@@ -6,6 +6,7 @@ directories:
   buildResources: build
 files:
   - out/**/*
+  - dist/**/*
   - package.json
 mac:
   category: public.app-category.developer-tools
