@@ -85,11 +85,20 @@ harbor run \
 
 ## 数据与会话
 
-会话和 Memory 按项目保存在 `~/.biny/agent/`，附件与工具结果归档在项目 `.biny/`。`biny sessions` 可列出会话，`biny resume latest` 可打开最近会话；Desktop、TUI 和 CLI 使用同一份历史。
+会话和 Memory 按项目保存在 `~/.biny/agent/`，附件与工具结果归档在项目 `.biny/`。会话正文仍是 JSONL；分支关系与标题、归档、未读等列表元数据保存在同项目的 catalog，运行状态保存在 run ledger，在途回合断点保存在 turnStore。`biny resume latest` 可恢复最近会话，Desktop 的“继续运行”会沿用断点和已完成工具步骤。
+
+`biny sessions` 默认列出第一页；需要机器读取或继续翻页时使用 `--json`、`--limit <count>` 和返回的 `--cursor <cursor>`，`--parent <session-id>` 可只查看某个会话的直接分支。Desktop 侧栏首屏加载根会话，展开父会话时再按页加载子节点。Desktop、TUI 和 CLI 使用同一份历史；复制、编辑重发和 fork 会保留父会话关系，删除会话会同步清理正文、catalog、断点和 run ledger。
+
+Desktop、TUI 和 `biny plan` 运行同一项目时，会通过本地 Unix socket attach 到同一个独立 Runtime Host，共享实时事件、权限请求和断点恢复；没有 owner 时会按项目自动启动 Host。一端退出不会复制出第二个 AgentSession。已有 Host 时，未带临时配置覆盖的 `biny run` 也会直接 attach。
+
+桌面端切换模型时，如果发现驻留 Host 是旧版本且当前项目处于空闲状态，会自动替换 owner 并重试请求；运行中的任务不会被强制重启。
+
+需要手动托管 owner 时可运行 `biny runtime-host --workspace-root <workspace> --persistence-root <data-root>`；通常不需要手动启动。
 
 ## 当前边界
 
 - 项目仍在持续开发，部分桌面端入口和扩展能力会继续调整。
+- 带 `--model`、步数、权限或 `--headless` 覆盖的 `biny run` 仍使用独立的一次性 runtime，不修改共享 Host。
 - 本地构建不签名、不公证；公开发布需要单独配置 macOS signing / notarization。
 - 暂无语音输入和实时语音对话。
 
