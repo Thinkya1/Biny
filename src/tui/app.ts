@@ -24,9 +24,17 @@ import { forkSession } from "../session/fork.js";
 import { executeRuntimeCommand } from "../runtime/commands.js";
 import {
   createInteractiveAgentHost,
-  type InteractiveAgentRuntime
+  type InteractiveRuntimeHandle
 } from "../runtime/InteractiveAgentRuntime.js";
 import type { CommandRuntime } from "../runtime/CommandRuntime.js";
+import {
+  connectOrSpawnRuntimeHost,
+  findLatestInterruptedSession,
+  startRuntimeHost,
+  RuntimeHostClient,
+  type RuntimeHostFactory,
+  type RuntimeHostServer
+} from "../runtime/RuntimeHost.js";
 import {
   isTerminalRunEvent,
   pendingPermission,
@@ -82,8 +90,9 @@ export class BinyTui {
   private readonly initialSession: string | undefined;
 
   private state: TuiState;
-  private runtime: InteractiveAgentRuntime | undefined;
+  private runtime: InteractiveRuntimeHandle | undefined;
   private commands: CommandRuntime | undefined;
+  private runtimeHost: RuntimeHostServer | undefined;
   private runtimeSnapshot: InteractiveRuntimeSnapshot | undefined;
 
   private readonly headerContainer = new Container();
@@ -169,7 +178,51 @@ export class BinyTui {
 
   private async startRuntime(): Promise<void> {
     try {
-      const { runtime, commands } = await createInteractiveAgentHost(this.workspaceRoot);
+      let attached: RuntimeHostClient | undefined;
+      try {
+        attached = await connectOrSpawnRuntimeHost(this.workspaceRoot, {
+          workspaceRoot: this.workspaceRoot,
+          sessionId: this.initialSession,
+          resumeInterrupted: true,
+          clientId: `tui-${process.pid}`,
+          surface: "tui"
+        });
+      } catch {
+        // 无配置或独立 Host 启动失败时，保留当前进程内的最小 fallback。
+      }
+      let runtime: InteractiveRuntimeHandle;
+      let commands: CommandRuntime | undefined;
+      if (attached) {
+        runtime = attached;
+      } else {
+        const selectedSession = this.initialSession ?? await findLatestInterruptedSession(this.workspaceRoot);
+        const createLocalRuntime: RuntimeHostFactory = async (sessionId?: string) => {
+          const local = await createInteractiveAgentHost(this.workspaceRoot);
+          if (sessionId !== undefined) await local.runtime.resumeSession(sessionId);
+          return local;
+        };
+        const local = await createLocalRuntime(selectedSession);
+        runtime = local.runtime;
+        commands = local.commands;
+        try {
+          this.runtimeHost = await startRuntimeHost(this.workspaceRoot, runtime, commands, {
+            createRuntime: createLocalRuntime,
+            resumeInterrupted: true
+          });
+        } catch (error) {
+          await runtime.close();
+          const retry = await connectOrSpawnRuntimeHost(this.workspaceRoot, {
+            workspaceRoot: this.workspaceRoot,
+            sessionId: this.initialSession,
+            resumeInterrupted: true,
+            clientId: `tui-${process.pid}`,
+            surface: "tui"
+          });
+          if (!retry) throw error;
+          runtime = retry;
+          commands = undefined;
+        }
+      }
       this.runtime = runtime;
       this.commands = commands;
       this.runtimeSnapshot = runtime.getSnapshot();
@@ -177,7 +230,10 @@ export class BinyTui {
       this.permissionMode = permissionMode;
       this.thinking = info.thinking;
       // 补全器要的是不带斜杠的命令名，它自己会补上 `/`；带斜杠会补出 `//resume`。
-      this.setAutocompleteProvider(commands.listSkills(), info.workspaceRoot);
+      const skills = commands
+        ? commands.listSkills()
+        : await requireRemoteRuntime(runtime).listSkills();
+      this.setAutocompleteProvider(skills, info.workspaceRoot);
       this.editor.borderColor = theme.thinkingBorder(this.thinking);
 
       void readGitBranch(info.workspaceRoot).then((branch) => {
@@ -208,7 +264,9 @@ export class BinyTui {
         modelLabel: info.modelLabel,
         reasoningLabel: info.reasoningLabel
       });
-      if (this.initialSession) await this.resumeSession(this.initialSession);
+      // 独立 Host 可能已经在启动阶段续跑了显式 session；运行中不能再次 resume，避免把
+      // 正在恢复的 turn 误判成普通会话切换。
+      if (this.initialSession && !runtimeIsBusy(this.runtimeSnapshot)) await this.resumeSession(this.initialSession);
       void this.refreshContextUsage();
     } catch (error) {
       this.notify(`TUI startup failed: ${describeError(error)}`);
@@ -269,9 +327,12 @@ export class BinyTui {
   }
 
   private async refreshContextUsage(): Promise<void> {
-    if (!this.commands) return;
+    const runtime = this.runtime;
+    if (!runtime) return;
     try {
-      const context = await this.commands.agent.contextStatus();
+      const context = this.commands
+        ? await this.commands.agent.contextStatus()
+        : await requireRemoteRuntime(runtime).contextStatus();
       // 百分比按模型自身的上下文窗口算；没有窗口信息时才退回输入预算。
       this.contextUsage = {
         usedTokens: context.budget.usedTokens,
@@ -305,10 +366,12 @@ export class BinyTui {
     void appendInputHistory(this.workspaceRoot, prompt)
       .catch((error) => this.notify(`写入输入历史失败：${describeError(error)}`));
 
-    if (value.startsWith("/skill:") && runtime && commands) {
+    if (value.startsWith("/skill:") && runtime) {
       try {
         // 与 Pi 一致：补全只显示元数据，按 Enter 后才读取并注入 Skill 正文。
-        const expandedPrompt = await commands.expandSkillCommand(value);
+        const expandedPrompt = commands
+          ? await commands.expandSkillCommand(value)
+          : await requireRemoteRuntime(runtime).expandSkillCommand(value);
         const input = withAttachmentReferences(expandedPrompt, attachments);
         if (runtimeIsBusy(this.runtimeSnapshot)) {
           runtime.followUp(input, attachments);
@@ -413,14 +476,16 @@ export class BinyTui {
   private async steerCurrentInput(): Promise<void> {
     const runtime = this.runtime;
     const commands = this.commands;
-    if (!runtime || !commands) return;
+    if (!runtime) return;
     const value = this.editor.getText().trim();
     if (!value && !this.pendingAttachments.length) return;
     const prompt = value || "请分析这个附件。";
     const attachments = this.pendingAttachments;
     try {
       const expandedPrompt = value.startsWith("/skill:")
-        ? await commands.expandSkillCommand(value)
+        ? commands
+          ? await commands.expandSkillCommand(value)
+          : await requireRemoteRuntime(runtime).expandSkillCommand(value)
         : prompt;
       runtime.steer(withAttachmentReferences(expandedPrompt, attachments), attachments);
       this.setPendingAttachments([]);
@@ -577,7 +642,7 @@ export class BinyTui {
   private async handleSlashCommand(value: string): Promise<void> {
     const runtime = this.runtime;
     const commands = this.commands;
-    if (!runtime || !commands) return;
+    if (!runtime) return;
     // 容忍多打的斜杠：`//resume` 只可能是想写 `/resume`。
     const [command = "", ...args] = value.trim().replace(/^\/+/, "/").split(/\s+/);
 
@@ -632,7 +697,7 @@ export class BinyTui {
         return;
       }
       const forked = await forkSession(
-        commands.persistenceRoot,
+        commands?.persistenceRoot ?? this.workspaceRoot,
         args[0],
         upTo === undefined ? {} : { upToEvent: upTo }
       );
@@ -645,19 +710,21 @@ export class BinyTui {
         this.showPermissionModePicker();
         return;
       }
-      this.showTextViewer(
-        "Permissions",
-        await runtime.runExclusiveOperation(
+      const result = commands
+        ? await runtime.runExclusiveOperation(
           "permission",
           async () => await commands.agent.runPermissionCommand(args)
         )
-      );
+        : await requireRemoteRuntime(runtime).runPermissionCommand(args);
+      this.showTextViewer("Permissions", result);
       this.permissionMode = runtime.getSnapshot().permissionMode;
       this.refreshChrome();
       return;
     }
 
-    const sharedResult = await executeRuntimeCommand(runtime, commands, value, "tui");
+    const sharedResult = commands
+      ? await executeRuntimeCommand(runtime, commands, value, "tui")
+      : await requireRemoteRuntime(runtime).executeCommand(value, "tui");
     if (sharedResult) {
       this.showTextViewer(sharedResult.title, sharedResult.content);
       if (command === "/compact") await this.refreshContextUsage();
@@ -671,18 +738,24 @@ export class BinyTui {
   private async handleModelCommand(args: string[]): Promise<void> {
     const runtime = this.runtime;
     const commands = this.commands;
-    if (!runtime || !commands) return;
+    if (!runtime) return;
     if (args[0]) {
       await this.applyModel(args[0], parseThinkingSelection(args[1]));
       return;
     }
-    await runtime.runExclusiveOperation(
-      "refresh_model",
-      async () => await commands.agent.refreshModelFromDisk()
-    );
+    if (commands) {
+      await runtime.runExclusiveOperation(
+        "refresh_model",
+        async () => await commands.agent.refreshModelFromDisk()
+      );
+    } else {
+      await requireRemoteRuntime(runtime).refreshModel();
+    }
     // /model 只读取配置和已恢复的目录缓存，不能因为远程目录请求阻塞模型选择。
     const info = runtime.getSnapshot().info;
-    const models = commands.agent.listModels();
+    const models = commands
+      ? commands.agent.listModels()
+      : await requireRemoteRuntime(runtime).listModels();
     this.showSelect({
       title: "Select model",
       hint: "↑↓ navigate · enter select · esc cancel",
@@ -701,8 +774,11 @@ export class BinyTui {
   private async selectModel(alias: string): Promise<void> {
     const runtime = this.runtime;
     const commands = this.commands;
-    if (!runtime || !commands) return;
-    const model = commands.agent.listModels().find((candidate) => candidate.alias === alias);
+    if (!runtime) return;
+    const models = commands
+      ? commands.agent.listModels()
+      : await requireRemoteRuntime(runtime).listModels();
+    const model = models.find((candidate) => candidate.alias === alias);
     if (!model) {
       this.showTextViewer("Model", `Unknown model alias: ${alias}`);
       return;
@@ -735,12 +811,14 @@ export class BinyTui {
   private async applyModel(alias: string, thinking?: ThinkingSelection): Promise<void> {
     const runtime = this.runtime;
     const commands = this.commands;
-    if (!runtime || !commands) return;
+    if (!runtime) return;
     try {
-      const info = await runtime.runExclusiveOperation(
-        "switch_model",
-        async () => await commands.agent.switchModel(alias, thinking)
-      );
+      const info = commands
+        ? await runtime.runExclusiveOperation(
+          "switch_model",
+          async () => await commands.agent.switchModel(alias, thinking)
+        )
+        : await requireRemoteRuntime(runtime).switchModel(alias, thinking);
       this.dispatch({
         type: "model.changed",
         provider: info.provider,
@@ -774,19 +852,26 @@ export class BinyTui {
   private async applyPermissionMode(mode: PermissionMode): Promise<void> {
     const runtime = this.runtime;
     const commands = this.commands;
-    if (!runtime || !commands) return;
-    await runtime.runExclusiveOperation(
-      "permission",
-      async () => await commands.agent.setPermissionMode(mode)
-    );
+    if (!runtime) return;
+    if (commands) {
+      await runtime.runExclusiveOperation(
+        "permission",
+        async () => await commands.agent.setPermissionMode(mode)
+      );
+    } else {
+      await requireRemoteRuntime(runtime).setPermissionMode(mode);
+    }
     this.permissionMode = mode;
     this.notify(formatPermissionModeChanged(mode));
   }
 
   private async showSessionPicker(): Promise<void> {
     const commands = this.commands;
-    if (!commands) return;
-    const summaries = (await commands.agent.listSessions())
+    const runtime = this.runtime;
+    if (!runtime) return;
+    const summaries = (await (commands
+      ? commands.agent.listSessions()
+      : requireRemoteRuntime(runtime).listSessions()))
       .filter((summary) => summary.firstUserMessage.trim())
       .slice();
     if (!summaries.length) {
@@ -843,6 +928,7 @@ export class BinyTui {
     if (this.runtime) {
       const info = this.runtime.getSnapshot().info;
       this.exitSummary = { sessionId: info.sessionId, sessionFile: info.sessionFile };
+      await this.runtimeHost?.close();
       await this.runtime.close();
     }
     this.ui.stop();
@@ -870,6 +956,11 @@ function sessionLabel(summary: SessionSummary, nowMs: number): string {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function requireRemoteRuntime(runtime: InteractiveRuntimeHandle): RuntimeHostClient {
+  if (!(runtime instanceof RuntimeHostClient)) throw new Error("Remote runtime client is unavailable.");
+  return runtime;
 }
 
 export function runtimeStatus(snapshot: InteractiveRuntimeSnapshot | undefined): TuiStatus {
