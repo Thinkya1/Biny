@@ -15,6 +15,7 @@ import { defaultConfig } from "../src/config/schema.js";
 import type { CommandRuntime } from "../src/runtime/CommandRuntime.js";
 import { ExecutionService } from "../src/runtime/ExecutionService.js";
 import { InteractiveAgentRuntime } from "../src/runtime/InteractiveAgentRuntime.js";
+import { SessionRunLedger } from "../src/session/runLedger.js";
 
 await testChatUsesOrdinaryAgentLoop();
 await testNaturalLanguageNeverSelectsAnotherExecutionFramework();
@@ -205,6 +206,9 @@ async function testExecutionUsesPromptBoundary(): Promise<void> {
     });
     assert.equal(result.turn.output, "prompt boundary");
     assert.equal(promptCalls, 1);
+    const run = await new SessionRunLedger(root).latestSessionRun("session-1");
+    assert.equal(run?.runId, result.runId);
+    assert.equal(run?.status, "completed");
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

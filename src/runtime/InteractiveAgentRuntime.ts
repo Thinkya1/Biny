@@ -9,6 +9,7 @@ import { redactSecrets, redactSensitiveValue } from "../utils/secrets.js";
 import { AgentEventBus } from "./AgentEventBus.js";
 import { createCommandRuntime, type CommandRuntime, type CommandRuntimeOptions } from "./CommandRuntime.js";
 import { resolveSessionFile, sessionIdFromFile } from "../session/store.js";
+import { SessionRunLedger, type FinishSessionRunOptions } from "../session/runLedger.js";
 import { SessionLeaseStore, type SessionLease } from "./SessionLease.js";
 import type {
   ActiveRunSnapshot,
@@ -28,6 +29,15 @@ export interface SubmittedAgentRun {
   completion: Promise<AgentRunOutcome>;
 }
 
+/**
+ * 跨进程客户端预先分配的回合标识。这样 Host 接受请求后仍能返回稳定的
+ * `runId`/`messageId`，客户端不需要先等待一轮 RPC 才能更新界面。
+ */
+export interface RuntimeRequestIds {
+  runId?: string;
+  messageId?: string;
+}
+
 export interface QueuedAgentMessage {
   runId: string;
   messageId: string;
@@ -43,11 +53,36 @@ export interface InteractiveAgentRuntimeOptions {
   shutdownDrainMs?: number;
   /** 由 composition root 注入；测试可省略跨进程租约。 */
   sessionLeases?: SessionLeaseStore;
+  /** 运行 ledger 可注入，未提供时由真实 CommandRuntime 的 persistenceRoot 创建。 */
+  runLedger?: SessionRunLedger;
 }
 
 export interface InteractiveAgentHost {
   runtime: InteractiveAgentRuntime;
   commands: CommandRuntime;
+}
+
+/** Desktop、TUI 和 Unix socket 客户端共享的最小交互运行时形状。 */
+export interface InteractiveRuntimeHandle {
+  submitPrompt(input: string, mode?: AgentRunMode, attachments?: AgentAttachment[], requestIds?: RuntimeRequestIds): SubmittedAgentRun;
+  steer(input: string, attachments?: AgentAttachment[], requestIds?: RuntimeRequestIds): QueuedAgentMessage;
+  followUp(input: string, attachments?: AgentAttachment[], requestIds?: RuntimeRequestIds): QueuedAgentMessage;
+  continueInterruptedTurn(): Promise<AgentRunOutcome | undefined>;
+  startInterruptedTurn(requestIds?: RuntimeRequestIds): Promise<SubmittedAgentRun | undefined>;
+  waitForIdle(): Promise<void>;
+  cancelCurrentRun(): void;
+  cancelRun(runId: string): boolean;
+  answerPermission(requestId: string, result: PermissionResult): void;
+  resumeSession(session: string): Promise<ResumedAgentSession>;
+  runExclusiveOperation<T>(operation: RuntimeOperation, execute: (signal: AbortSignal) => Promise<T>): Promise<T>;
+  startBackgroundOperation<T extends { completion: Promise<unknown> }>(
+    operation: RuntimeOperation,
+    start: (signal: AbortSignal) => T
+  ): T;
+  compactConversation(hint?: string): Promise<string>;
+  getSnapshot(): InteractiveRuntimeSnapshot;
+  subscribe(listener: (update: AgentRuntimeUpdate) => void): () => void;
+  close(): Promise<void>;
 }
 
 interface BackgroundOperation {
@@ -82,6 +117,7 @@ export class InteractiveAgentRuntime {
   private static readonly defaultShutdownDrainMs = 2_000;
   private readonly updates = new AgentEventBus<AgentRuntimeUpdate>();
   private readonly sessionLeases: SessionLeaseStore | undefined;
+  private readonly runLedger: SessionRunLedger | undefined;
   private sessionLease: SessionLease | undefined;
   private lastInfo: AgentSessionInfo | undefined;
   private state: InteractiveRunState = { kind: "idle" };
@@ -107,6 +143,10 @@ export class InteractiveAgentRuntime {
       throw new Error("shutdownDrainMs must be a non-negative safe integer.");
     }
     this.sessionLeases = options.sessionLeases;
+    this.runLedger = options.runLedger
+      ?? (typeof commandRuntime.persistenceRoot === "string"
+        ? new SessionRunLedger(commandRuntime.persistenceRoot)
+        : undefined);
   }
 
   private getInfo(): AgentSessionInfo {
@@ -115,47 +155,60 @@ export class InteractiveAgentRuntime {
     return info;
   }
 
-  submitPrompt(input: string, mode: AgentRunMode = "chat", attachments: AgentAttachment[] = []): SubmittedAgentRun {
-    return this.startRun(input, mode, attachments, false);
+  submitPrompt(
+    input: string,
+    mode: AgentRunMode = "chat",
+    attachments: AgentAttachment[] = [],
+    requestIds?: RuntimeRequestIds
+  ): SubmittedAgentRun {
+    return this.startRun(input, mode, attachments, false, requestIds);
   }
 
-  steer(input: string, attachments: AgentAttachment[] = []): QueuedAgentMessage {
-    return this.queueMessage(input, attachments, "steer");
+  steer(input: string, attachments: AgentAttachment[] = [], requestIds?: RuntimeRequestIds): QueuedAgentMessage {
+    return this.queueMessage(input, attachments, "steer", requestIds);
   }
 
-  followUp(input: string, attachments: AgentAttachment[] = []): QueuedAgentMessage {
-    return this.queueMessage(input, attachments, "followUp");
+  followUp(input: string, attachments: AgentAttachment[] = [], requestIds?: RuntimeRequestIds): QueuedAgentMessage {
+    return this.queueMessage(input, attachments, "followUp", requestIds);
   }
 
   private queueMessage(
     input: string,
     attachments: AgentAttachment[],
-    delivery: "steer" | "followUp"
+    delivery: "steer" | "followUp",
+    requestIds?: RuntimeRequestIds
   ): QueuedAgentMessage {
     if (this.closed) throw new Error("Agent runtime is closed.");
     const run = this.activeRun;
     if (!run || this.state.kind !== "runs") throw new Error("There is no active run to receive a queued message.");
     if (!input.trim() && !attachments.length) throw new Error("Queued message cannot be empty.");
-    const messageId = randomUUID();
+    const messageId = requestIds?.messageId ?? randomUUID();
     if (delivery === "steer") this.commandRuntime.agent.queueSteering(messageId, input, attachments);
     else this.commandRuntime.agent.queueFollowUp(messageId, input, attachments);
     return { runId: run.runId, messageId, delivery };
   }
 
   async continueInterruptedTurn(): Promise<AgentRunOutcome | undefined> {
+    const submitted = await this.startInterruptedTurn();
+    return submitted?.completion;
+  }
+
+  /** 只启动持久化断点恢复，返回句柄让 Desktop/TUI 保持流式事件通道。 */
+  async startInterruptedTurn(requestIds?: RuntimeRequestIds): Promise<SubmittedAgentRun | undefined> {
     if (this.state.kind !== "idle" || this.activeRun) {
       throw new Error("Cannot continue an interrupted turn while the runtime is busy.");
     }
     const interrupted = await this.commandRuntime.agent.interruptedTurn();
     if (!interrupted) return undefined;
-    return await this.startRun(interrupted.prompt, "chat", [], true).completion;
+    return this.startRun(interrupted.prompt, "chat", [], true, requestIds);
   }
 
   private startRun(
     input: string,
     mode: AgentRunMode,
     attachments: AgentAttachment[],
-    continuation: boolean
+    continuation: boolean,
+    requestIds?: RuntimeRequestIds
   ): SubmittedAgentRun {
     if (this.closed) throw new Error("Agent runtime is closed.");
     if (this.state.kind === "maintenance") {
@@ -169,8 +222,8 @@ export class InteractiveAgentRuntime {
     // vision/audio 错误，避免用户粘贴的内容在失败时从会话历史里消失。
     const sessionId = this.getInfo().sessionId;
     this.acquireSessionLease(sessionId);
-    const runId = randomUUID();
-    const messageId = randomUUID();
+    const runId = requestIds?.runId ?? randomUUID();
+    const messageId = requestIds?.messageId ?? randomUUID();
     const startedAtMs = Date.now();
     const run: AgentRun = {
       sessionId,
@@ -447,12 +500,12 @@ export class InteractiveAgentRuntime {
     this.sessionLease = undefined;
   }
 
-  private failUncaughtRun(run: AgentRun, error: unknown): AgentRunOutcome {
+  private async failUncaughtRun(run: AgentRun, error: unknown): Promise<AgentRunOutcome> {
     const message = redactSecrets(error instanceof Error ? error.message : String(error));
     const durationMs = Math.max(0, Date.now() - run.startedAtMs);
     run.status = "failed";
     this.emit({ ...this.eventBase(run), type: "run.failed", durationMs, error: message });
-    return {
+    const outcome: AgentRunOutcome = {
       runId: run.runId,
       status: "failed",
       stopReason: "provider_error",
@@ -461,11 +514,34 @@ export class InteractiveAgentRuntime {
       durationMs,
       error: message
     };
+    await this.finishRunLedger(run, {
+      status: "failed",
+      durationMs,
+      stopReason: outcome.stopReason,
+      steps: outcome.steps,
+      error: message
+    });
+    return outcome;
+  }
+
+  private async startRunLedger(run: AgentRun): Promise<void> {
+    await this.runLedger?.start({
+      runId: run.runId,
+      sessionId: run.sessionId,
+      messageId: run.messageId,
+      runtimeId: this.sessionLeases?.runtimeId,
+      startedAt: run.startedAt
+    }).catch(() => undefined);
+  }
+
+  private async finishRunLedger(run: ActiveRunSnapshot, options: FinishSessionRunOptions): Promise<void> {
+    await this.runLedger?.finish(run.runId, options).catch(() => undefined);
   }
 
   private async executeRun(run: AgentRun, signal: AbortSignal): Promise<AgentRunOutcome> {
     const agent = this.commandRuntime.agent;
     const startedAtMs = Date.now();
+    await this.startRunLedger(run);
     await this.commandRuntime.refreshSkills();
     const info = this.getInfo();
     run.sessionId = info.sessionId;
@@ -562,7 +638,7 @@ export class InteractiveAgentRuntime {
     }
   }
 
-  private completeRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): AgentRunOutcome {
+  private async completeRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): Promise<AgentRunOutcome> {
     run.status = "completed";
     this.emit({
       ...this.eventBase(run),
@@ -573,10 +649,18 @@ export class InteractiveAgentRuntime {
       steps: turn.steps,
       usage: turn.usage
     });
-    return { runId: run.runId, durationMs, ...turn };
+    const outcome = { runId: run.runId, durationMs, ...turn };
+    await this.finishRunLedger(run, {
+      status: "completed",
+      durationMs,
+      stopReason: turn.stopReason,
+      finishReason: turn.finishReason,
+      steps: turn.steps
+    });
+    return outcome;
   }
 
-  private incompleteRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): AgentRunOutcome {
+  private async incompleteRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): Promise<AgentRunOutcome> {
     const reason = turn.error ?? incompleteReason(turn);
     run.status = "incomplete";
     this.emit({
@@ -590,10 +674,20 @@ export class InteractiveAgentRuntime {
       steps: turn.steps,
       usage: turn.usage
     });
-    return { runId: run.runId, durationMs, ...turn, error: turn.error ?? redactSecrets(reason) };
+    const outcome = { runId: run.runId, durationMs, ...turn, error: turn.error ?? redactSecrets(reason) };
+    await this.finishRunLedger(run, {
+      status: "incomplete",
+      durationMs,
+      stopReason: turn.stopReason,
+      finishReason: turn.finishReason,
+      steps: turn.steps,
+      resumable: turn.resumable,
+      error: outcome.error
+    });
+    return outcome;
   }
 
-  private blockRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): AgentRunOutcome {
+  private async blockRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): Promise<AgentRunOutcome> {
     const summary = redactSecrets(turn.error ?? "The current task is blocked.");
     const requiredAction = turn.requiredAction === undefined ? undefined : redactSecrets(turn.requiredAction);
     run.status = "blocked";
@@ -611,21 +705,33 @@ export class InteractiveAgentRuntime {
       steps: turn.steps,
       usage: turn.usage
     });
-    return {
+    const outcome = {
       runId: run.runId,
       durationMs,
       ...turn,
       error: summary,
       requiredAction
     };
+    await this.finishRunLedger(run, {
+      status: "blocked",
+      durationMs,
+      stopReason: turn.stopReason,
+      finishReason: turn.finishReason,
+      steps: turn.steps,
+      resumable: turn.resumable,
+      blockedReason: normalizeBlockedReason(turn.blockedReason),
+      requiredAction,
+      error: summary
+    });
+    return outcome;
   }
 
-  private cancelledRun(
+  private async cancelledRun(
     run: ActiveRunSnapshot,
     durationMs: number,
     reason: string,
     turn?: AgentTurnOutcome
-  ): AgentRunOutcome {
+  ): Promise<AgentRunOutcome> {
     const publicReason = redactSecrets(reason);
     run.status = "cancelled";
     this.emit({
@@ -638,7 +744,7 @@ export class InteractiveAgentRuntime {
       steps: turn?.steps ?? 0,
       usage: turn?.usage
     });
-    return {
+    const outcome: AgentRunOutcome = {
       runId: run.runId,
       status: "cancelled",
       stopReason: "cancelled",
@@ -649,14 +755,23 @@ export class InteractiveAgentRuntime {
       usage: turn?.usage,
       error: publicReason
     };
+    await this.finishRunLedger(run, {
+      status: "cancelled",
+      durationMs,
+      stopReason: turn?.stopReason ?? "cancelled",
+      finishReason: turn?.finishReason,
+      steps: turn?.steps ?? 0,
+      error: publicReason
+    });
+    return outcome;
   }
 
-  private abortRun(
+  private async abortRun(
     run: ActiveRunSnapshot,
     durationMs: number,
     reason: string,
     turn?: AgentTurnOutcome
-  ): AgentRunOutcome {
+  ): Promise<AgentRunOutcome> {
     const publicReason = redactSecrets(reason);
     run.status = "aborted";
     this.emit({
@@ -668,7 +783,7 @@ export class InteractiveAgentRuntime {
       finishReason: turn?.finishReason,
       steps: turn?.steps ?? 0
     });
-    return {
+    const outcome: AgentRunOutcome = {
       runId: run.runId,
       status: "aborted",
       stopReason: "aborted",
@@ -679,14 +794,23 @@ export class InteractiveAgentRuntime {
       usage: turn?.usage,
       error: publicReason
     };
+    await this.finishRunLedger(run, {
+      status: "aborted",
+      durationMs,
+      stopReason: turn?.stopReason ?? "aborted",
+      finishReason: turn?.finishReason,
+      steps: turn?.steps ?? 0,
+      error: publicReason
+    });
+    return outcome;
   }
 
-  private failRun(
+  private async failRun(
     run: ActiveRunSnapshot,
     durationMs: number,
     error: string,
     turn?: AgentTurnOutcome
-  ): AgentRunOutcome {
+  ): Promise<AgentRunOutcome> {
     const publicError = redactSecrets(error);
     run.status = "failed";
     this.emit({
@@ -698,7 +822,7 @@ export class InteractiveAgentRuntime {
       finishReason: turn?.finishReason,
       steps: turn?.steps ?? 0
     });
-    return {
+    const outcome: AgentRunOutcome = {
       runId: run.runId,
       status: "failed",
       stopReason: turn?.stopReason ?? "provider_error",
@@ -709,6 +833,15 @@ export class InteractiveAgentRuntime {
       usage: turn?.usage,
       error: publicError
     };
+    await this.finishRunLedger(run, {
+      status: "failed",
+      durationMs,
+      stopReason: turn?.stopReason ?? "provider_error",
+      finishReason: turn?.finishReason,
+      steps: turn?.steps ?? 0,
+      error: publicError
+    });
+    return outcome;
   }
 
   private handleAgentEvent(

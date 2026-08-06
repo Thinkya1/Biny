@@ -10,7 +10,7 @@ import { redactSecrets } from "../utils/secrets.js";
 import { formatSubagentTaskReport } from "./subagentTaskReport.js";
 import { formatStatusReport } from "./statusReport.js";
 import type { CommandRuntime } from "./CommandRuntime.js";
-import type { InteractiveAgentRuntime } from "./InteractiveAgentRuntime.js";
+import type { InteractiveRuntimeHandle } from "./InteractiveAgentRuntime.js";
 import type { CommandSurface } from "./commandRegistry.js";
 
 export interface RuntimeCommandResult {
@@ -23,7 +23,7 @@ export interface RuntimeCommandResult {
  * 执行不依赖具体界面布局的命令。返回 undefined 表示该命令应由前端本地处理。
  */
 export async function executeRuntimeCommand(
-  runtime: InteractiveAgentRuntime,
+  runtime: InteractiveRuntimeHandle,
   services: CommandRuntime,
   input: string,
   source: CommandSurface
@@ -103,7 +103,7 @@ export async function executeRuntimeCommand(
 }
 
 async function executeSubagentCommand(
-  runtime: InteractiveAgentRuntime,
+  runtime: InteractiveRuntimeHandle,
   services: CommandRuntime,
   command: string,
   args: string[],
@@ -142,7 +142,7 @@ async function executeSubagentCommand(
 }
 
 async function runForegroundSubagent(
-  runtime: InteractiveAgentRuntime,
+  runtime: InteractiveRuntimeHandle,
   services: CommandRuntime,
   task: string
 ): Promise<string> {
