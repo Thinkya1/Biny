@@ -15,6 +15,7 @@ import { createSessionFile, resolveSessionFile, sessionIdFromFile } from "./stor
 import { createSessionId } from "./recorder.js";
 import { readStoredSessionEvents } from "./events.js";
 import type { SessionEvent } from "./recorder.js";
+import { registerSessionBranch } from "./catalog.js";
 
 export interface ForkSessionOptions {
   /** 保留前 N 条事件；不给则复制整条会话。会向前对齐到安全的截断点。 */
@@ -49,6 +50,11 @@ export async function forkSession(
   const bytes = Buffer.from(`${kept.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
   const sessionId = createSessionId();
   const filePath = await createSessionFile(persistenceRoot, sessionId, bytes);
+  await registerSessionBranch(persistenceRoot, {
+    sessionId,
+    parentSessionId: sessionIdFromFile(sourcePath),
+    branchPoint: { kind: "event", index: kept.length }
+  });
   return { sessionId, filePath, sourceSessionId: sessionIdFromFile(sourcePath), events: kept.length };
 }
 

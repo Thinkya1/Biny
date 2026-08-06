@@ -110,6 +110,11 @@ export class TurnStore {
   }
 }
 
+/** 删除会话对应的在途回合旁路状态，供统一 session 生命周期清理使用。 */
+export async function deleteInterruptedTurn(persistenceRoot: string, sessionId: string): Promise<void> {
+  await new TurnStore(persistenceRoot, sessionId).clear();
+}
+
 function isInterruptedTurn(value: unknown): value is InterruptedTurn {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Partial<InterruptedTurn>;
