@@ -22,9 +22,13 @@ export class BlockedAddressError extends Error {
   }
 }
 
+export type HostnameResolver = (hostname: string) => Promise<string[]>;
+
 export interface AddressPolicy {
   /** 放开私网/环回校验。只应在用户明确为本地服务开启时使用。 */
   allowPrivateNetwork?: boolean;
+  /** 测试可注入确定性解析结果；生产默认使用系统 DNS。 */
+  resolveHostname?: HostnameResolver;
 }
 
 export async function assertFetchableUrl(url: URL, policy: AddressPolicy = {}): Promise<void> {
@@ -39,12 +43,16 @@ export async function assertFetchableUrl(url: URL, policy: AddressPolicy = {}): 
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
   const addresses = net.isIP(hostname)
     ? [hostname]
-    : (await lookup(hostname, { all: true })).map((entry) => entry.address);
+    : await (policy.resolveHostname ?? resolveHostnameWithSystemDns)(hostname);
   if (!addresses.length) throw new BlockedAddressError(`Host did not resolve: ${url.hostname}`);
   for (const address of addresses) {
     const reason = blockedAddressReason(address);
     if (reason) throw new BlockedAddressError(`Refused to fetch ${url.hostname}: it resolves to ${address}, ${reason}.`);
   }
+}
+
+async function resolveHostnameWithSystemDns(hostname: string): Promise<string[]> {
+  return (await lookup(hostname, { all: true })).map((entry) => entry.address);
 }
 
 export function blockedAddressReason(address: string): string | undefined {

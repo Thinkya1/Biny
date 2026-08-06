@@ -9,7 +9,7 @@ import { z } from "zod";
 import type { WebCookiesConfig, WebFetchConfig } from "../../config/schema.js";
 import { ToolAccesses } from "../access.js";
 import type { Tool } from "../types.js";
-import { assertFetchableUrl } from "./addressPolicy.js";
+import { assertFetchableUrl, type HostnameResolver } from "./addressPolicy.js";
 import { cookieHeaderFor, defaultCookieJarPath, readCookieJar, type StoredCookie } from "./cookieJar.js";
 import { htmlTitle, htmlToText } from "./html.js";
 
@@ -35,7 +35,15 @@ export interface WebFetchResult {
   truncatedAtByteLimit: boolean;
 }
 
-export function createWebFetchTool(config?: WebFetchConfig, cookies?: WebCookiesConfig): Tool<WebFetchArgs, WebFetchResult> {
+export interface WebFetchDependencies {
+  resolveHostname?: HostnameResolver;
+}
+
+export function createWebFetchTool(
+  config?: WebFetchConfig,
+  cookies?: WebCookiesConfig,
+  dependencies?: WebFetchDependencies
+): Tool<WebFetchArgs, WebFetchResult> {
   const timeoutMs = config?.timeoutMs ?? 15_000;
   const maxBytes = config?.maxBytes ?? 2 * 1024 * 1024;
   const maxRedirects = config?.maxRedirects ?? 5;
@@ -72,7 +80,14 @@ export function createWebFetchTool(config?: WebFetchConfig, cookies?: WebCookies
         approvalRule: `web_fetch(${target.origin})`,
         async execute({ signal }) {
           const jar = cookieJarPath ? await readCookieJar(cookieJarPath) : [];
-          const fetched = await fetchDocument(target, { timeoutMs, maxBytes, maxRedirects, allowPrivateNetwork, jar }, signal);
+          const fetched = await fetchDocument(target, {
+            timeoutMs,
+            maxBytes,
+            maxRedirects,
+            allowPrivateNetwork,
+            jar,
+            resolveHostname: dependencies?.resolveHostname
+          }, signal);
           const text = isHtml(fetched.contentType) ? htmlToText(fetched.body) : fetched.body;
           const offset = Math.min(args.offset ?? 0, text.length);
           const content = text.slice(offset, offset + (args.length ?? defaultLength));
@@ -99,6 +114,7 @@ interface FetchLimits {
   maxBytes: number;
   maxRedirects: number;
   allowPrivateNetwork: boolean;
+  resolveHostname?: HostnameResolver;
   /** 共享 cookie jar 的内容；每一跳按当跳地址重新匹配，jar 为空即等于不带 cookie。 */
   jar: StoredCookie[];
 }
@@ -125,7 +141,10 @@ async function fetchDocument(url: URL, limits: FetchLimits, signal?: AbortSignal
   try {
     let current = url;
     for (let redirect = 0; redirect <= limits.maxRedirects; redirect += 1) {
-      await assertFetchableUrl(current, { allowPrivateNetwork: limits.allowPrivateNetwork });
+      await assertFetchableUrl(current, {
+        allowPrivateNetwork: limits.allowPrivateNetwork,
+        resolveHostname: limits.resolveHostname
+      });
       const headers: Record<string, string> = {
         accept: "text/html,text/plain,application/json;q=0.9,*/*;q=0.8",
         "user-agent": "Biny/web_fetch"

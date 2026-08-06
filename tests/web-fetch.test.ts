@@ -7,6 +7,19 @@ import { writeCookieJar } from "../src/tools/web/cookieJar.js";
 import { createWebFetchTool, type WebFetchResult } from "../src/tools/web/fetch.js";
 import { htmlTitle, htmlToText } from "../src/tools/web/html.js";
 
+const testHostAddresses: Record<string, string[]> = {
+  "example.com": ["8.8.8.8"],
+  "example.org": ["1.1.1.1"]
+};
+
+const testWebFetchDependencies = {
+  resolveHostname: async (hostname: string): Promise<string[]> => {
+    const addresses = testHostAddresses[hostname];
+    if (!addresses) throw new Error(`Unexpected test hostname: ${hostname}`);
+    return addresses;
+  }
+};
+
 async function main(): Promise<void> {
   testBlockedAddressClassification();
   await testUrlPolicyRefusesInternalTargets();
@@ -37,6 +50,13 @@ async function testUrlPolicyRefusesInternalTargets(): Promise<void> {
   await assert.rejects(assertFetchableUrl(new URL("http://169.254.169.254/latest/meta-data/")), /link-local/);
   await assert.rejects(assertFetchableUrl(new URL("file:///etc/passwd")), /http and https/);
   await assert.rejects(assertFetchableUrl(new URL("http://user:pw@example.com/")), /credentials/);
+  await assertFetchableUrl(new URL("https://example.com/"), testWebFetchDependencies);
+  await assert.rejects(
+    assertFetchableUrl(new URL("https://example.com/"), {
+      resolveHostname: async () => ["fdfe:dcba:9876::36"]
+    }),
+    /unique local/
+  );
   // 明确开启后才放行本机，用于抓本地开发服务。
   await assertFetchableUrl(new URL("http://127.0.0.1:8080/x"), { allowPrivateNetwork: true });
 }
@@ -55,7 +75,7 @@ function testHtmlExtraction(): void {
 async function testFetchesTextAndPages(): Promise<void> {
   const body = "<html><title>T</title><body><p>" + "word ".repeat(200) + "</p></body></html>";
   await withFetch(async () => new Response(body, { status: 200, headers: { "content-type": "text/html" } }), async () => {
-    const tool = createWebFetchTool();
+    const tool = createWebFetchTool(undefined, undefined, testWebFetchDependencies);
     const first = await run(tool, { url: "https://example.com/doc", length: 40 });
     assert.equal(first.status, 200);
     assert.equal(first.title, "T");
@@ -76,7 +96,7 @@ async function testRedirectToInternalTargetIsRefused(): Promise<void> {
     }
     return new Response("instance credentials", { status: 200, headers: { "content-type": "text/plain" } });
   }, async () => {
-    const tool = createWebFetchTool();
+    const tool = createWebFetchTool(undefined, undefined, testWebFetchDependencies);
     await assert.rejects(run(tool, { url: "https://example.com/redirect" }), /link-local/);
   });
 }
@@ -87,7 +107,11 @@ async function testByteLimitTruncatesInsteadOfHanging(): Promise<void> {
     status: 200,
     headers: { "content-type": "text/plain", "content-length": "10" }
   }), async () => {
-    const tool = createWebFetchTool({ enabled: true, timeoutMs: 5_000, maxBytes: 4_096, maxRedirects: 5, allowPrivateNetwork: false });
+    const tool = createWebFetchTool(
+      { enabled: true, timeoutMs: 5_000, maxBytes: 4_096, maxRedirects: 5, allowPrivateNetwork: false },
+      undefined,
+      testWebFetchDependencies
+    );
     const result = await run(tool, { url: "https://example.com/big", length: 200_000 });
     assert.equal(result.truncatedAtByteLimit, true);
     assert.equal(result.totalCharacters <= 4_096, true, `expected <= 4096 characters, got ${String(result.totalCharacters)}`);
@@ -112,7 +136,7 @@ async function testFetchUsesOnlyMatchingCookiesPerRedirect(): Promise<void> {
       }
       return new Response("redirected", { status: 200, headers: { "content-type": "text/plain" } });
     }, async () => {
-      const tool = createWebFetchTool(undefined, { enabled: true, path: jarPath });
+      const tool = createWebFetchTool(undefined, { enabled: true, path: jarPath }, testWebFetchDependencies);
       const result = await run(tool, { url: "https://example.com/start" });
       assert.equal(result.content, "redirected");
     });
