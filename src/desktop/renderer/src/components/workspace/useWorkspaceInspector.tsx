@@ -234,7 +234,9 @@ function FilePanelResizer({ width, onWidthChange, onResizeStart, onResizeEnd }: 
   onResizeEnd(width: number): void;
 }): React.JSX.Element {
   const resizeWithKeyboard = (direction: -1 | 1): void => {
-    const next = clampFilePanelWidth(width + direction * 16, window.innerWidth, false);
+    const layoutRoot = document.querySelector<HTMLElement>(".cindy-app-shell");
+    const layoutWidth = layoutRoot?.clientWidth ?? document.documentElement.clientWidth;
+    const next = clampFilePanelWidth(width + direction * 16, layoutWidth, false);
     onWidthChange(next);
     onResizeEnd(next);
   };
@@ -243,14 +245,14 @@ function FilePanelResizer({ width, onWidthChange, onResizeStart, onResizeEnd }: 
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     onResizeStart();
-    const workspace = event.currentTarget.closest(".workspace");
-    const workspaceWidth = workspace instanceof HTMLElement ? workspace.clientWidth : window.innerWidth;
+    const layoutRoot = event.currentTarget.closest(".cindy-app-shell");
+    const layoutWidth = layoutRoot instanceof HTMLElement ? layoutRoot.clientWidth : document.documentElement.clientWidth;
     const startX = event.clientX;
     const startWidth = event.currentTarget.parentElement?.getBoundingClientRect().width ?? width;
     let currentWidth = startWidth;
     let active = true;
     const move = (moveEvent: PointerEvent): void => {
-      currentWidth = clampFilePanelWidth(startWidth + startX - moveEvent.clientX, workspaceWidth, false);
+      currentWidth = clampFilePanelWidth(startWidth + startX - moveEvent.clientX, layoutWidth, false);
       onWidthChange(currentWidth);
     };
     const stop = (): void => {

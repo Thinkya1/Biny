@@ -70,6 +70,54 @@ export function replaceProjectSessions(
   ];
 }
 
+/** 把懒加载得到的某一页并入侧栏；不触碰尚未重新读取的兄弟节点。 */
+export function mergeProjectSessionPage(
+  sessions: DesktopSessionSummary[],
+  projectId: string,
+  pageSessions: DesktopSessionSummary[]
+): DesktopSessionSummary[] {
+  const projectSessions = new Map(
+    sessions.filter((session) => session.projectId === projectId).map((session) => [session.id, session])
+  );
+  for (const session of pageSessions) projectSessions.set(session.id, session);
+  const firstProjectIndex = sessions.findIndex((session) => session.projectId === projectId);
+  const remaining = sessions.filter((session) => session.projectId !== projectId);
+  const insertAt = firstProjectIndex < 0 ? remaining.length : Math.min(firstProjectIndex, remaining.length);
+  return [
+    ...remaining.slice(0, insertAt),
+    ...[...projectSessions.values()].sort(sessionSort),
+    ...remaining.slice(insertAt)
+  ];
+}
+
+/** 快照刷新根页时替换根节点，但保留已经展开并加载的子树。 */
+export function replaceProjectSessionRoots(
+  sessions: DesktopSessionSummary[],
+  projectId: string,
+  rootSessions: DesktopSessionSummary[],
+  allProjectSessions: DesktopSessionSummary[]
+): DesktopSessionSummary[] {
+  const firstProjectIndex = sessions.findIndex((session) => session.projectId === projectId);
+  const existingSessionIds = new Set(
+    allProjectSessions
+      .filter((session) => session.projectId === projectId)
+      .map((session) => session.id)
+  );
+  const childSessions = sessions.filter((session) => (
+    session.projectId === projectId
+    && session.parentSessionId !== undefined
+    && existingSessionIds.has(session.id)
+  ));
+  const otherSessions = sessions.filter((session) => session.projectId !== projectId);
+  const merged = new Map([...rootSessions, ...childSessions].map((session) => [session.id, session]));
+  const insertAt = firstProjectIndex < 0 ? otherSessions.length : Math.min(firstProjectIndex, otherSessions.length);
+  return [
+    ...otherSessions.slice(0, insertAt),
+    ...[...merged.values()].sort(sessionSort),
+    ...otherSessions.slice(insertAt)
+  ];
+}
+
 function applyUpdatesToProjectSessions(
   projectId: string,
   currentSessions: DesktopSessionSummary[],

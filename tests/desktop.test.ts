@@ -22,11 +22,13 @@ import { DesktopStateStore } from "../src/desktop/electron/main/DesktopStateStor
 import { DesktopUserDataStore } from "../src/desktop/electron/main/DesktopUserDataStore.js";
 import { clampFilePanelWidth, DEFAULT_FILE_PANEL_WIDTH, MAX_FILE_PANEL_WIDTH, MIN_FILE_PANEL_WIDTH } from "../src/desktop/filePanelSizing.js";
 import { clampSidebarResizeWidth, clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH, isCompactSidebarWidth, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, normalizeSidebarWidth, SIDEBAR_RAIL_THRESHOLD, SIDEBAR_RAIL_WIDTH } from "../src/desktop/sidebarSizing.js";
+import { adjustSidebarWithKeyboard, commitSidebarResize, normalizeSidebarExpandedWidth, previewSidebarResize, resolveSidebarLayout, sidebarResizeStart } from "../src/desktop/sidebarLayout.js";
 import type { DesktopAgentEventEnvelope, DesktopProject, DesktopSessionSummary, DesktopWorkspaceSnapshot } from "../src/desktop/protocol.js";
 import {
   applyProjectOrder,
   applyUpdatesToSidebarSessions,
   applyUpdatesToWorkspace,
+  replaceProjectSessionRoots,
   replaceProjectSessions
 } from "../src/desktop/renderer/src/app/desktopState.js";
 import {
@@ -77,6 +79,7 @@ testCommandHighlighting();
 testWorkspaceFileMarkers();
 await testFilePanelSizing();
 testSidebarSizing();
+testSidebarLayoutState();
 await testSidebarStateNormalizesWidth();
 await testDesktopThemePreference();
 await testDesktopModelConfiguration();
@@ -104,7 +107,7 @@ testHistoricalPrefixKeepsUnpersistedDuplicatePrompt();
 testHistoricalEmptyAssistantDoesNotEraseReply();
 testChangedFileProjection();
 testLiveTimelineProjection();
-testLiveTimelineDoesNotRetainReasoningDeltas();
+testLiveTimelineCoalescesReasoningDeltas();
 testLiveBlockedAndCancelledProjection();
 testTerminalRunEventClassification();
 testLiveReasoningAndSkillProjection();
@@ -113,6 +116,7 @@ testDesktopNavigationHistory();
 testPendingPermissionToolSelection();
 testDesktopRendererStateProjection();
 testDesktopRendererSidebarProjection();
+testDesktopRendererRootRefreshDropsDeletedSession();
 testDesktopRendererProjectOrder();
 
 async function testInteractiveRuntimeProtocol(): Promise<void> {
@@ -254,6 +258,30 @@ function testDesktopRendererSidebarProjection(): void {
   assert.equal(replaced.filter((session) => session.projectId === "project-b").length, 1);
   assert.equal(replaced.find((session) => session.projectId === "project-b")?.title, "Renamed task");
   assert.ok(replaced.includes(existing));
+}
+
+function testDesktopRendererRootRefreshDropsDeletedSession(): void {
+  const root = desktopRendererSession("project-a", "root", "Root task");
+  const child = {
+    ...desktopRendererSession("project-a", "child", "Fork task"),
+    parentSessionId: root.id
+  };
+  const deleted = {
+    ...desktopRendererSession("project-a", "deleted", "Deleted fork"),
+    parentSessionId: root.id
+  };
+  const otherProject = desktopRendererSession("project-b", "other", "Other task");
+  const refreshedRoot = { ...root, title: "Root task (updated)" };
+
+  const projected = replaceProjectSessionRoots(
+    [root, child, deleted, otherProject],
+    "project-a",
+    [refreshedRoot],
+    [refreshedRoot, child]
+  );
+
+  assert.deepEqual(projected.map((session) => session.id), ["root", "child", "other"]);
+  assert.equal(projected.find((session) => session.id === "root")?.title, "Root task (updated)");
 }
 
 function testDesktopRendererProjectOrder(): void {
@@ -782,6 +810,169 @@ function testSidebarSizing(): void {
   assert.equal(isCompactSidebarWidth(MIN_SIDEBAR_WIDTH), false);
   for (let width = 74; width <= 86; width += 1) assert.equal(normalizeSidebarWidth(width), DEFAULT_SIDEBAR_WIDTH, `legacy rail width ${width}`);
   assert.equal(normalizeSidebarWidth(180), MIN_SIDEBAR_WIDTH);
+}
+
+function testSidebarLayoutState(): void {
+  assert.equal(normalizeSidebarExpandedWidth(74), DEFAULT_SIDEBAR_WIDTH, "legacy rail width keeps the default expanded width");
+  assert.equal(normalizeSidebarExpandedWidth(10_000), MAX_SIDEBAR_WIDTH);
+
+  const expandedStart = sidebarResizeStart({ baseMode: "expanded", expandedWidth: 260, startX: 100 });
+  assert.deepEqual(expandedStart, { startX: 100, startWidth: 260, expandedWidth: 260 });
+  assert.deepEqual(previewSidebarResize(expandedStart, 30), { mode: "expanded", width: 190 });
+  assert.deepEqual(previewSidebarResize(expandedStart, -40), { mode: "expanded", width: SIDEBAR_RAIL_THRESHOLD });
+  assert.deepEqual(previewSidebarResize(expandedStart, -41), { mode: "rail", width: SIDEBAR_RAIL_THRESHOLD - 1 });
+
+  const railStart = sidebarResizeStart({ baseMode: "rail", expandedWidth: 320, startX: 100 });
+  assert.equal(railStart.startWidth, SIDEBAR_RAIL_WIDTH);
+  assert.equal(railStart.expandedWidth, 320, "rail drag retains the last valid expanded width");
+  assert.deepEqual(commitSidebarResize({ mode: "rail", width: SIDEBAR_RAIL_WIDTH }, 320), {
+    mode: "rail",
+    expandedWidth: 320,
+    persistRail: true
+  });
+  assert.deepEqual(commitSidebarResize({ mode: "expanded", width: MAX_SIDEBAR_WIDTH + 20 }, 320), {
+    mode: "expanded",
+    expandedWidth: MAX_SIDEBAR_WIDTH,
+    persistRail: false,
+    persistWidth: MAX_SIDEBAR_WIDTH
+  });
+
+  assert.deepEqual(resolveSidebarLayout({
+    baseMode: "expanded",
+    expandedWidth: 260,
+    resizing: false,
+    peekPhase: "idle"
+  }), {
+    mode: "expanded",
+    visualWidth: 260,
+    flowWidth: 260,
+    contentWidth: 260,
+    expandedWidth: 260,
+    resizing: false,
+    transition: "idle"
+  });
+  assert.deepEqual(resolveSidebarLayout({
+    baseMode: "rail",
+    expandedWidth: 320,
+    resizing: false,
+    peekPhase: "idle"
+  }), {
+    mode: "rail",
+    visualWidth: SIDEBAR_RAIL_WIDTH,
+    flowWidth: SIDEBAR_RAIL_WIDTH,
+    contentWidth: SIDEBAR_RAIL_WIDTH,
+    expandedWidth: 320,
+    resizing: false,
+    transition: "idle"
+  });
+  assert.deepEqual(resolveSidebarLayout({
+    baseMode: "collapsed",
+    expandedWidth: 320,
+    resizing: false,
+    peekPhase: "idle"
+  }), {
+    mode: "collapsed",
+    visualWidth: 0,
+    flowWidth: 0,
+    contentWidth: 320,
+    expandedWidth: 320,
+    resizing: false,
+    transition: "idle"
+  });
+  assert.deepEqual(resolveSidebarLayout({
+    baseMode: "collapsed",
+    expandedWidth: 320,
+    resizing: false,
+    peekPhase: "peeking"
+  }), {
+    mode: "peek",
+    visualWidth: 320,
+    flowWidth: 0,
+    contentWidth: 320,
+    expandedWidth: 320,
+    resizing: false,
+    transition: "idle"
+  });
+  assert.deepEqual(resolveSidebarLayout({
+    baseMode: "collapsed",
+    expandedWidth: 320,
+    resizing: false,
+    peekPhase: "peekExited"
+  }), {
+    mode: "collapsed",
+    visualWidth: 0,
+    flowWidth: 0,
+    contentWidth: 320,
+    expandedWidth: 320,
+    resizing: false,
+    transition: "peek-exited"
+  });
+  assert.deepEqual(resolveSidebarLayout({
+    baseMode: "collapsed",
+    expandedWidth: 320,
+    resizing: false,
+    peekPhase: "pinning"
+  }), {
+    mode: "peek",
+    visualWidth: 320,
+    flowWidth: 320,
+    contentWidth: 320,
+    expandedWidth: 320,
+    resizing: false,
+    transition: "pinning"
+  });
+  assert.deepEqual(resolveSidebarLayout({
+    baseMode: "expanded",
+    expandedWidth: 260,
+    previewWidth: SIDEBAR_RAIL_THRESHOLD - 1,
+    resizing: true,
+    peekPhase: "idle"
+  }), {
+    mode: "rail",
+    visualWidth: SIDEBAR_RAIL_THRESHOLD - 1,
+    flowWidth: SIDEBAR_RAIL_THRESHOLD - 1,
+    contentWidth: SIDEBAR_RAIL_THRESHOLD - 1,
+    expandedWidth: 260,
+    resizing: true,
+    transition: "idle"
+  });
+  assert.deepEqual(resolveSidebarLayout({
+    baseMode: "expanded",
+    expandedWidth: 260,
+    previewWidth: 148,
+    resizing: true,
+    peekPhase: "idle"
+  }), {
+    mode: "expanded",
+    visualWidth: 148,
+    flowWidth: 148,
+    contentWidth: 148,
+    expandedWidth: 260,
+    resizing: true,
+    transition: "idle"
+  });
+
+  assert.deepEqual(adjustSidebarWithKeyboard({ mode: "expanded", expandedWidth: 260, direction: "left" }), {
+    mode: "expanded",
+    expandedWidth: 244,
+    persistRail: false,
+    persistWidth: 244
+  });
+  assert.deepEqual(adjustSidebarWithKeyboard({ mode: "expanded", expandedWidth: MIN_SIDEBAR_WIDTH, direction: "left" }), {
+    mode: "rail",
+    expandedWidth: MIN_SIDEBAR_WIDTH,
+    persistRail: true
+  });
+  assert.deepEqual(adjustSidebarWithKeyboard({ mode: "rail", expandedWidth: 320, direction: "right" }), {
+    mode: "expanded",
+    expandedWidth: 320,
+    persistRail: false
+  });
+  assert.deepEqual(adjustSidebarWithKeyboard({ mode: "collapsed", expandedWidth: 320, direction: "right" }), {
+    mode: "collapsed",
+    expandedWidth: 320,
+    persistRail: false
+  });
 }
 
 async function testSidebarStateNormalizesWidth(): Promise<void> {
@@ -1607,15 +1798,18 @@ function testLiveTimelineProjection(): void {
   assert.equal(typedFailure[0]?.error, "Step limit reached.");
 }
 
-function testLiveTimelineDoesNotRetainReasoningDeltas(): void {
+function testLiveTimelineCoalescesReasoningDeltas(): void {
   const base = { sessionId: "session", runId: "run", timestamp: "2026-01-01T00:00:00.000Z" };
   const events: AgentHostEvent[] = [
     { ...base, type: "reasoning.started", phase: "initial" },
-    { ...base, type: "reasoning.delta", content: "private thought" },
+    { ...base, type: "reasoning.delta", content: "private " },
+    { ...base, type: "reasoning.delta", content: "thought" },
     { ...base, type: "reasoning.completed" },
     { ...base, type: "assistant.delta", content: "answer" }
   ];
-  assert.deepEqual(liveTimelineEvents(events).map((event) => event.type), ["reasoning.started", "reasoning.completed", "assistant.delta"]);
+  const live = liveTimelineEvents(events);
+  assert.deepEqual(live.map((event) => event.type), ["reasoning.started", "reasoning.delta", "reasoning.completed", "assistant.delta"]);
+  assert.equal(live[1]?.type === "reasoning.delta" ? live[1].content : undefined, "private thought");
 }
 
 function testLiveBlockedAndCancelledProjection(): void {

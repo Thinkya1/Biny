@@ -5,19 +5,14 @@
  * 权限和文件检查器回调。页面层只负责把这些能力放到正确的视觉区域。
  */
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
-import type {
-  DesktopProject,
-  DesktopWorkspaceDirectory,
-  DesktopWorkspaceFilePreview
-} from "../../../protocol.js";
+import { useEffect, useRef, useState } from "react";
+import { ThinkingOrb } from "thinking-orbs";
+import type { DesktopProject } from "../../../protocol.js";
 import type { TimelineTurn } from "../sessionTimeline.js";
 import { Icon } from "./Icon.js";
 import { MessageTimeline } from "./MessageTimeline.js";
-import { useWorkspaceInspector } from "./workspace/useWorkspaceInspector.js";
 
 interface WorkspaceProps {
-  filePanelResizing: boolean;
-  filePanelWidth: number;
   project?: DesktopProject;
   projectId?: string;
   sessionId?: string;
@@ -26,14 +21,11 @@ interface WorkspaceProps {
   loading: boolean;
   runtimeError?: string;
   onOpenProject(): void;
-  onFilePanelResizeEnd(width: number): void;
-  onFilePanelResizeStart(): void;
-  onFilePanelWidthChange(width: number): void;
-  onListDirectory(path: string): Promise<DesktopWorkspaceDirectory>;
-  onReadFile(path: string): Promise<DesktopWorkspaceFilePreview>;
-  onOpenFile(path: string): void;
+  onPreviewFile(path: string): void;
+  onToggleFiles(): void;
   onOpenExternal(url: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
+  onResume(): Promise<void>;
   onRetry(input: string): void;
   onEditUserMessage(input: string, userMessageIndex: number): Promise<void>;
   onCreateBranch(): void;
@@ -43,8 +35,6 @@ interface WorkspaceProps {
 }
 
 export function Workspace({
-  filePanelResizing,
-  filePanelWidth,
   project,
   projectId,
   sessionId,
@@ -53,14 +43,11 @@ export function Workspace({
   loading,
   runtimeError,
   onOpenProject,
-  onFilePanelResizeEnd,
-  onFilePanelResizeStart,
-  onFilePanelWidthChange,
-  onListDirectory,
-  onReadFile,
-  onOpenFile,
+  onPreviewFile,
+  onToggleFiles,
   onOpenExternal,
   onResolvePermission,
+  onResume,
   onRetry,
   onEditUserMessage,
   onCreateBranch,
@@ -68,18 +55,6 @@ export function Workspace({
   onDeleteUserMessage,
   children
 }: WorkspaceProps): React.JSX.Element {
-  const inspector = useWorkspaceInspector({
-    filePanelResizing,
-    filePanelWidth,
-    onFilePanelResizeEnd,
-    onFilePanelResizeStart,
-    onFilePanelWidthChange,
-    onListDirectory,
-    onOpenFile,
-    onReadFile,
-    projectId,
-    source: `${projectId ?? "none"}:${sessionId ?? "draft"}`
-  });
   const streaming = turns.some((turn) => turn.status === "running" || turn.status === "waiting_permission");
   const isHome = !loading && !runtimeError && turns.length === 0;
 
@@ -94,7 +69,6 @@ export function Workspace({
         <div className="cindy-home-content">
           <div className="cindy-home-composer">{children}</div>
         </div>
-        {inspector.dock}
       </div>
     );
   }
@@ -112,7 +86,7 @@ export function Workspace({
               aria-label="打开文件面板"
               className="cindy-toolbar-button"
               disabled={!projectId}
-              onClick={inspector.toggleFiles}
+              onClick={onToggleFiles}
               type="button"
             >
               <Icon name="panel-right" size={15} />
@@ -121,35 +95,59 @@ export function Workspace({
         </header>
         <div className="cindy-chat-body">
           {loading ? <LoadingState /> : runtimeError ? <RuntimeError error={runtimeError} onOpenProject={onOpenProject} /> : turns.length > 0 && projectId ? (
-            <div className="cindy-chat-scroll">
+            <ChatScroll>
               <MessageTimeline
                 onCreateBranch={onCreateBranch}
                 onDeleteUserMessage={onDeleteUserMessage}
                 onEditUserMessage={onEditUserMessage}
                 onOpenExternal={onOpenExternal}
-                onPreviewFile={inspector.previewFile}
+                onPreviewFile={onPreviewFile}
                 onResolvePermission={onResolvePermission}
+                onResume={onResume}
                 onRollbackFiles={onRollbackFiles}
                 onRetry={onRetry}
                 projectId={projectId}
                 sessionId={sessionId}
                 turns={turns}
               />
-            </div>
+            </ChatScroll>
           ) : (
             <div className="cindy-chat-empty"><Icon name="message" size={20} /><span>开始一段新的对话</span></div>
           )}
         </div>
         <div className="cindy-chat-composer">{children}</div>
       </div>
-      {inspector.dock}
       {streaming ? <span className="cindy-streaming-state" aria-hidden="true" /> : null}
     </div>
   );
 }
 
+function ChatScroll({ children }: { children: React.ReactNode }): React.JSX.Element {
+  const [scrollActive, setScrollActive] = useState(false);
+  const fadeTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  useEffect(() => () => {
+    if (fadeTimerRef.current !== undefined) clearTimeout(fadeTimerRef.current);
+  }, []);
+
+  const revealScrollbar = (): void => {
+    setScrollActive(true);
+    if (fadeTimerRef.current !== undefined) clearTimeout(fadeTimerRef.current);
+    fadeTimerRef.current = setTimeout(() => {
+      fadeTimerRef.current = undefined;
+      setScrollActive(false);
+    }, 1000);
+  };
+
+  return (
+    <div className={`cindy-chat-scroll${scrollActive ? " is-scroll-active" : ""}`} onScroll={revealScrollbar} onWheel={revealScrollbar}>
+      {children}
+    </div>
+  );
+}
+
 function LoadingState(): React.JSX.Element {
-  return <div className="cindy-status-state" role="status"><span className="large-spinner" /><span>正在恢复会话…</span></div>;
+  return <div className="cindy-status-state" role="status"><ThinkingOrb aria-label="正在恢复会话" className="thinking-orb" size={20} state="connecting" theme="auto" /><span>正在恢复会话…</span></div>;
 }
 
 function RuntimeError({ error, onOpenProject }: { error: string; onOpenProject(): void }): React.JSX.Element {

@@ -4,9 +4,22 @@
  * 颜色和尺寸集中在根节点 token；选择器全部挂在根节点下，旧的消息、设置和检查器样式仍
  * 可安全复用，不会污染 Renderer 的其他浮层。
  */
+@property --cindy-sidebar-animated-visual-width {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 0px;
+}
+
+@property --cindy-sidebar-animated-flow-width {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 0px;
+}
+
 :root {
   --cindy-surface: var(--surface);
   --cindy-surface-elevated: var(--surface-raised);
+  --cindy-surface-soft: var(--surface-soft);
   --cindy-surface-hover: var(--surface-hover);
   --cindy-sidebar-surface: var(--sidebar);
   --cindy-border: var(--border);
@@ -38,6 +51,9 @@
   --cindy-overlay-hover: rgb(0 0 0 / 8%);
   --cindy-overlay-pressed: rgb(0 0 0 / 14%);
   --cindy-shadow: 0 1px 2px var(--shadow);
+  --cindy-composer-radius: 28px;
+  --cindy-composer-shadow-rest: 0 2px 4px var(--cindy-shadow-color), 0 7px 18px var(--cindy-shadow-soft);
+  --cindy-composer-shadow-focus: 0 0 0 1px color-mix(in srgb, var(--cindy-focus) 16%, transparent), 0 2px 4px var(--cindy-shadow-color), 0 7px 18px var(--cindy-shadow-soft);
   --color-overlay: var(--cindy-overlay);
   --color-overlay-hover: var(--cindy-overlay-hover);
   --color-overlay-pressed: var(--cindy-overlay-pressed);
@@ -58,13 +74,56 @@
 }
 
 .desktop-root.cindy-root {
-  --cindy-light-surface: #ededed;
-  --cindy-light-surface-elevated: #f8f8f8;
-  --cindy-light-surface-hover: #e4e4e4;
-  --cindy-light-sidebar-surface: var(--cindy-light-surface);
-  --cindy-light-border: #dcdfe3;
-  --cindy-light-text: #3c3f43;
-  --cindy-light-text-secondary: #8c8e94;
+  /* 每个语义层都单独映射，浅色模式不能依赖深色 token 的透明度反转。 */
+  --cindy-light-surface: #f4f5f7;
+  --cindy-light-surface-elevated: #ffffff;
+  --cindy-light-surface-soft: #eef0f3;
+  --cindy-light-surface-hover: #e4e7eb;
+  --cindy-light-surface-selected: #e0e9f8;
+  --cindy-light-sidebar-surface: #e9ebee;
+  --cindy-light-border: #d4d8de;
+  --cindy-light-border-strong: #b8bec7;
+  --cindy-light-text: #252a31;
+  --cindy-light-text-secondary: #68717c;
+  --cindy-light-text-tertiary: #8a929c;
+  --cindy-light-focus: #326bd4;
+  --cindy-light-send-bg: #2f3339;
+  --cindy-light-send-icon: #ffffff;
+  --cindy-light-pill: #ffffff;
+  --cindy-light-danger: #c23f4b;
+  --cindy-light-danger-bg: rgb(194 63 75 / 13%);
+  --cindy-light-success: #2e875d;
+  --cindy-light-success-bg: rgb(46 135 93 / 13%);
+  --cindy-light-warning: #a16e12;
+  --cindy-light-warning-bg: rgb(161 110 18 / 14%);
+  --cindy-light-code: #e9edf2;
+  --cindy-light-placeholder: #8a929c;
+  --cindy-light-selection-surface: #353a42;
+  --cindy-light-selection-text: #ffffff;
+  --cindy-light-selection-muted: rgb(255 255 255 / 78%);
+  --cindy-light-shadow-color: rgb(37 42 49 / 7%);
+  --cindy-light-shadow-soft: rgb(37 42 49 / 10%);
+  --cindy-light-shadow-heavy: rgb(37 42 49 / 18%);
+  --cindy-light-shadow-sidebar: rgb(37 42 49 / 12%);
+  --cindy-dark-surface-soft: #343232;
+  --cindy-dark-surface-selected: color-mix(in srgb, #79a9ff 12%, #2a2828);
+  --cindy-dark-border-strong: color-mix(in srgb, #434343 70%, #979797);
+  --cindy-dark-text-tertiary: color-mix(in srgb, #979797 78%, #2a2828);
+  --cindy-dark-danger: #c74d4d;
+  --cindy-dark-danger-bg: rgb(199 77 77 / 12%);
+  --cindy-dark-success: #8ebf8b;
+  --cindy-dark-success-bg: rgb(142 191 139 / 14%);
+  --cindy-dark-warning: #d2ad66;
+  --cindy-dark-warning-bg: rgb(210 173 102 / 14%);
+  --cindy-dark-code: #242222;
+  --cindy-dark-placeholder: #888888;
+  --cindy-dark-selection-surface: #eeeeee;
+  --cindy-dark-selection-text: #3c3c3c;
+  --cindy-dark-selection-muted: rgb(60 60 60 / 76%);
+  --cindy-dark-shadow-color: rgb(0 0 0 / 30%);
+  --cindy-dark-shadow-soft: rgb(0 0 0 / 22%);
+  --cindy-dark-shadow-heavy: rgb(0 0 0 / 34%);
+  --cindy-dark-shadow-sidebar: rgb(0 0 0 / 24%);
   --cindy-dark-surface: #2a2828;
   --cindy-dark-surface-elevated: #312f2f;
   --cindy-dark-surface-hover: #393737;
@@ -74,44 +133,45 @@
   --cindy-dark-text-secondary: #979797;
   --cindy-surface: var(--cindy-light-surface);
   --cindy-surface-elevated: var(--cindy-light-surface-elevated);
+  --cindy-surface-soft: var(--cindy-light-surface-soft);
   --cindy-surface-hover: var(--cindy-light-surface-hover);
+  --cindy-surface-selected: var(--cindy-light-surface-selected);
   --cindy-sidebar-surface: var(--cindy-light-sidebar-surface);
   --cindy-border: var(--cindy-light-border);
   --cindy-border-real: var(--cindy-light-border);
+  --cindy-border-strong: var(--cindy-light-border-strong);
   --cindy-text: var(--cindy-light-text);
   --cindy-text-secondary: var(--cindy-light-text-secondary);
-  --cindy-text-tertiary: color-mix(in srgb, var(--cindy-text-secondary) 78%, var(--cindy-surface));
-  --cindy-focus: #417cdd;
-  --cindy-send-bg: #444242;
-  --cindy-send-icon: #585555;
-  --cindy-pill: #fcfcfc;
-  --cindy-border-strong: color-mix(in srgb, var(--cindy-border) 70%, var(--cindy-text-secondary));
-  --cindy-surface-selected: color-mix(in srgb, var(--cindy-focus) 12%, var(--cindy-surface));
-  --cindy-danger: #c74d4d;
-  --cindy-danger-bg: color-mix(in srgb, var(--cindy-danger) 12%, transparent);
-  --cindy-success: #5d9a6b;
-  --cindy-success-bg: color-mix(in srgb, var(--cindy-success) 14%, transparent);
-  --cindy-warning: #ad863f;
-  --cindy-warning-bg: color-mix(in srgb, var(--cindy-warning) 14%, transparent);
-  --cindy-code: #f2f2f2;
-  --cindy-placeholder: #bfc2c7;
-  --cindy-selection-surface: #444242;
-  --cindy-selection-text: #ffffff;
-  --cindy-selection-muted: rgb(255 255 255 / 82%);
-  --cindy-shadow-color: rgb(45 48 52 / 4%);
-  --cindy-shadow-soft: rgb(45 48 52 / 7%);
-  --cindy-shadow-heavy: rgb(45 48 52 / 18%);
-  --cindy-shadow-sidebar: rgb(45 48 52 / 10%);
+  --cindy-text-tertiary: var(--cindy-light-text-tertiary);
+  --cindy-focus: var(--cindy-light-focus);
+  --cindy-send-bg: var(--cindy-light-send-bg);
+  --cindy-send-icon: var(--cindy-light-send-icon);
+  --cindy-pill: var(--cindy-light-pill);
+  --cindy-danger: var(--cindy-light-danger);
+  --cindy-danger-bg: var(--cindy-light-danger-bg);
+  --cindy-success: var(--cindy-light-success);
+  --cindy-success-bg: var(--cindy-light-success-bg);
+  --cindy-warning: var(--cindy-light-warning);
+  --cindy-warning-bg: var(--cindy-light-warning-bg);
+  --cindy-code: var(--cindy-light-code);
+  --cindy-placeholder: var(--cindy-light-placeholder);
+  --cindy-selection-surface: var(--cindy-light-selection-surface);
+  --cindy-selection-text: var(--cindy-light-selection-text);
+  --cindy-selection-muted: var(--cindy-light-selection-muted);
+  --cindy-shadow-color: var(--cindy-light-shadow-color);
+  --cindy-shadow-soft: var(--cindy-light-shadow-soft);
+  --cindy-shadow-heavy: var(--cindy-light-shadow-heavy);
+  --cindy-shadow-sidebar: var(--cindy-light-shadow-sidebar);
   --cindy-overlay: rgb(0 0 0 / 20%);
   --cindy-overlay-hover: rgb(0 0 0 / 8%);
   --cindy-overlay-pressed: rgb(0 0 0 / 14%);
-  --cindy-shadow: 0 1px 2px rgb(45 48 52 / 4%);
+  --cindy-shadow: 0 1px 2px var(--cindy-shadow-color);
   --accent: var(--cindy-focus);
   --bg: var(--cindy-surface);
   --sidebar: var(--cindy-sidebar-surface);
   --surface: var(--cindy-surface);
   --surface-raised: var(--cindy-surface-elevated);
-  --surface-soft: color-mix(in srgb, var(--cindy-surface-elevated) 72%, var(--cindy-surface));
+  --surface-soft: var(--cindy-surface-soft);
   --surface-hover: var(--cindy-surface-hover);
   --surface-selected: var(--cindy-surface-selected);
   --user-bubble: var(--cindy-surface-hover);
@@ -185,12 +245,16 @@
   --shadow-high: 0 16px 40px var(--cindy-shadow-heavy);
   /* 标题从第二个 chrome 按钮右侧留出 7px，避免收起后被固定层盖住。 */
   --cindy-sidebar-chrome-width: 148px;
-  --cindy-sidebar-compact-width: 78px;
-  --cindy-sidebar-compact-toolbar-offset: calc(var(--cindy-sidebar-chrome-width) - var(--cindy-sidebar-compact-width));
   --cindy-chat-toolbar-inline-padding: 18px;
   --cindy-sidebar-transition: 250ms cubic-bezier(0.4, 0, 0.2, 1);
   --cindy-sidebar-content-fade-duration: 200ms;
   --cindy-sidebar-content-fade: var(--cindy-sidebar-content-fade-duration) ease;
+  /* 所有会改变侧栏几何边界的层都消费这两个共享插值值，避免各自启动过渡。 */
+  --cindy-sidebar-animated-visual-width: var(--cindy-sidebar-visual-width, 0px);
+  --cindy-sidebar-animated-flow-width: var(--cindy-sidebar-flow-width, 0px);
+  transition:
+    --cindy-sidebar-animated-visual-width var(--cindy-sidebar-transition),
+    --cindy-sidebar-animated-flow-width var(--cindy-sidebar-transition);
   position: relative;
   display: block;
   width: 100%;
@@ -206,27 +270,35 @@
 :root[data-theme="dark"] .desktop-root.cindy-root {
   --cindy-surface: var(--cindy-dark-surface);
   --cindy-surface-elevated: var(--cindy-dark-surface-elevated);
+  --cindy-surface-soft: var(--cindy-dark-surface-soft);
   --cindy-surface-hover: var(--cindy-dark-surface-hover);
+  --cindy-surface-selected: var(--cindy-dark-surface-selected);
   --cindy-sidebar-surface: var(--cindy-dark-sidebar-surface);
   --cindy-border: var(--cindy-dark-border);
   --cindy-border-real: var(--cindy-dark-border);
+  --cindy-border-strong: var(--cindy-dark-border-strong);
   --cindy-text: var(--cindy-dark-text);
   --cindy-text-secondary: var(--cindy-dark-text-secondary);
+  --cindy-text-tertiary: var(--cindy-dark-text-tertiary);
   --cindy-focus: #79a9ff;
   --cindy-send-bg: #eeeeee;
   --cindy-send-icon: #3c3c3c;
   --cindy-pill: #393838;
-  --cindy-success: #8ebf8b;
-  --cindy-warning: #d2ad66;
-  --cindy-code: #242222;
-  --cindy-placeholder: #888888;
-  --cindy-selection-surface: var(--cindy-send-bg);
-  --cindy-selection-text: var(--cindy-send-icon);
-  --cindy-selection-muted: rgb(60 60 60 / 76%);
-  --cindy-shadow-color: rgb(0 0 0 / 30%);
-  --cindy-shadow-soft: rgb(0 0 0 / 22%);
-  --cindy-shadow-heavy: rgb(0 0 0 / 34%);
-  --cindy-shadow-sidebar: rgb(0 0 0 / 24%);
+  --cindy-danger: var(--cindy-dark-danger);
+  --cindy-danger-bg: var(--cindy-dark-danger-bg);
+  --cindy-success: var(--cindy-dark-success);
+  --cindy-success-bg: var(--cindy-dark-success-bg);
+  --cindy-warning: var(--cindy-dark-warning);
+  --cindy-warning-bg: var(--cindy-dark-warning-bg);
+  --cindy-code: var(--cindy-dark-code);
+  --cindy-placeholder: var(--cindy-dark-placeholder);
+  --cindy-selection-surface: var(--cindy-dark-selection-surface);
+  --cindy-selection-text: var(--cindy-dark-selection-text);
+  --cindy-selection-muted: var(--cindy-dark-selection-muted);
+  --cindy-shadow-color: var(--cindy-dark-shadow-color);
+  --cindy-shadow-soft: var(--cindy-dark-shadow-soft);
+  --cindy-shadow-heavy: var(--cindy-dark-shadow-heavy);
+  --cindy-shadow-sidebar: var(--cindy-dark-shadow-sidebar);
   --cindy-overlay: rgb(0 0 0 / 42%);
   --cindy-overlay-hover: rgb(0 0 0 / 16%);
   --cindy-overlay-pressed: rgb(0 0 0 / 24%);
@@ -237,27 +309,35 @@
   :root[data-theme="system"] .desktop-root.cindy-root {
     --cindy-surface: var(--cindy-dark-surface);
     --cindy-surface-elevated: var(--cindy-dark-surface-elevated);
+    --cindy-surface-soft: var(--cindy-dark-surface-soft);
     --cindy-surface-hover: var(--cindy-dark-surface-hover);
+    --cindy-surface-selected: var(--cindy-dark-surface-selected);
     --cindy-sidebar-surface: var(--cindy-dark-sidebar-surface);
     --cindy-border: var(--cindy-dark-border);
     --cindy-border-real: var(--cindy-dark-border);
+    --cindy-border-strong: var(--cindy-dark-border-strong);
     --cindy-text: var(--cindy-dark-text);
     --cindy-text-secondary: var(--cindy-dark-text-secondary);
+    --cindy-text-tertiary: var(--cindy-dark-text-tertiary);
     --cindy-focus: #79a9ff;
     --cindy-send-bg: #eeeeee;
     --cindy-send-icon: #3c3c3c;
     --cindy-pill: #393838;
-    --cindy-success: #8ebf8b;
-    --cindy-warning: #d2ad66;
-    --cindy-code: #242222;
-    --cindy-placeholder: #888888;
-    --cindy-selection-surface: var(--cindy-send-bg);
-    --cindy-selection-text: var(--cindy-send-icon);
-    --cindy-selection-muted: rgb(60 60 60 / 76%);
-    --cindy-shadow-color: rgb(0 0 0 / 30%);
-    --cindy-shadow-soft: rgb(0 0 0 / 22%);
-    --cindy-shadow-heavy: rgb(0 0 0 / 34%);
-    --cindy-shadow-sidebar: rgb(0 0 0 / 24%);
+    --cindy-danger: var(--cindy-dark-danger);
+    --cindy-danger-bg: var(--cindy-dark-danger-bg);
+    --cindy-success: var(--cindy-dark-success);
+    --cindy-success-bg: var(--cindy-dark-success-bg);
+    --cindy-warning: var(--cindy-dark-warning);
+    --cindy-warning-bg: var(--cindy-dark-warning-bg);
+    --cindy-code: var(--cindy-dark-code);
+    --cindy-placeholder: var(--cindy-dark-placeholder);
+    --cindy-selection-surface: var(--cindy-dark-selection-surface);
+    --cindy-selection-text: var(--cindy-dark-selection-text);
+    --cindy-selection-muted: var(--cindy-dark-selection-muted);
+    --cindy-shadow-color: var(--cindy-dark-shadow-color);
+    --cindy-shadow-soft: var(--cindy-dark-shadow-soft);
+    --cindy-shadow-heavy: var(--cindy-dark-shadow-heavy);
+    --cindy-shadow-sidebar: var(--cindy-dark-shadow-sidebar);
     --cindy-overlay: rgb(0 0 0 / 42%);
     --cindy-overlay-hover: rgb(0 0 0 / 16%);
     --cindy-overlay-pressed: rgb(0 0 0 / 24%);
@@ -277,11 +357,23 @@
 
 .cindy-app-shell {
   display: flex;
+  flex-direction: row;
   width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
   background: var(--cindy-surface);
+}
+
+/* 原生拖拽预览必须直接反映 pointer 位置，不能等待共享状态过渡。 */
+.desktop-root.cindy-root[data-sidebar-resizing="true"] {
+  transition: none;
+}
+
+/* peek 抽屉已经离屏，交换回普通 collapsed 流布局时必须跳过第二段宽度动画。 */
+.desktop-root.cindy-root[data-sidebar-transition="peek-exited"] {
+  transition: none;
 }
 
 /*
@@ -299,6 +391,19 @@
   overflow: visible;
 }
 
+/* 三栏由同一个 flex 容器管理：左侧栏、Chat 工作区和右侧 Inspector 只改变自身宽度。 */
+.cindy-content-shell {
+  order: 0;
+  overflow: hidden;
+}
+
+.cindy-app-shell > .desktop-inspector-wrap {
+  order: 1;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
 /* Peek 固定展开时先由这个流内占位条推动主区，避免 fixed 侧栏切回流布局时发生二次回弹。 */
 .cindy-sidebar-pin-spacer {
   box-sizing: border-box;
@@ -309,13 +414,14 @@
   order: -2;
   pointer-events: none;
   background: var(--cindy-sidebar-surface);
-  transition: width var(--cindy-sidebar-transition), flex-basis var(--cindy-sidebar-transition);
+  flex-basis: 0;
   will-change: width, flex-basis;
 }
 
-/* pinning 结束时 aside 同帧回到普通流，spacer 只做布局交换快照，不能再播放 200→0。 */
-.cindy-root:not([data-sidebar-pinning="true"]) .cindy-sidebar-pin-spacer {
-  transition: none;
+/* pinning 时占位条跟随共享流宽度；结束时瞬间交给普通流中的 aside。 */
+.cindy-root[data-sidebar-transition="pinning"] .cindy-sidebar-pin-spacer[data-active="true"] {
+  width: var(--cindy-sidebar-animated-flow-width);
+  flex-basis: var(--cindy-sidebar-animated-flow-width);
 }
 
 /* 收起后只在窗口左缘保留一个很窄的 hover 命中区，不遮住主区正常交互。 */
@@ -384,12 +490,16 @@
   height: 100%;
   flex: 0 0 auto;
   flex-direction: column;
-  overflow: visible;
+  /*
+   * 外壳是唯一的视觉裁剪边界。body/footer 可能暂时保留上一次展开盒宽，
+   * 但不能在外壳的 width 过渡期间溢出到主区，否则顶部背景和下方主体会不同步。
+   * 侧栏菜单使用窗口级 portal，resizer 改为完全落在这个裁剪盒内。
+   */
+  overflow: hidden;
   /* 视觉分隔线由独立层绘制；这里保留边框盒尺寸，避免拖拽时布局宽度跳变。 */
   border-right: 1px solid transparent;
   background: var(--cindy-sidebar-surface);
   color: var(--cindy-text);
-  transition: width var(--cindy-sidebar-transition);
   will-change: width;
 }
 
@@ -401,12 +511,7 @@
 /* 原生拖拽期间要跟手；松手或键盘/状态切换时再使用 Cindy 风格缓出过渡。 */
 .cindy-sidebar.is-resizing,
 .cindy-root[data-sidebar-resizing="true"] .cindy-sidebar {
-  transition: none;
-}
-
-/* peek 抽屉已经滑出屏幕后，回到流布局的 260→0 只应是快照，不再播放第二段收起动画。 */
-.cindy-sidebar.is-peek-exited {
-  transition: none;
+  will-change: width;
 }
 
 .cindy-sidebar-body,
@@ -443,23 +548,74 @@
   app-region: drag;
 }
 
+/*
+ * 顶部背景和按钮命中层分离：背景只负责把侧栏表面与主体连成一个整体，
+ * 不参与鼠标命中；按钮层保持窄的 no-drag sibling，避免覆盖聊天区的拖拽/点击。
+ * 伪元素的宽度和 aside 使用同一个视觉宽度变量、同一个过渡时长，因此收起和
+ * 展开时左侧深色表面不会先被顶部 chrome 切成另一块。
+ */
+.cindy-sidebar-topbar-visual {
+  position: fixed;
+  z-index: 99;
+  top: 0;
+  left: 0;
+  box-sizing: border-box;
+  width: 100%;
+  height: 46px;
+  pointer-events: none;
+  background: var(--cindy-surface);
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.cindy-sidebar-topbar-visual::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--cindy-sidebar-animated-visual-width);
+  background: var(--cindy-sidebar-surface);
+  content: "";
+  pointer-events: none;
+  will-change: width;
+}
+
+/* 收起稳定后，窗口级 chrome 只保留这一条底部分隔线。 */
+.cindy-root[data-sidebar-mode="collapsed"] .cindy-sidebar-topbar-visual {
+  border-bottom: 1px solid var(--cindy-border);
+}
+
 .cindy-sidebar-topbar-floating {
   position: fixed;
   z-index: 100;
   top: 0;
   left: 0;
   box-sizing: border-box;
+  display: block;
   /*
-   * 这是固定的按钮命中层，不再拥有第二份背景。侧栏和主区各自绘制自己的表面，
-   * 也不在这里绘制 divider；这样 pinning 的第一帧不会出现第二条横线。
+   * 外层是和 aside 同宽的透明动画壳；真正的按钮命中层在内部保持固定宽度，
+   * 这样顶部控制既能跟侧栏同帧进出，又不会把 Electron 命中依赖在零宽外层上。
    */
-  width: var(--cindy-sidebar-chrome-width);
+  width: var(--cindy-sidebar-animated-visual-width);
+  height: 46px;
+  min-height: 46px;
+  padding: 0;
+  overflow: visible;
   background: transparent;
-  /* chrome 只占用左侧按钮区域，整层直接参与命中，避免 Electron 原生拖拽区吞掉子按钮事件。 */
+  /* 外层覆盖的只是侧栏当前视觉区域；按钮子层单独接管实际命中。 */
   pointer-events: auto;
-  justify-content: flex-start;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+  will-change: width;
+}
+
+.cindy-sidebar-topbar-hit-layer {
+  display: flex;
+  width: var(--cindy-sidebar-chrome-width);
+  height: 46px;
+  min-height: 46px;
+  align-items: center;
   gap: 9px;
   padding: 0 12px 0 80px;
+  pointer-events: auto;
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
@@ -473,22 +629,72 @@
   width: 1px;
   pointer-events: none;
   background: var(--cindy-border);
-  transition: left var(--cindy-sidebar-transition);
+  left: var(--cindy-sidebar-animated-flow-width);
   will-change: left;
 }
 
-.cindy-root[data-sidebar-collapsed="true"] .cindy-sidebar-divider {
+.cindy-root[data-sidebar-mode="collapsed"] .cindy-sidebar-divider,
+.cindy-root[data-sidebar-mode="peek"] .cindy-sidebar-divider {
   display: none;
-}
-
-.cindy-root[data-sidebar-resizing="true"] .cindy-sidebar-divider {
-  transition: none;
 }
 
 .cindy-sidebar-topbar-floating .cindy-chrome-button {
   pointer-events: auto;
   -webkit-app-region: no-drag;
   app-region: no-drag;
+}
+
+/* Composer 的所有动作按钮都明确脱离 Electron drag region。 */
+.cindy-composer-action,
+.cindy-send-button-anchor {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.cindy-composer-action {
+  appearance: none;
+  border: 0;
+  font: inherit;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, opacity 120ms ease, transform 120ms ease;
+}
+
+.cindy-composer-action-content {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  gap: inherit;
+}
+
+.cindy-composer-action:hover:not(:disabled):not([aria-disabled="true"]),
+.cindy-composer-action[data-active="true"] {
+  background: var(--cindy-surface-hover);
+  color: var(--cindy-text);
+}
+
+.cindy-composer-action[data-active="true"] {
+  background: var(--cindy-surface-selected);
+  color: var(--cindy-text);
+}
+
+.cindy-composer-action:active:not(:disabled):not([aria-disabled="true"]) {
+  transform: scale(0.98);
+}
+
+.cindy-composer-action:focus-visible {
+  outline: 2px solid var(--cindy-focus);
+  outline-offset: 2px;
+}
+
+.cindy-composer-action[aria-disabled="true"],
+.cindy-composer-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.cindy-composer-action[data-loading="true"] {
+  cursor: progress;
 }
 
 .cindy-chrome-button,
@@ -520,7 +726,7 @@
 .cindy-toolbar-button:focus-visible,
 .cindy-composer-add:focus-visible,
 .cindy-mic-button:focus-visible,
-.cindy-user-card:focus-visible,
+.cindy-sidebar-settings-item:focus-visible,
 .cindy-sidebar-nav-item:focus-visible,
 .cindy-session-item:focus-visible,
 .cindy-project-item:focus-visible,
@@ -540,14 +746,15 @@
 
 .cindy-sidebar-scroll {
   min-height: 100%;
-  padding: 0 12px 16px;
+  /* 一级导航和底部设置项共用 16px 内容起点；会话列表的额外缩进保留树形层级。 */
+  padding: 0 0 16px;
 }
 
 .cindy-sidebar-nav {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 4px 12px 0;
+  padding: 4px 0 0;
 }
 
 .cindy-sidebar-nav-item,
@@ -558,8 +765,8 @@
   min-width: 0;
   height: 32px;
   align-items: center;
-  gap: 12px;
-  padding: 0 12px;
+  gap: 8px;
+  padding: 0 16px;
   overflow: hidden;
   border: 0;
   border-radius: 17px;
@@ -572,12 +779,40 @@
   transition: background 120ms ease, color 120ms ease;
 }
 
-.cindy-sidebar-nav-item:hover,
+/* 侧栏主体可能位于窗口拖拽区之下；可交互节点统一明确接管命中。 */
+.cindy-sidebar-nav-item,
+.cindy-sidebar-section-trigger,
+.cindy-sidebar-section-action,
+.cindy-project-row,
+.cindy-project-row-action,
+.cindy-sidebar-session-toggle,
+.cindy-sidebar-session-item,
+.cindy-sidebar-session-expand,
+.cindy-sidebar-menu,
+.cindy-sidebar-menu button {
+  pointer-events: auto;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* Cindy 的悬停底色不贴住侧栏边缘；缩进后的内容起点仍保持 16px。 */
+.cindy-sidebar-nav-item {
+  width: calc(100% - 12px);
+  margin-inline: 6px;
+  padding-inline: 10px;
+}
+
+.cindy-sidebar-nav-item:hover:not(:disabled),
 .cindy-session-item:hover,
 .cindy-project-item:hover,
 .cindy-session-item.is-selected,
 .cindy-project-item.is-selected {
   background: var(--cindy-surface-hover);
+}
+
+.cindy-sidebar-nav-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
 }
 
 .cindy-sidebar-nav-item svg,
@@ -623,18 +858,6 @@
   text-overflow: ellipsis;
 }
 
-.cindy-session-dot {
-  width: 5px;
-  height: 5px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: var(--cindy-text-secondary);
-}
-
-.cindy-session-item.is-selected .cindy-session-dot {
-  background: var(--cindy-focus);
-}
-
 .cindy-project-section {
   display: flex;
   flex-direction: column;
@@ -658,68 +881,47 @@
 }
 
 .cindy-sidebar-footer {
-  padding: 2px 12px 12px;
+  display: flex;
+  min-height: 48px;
+  flex: 0 0 48px;
+  align-items: stretch;
+  padding: 0;
+  border-top: 1px solid var(--cindy-border);
 }
 
-.cindy-user-card {
+.cindy-sidebar-settings-item {
   display: flex;
-  width: 100%;
-  height: 40px;
+  width: calc(100% - 12px);
+  height: 48px;
   align-items: center;
   gap: 8px;
-  padding: 0 7px;
-  border: 1px solid var(--cindy-border);
-  border-radius: 22px;
-  background: var(--cindy-surface-elevated);
+  margin-inline: 6px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 16px;
+  background: transparent;
   color: var(--cindy-text);
+  font: inherit;
+  text-align: left;
   cursor: pointer;
-  box-shadow: var(--cindy-shadow);
 }
 
-.cindy-account-placeholder {
-  display: inline-flex;
-  width: 27px;
-  height: 27px;
+.cindy-sidebar-settings-item svg {
   flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  border-radius: 50%;
+  color: var(--cindy-text-secondary);
+}
+
+.cindy-sidebar-settings-item:hover {
   background: var(--cindy-surface-hover);
-  color: var(--cindy-text-secondary);
 }
 
-.cindy-user-copy {
-  display: flex;
-  min-width: 0;
-  flex: 1 1 auto;
-  flex-direction: column;
-  align-items: flex-start;
-  line-height: 1.05;
+.cindy-sidebar-settings-item:hover svg {
+  color: var(--cindy-text);
 }
 
-.cindy-user-copy strong {
-  overflow: hidden;
-  max-width: 100%;
-  font-size: 13px;
-  font-weight: 500;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.cindy-user-copy small {
-  margin-top: 3px;
-  color: var(--cindy-text-secondary);
-  font-size: 10px;
-}
-
-.cindy-user-action {
-  display: inline-flex;
-  width: 24px;
-  height: 24px;
-  align-items: center;
-  justify-content: center;
-  border-radius: 50%;
-  color: var(--cindy-text-secondary);
+.cindy-sidebar-settings-item {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .cindy-sidebar-resizer,
@@ -734,7 +936,7 @@
   position: absolute;
   z-index: 4;
   top: 0;
-  right: -4px;
+  right: 0;
   bottom: 0;
   width: 8px;
   pointer-events: auto;
@@ -811,26 +1013,22 @@
   padding: 0;
 }
 
-.cindy-sidebar.is-compact .cindy-user-card {
+.cindy-sidebar.is-compact .cindy-sidebar-settings-item {
   box-sizing: border-box;
   width: 32px;
-  height: 64px;
-  flex-direction: column;
-  gap: 5px;
-  padding: 4px 0;
+  height: 32px;
+  flex: 0 0 32px;
+  justify-content: center;
+  gap: 0;
+  margin: auto;
+  padding: 0;
   border: 0;
   border-radius: 18px;
   background: transparent;
-  box-shadow: none;
 }
 
-.cindy-sidebar.is-compact .cindy-user-copy,
-.cindy-sidebar.is-compact .cindy-user-action-secondary {
+.cindy-sidebar.is-compact .cindy-sidebar-settings-item > span {
   display: none;
-}
-
-.cindy-sidebar.is-compact .cindy-user-action-primary {
-  display: inline-flex;
 }
 
 /* 左侧项目树：段标题、项目文件夹和其下会话共用同一条文字对齐线。 */
@@ -843,7 +1041,8 @@
   min-height: 26px;
   align-items: center;
   gap: 2px;
-  padding: 0 4px;
+  margin-inline: 6px;
+  padding: 0;
 }
 
 .cindy-sidebar-section-trigger {
@@ -853,7 +1052,7 @@
   flex: 1 1 auto;
   align-items: center;
   gap: 6px;
-  padding: 0 8px;
+  padding: 0 10px;
   border: 0;
   border-radius: 13px;
   color: var(--cindy-text-secondary);
@@ -948,7 +1147,7 @@
 
 .cindy-project-group {
   position: relative;
-  margin: 1px 0;
+  margin: 1px 6px;
 }
 
 .cindy-project-group.is-dragging {
@@ -958,8 +1157,8 @@
 .cindy-project-group.is-drop-before::before,
 .cindy-project-group.is-drop-after::after {
   position: absolute;
-  right: 6px;
-  left: 6px;
+  right: 0;
+  left: 0;
   height: 2px;
   border-radius: 2px;
   content: "";
@@ -1003,7 +1202,7 @@
   flex: 1 1 auto;
   align-items: center;
   gap: 8px;
-  padding: 0 42px 0 24px;
+  padding: 0 42px 0 18px;
   overflow: hidden;
   border: 0;
   border-radius: 16px;
@@ -1033,8 +1232,7 @@
   white-space: nowrap;
 }
 
-.cindy-project-status,
-.cindy-session-dot {
+.cindy-project-status {
   width: 5px;
   height: 5px;
   flex: 0 0 auto;
@@ -1043,41 +1241,14 @@
   opacity: 0.7;
 }
 
-.cindy-project-status.is-running,
-.cindy-session-dot.is-running,
-.cindy-session-dot.is-waiting_permission {
+.cindy-project-status.is-running {
   background: var(--cindy-focus);
   opacity: 1;
 }
 
-.cindy-project-status.is-failed,
-.cindy-session-dot.is-failed,
-.cindy-session-dot.is-blocked,
-.cindy-session-dot.is-incomplete {
+.cindy-project-status.is-failed {
   background: var(--cindy-danger);
   opacity: 1;
-}
-
-.cindy-project-disclosure {
-  display: inline-grid;
-  width: 16px;
-  height: 16px;
-  flex: 0 0 16px;
-  place-items: center;
-  opacity: 0;
-  color: var(--cindy-text-secondary);
-  transform: rotate(-90deg);
-  transition: opacity 120ms ease, transform 150ms ease;
-}
-
-.cindy-project-row:hover .cindy-project-disclosure,
-.cindy-project-row:focus-visible .cindy-project-disclosure {
-  opacity: 1;
-}
-
-.cindy-project-disclosure.is-expanded {
-  opacity: 1;
-  transform: rotate(0);
 }
 
 .cindy-project-row-actions {
@@ -1139,11 +1310,49 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding: 2px 0 2px 24px;
+  padding: 2px 6px 2px 24px;
 }
 
 .cindy-sidebar-session-list.is-indented {
   padding-left: 24px;
+}
+
+.cindy-sidebar-session-tree-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0;
+}
+
+.cindy-sidebar-session-toggle {
+  display: grid;
+  width: 18px;
+  height: 30px;
+  flex: 0 0 18px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--cindy-text-secondary);
+  cursor: pointer;
+}
+
+.cindy-sidebar-session-toggle:not(.is-empty):hover {
+  background: var(--cindy-surface-hover);
+  color: var(--cindy-text);
+}
+
+.cindy-sidebar-session-toggle[aria-expanded="true"] svg {
+  transform: rotate(90deg);
+}
+
+.cindy-sidebar-session-toggle:disabled {
+  cursor: default;
+}
+
+.cindy-sidebar-session-toggle.is-empty {
+  pointer-events: none;
 }
 
 .cindy-sidebar-session-item {
@@ -1174,23 +1383,28 @@
   background: var(--cindy-selection-surface);
 }
 
-.cindy-sidebar-session-item > span:nth-child(2) {
-  min-width: 0;
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.cindy-sidebar-session-item time {
-  flex: 0 0 auto;
+.cindy-sidebar-session-item.is-archived {
   color: var(--cindy-text-secondary);
-  font-size: 11px;
-  white-space: nowrap;
+  opacity: 0.72;
 }
 
-.cindy-sidebar-session-item.is-selected time {
-  color: var(--cindy-selection-muted);
+.cindy-sidebar-session-unread {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: 50%;
+  background: var(--cindy-accent);
+}
+
+.cindy-sidebar-session-title {
+  min-width: 0;
+  flex: 1 1 0;
+  overflow: hidden;
+  text-overflow: clip;
+  white-space: nowrap;
+  /* 标题超长时渐隐收尾，避免在侧栏边界处被硬切。 */
+  -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 14px), transparent 100%);
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 14px), transparent 100%);
 }
 
 .cindy-sidebar-session-expand {
@@ -1221,9 +1435,14 @@
   font-size: 12px;
 }
 
+.cindy-sidebar-project-empty {
+  margin-left: 24px;
+}
+
 .cindy-sidebar-menu {
   position: fixed;
-  z-index: 100;
+  /* 菜单必须盖住侧栏分隔线，否则浮层中间会出现一条不可见但可见的切线。 */
+  z-index: 130;
   width: 222px;
   padding: 5px;
   border: 1px solid var(--cindy-border);
@@ -1289,6 +1508,7 @@
   min-width: 0;
   min-height: 0;
   flex: 1 1 auto;
+  flex-direction: column;
   overflow: hidden;
   background: var(--cindy-surface);
   color: var(--cindy-text);
@@ -1350,7 +1570,7 @@
   flex-direction: column;
   box-sizing: border-box;
   border: 1px solid var(--cindy-border);
-  border-radius: 13px;
+  border-radius: var(--cindy-composer-radius);
   background: var(--cindy-surface-elevated);
   box-shadow: var(--cindy-shadow);
   color: var(--cindy-text);
@@ -1420,6 +1640,7 @@
 
 .cindy-permission-pill,
 .cindy-model-pill,
+.cindy-thinking-pill,
 .cindy-plan-pill {
   display: inline-flex;
   height: 30px;
@@ -1438,6 +1659,7 @@
 
 .cindy-permission-pill:hover:not(:disabled),
 .cindy-model-pill:hover:not(:disabled),
+.cindy-thinking-pill:hover:not(:disabled),
 .cindy-plan-pill:hover:not(:disabled) {
   background: var(--cindy-surface-hover);
   color: var(--cindy-text);
@@ -1448,12 +1670,14 @@
 }
 
 .cindy-permission-pill svg:last-child,
-.cindy-model-pill svg:last-child {
+.cindy-model-pill svg:last-child,
+.cindy-thinking-pill svg:last-child {
   color: var(--cindy-text-secondary);
 }
 
 .cindy-permission-pill:disabled,
 .cindy-model-pill:disabled,
+.cindy-thinking-pill:disabled,
 .cindy-composer-add:disabled,
 .cindy-mic-button:disabled {
   cursor: not-allowed;
@@ -1469,9 +1693,26 @@
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--cindy-border) 70%, transparent);
 }
 
-.cindy-model-pill > span:not(.model-trigger-brand) {
+.cindy-model-pill .cindy-composer-action-content,
+.cindy-thinking-pill .cindy-composer-action-content {
+  min-width: 0;
+}
+
+.cindy-model-pill .cindy-composer-action-content > span:not(.model-trigger-brand),
+.cindy-thinking-pill .cindy-composer-action-content > span:not(.model-trigger-brand) {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cindy-thinking-pill {
+  max-width: 130px;
+  padding-inline: 8px;
+  color: var(--cindy-text-secondary);
+}
+
+.cindy-thinking-pill svg:first-child {
+  color: var(--cindy-focus);
 }
 
 .model-trigger-brand {
@@ -1508,8 +1749,17 @@
   transition: transform 120ms ease, opacity 120ms ease, background 120ms ease;
 }
 
+.cindy-send-button.is-stop {
+  background: var(--cindy-surface-hover);
+  color: var(--cindy-text);
+}
+
 .cindy-send-button:not(:disabled):hover {
   transform: scale(1.04);
+}
+
+.cindy-send-button.is-stop:not(:disabled):hover {
+  background: var(--cindy-surface-selected);
 }
 
 .cindy-send-button:disabled {
@@ -1526,7 +1776,7 @@
 
 .cindy-attachment-chip {
   display: inline-flex;
-  height: 26px;
+  min-height: 26px;
   align-items: center;
   gap: 5px;
   padding: 0 7px;
@@ -1536,6 +1786,50 @@
   color: var(--cindy-text-secondary);
   font-size: 12px;
   white-space: nowrap;
+}
+
+.cindy-attachment-chip.is-uploading {
+  color: var(--cindy-text-secondary);
+}
+
+.cindy-attachment-chip.is-error {
+  border-color: color-mix(in srgb, var(--cindy-danger) 45%, var(--cindy-border));
+  color: var(--cindy-danger);
+}
+
+.cindy-attachment-copy {
+  display: inline-flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+  line-height: 1.1;
+}
+
+.cindy-attachment-copy > span {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cindy-attachment-copy small {
+  overflow: hidden;
+  color: var(--cindy-text-tertiary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+}
+
+.cindy-attachment-chip.is-error .cindy-attachment-copy small {
+  color: var(--cindy-danger);
+}
+
+.cindy-attachment-spinner {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 auto;
+  border: 1.5px solid color-mix(in srgb, var(--cindy-focus) 30%, transparent);
+  border-top-color: var(--cindy-focus);
+  border-radius: 50%;
+  animation: cindy-composer-spin 700ms linear infinite;
 }
 
 .cindy-attachment-chip button {
@@ -1579,12 +1873,186 @@
   left: auto;
 }
 
+/*
+ * Astryx ChatComposer 适配：只替换输入区的内部实现，外层宽度、圆角和 Cindy 的颜色
+ * 继续由桌面端样式控制。组件库的稳定类名只用于定位 shell/drawer/input，避免依赖
+ * StyleX 生成的短类名。
+ */
+.cindy-composer-frame {
+  width: min(820px, calc(100% - 32px));
+  margin-inline: auto;
+}
+
+/* 对话态的输入框与消息时间线共用同一条内容宽度，避免两边的留白逐渐漂移。 */
+.cindy-chat-composer > .cindy-composer-frame {
+  width: 100%;
+  max-width: none;
+}
+
+.cindy-composer {
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.cindy-composer:focus-within {
+  border: 0;
+  box-shadow: none;
+}
+
+.cindy-composer > .astryx-chat-composer-drawer {
+  color: var(--cindy-text);
+  background-color: var(--cindy-surface-elevated);
+  background-image: none;
+}
+
+.cindy-composer > div:not(.astryx-chat-composer-drawer) {
+  min-height: 108px;
+  box-sizing: border-box;
+  border: 1px solid var(--cindy-border);
+  border-radius: var(--cindy-composer-radius);
+  background: var(--cindy-surface-elevated);
+  box-shadow: var(--cindy-composer-shadow-rest);
+  color: var(--cindy-text);
+}
+
+.cindy-composer > div:not(.astryx-chat-composer-drawer):focus-within {
+  border-color: color-mix(in srgb, var(--cindy-focus) 65%, var(--cindy-border));
+  box-shadow: var(--cindy-composer-shadow-focus);
+}
+
+/* ChatComposer 的 status slot 参与正常布局，不再悬浮覆盖输入区。 */
+.cindy-composer > [role="alert"],
+.cindy-composer > [role="status"] {
+  min-height: 28px;
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 0 0 var(--cindy-composer-radius) var(--cindy-composer-radius);
+  box-shadow: none;
+  font-size: 12px;
+}
+
+.cindy-composer-editor {
+  position: relative;
+  min-height: 56px;
+  flex: 1 1 auto;
+  padding: 0;
+}
+
+.cindy-composer-input {
+  min-height: 56px;
+  color: var(--cindy-text);
+}
+
+.cindy-composer-input > [contenteditable="true"] {
+  min-height: 22px;
+  padding: 0;
+  color: var(--cindy-text);
+  font: inherit;
+  font-size: 15px;
+  line-height: 22px;
+}
+
+.cindy-composer-input > [aria-hidden="true"] {
+  padding: 0;
+  color: var(--cindy-placeholder);
+  font: inherit;
+  font-size: 15px;
+  line-height: 22px;
+}
+
+.cindy-composer .cindy-composer-footer-start,
+.cindy-composer .cindy-composer-footer-end {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.cindy-composer .cindy-composer-footer-end {
+  justify-content: flex-end;
+}
+
+.cindy-composer .cindy-composer-attachments {
+  padding: 0;
+}
+
+.cindy-attachment-remove {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: 50%;
+  color: var(--cindy-text-tertiary);
+}
+
+.cindy-attachment-remove:hover:not(:disabled):not([aria-disabled="true"]) {
+  color: var(--cindy-text);
+  background: var(--cindy-surface-hover);
+}
+
+.cindy-send-button-anchor {
+  position: relative;
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+.cindy-send-button-anchor.is-pending::after {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border: 1.5px solid color-mix(in srgb, var(--cindy-send-icon) 35%, transparent);
+  border-top-color: var(--cindy-send-icon);
+  border-radius: 50%;
+  content: "";
+  pointer-events: none;
+  animation: cindy-composer-spin 700ms linear infinite;
+}
+
+.cindy-send-button-anchor.is-pending .cindy-send-button {
+  pointer-events: none;
+  opacity: 0.58;
+}
+
+.cindy-composer-popover button {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* 模型和思考菜单都从左侧 footer 控件向上展开，保持与 MakaAgent 相同的紧凑宽度。 */
+.cindy-composer-popover.model-menu {
+  width: 286px;
+}
+
+.cindy-composer-popover.thinking-level-menu {
+  width: 240px;
+}
+
+@keyframes cindy-composer-spin {
+  to { transform: rotate(360deg); }
+}
+
+.cindy-composer-frame .composer-hint {
+  position: absolute;
+  bottom: -24px;
+  left: 12px;
+  color: var(--cindy-text-secondary);
+  font-size: 12px;
+}
+
 .cindy-workspace-main {
   display: flex;
+  width: 100%;
   min-width: 0;
   min-height: 0;
   flex: 1 1 auto;
   flex-direction: column;
+  --cindy-chat-content-width: min(820px, calc(100% - 32px));
 }
 
 .cindy-chat-toolbar {
@@ -1594,7 +2062,7 @@
   align-items: center;
   gap: 14px;
   padding: 0 var(--cindy-chat-toolbar-inline-padding);
-  border-bottom: 1px solid var(--cindy-border);
+  border-bottom: 1px solid transparent;
   background: var(--cindy-surface);
   transition: padding-left var(--cindy-sidebar-transition), opacity var(--cindy-sidebar-content-fade);
   /* 左侧浮动 chrome 位于这一行上方；工具栏整行不能成为底层拖拽命中区。 */
@@ -1602,26 +2070,20 @@
   app-region: no-drag;
 }
 
-/*
- * 收起侧栏后聊天 toolbar 仍是主区自己的 ContentHeader：不卸载、不淡出，
- * 只把左 padding 让给固定 chrome 按钮。这样标题在切换期间持续可见，底线也
- * 从窗口左缘贯穿到右侧；下方 chat body/composer 的 46px 顶部锚点保持不变。
- */
-.cindy-root[data-sidebar-collapsed="true"] .cindy-chat-toolbar {
-  padding-left: var(--cindy-sidebar-chrome-width);
-}
-
-/* pinning 时 spacer 与 toolbar 同帧开始，标题只走一次连续路径，不在 300ms 后再回弹。 */
-.cindy-root[data-sidebar-pinning="true"] .cindy-chat-toolbar {
-  padding-left: var(--cindy-chat-toolbar-inline-padding);
-}
-
 .cindy-root[data-sidebar-resizing="true"] .cindy-chat-toolbar {
   transition: none;
 }
 
-.cindy-root[data-sidebar-compact="true"] .cindy-chat-toolbar {
-  padding-left: var(--cindy-sidebar-compact-toolbar-offset);
+/* 收起态的窗口 chrome 已经占据顶部 46px，聊天标题不能再生成第二行。 */
+.cindy-root[data-sidebar-mode="collapsed"] .cindy-content-shell,
+.cindy-root[data-sidebar-mode="peek"] .cindy-content-shell {
+  box-sizing: border-box;
+  padding-top: 46px;
+}
+
+.cindy-root[data-sidebar-mode="collapsed"] .cindy-chat-toolbar,
+.cindy-root[data-sidebar-mode="peek"] .cindy-chat-toolbar {
+  display: none;
 }
 
 .cindy-chat-navigation {
@@ -1741,18 +2203,68 @@
 }
 
 .cindy-chat-scroll {
-  width: min(920px, calc(100% - 48px));
+  width: 100%;
   height: 100%;
-  margin: 0 auto;
-  overflow: auto;
+  min-width: 0;
+  box-sizing: border-box;
+  margin: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: 28px 0 36px;
+  scrollbar-color: transparent transparent;
+  scrollbar-width: thin;
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
 
+.cindy-chat-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.cindy-chat-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.cindy-chat-scroll::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  background-clip: padding-box;
+  transition: background-color 160ms ease;
+}
+
+.cindy-chat-scroll.is-scroll-active,
+.cindy-chat-scroll:hover {
+  scrollbar-color: var(--cindy-border-strong) transparent;
+}
+
+.cindy-chat-scroll.is-scroll-active::-webkit-scrollbar-thumb,
+.cindy-chat-scroll:hover::-webkit-scrollbar-thumb {
+  background: var(--cindy-border-strong);
+  background-clip: padding-box;
+}
+
 .cindy-chat-scroll .desktop-message-list,
 .cindy-chat-scroll .message-timeline {
+  width: var(--cindy-chat-content-width);
+  max-width: 100%;
+  margin-inline: auto;
+}
+
+/* ChatMessage 的用户列默认按内容收缩；这里撑满内容列，避免短消息被压成窄列后提前换行。 */
+.cindy-chat-scroll .user-message {
   width: 100%;
+}
+
+.cindy-chat-scroll article.user-message > div {
+  width: 100%;
+  min-width: 0;
+}
+
+.cindy-chat-scroll .user-bubble {
+  max-width: min(720px, 100%);
+  overflow-wrap: break-word;
 }
 
 /* 顶部消息的操作菜单不能向滚动容器外弹出，否则会被 scroll viewport 裁成只剩删除项。 */
@@ -1796,7 +2308,8 @@
 }
 
 .cindy-chat-composer {
-  width: min(934px, calc(100% - 48px));
+  width: var(--cindy-chat-content-width);
+  max-width: 100%;
   margin: 0 auto;
   padding: 0 0 18px;
   -webkit-app-region: no-drag;
@@ -1864,8 +2377,7 @@
 }
 
 @media (max-width: 1000px) {
-  .cindy-home-content,
-  .cindy-chat-composer {
+  .cindy-home-content {
     width: calc(100% - 32px);
   }
 
@@ -1874,7 +2386,7 @@
   }
 
   .cindy-chat-scroll {
-    width: calc(100% - 32px);
+    width: 100%;
   }
 
   .cindy-composer-footer {
@@ -1892,7 +2404,6 @@
     top: 0;
     bottom: 0;
     left: 0;
-    box-shadow: 8px 0 28px var(--cindy-shadow-sidebar);
   }
 
   .cindy-home-mode {
@@ -1923,11 +2434,14 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .desktop-root.cindy-root,
   .cindy-sidebar,
   .cindy-sidebar-divider,
   .cindy-sidebar-pin-spacer,
   .cindy-sidebar-body,
   .cindy-sidebar-footer,
+  .cindy-sidebar-topbar-floating,
+  .cindy-sidebar-settings-item,
   .cindy-sidebar-block,
   .cindy-chat-toolbar {
     transition: none !important;

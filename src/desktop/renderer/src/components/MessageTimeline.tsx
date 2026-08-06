@@ -4,11 +4,10 @@
  * 数据由 `buildSessionTimeline` 算好，这里只做渲染和局部交互（展开思考、复制、编辑重发、
  * 回滚文件等）。整体用 memo 包住，因为流式输出期间父组件会高频重渲染。
  */
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ChatMessage, ChatMessageBubble } from "@astryxdesign/core/Chat";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
 import { splitAttachmentReferences, type AttachmentReference } from "../../../attachmentReferences.js";
-import { activitySummaryText } from "../../../../runtime/activitySummary.js";
 import { copyToClipboard } from "../copyToClipboard.js";
 import { useInlineImage } from "../inlineImage.js";
 import { listChangedFiles, type TimelineReasoningStep, type TimelineStep, type TimelineTurn } from "../sessionTimeline.js";
@@ -17,6 +16,7 @@ import { speak, speechSupported } from "../speech.js";
 import { CopyButton } from "./CopyButton.js";
 import { Icon } from "./Icon.js";
 import { MarkdownContent } from "./MarkdownContent.js";
+import { ThinkingGlyph } from "./ThinkingGlyph.js";
 import { ToolActivity } from "./ToolActivity.js";
 
 interface MessageTimelineProps {
@@ -26,6 +26,7 @@ interface MessageTimelineProps {
   onPreviewFile(path: string): void;
   onOpenExternal(url: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
+  onResume(): Promise<void>;
   onRetry(input: string): void;
   onEditUserMessage(input: string, userMessageIndex: number): Promise<void>;
   onCreateBranch(): void;
@@ -33,7 +34,7 @@ interface MessageTimelineProps {
   onDeleteUserMessage(turnId: string): void;
 }
 
-export const MessageTimeline = memo(function MessageTimeline({ projectId, sessionId, turns, onPreviewFile, onOpenExternal, onResolvePermission, onRetry, onEditUserMessage, onCreateBranch, onRollbackFiles, onDeleteUserMessage }: MessageTimelineProps): React.JSX.Element {
+export const MessageTimeline = memo(function MessageTimeline({ projectId, sessionId, turns, onPreviewFile, onOpenExternal, onResolvePermission, onResume, onRetry, onEditUserMessage, onCreateBranch, onRollbackFiles, onDeleteUserMessage }: MessageTimelineProps): React.JSX.Element {
   const [editing, setEditing] = useState<{ turnId: string; value: string; userMessageIndex: number }>();
 
   const startEditing = (turn: TimelineTurn): void => {
@@ -63,6 +64,7 @@ export const MessageTimeline = memo(function MessageTimeline({ projectId, sessio
           onPreviewFile={onPreviewFile}
           onOpenExternal={onOpenExternal}
           onResolvePermission={onResolvePermission}
+          onResume={onResume}
           onRollbackFiles={onRollbackFiles}
           onRetry={onRetry}
           projectId={projectId}
@@ -80,6 +82,7 @@ const Turn = memo(function Turn({
   onPreviewFile,
   onOpenExternal,
   onResolvePermission,
+  onResume,
   onRetry,
   onCancelEdit,
   onChangeEdit,
@@ -95,6 +98,7 @@ const Turn = memo(function Turn({
   onPreviewFile(path: string): void;
   onOpenExternal(url: string): void;
   onResolvePermission(requestId: string, result: PermissionResult): Promise<void>;
+  onResume(): Promise<void>;
   onRetry(input: string): void;
   onCancelEdit(): void;
   onChangeEdit(value: string): void;
@@ -152,7 +156,7 @@ const Turn = memo(function Turn({
             skills={turn.skills}
           />
         ) : running && !turn.assistant ? (
-          <div className="reasoning-row is-static"><span className="reasoning-pulse" /><span>正在处理</span></div>
+          <div className="reasoning-row is-static"><ThinkingGlyph animated /><span>正在处理</span></div>
         ) : null}
         {!executionSteps.some((step) => step.kind === "assistant") && turn.assistant ? <MarkdownContent content={turn.assistant} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} /> : null}
 
@@ -187,7 +191,8 @@ const Turn = memo(function Turn({
             <button className="run-error-heading" onClick={() => setErrorOpen(!errorOpen)} type="button"><span>{runErrorHeading(turn.status)}</span><Icon name="chevron" size={12} /></button>
             {errorOpen ? <pre><code>{turn.error}</code></pre> : null}
             <div className="run-error-actions">
-              {turn.status === "failed" && turn.user ? <button onClick={() => onRetry(turn.user)} type="button">重试</button> : null}
+            {turn.status === "failed" && turn.user ? <button onClick={() => onRetry(turn.user)} type="button">重试</button> : null}
+              {turn.resumable ? <button onClick={() => void onResume()} type="button">继续运行</button> : null}
               <button onClick={() => void copyToClipboard(turn.error ?? "")} type="button">复制错误</button>
             </div>
           </section>
@@ -234,7 +239,7 @@ function ExecutionTimeline({
   return (
     <div className="execution-timeline">
       {skills.length ? (
-        <div className="execution-skills">
+        <div className="execution-step execution-skills">
           <Icon name="wand" size={14} />
           <span>使用 {String(skills.length)} 个技能</span>
           <span className="execution-skills-list">{skills.join(" · ")}</span>
@@ -260,23 +265,37 @@ function ExecutionTimeline({
         }
         if (step.kind === "user") {
           return (
-            <div className="execution-user-step user-message" key={step.id}>
+            <div className="execution-step execution-user-step user-message" key={step.id}>
               <div className="user-bubble"><MarkdownContent content={step.content} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} /></div>
             </div>
           );
         }
-        if (step.summary) return <ActivitySummaryStep content={step.content} key={step.id} />;
-        return <div className="execution-assistant-step" key={step.id}><MarkdownContent content={step.content} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} /></div>;
+        if (step.summary) {
+          return (
+            <ActivitySummaryStep
+              content={step.content}
+              key={step.id}
+              onOpenExternal={onOpenExternal}
+              onPreviewFile={onPreviewFile}
+              projectId={projectId}
+            />
+          );
+        }
+        return <div className="execution-step execution-assistant-step" key={step.id}><MarkdownContent content={step.content} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} /></div>;
       })}
     </div>
   );
 }
 
-function ActivitySummaryStep({ content }: { content: string }): React.JSX.Element {
+function ActivitySummaryStep({ content, onOpenExternal, onPreviewFile, projectId }: {
+  content: string;
+  onOpenExternal(url: string): void;
+  onPreviewFile(path: string): void;
+  projectId: string;
+}): React.JSX.Element {
   return (
-    <div className="reasoning-row is-summary" role="status">
-      <span className="reasoning-summary-marker"></span>
-      <span>{activitySummaryText(content)}</span>
+    <div className="execution-step execution-assistant-step execution-summary-step">
+      <MarkdownContent content={content} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} />
     </div>
   );
 }
@@ -293,26 +312,24 @@ function ReasoningStepView({ expanded, onOpenExternal, onPreviewFile, onToggle, 
   // The status is a label for the disclosure row, not the model's reasoning
   // content. Providers that do not return reasoning deltas must not make
   // statuses such as “分析完成” look like generated content.
+  const detailId = useId();
   const text = reasoningDetailText(step);
-  const label = step.durationMs !== undefined
-    ? `思考了 ${formatThinkingDuration(step.durationMs)}`
-    : step.completed
-      ? "深度思考"
-      : step.status ?? (running ? "正在思考" : "深度思考");
   return (
-    <section className={`execution-reasoning${expanded ? " is-open" : ""}`}>
-      <button aria-expanded={expanded} className="execution-reasoning-button" onClick={onToggle} type="button">
-        {running && !step.completed ? <span className="reasoning-pulse" /> : <Icon name="brain" size={14} />}
-        <span>{label}</span>
+    <section className={`execution-step execution-reasoning${expanded ? " is-open" : ""}`}>
+      <button aria-controls={detailId} aria-expanded={expanded} className="execution-reasoning-button" onClick={onToggle} type="button">
+        <ThinkingGlyph animated={running && !step.completed} />
+        <span className="reasoning-label">Thinking</span>
         <span className={`reasoning-chevron${expanded ? " is-expanded" : ""}`}><Icon name="chevron" size={12} /></span>
       </button>
-      {expanded ? (
-        <div className="reasoning-detail">
-          <div className="reasoning-detail-copy">
-            <MarkdownContent content={text} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} variant="is-compact" />
+      <div aria-hidden={!expanded} className={`timeline-reveal t-resize${expanded ? " is-open" : ""}`} id={detailId} inert={!expanded}>
+        <div className="timeline-reveal-inner">
+          <div className="reasoning-detail">
+            <div className="reasoning-detail-copy">
+              <MarkdownContent content={text} onOpenExternal={onOpenExternal} onPreviewFile={onPreviewFile} projectId={projectId} variant="is-compact" />
+            </div>
           </div>
         </div>
-      ) : null}
+      </div>
     </section>
   );
 }
@@ -462,12 +479,6 @@ function plainTextFromMarkdown(content: string): string {
     .replace(/^#{1,6}\s+/gm, "")
     .replace(/[*_~`]/g, "")
     .trim();
-}
-
-function formatThinkingDuration(durationMs: number): string {
-  const seconds = durationMs / 1_000;
-  if (seconds >= 60) return `${String(Math.floor(seconds / 60))} 分 ${String(Math.round(seconds % 60))} 秒`;
-  return `${seconds.toFixed(seconds < 10 ? 2 : 1)} 秒`;
 }
 
 /** 助手回复下方的操作条：复制、朗读、重新生成，以及放次要操作的更多菜单。 */

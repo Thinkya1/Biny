@@ -34,6 +34,7 @@ export type IconName =
   | "eye-off"
   | "file"
   | "folder"
+  | "folder-open"
   | "folder-panel"
   | "help"
   | "home"
@@ -127,6 +128,7 @@ function pathFor(name: IconName): React.JSX.Element {
     case "eye-off": return <><path {...common} d="m4 4 16 16M9.9 9.9A3 3 0 0 0 12 15a3 3 0 0 0 2.1-.9M7 7.4C4.4 8.8 2.5 12 2.5 12s3.5 6.5 9.5 6.5c1.6 0 3-.3 4.3-.9M14.1 9A3 3 0 0 0 12 9c-.4 0-.7.1-1 .2M10.6 5.2C11.1 5.1 11.5 5 12 5c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-2.1 2.8" /></>;
     case "file": return <path {...common} d="M7 3.5h6l4 4V20a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1Zm6 0v4h4" />;
     case "folder": return <path {...common} d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />;
+    case "folder-open": return <path {...common} d="M3 9V5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v2M3 9h19l-2.4 8.2A2 2 0 0 1 17.7 19H5a2 2 0 0 1-2-2V9Z" />;
     case "folder-panel": return <><path {...common} d="M7.5 5h4l2 2H19a1.5 1.5 0 0 1 1.5 1.5V16" /><path {...common} d="M3.5 9h6l2-2h7v11.5A1.5 1.5 0 0 1 17 20H5a1.5 1.5 0 0 1-1.5-1.5V9Z" /></>;
     case "help": return <><circle {...common} cx="12" cy="12" r="9" /><path {...common} d="M9.8 9a2.3 2.3 0 0 1 4.5.7c0 1.8-2.3 2-2.3 3.8M12 17.4h.01" /></>;
     case "home": return <path {...common} d="m4 10 8-6 8 6v9a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1v-9Z" />;

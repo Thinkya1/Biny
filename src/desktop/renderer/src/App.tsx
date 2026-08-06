@@ -17,6 +17,7 @@ import type {
   DesktopProject,
   DesktopSessionDocument,
   DesktopSessionSummary,
+  DesktopSessionTreePage,
   DesktopSlashResult,
   DesktopThemePreference,
   DesktopWorkspaceDirectory,
@@ -24,7 +25,6 @@ import type {
 } from "../../protocol.js";
 import { DEFAULT_FILE_PANEL_WIDTH } from "../../filePanelSizing.js";
 import { DEFAULT_FONT_PREFERENCE, SYSTEM_FONT_FAMILY } from "../../fontPreference.js";
-import { clampSidebarResizeWidth, clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH, normalizeSidebarWidth } from "../../sidebarSizing.js";
 import {
   createNavigationState,
   pushNavigation,
@@ -39,12 +39,14 @@ import {
   eventsBeforeUserMessage,
   lastReportedInputTokens,
   mergeProject,
+  mergeProjectSessionPage,
   replaceProjectSessions,
+  replaceProjectSessionRoots,
   syntheticSession
 } from "./app/desktopState.js";
 import { useDesktopEventBridge } from "./app/useDesktopEventBridge.js";
 import { useDesktopSettingsActions } from "./app/useDesktopSettingsActions.js";
-import { useSidebarPeek } from "./app/useSidebarPeek.js";
+import { useSidebarLayout } from "./app/useSidebarLayout.js";
 import { Composer, type ContextUsage } from "./components/Composer.js";
 import { DesktopShell } from "./components/DesktopShell.js";
 import { Sidebar } from "./components/Sidebar.js";
@@ -54,22 +56,14 @@ import { RenameOverlay } from "./components/overlays/RenameOverlay.js";
 import { SearchOverlay } from "./components/overlays/SearchOverlay.js";
 import { SlashResultOverlay } from "./components/overlays/SlashResultOverlay.js";
 import { SettingsOverlay, type SettingsTab } from "./components/settings/SettingsOverlay.js";
+import { useWorkspaceInspector } from "./components/workspace/useWorkspaceInspector.js";
 
 interface RenameTarget {
   kind: "project" | "session";
   projectId: string;
   sessionId?: string;
   title: string;
-}
-
-const SIDEBAR_RAIL_STORAGE_KEY = "biny.desktop.sidebar-rail";
-
-function readSidebarRailPreference(): boolean {
-  try {
-    return typeof window !== "undefined" && window.localStorage.getItem(SIDEBAR_RAIL_STORAGE_KEY) === "true";
-  } catch {
-    return false;
-  }
+  metadataRevision?: string;
 }
 
 export function App(): React.JSX.Element {
@@ -80,10 +74,6 @@ export function App(): React.JSX.Element {
   const [document, setDocument] = useState<DesktopSessionDocument>();
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
   const [loading, setLoading] = useState(true);
-  const [sidebarVisible, setSidebarVisible] = useState(true);
-  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
-  const [sidebarRailMode, setSidebarRailMode] = useState(readSidebarRailPreference);
-  const [sidebarResizing, setSidebarResizing] = useState(false);
   const [filePanelWidth, setFilePanelWidth] = useState(DEFAULT_FILE_PANEL_WIDTH);
   const [filePanelResizing, setFilePanelResizing] = useState(false);
   const [themePreference, setThemePreference] = useState<DesktopThemePreference>("system");
@@ -104,36 +94,19 @@ export function App(): React.JSX.Element {
   const menuActionRef = useRef<(action: DesktopMenuAction) => void>(() => undefined);
   const modelSetupWasRequiredRef = useRef(false);
 
-  const pinSidebar = useCallback((): void => {
-    setSidebarVisible(true);
-    setSidebarRailMode(false);
+  const persistSidebarWidth = useCallback((width: number): void => {
+    void window.biny.setSidebarWidth(width);
   }, []);
   const {
+    layout: sidebarLayout,
     drawerHandlers: sidebarPeekDrawerHandlers,
     drawerRef: sidebarPeekDrawerRef,
-    pin: pinSidebarPeek,
-    peekState: sidebarPeekState,
-    triggerHandlers: sidebarPeekTriggerHandlers
-  } = useSidebarPeek({
-    collapsed: !sidebarVisible,
-    onPin: pinSidebar
-  });
-  const requestSidebarExpand = useCallback((): void => {
-    setSidebarRailMode(false);
-    pinSidebarPeek();
-  }, [pinSidebarPeek]);
-  const setSidebarVisibility = useCallback((visible: boolean): void => {
-    if (visible) requestSidebarExpand();
-    else setSidebarVisible(false);
-  }, [requestSidebarExpand]);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(SIDEBAR_RAIL_STORAGE_KEY, String(sidebarRailMode));
-    } catch {
-      // Renderer 本地存储不可用时仍保留本次会话的 Rail 状态。
-    }
-  }, [sidebarRailMode]);
+    triggerHandlers: sidebarPeekTriggerHandlers,
+    hydrateExpandedWidth: hydrateSidebarWidth,
+    toggle: toggleSidebar,
+    onResizeKeyDown: onSidebarResizeKeyDown,
+    onResizePointerDown: onSidebarResizePointerDown
+  } = useSidebarLayout({ persistWidth: persistSidebarWidth });
 
   const openSettings = useCallback((targetTab?: SettingsTab): void => {
     setSettingsTargetTab(targetTab);
@@ -143,6 +116,14 @@ export function App(): React.JSX.Element {
   const closeSettings = useCallback((): void => {
     setSettingsOpen(false);
     setSettingsTargetTab(undefined);
+  }, []);
+
+  const openSearch = useCallback((): void => {
+    setSearchOpen(true);
+  }, []);
+
+  const closeSearch = useCallback((): void => {
+    setSearchOpen(false);
   }, []);
 
   useEffect(() => {
@@ -167,14 +148,33 @@ export function App(): React.JSX.Element {
 
   const mergeWorkspaceProject = useCallback((snapshot: DesktopWorkspaceSnapshot): void => {
     setProjects((current) => mergeProject(current, snapshot.project));
-    setSidebarSessions((current) => replaceProjectSessions(current, snapshot.project.id, snapshot.sessions));
+    setSidebarSessions((current) => snapshot.sessionPage
+      ? replaceProjectSessionRoots(current, snapshot.project.id, snapshot.sessionPage.sessions, snapshot.sessions)
+      : replaceProjectSessions(current, snapshot.project.id, snapshot.sessions));
     setWorkspace(snapshot);
   }, []);
 
   const mergeProjectSnapshot = useCallback((snapshot: DesktopWorkspaceSnapshot): void => {
     setProjects((current) => mergeProject(current, snapshot.project));
-    setSidebarSessions((current) => replaceProjectSessions(current, snapshot.project.id, snapshot.sessions));
+    setSidebarSessions((current) => snapshot.sessionPage
+      ? replaceProjectSessionRoots(current, snapshot.project.id, snapshot.sessionPage.sessions, snapshot.sessions)
+      : replaceProjectSessions(current, snapshot.project.id, snapshot.sessions));
     if (projectRef.current === snapshot.project.id) setWorkspace(snapshot);
+  }, []);
+
+  const loadSessionChildren = useCallback(async (
+    projectId: string,
+    parentSessionId: string,
+    cursor?: string
+  ): Promise<DesktopSessionTreePage> => {
+    const page = await window.biny.listSessionTreePage(projectId, {
+      parentSessionId,
+      cursor,
+      limit: 32,
+      includeArchived: true
+    });
+    setSidebarSessions((current) => mergeProjectSessionPage(current, projectId, page.sessions));
+    return page;
   }, []);
 
   const reportEventError = useCallback((error: unknown): void => {
@@ -217,7 +217,10 @@ export function App(): React.JSX.Element {
     if (showLoader) setLoading(true);
     try {
       const nextDocument = await window.biny.openSession(projectId, sessionId);
-      if (loadRequestRef.current === request) setDocument(nextDocument);
+      if (loadRequestRef.current === request) {
+        setDocument(nextDocument);
+        setSidebarSessions((current) => mergeProjectSessionPage(current, projectId, [nextDocument.session]));
+      }
     } catch (error) {
       if (loadRequestRef.current === request) {
         setDocument(undefined);
@@ -260,7 +263,7 @@ export function App(): React.JSX.Element {
       setVersion(bootstrap.version);
       setProjects(bootstrap.projects);
       setSidebarSessions(bootstrap.sidebarSessions);
-      setSidebarWidth(normalizeSidebarWidth(bootstrap.sidebarWidth));
+      hydrateSidebarWidth(bootstrap.sidebarWidth);
       setFilePanelWidth(bootstrap.filePanelWidth ?? DEFAULT_FILE_PANEL_WIDTH);
       setThemePreference(bootstrap.themePreference ?? "system");
       setFontPreference(bootstrap.fontPreference ?? DEFAULT_FONT_PREFERENCE);
@@ -281,7 +284,7 @@ export function App(): React.JSX.Element {
       setToast(`Biny 启动失败：${errorMessage(error)}`);
     });
     return () => { active = false; };
-  }, [commitNavigation, mergeWorkspaceProject, openSession]);
+  }, [commitNavigation, hydrateSidebarWidth, mergeWorkspaceProject, openSession]);
 
   useDesktopEventBridge({
     activeProjectIdRef: projectRef,
@@ -364,14 +367,18 @@ export function App(): React.JSX.Element {
 
   const openSessionMenu = useCallback(async (session: DesktopSessionSummary): Promise<void> => {
     try {
-      const action = await window.biny.showSessionMenu(session.projectId, session.id, session.pinned);
+      const action = await window.biny.showSessionMenu(session.projectId, session.id, session.pinned, session.archived ?? false);
       if (!action) return;
       if (action === "rename") {
-        setRenameTarget({ kind: "session", projectId: session.projectId, sessionId: session.id, title: session.title });
+        setRenameTarget({ kind: "session", projectId: session.projectId, sessionId: session.id, title: session.title, metadataRevision: session.metadataRevision });
         return;
       }
       if (action === "pin" || action === "unpin") {
-        mergeProjectSnapshot(await window.biny.pinSession(session.projectId, session.id, action === "pin"));
+        mergeProjectSnapshot(await window.biny.pinSession(session.projectId, session.id, action === "pin", session.metadataRevision));
+        return;
+      }
+      if (action === "archive" || action === "unarchive") {
+        mergeProjectSnapshot(await window.biny.archiveSession(session.projectId, session.id, action === "archive", session.metadataRevision));
         return;
       }
       if (action === "duplicate") {
@@ -412,15 +419,12 @@ export function App(): React.JSX.Element {
     menuActionRef.current = (action) => {
       if (action === "new-task") void newTask();
       if (action === "open-project") void openProject();
-      if (action === "search") setSearchOpen(true);
+      if (action === "search") openSearch();
       if (action === "settings") openSettings();
-      if (action === "toggle-sidebar") {
-        if (sidebarVisible) setSidebarVisible(false);
-        else requestSidebarExpand();
-      }
+      if (action === "toggle-sidebar") toggleSidebar();
       if (action === "focus-composer") setFocusToken((value) => value + 1);
     };
-  }, [newTask, openProject, openSettings, requestSidebarExpand, sidebarVisible]);
+  }, [newTask, openProject, openSearch, openSettings, toggleSidebar]);
 
   const sendPrompt = useCallback(async (input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[], delivery?: "steer" | "followUp"): Promise<void> => {
     const projectId = projectRef.current;
@@ -441,6 +445,18 @@ export function App(): React.JSX.Element {
       setDocument({ session: summary, events: [], liveEvents: [] });
     }
   }, [commitNavigation, document, workspace?.sessions]);
+
+  const resumeInterruptedTurn = useCallback(async (): Promise<void> => {
+    const projectId = projectRef.current;
+    const sessionId = selectedRef.current;
+    if (!projectId || !sessionId) return;
+    const receipt = await window.biny.resumeInterruptedTurn(projectId, sessionId);
+    if (!receipt) {
+      setToast("当前会话没有可恢复的在途回合。");
+      return;
+    }
+    setSelectedSessionId(receipt.sessionId);
+  }, []);
 
   const runSlashCommand = useCallback(async (command: string): Promise<void> => {
     const projectId = projectRef.current;
@@ -593,7 +609,7 @@ export function App(): React.JSX.Element {
   const saveAttachment = useCallback(async (file: File): Promise<DesktopAttachment> => {
     const projectId = projectRef.current;
     if (!projectId) throw new Error("请先打开一个项目。");
-    if (file.size > 25 * 1024 * 1024) throw new Error(`${file.name} 超过 25 MB。`);
+    if (file.size > 50 * 1024 * 1024) throw new Error(`${file.name} 超过 50 MB。`);
     return await window.biny.saveAttachment(projectId, file.name, file.type, new Uint8Array(await file.arrayBuffer()));
   }, []);
 
@@ -620,6 +636,22 @@ export function App(): React.JSX.Element {
     if (!projectId) return;
     void window.biny.openWorkspaceFile(projectId, path).catch((error) => setToast(errorMessage(error)));
   }, []);
+
+  const inspector = useWorkspaceInspector({
+    filePanelResizing,
+    filePanelWidth,
+    onFilePanelResizeEnd: (width) => {
+      setFilePanelResizing(false);
+      void window.biny.setFilePanelWidth(width);
+    },
+    onFilePanelResizeStart: () => setFilePanelResizing(true),
+    onFilePanelWidthChange: setFilePanelWidth,
+    onListDirectory: listWorkspaceDirectory,
+    onOpenFile: openWorkspaceFile,
+    onReadFile: readWorkspaceFile,
+    projectId: workspace?.project.id,
+    source: `${workspace?.project.id ?? "none"}:${document?.session.id ?? "draft"}`
+  });
 
   const turns = useMemo(() => document ? buildSessionTimeline(document.events, document.liveEvents) : [], [document]);
   const messageScope = `${workspace?.project.id ?? "none"}:${document?.session.id ?? "draft"}`;
@@ -668,7 +700,7 @@ export function App(): React.JSX.Element {
       overlays={(
         <>
           <SearchOverlay
-            onClose={() => setSearchOpen(false)}
+            onClose={closeSearch}
             onProject={(projectId) => void selectProject(projectId)}
             onSession={(projectId, sessionId) => void navigateToSession(projectId, sessionId)}
             open={searchOpen}
@@ -719,7 +751,7 @@ export function App(): React.JSX.Element {
               if (renameTarget.kind === "project") {
                 mergeProjectSnapshot(await window.biny.renameProject(renameTarget.projectId, title));
               } else if (renameTarget.sessionId) {
-                mergeProjectSnapshot(await window.biny.renameSession(renameTarget.projectId, renameTarget.sessionId, title));
+                mergeProjectSnapshot(await window.biny.renameSession(renameTarget.projectId, renameTarget.sessionId, title, renameTarget.metadataRevision));
                 setDocument((current) => {
                   if (!current || current.session.id !== renameTarget.sessionId) return current;
                   return { events: current.events, liveEvents: current.liveEvents, session: { ...current.session, title } };
@@ -732,13 +764,10 @@ export function App(): React.JSX.Element {
           />
           <SlashResultOverlay onClose={() => setSlashResult(undefined)} result={slashResult} />
           <DesktopToast message={toast} onClose={clearToast} />
-        </>
+      </>
       )}
-      sidebarVisible={sidebarVisible}
-      sidebarWidth={sidebarWidth}
-      sidebarRailMode={sidebarRailMode}
-      sidebarResizing={sidebarResizing}
-      sidebarPeekState={sidebarPeekState}
+      rightPanel={inspector.dock}
+      sidebarLayout={sidebarLayout}
       sideNav={(
         <Sidebar
           activeProjectId={workspace?.project.id}
@@ -752,53 +781,38 @@ export function App(): React.JSX.Element {
           onRenameProject={renameProject}
           onReorderProjects={(projectIds) => void reorderProjects(projectIds)}
           onRevealProject={(projectId) => { void window.biny.revealProject(projectId).catch((error) => setToast(errorMessage(error))); }}
-          onSearch={() => setSearchOpen(true)}
-          onSelectProject={(projectId) => void selectProject(projectId)}
+          onSearch={openSearch}
           onSelectSession={(projectId, sessionId) => void navigateToSession(projectId, sessionId)}
+          onLoadSessionChildren={loadSessionChildren}
           onSessionMenu={(session) => void openSessionMenu(session)}
           onSettings={() => openSettings()}
-          onVisibleChange={setSidebarVisibility}
-          onPinPeek={requestSidebarExpand}
-          onRailModeChange={setSidebarRailMode}
-          onResizeStateChange={setSidebarResizing}
-          onWidthChange={(width) => setSidebarWidth(clampSidebarResizeWidth(width))}
-          onWidthCommit={(width) => { void window.biny.setSidebarWidth(clampSidebarWidth(width)); }}
+          onResizeKeyDown={onSidebarResizeKeyDown}
+          onResizePointerDown={onSidebarResizePointerDown}
+          onToggleSidebar={toggleSidebar}
+          layout={sidebarLayout}
           projects={projects}
           selectedSessionId={selectedSessionId}
           sessions={sidebarSessions}
-          visible={sidebarVisible}
-          railMode={sidebarRailMode}
           peekDrawerHandlers={sidebarPeekDrawerHandlers}
           peekDrawerRef={sidebarPeekDrawerRef}
-          peekState={sidebarPeekState}
           peekTriggerHandlers={sidebarPeekTriggerHandlers}
-          version={version}
-          width={sidebarWidth}
         />
       )}
       theme={themePreference}
     >
       <Workspace
-        filePanelResizing={filePanelResizing}
-        filePanelWidth={filePanelWidth}
         loading={loading}
         onCreateBranch={() => { void createBranch(); }}
         onDeleteUserMessage={deleteUserMessage}
         onEditUserMessage={editUserMessage}
-        onFilePanelResizeEnd={(width) => {
-          setFilePanelResizing(false);
-          void window.biny.setFilePanelWidth(width);
-        }}
-        onFilePanelResizeStart={() => setFilePanelResizing(true)}
-        onFilePanelWidthChange={setFilePanelWidth}
-        onOpenFile={openWorkspaceFile}
         onOpenExternal={(url) => void window.biny.openExternal(url).catch((error) => setToast(errorMessage(error)))}
         onOpenProject={() => void openProject()}
-        onListDirectory={listWorkspaceDirectory}
-        onReadFile={readWorkspaceFile}
+        onPreviewFile={inspector.previewFile}
         onResolvePermission={resolvePermission}
+        onResume={resumeInterruptedTurn}
         onRollbackFiles={rollbackFiles}
         onRetry={(input) => void sendPrompt(input, "chat", []).catch((error) => setToast(errorMessage(error)))}
+        onToggleFiles={inspector.toggleFiles}
         project={workspace?.project}
         projectId={workspace?.project.id}
         runtimeError={workspace?.runtimeError}

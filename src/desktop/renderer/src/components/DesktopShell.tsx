@@ -6,64 +6,61 @@
  */
 import { Theme } from "@astryxdesign/core/theme";
 import { neutralTheme } from "@astryxdesign/theme-neutral/built";
-import { clampSidebarResizeWidth, clampSidebarWidth, SIDEBAR_RAIL_WIDTH } from "../../../sidebarSizing.js";
-import type { SidebarPeekState } from "../app/useSidebarPeek.js";
+import type { SidebarLayoutSnapshot } from "../../../sidebarLayout.js";
 import type { DesktopThemePreference } from "../../../protocol.js";
 
 interface DesktopShellProps {
   children: React.ReactNode;
   overlays?: React.ReactNode;
+  rightPanel?: React.ReactNode;
   sideNav: React.ReactNode;
-  sidebarVisible: boolean;
-  sidebarWidth: number;
-  sidebarRailMode: boolean;
-  sidebarResizing: boolean;
-  sidebarPeekState: SidebarPeekState;
+  sidebarLayout: SidebarLayoutSnapshot;
   theme: DesktopThemePreference;
 }
 
 /**
  * Peek 固定展开时的流内占位。
  *
- * 始终留在 flex 流中，只有 pinning 状态把它从 0 宽切到目标宽；这样 spacer 和
- * toolbar 在同一个状态提交中启动过渡，固定抽屉切回普通布局时也不会重复推拉主区。
+ * 始终留在 flex 流中，只有 pinning 状态把它切到共享的流宽度；这样 spacer 和
+ * 侧栏主体使用同一个动画时钟，固定抽屉切回普通布局时也不会重复推拉主区。
  */
-function SidebarPinSpacer({ width, active }: { width: number; active: boolean }): React.JSX.Element {
+function SidebarPinSpacer({ active }: { active: boolean }): React.JSX.Element {
   return (
     <div
       aria-hidden="true"
       className="cindy-sidebar-pin-spacer"
-      style={{ flexBasis: active ? width : 0, width: active ? width : 0 }}
+      data-active={active ? "true" : undefined}
     />
   );
 }
 
-export function DesktopShell({ children, overlays, sideNav, sidebarVisible, sidebarWidth, sidebarRailMode, sidebarResizing, sidebarPeekState, theme }: DesktopShellProps): React.JSX.Element {
-  const resolvedSidebarWidth = sidebarResizing
-    ? clampSidebarResizeWidth(sidebarWidth)
-    : sidebarRailMode
-      ? SIDEBAR_RAIL_WIDTH
-      : clampSidebarWidth(sidebarWidth);
+export function DesktopShell({ children, overlays, rightPanel, sideNav, sidebarLayout, theme }: DesktopShellProps): React.JSX.Element {
+  const rootStyle = {
+    "--cindy-sidebar-visual-width": `${sidebarLayout.visualWidth}px`,
+    "--cindy-sidebar-flow-width": `${sidebarLayout.flowWidth}px`,
+    "--cindy-sidebar-content-width": `${sidebarLayout.contentWidth}px`,
+    "--cindy-sidebar-expanded-width": `${sidebarLayout.expandedWidth}px`
+  } as React.CSSProperties;
   return (
     <Theme mode={theme} theme={neutralTheme}>
       <div
         className="desktop-root cindy-root"
-        data-sidebar-collapsed={sidebarVisible ? undefined : "true"}
-        data-sidebar-compact={sidebarVisible && sidebarRailMode ? "true" : undefined}
-        data-sidebar-pinning={sidebarPeekState === "pinning" ? "true" : undefined}
-        data-sidebar-resizing={sidebarResizing ? "true" : undefined}
+        data-sidebar-mode={sidebarLayout.mode}
+        data-sidebar-resizing={sidebarLayout.resizing ? "true" : undefined}
+        data-sidebar-transition={sidebarLayout.transition === "idle" ? undefined : sidebarLayout.transition}
+        style={rootStyle}
       >
         <div className="cindy-app-shell">
           <main className="cindy-content-shell">{children}</main>
           <div className="cindy-sidebar-block">
-            <SidebarPinSpacer active={sidebarPeekState === "pinning"} width={clampSidebarWidth(sidebarWidth)} />
+            <SidebarPinSpacer active={sidebarLayout.transition === "pinning"} />
             {sideNav}
           </div>
+          {rightPanel}
         </div>
         <div
           aria-hidden="true"
           className="cindy-sidebar-divider"
-          style={{ left: `${sidebarVisible ? resolvedSidebarWidth : 0}px` }}
         />
         {overlays}
       </div>

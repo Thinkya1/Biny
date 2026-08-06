@@ -5,7 +5,7 @@
  * 保持折叠，运行状态由行首的 spinner 表达；用户手动切换后 `override` 记住该选择，
  * 直到工具状态发生变化再回到自动策略。
  */
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import { isFullYesConfirmation } from "../../../../permission/confirmation.js";
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
 import { tokenizeCommand } from "../commandHighlight.js";
@@ -13,6 +13,7 @@ import type { TimelineCommand, TimelineTool } from "../sessionTimeline.js";
 import { projectWebSearchView, type WebSearchResultView, type WebSearchView } from "../webSearchPresentation.js";
 import { CopyButton } from "./CopyButton.js";
 import { Icon } from "./Icon.js";
+import { ThinkingGlyph } from "./ThinkingGlyph.js";
 
 interface ToolActivityProps {
   projectId: string;
@@ -28,13 +29,13 @@ export const ToolActivity = memo(function ToolActivity({ projectId, tool, onPrev
   // override 连同当时的状态一起记：状态一变（比如从 running 变 success）就作废，回到自动策略。
   const [override, setOverride] = useState<{ status: TimelineTool["status"]; expanded: boolean }>();
   const expanded = override?.status === tool.status ? override.expanded : auto;
+  const detailsId = useId();
   const [resolving, setResolving] = useState(false);
   const command = useMemo(() => commandDetails(tool), [tool]);
   const diff = useMemo(() => tool.diff ? analyzeDiff(tool.diff) : undefined, [tool.diff]);
   const fileChange = useMemo(() => fileChangeDetails(tool), [tool]);
   const webSearch = useMemo(() => tool.tool === "web_search" ? projectWebSearchView(tool.args, tool.result) : undefined, [tool.args, tool.result, tool.tool]);
   const summary = toolSummary(tool, command, diff, webSearch);
-  const previewPath = changedFilePath(tool);
   const durationMs = useLiveDuration(tool);
   const errorText = meaningfulError(tool, command);
 
@@ -49,52 +50,43 @@ export const ToolActivity = memo(function ToolActivity({ projectId, tool, onPrev
   };
 
   return (
-    <article className={`tool-activity is-${tool.status}`} data-project-id={projectId}>
+    <article className={`execution-step tool-activity is-${tool.status}`} data-project-id={projectId}>
       <div className="tool-heading-row">
-        <button aria-expanded={expanded} className="tool-heading" onClick={() => setOverride({ status: tool.status, expanded: !expanded })} type="button">
+        <button aria-controls={detailsId} aria-expanded={expanded} className="tool-heading" onClick={() => setOverride({ status: tool.status, expanded: !expanded })} type="button">
           <ToolStatusGlyph status={tool.status} />
           <span className="tool-name">{toolLabel(tool.tool)}</span>
           <span className="tool-summary">{summary}</span>
+          {durationMs !== undefined ? <span className="tool-duration">{formatDuration(durationMs)}</span> : null}
           <span className={`tool-disclosure${expanded ? " is-expanded" : ""}`}><Icon name="chevron" size={13} /></span>
         </button>
-        {previewPath ? (
-          <button
-            aria-label={`在右侧预览 ${previewPath}`}
-            className="tool-file-preview"
-            disabled={tool.status !== "success"}
-            onClick={() => onPreviewFile(previewPath)}
-            title={tool.status === "success" ? "在右侧预览" : "文件写入完成后可预览"}
-            type="button"
-          >
-            <Icon name="panel-right" size={14} />
-          </button>
-        ) : null}
       </div>
-      {expanded ? (
-        <div className="tool-details">
-          {tool.permission ? (
-            <PermissionCard disabled={resolving} permission={tool.permission} onResolve={resolve} />
-          ) : null}
-          {command ? <CommandLog command={command} running={tool.status === "running"} /> : null}
-          {fileChange ? <FileChangeView change={fileChange} onPreviewFile={onPreviewFile} /> : null}
-          {diff && tool.diff ? <DiffView diff={tool.diff} info={diff} onPreviewFile={onPreviewFile} /> : null}
-          {webSearch ? <WebSearchLog onOpenExternal={onOpenExternal} tool={tool} view={webSearch} /> : null}
-          {tool.path && !diff && !fileChange ? (
-            <button className="file-path-row" onClick={() => onPreviewFile(tool.path ?? "")} title="在右侧预览" type="button"><Icon name="file" size={13} /><span>{tool.path}</span></button>
-          ) : null}
-          {!command && !diff && !webSearch && !fileChange ? <ToolPayload tool={tool} /> : null}
-          {errorText ? (
-            <section className="tool-section">
-              <h4 className="tool-section-label">错误</h4>
-              <div className="copyable-code-block is-error">
-                <CopyButton className="copy-button" label="复制错误" value={errorText} />
-                <pre className="tool-error-output"><code>{errorText}</code></pre>
-              </div>
-            </section>
-          ) : null}
-          {durationMs !== undefined ? <footer className="tool-call-meta">时长 {formatDuration(durationMs)}</footer> : null}
+      <div aria-hidden={!expanded} className={`timeline-reveal t-resize${expanded ? " is-open" : ""}`} id={detailsId} inert={!expanded}>
+        <div className="timeline-reveal-inner">
+          <div className="tool-details">
+            {tool.permission ? (
+              <PermissionCard disabled={resolving} permission={tool.permission} onResolve={resolve} />
+            ) : null}
+            {command ? <CommandLog command={command} running={tool.status === "running"} /> : null}
+            {fileChange ? <FileChangeView change={fileChange} onPreviewFile={onPreviewFile} /> : null}
+            {diff && tool.diff ? <DiffView diff={tool.diff} info={diff} onPreviewFile={onPreviewFile} /> : null}
+            {webSearch ? <WebSearchLog onOpenExternal={onOpenExternal} tool={tool} view={webSearch} /> : null}
+            {tool.path && !diff && !fileChange ? (
+              <button className="file-path-row" onClick={() => onPreviewFile(tool.path ?? "")} title="在右侧预览" type="button"><Icon name="file" size={13} /><span>{tool.path}</span></button>
+            ) : null}
+            {!command && !diff && !webSearch && !fileChange ? <ToolPayload tool={tool} /> : null}
+            {errorText ? (
+              <section className="tool-section">
+                <h4 className="tool-section-label">错误</h4>
+                <div className="copyable-code-block is-error">
+                  <CopyButton className="copy-button" label="复制错误" value={errorText} />
+                  <pre className="tool-error-output"><code>{errorText}</code></pre>
+                </div>
+              </section>
+            ) : null}
+            {durationMs !== undefined ? <footer className="tool-call-meta">时长 {formatDuration(durationMs)}</footer> : null}
+          </div>
         </div>
-      ) : null}
+      </div>
     </article>
   );
 });
@@ -104,12 +96,6 @@ function meaningfulError(tool: TimelineTool, command: TimelineCommand | undefine
   if (!tool.error) return undefined;
   if (command?.exitCode !== undefined && /^Command exited with code \d+\.$/.test(tool.error)) return undefined;
   return tool.error;
-}
-
-function changedFilePath(tool: TimelineTool): string | undefined {
-  const operation = tool.display?.kind === "file_io" ? tool.display.operation : undefined;
-  if (tool.tool !== "write_file" && tool.tool !== "edit_file" && operation !== "write" && operation !== "edit") return undefined;
-  return tool.path ?? (tool.display?.kind === "file_io" ? tool.display.path : undefined);
 }
 
 function PermissionCard({
@@ -174,36 +160,48 @@ function CommandText({ command }: { command: string }): React.JSX.Element {
 
 function CommandLog({ command, running }: { command: TimelineCommand; running: boolean }): React.JSX.Element {
   const [expanded, setExpanded] = useState(false);
+  const outputRef = useRef<HTMLPreElement>(null);
+  const [expandedHeight, setExpandedHeight] = useState<number>();
   const output = [command.stdout, command.stderr].filter(Boolean).join(command.stdout && command.stderr ? "\n" : "");
+  const copyPayload = [command.command, output].filter(Boolean).join("\n");
   const longOutput = output.length > 3_000 || output.split("\n").length > 18;
+  useEffect(() => {
+    if (!running || !outputRef.current) return;
+    outputRef.current.scrollTop = outputRef.current.scrollHeight;
+  }, [output, running]);
+  useEffect(() => {
+    const outputElement = outputRef.current;
+    if (!outputElement) return;
+    const updateExpandedHeight = (): void => {
+      const nextHeight = outputElement.scrollHeight;
+      setExpandedHeight((current) => current === nextHeight ? current : nextHeight);
+    };
+    updateExpandedHeight();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(updateExpandedHeight);
+    observer.observe(outputElement);
+    return () => observer.disconnect();
+  }, [output]);
+  const outputStyle = expandedHeight === undefined
+    ? undefined
+    : { "--terminal-output-expanded-height": `${String(expandedHeight)}px` } as React.CSSProperties;
   return (
-    <>
-      <section className="tool-section">
-        <h4 className="tool-section-label">命令</h4>
-        <div className="code-card is-dashed command-card">
-          <CopyButton className="copy-button" label="复制命令" value={command.command} />
-          <pre className="command-text"><code><CommandText command={command.command} /></code></pre>
-        </div>
-      </section>
+    <section className={`tool-output-surface${command.exitCode !== undefined && command.exitCode !== 0 ? " is-error" : ""}`}>
+      <header className="tool-output-header">
+        <code className="tool-output-command"><CommandText command={command.command} /></code>
+        <CopyButton className="copy-button" label="复制命令和输出" value={copyPayload} />
+      </header>
       {output || running ? (
-        <section className="tool-section">
-          <h4 className="tool-section-label">
-            结果
-            {running ? <span className="running-label"><span className="mini-spinner" />运行中</span>
-              : command.exitCode !== undefined && command.exitCode !== 0 ? <span className="tool-section-meta is-error">退出码 {command.exitCode}</span> : null}
-          </h4>
-          {output ? (
-            <div className="code-card">
-              <div className="terminal-output-wrap">
-                <pre className={`terminal-output${expanded ? " is-expanded" : ""}`}><code>{command.stdout}{command.stdout && command.stderr && !command.stdout.endsWith("\n") ? "\n" : null}{command.stderr ? <span className="stderr-output">{command.stderr}</span> : null}</code></pre>
-                <CopyButton label="复制输出" value={output} />
-              </div>
-              {longOutput ? <button className="expand-output" onClick={() => setExpanded(!expanded)} type="button">{expanded ? "收起输出" : "展开全部输出"}</button> : null}
-            </div>
-          ) : <div className="code-card is-empty">等待输出…</div>}
-        </section>
+        output ? (
+          <div className="tool-output-body-wrap">
+            <pre className={`tool-output-body${expanded ? " is-expanded" : ""}`} ref={outputRef} style={outputStyle}><code>{command.stdout}{command.stdout && command.stderr && !command.stdout.endsWith("\n") ? "\n" : null}{command.stderr ? <span className="stderr-output">{command.stderr}</span> : null}</code></pre>
+            <CopyButton className="tool-output-copy" label="复制输出" value={output} />
+          </div>
+        ) : <div className="tool-output-empty"><span className="mini-spinner" />等待输出…</div>
       ) : null}
-    </>
+      {command.exitCode !== undefined && command.exitCode !== 0 ? <p className="tool-output-error-meta">退出码 {command.exitCode}</p> : null}
+      {longOutput ? <button className="expand-output" onClick={() => setExpanded(!expanded)} type="button">{expanded ? "收起输出" : "展开全部输出"}</button> : null}
+    </section>
   );
 }
 
@@ -343,46 +341,34 @@ interface DiffInfo {
 
 function DiffView({ diff, info, onPreviewFile }: { diff: string; info: DiffInfo; onPreviewFile(path: string): void }): React.JSX.Element {
   const [showAll, setShowAll] = useState(false);
-  const lines = numberedDiffLines(diff);
-  const visibleLines = showAll ? lines : lines.slice(0, 260);
+  const lines = diffLines(diff);
+  const visibleLines = showAll ? lines : lines.slice(0, 500);
   return (
-    <section className="diff-view">
-      <header className="diff-summary">
-        <span>修改了 {info.files.length} 个文件</span>
-        <span className="diff-add">+{info.additions}</span>
-        <span className="diff-delete">-{info.deletions}</span>
+    <section className="tool-output-surface diff-surface">
+      <header className="tool-output-header diff-header">
+        <div className="diff-paths" title={info.files.map((file) => file.path).join(", ")}>
+          {info.files.length ? info.files.map((file, index) => (
+            <span className="diff-path" key={`${file.status}-${file.path}`}>
+              <button onClick={() => onPreviewFile(file.path)} title="在右侧预览" type="button">{file.path}</button>
+              {index < info.files.length - 1 ? "," : null}
+            </span>
+          )) : <span>Diff</span>}
+        </div>
+        <span className="diff-stats"><span className="diff-add">+{info.additions}</span><span className="diff-delete">-{info.deletions}</span></span>
         <CopyButton label="复制 Diff" value={diff} />
       </header>
-      {info.files.length ? (
-        <div className="diff-files">
-          {info.files.map((file) => (
-            <button key={`${file.status}-${file.path}`} onClick={() => onPreviewFile(file.path)} title="在右侧预览" type="button"><span className={`diff-file-status is-${file.status}`}>{diffStatusLabel(file.status)}</span><span>{file.path}</span></button>
-          ))}
-        </div>
-      ) : null}
       <pre className="diff-code"><code>{visibleLines.map((line, index) => <DiffLine key={`${String(index)}-${line.text.slice(0, 20)}`} line={line} />)}</code></pre>
       {lines.length > visibleLines.length ? <button className="expand-output" onClick={() => setShowAll(true)} type="button">展开全部 {lines.length} 行</button> : null}
     </section>
   );
 }
 
-interface NumberedDiffLine {
+interface DiffLineData {
   text: string;
-  oldNumber?: number;
-  newNumber?: number;
 }
 
-function DiffLine({ line }: { line: NumberedDiffLine }): React.JSX.Element {
-  const className = line.text.startsWith("+") && !line.text.startsWith("+++")
-    ? "is-addition"
-    : line.text.startsWith("-") && !line.text.startsWith("---")
-      ? "is-deletion"
-      : line.text.startsWith("@@")
-        ? "is-hunk"
-        : line.text.startsWith("diff ") || line.text.startsWith("index ") || line.text.startsWith("---") || line.text.startsWith("+++")
-          ? "is-header"
-          : "";
-  return <span className={className}><span className="diff-line-number">{line.oldNumber ?? ""}</span><span className="diff-line-number">{line.newNumber ?? ""}</span><span className="diff-line-content">{line.text}</span>{"\n"}</span>;
+function DiffLine({ line }: { line: DiffLineData }): React.JSX.Element {
+  return <span className="diff-line" data-line={diffLineKind(line.text)}>{line.text}{"\n"}</span>;
 }
 
 function ToolPayload({ tool }: { tool: TimelineTool }): React.JSX.Element {
@@ -436,7 +422,7 @@ function CopyableCodeBlock({ value, label }: { value: string; label: string }): 
 
 // 运行中的工具没有 durationMs，用事件时间戳实时递增，结束后回落到权威时长（Alma 同款交互）。
 function useLiveDuration(tool: TimelineTool): number | undefined {
-  const running = tool.durationMs === undefined && tool.status === "running";
+  const running = tool.durationMs === undefined && (tool.status === "running" || tool.status === "waiting");
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (!running) return;
@@ -452,7 +438,7 @@ function useLiveDuration(tool: TimelineTool): number | undefined {
 
 // 行首状态字形（Alma 风格）：类型信息交给工具名，行首只表达执行状态。
 function ToolStatusGlyph({ status }: { status: TimelineTool["status"] }): React.JSX.Element {
-  if (status === "running") return <span className="tool-status-glyph is-running"><span className="mini-spinner" /></span>;
+  if (status === "running" || status === "waiting") return <span className="tool-status-glyph is-running"><ThinkingGlyph animated={status === "running"} /></span>;
   if (status === "success") return <span className="tool-status-glyph is-success"><Icon name="check" size={13} /></span>;
   if (status === "failed") return <span className="tool-status-glyph is-error"><Icon name="close" size={13} /></span>;
   if (status === "denied") return <span className="tool-status-glyph is-error"><Icon name="shield" size={12} /></span>;
@@ -516,39 +502,16 @@ function analyzeDiff(diff: string): DiffInfo {
   return { files, additions, deletions };
 }
 
-function numberedDiffLines(diff: string): NumberedDiffLine[] {
-  let oldNumber: number | undefined;
-  let newNumber: number | undefined;
-  return diff.split("\n").map((text) => {
-    if (text.startsWith("diff --git ") || text.startsWith("index ") || text.startsWith("--- ") || text.startsWith("+++ ")) {
-      if (text.startsWith("diff --git ")) {
-        oldNumber = undefined;
-        newNumber = undefined;
-      }
-      return { text };
-    }
-    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text);
-    if (hunk?.[1] && hunk[2]) {
-      oldNumber = Number(hunk[1]);
-      newNumber = Number(hunk[2]);
-      return { text };
-    }
-    if (oldNumber === undefined || newNumber === undefined || text.startsWith("\\ No newline")) return { text };
-    if (text.startsWith("+") && !text.startsWith("+++")) {
-      const line = { text, oldNumber: undefined, newNumber };
-      newNumber += 1;
-      return line;
-    }
-    if (text.startsWith("-") && !text.startsWith("---")) {
-      const line = { text, oldNumber, newNumber: undefined };
-      oldNumber += 1;
-      return line;
-    }
-    const line = { text, oldNumber, newNumber };
-    oldNumber += 1;
-    newNumber += 1;
-    return line;
-  });
+function diffLines(diff: string): DiffLineData[] {
+  return diff.split("\n").map((text) => ({ text }));
+}
+
+function diffLineKind(text: string): "add" | "del" | "hunk" | "meta" | "ctx" {
+  if (text.startsWith("+") && !text.startsWith("+++")) return "add";
+  if (text.startsWith("-") && !text.startsWith("---")) return "del";
+  if (text.startsWith("@@")) return "hunk";
+  if (text.startsWith("diff ") || text.startsWith("index ") || text.startsWith("---") || text.startsWith("+++")) return "meta";
+  return "ctx";
 }
 
 function fileToolResult(value: unknown): { count?: string; text?: string } | undefined {
@@ -613,15 +576,10 @@ function riskLabel(risk: string): string {
   return "需确认";
 }
 
-function diffStatusLabel(status: DiffInfo["files"][number]["status"]): string {
-  if (status === "added") return "A";
-  if (status === "deleted") return "D";
-  if (status === "renamed") return "R";
-  return "M";
-}
-
 function formatDuration(durationMs: number): string {
-  return durationMs < 1_000 ? `${String(durationMs)}ms` : `${(durationMs / 1_000).toFixed(durationMs >= 10_000 ? 0 : 1)}s`;
+  if (durationMs < 1_000) return `${String(durationMs)} ms`;
+  if (durationMs < 60_000) return `${(durationMs / 1_000).toFixed(durationMs < 10_000 ? 1 : 0)}s`;
+  return `${String(Math.floor(durationMs / 60_000))}m${String(Math.round((durationMs % 60_000) / 1_000))}s`;
 }
 
 function stringField(record: Record<string, unknown> | undefined, key: string): string | undefined {

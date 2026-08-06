@@ -86,7 +86,7 @@ export interface TimelineAssistantStep {
   kind: "assistant";
   id: string;
   content: string;
-  /** 工具前的公开说明，只作为活动摘要展示，不计入最终 assistant 正文。 */
+  /** 工具前的公开说明，作为时间线正文摘要展示，但不计入最终 assistant 正文。 */
   summary?: boolean;
 }
 
@@ -161,14 +161,42 @@ export interface TimelineChangedFile {
 }
 
 /**
- * 过滤实时时间线中的 reasoning 增量。
+ * 合并同一帧里的 reasoning 增量。
  *
- * 原始 thinking 仍由主进程写入 session，完成后从历史事件恢复；渲染进程只需要
- * reasoning.started / completed 来显示状态和耗时。把每个增量都留在 liveEvents
- * 会让每一帧都从头重放越来越长的字符串，长思考时会拖慢整个桌面端。
+ * 思考预览需要在模型输出时出现，但不能把一帧内的几十个小片段原样塞进 React
+ * 状态。只合并连续增量，遇到其他事件就重新开始，既保留事件顺序，也把每帧的
+ * 时间线更新压缩成一个字符串。
  */
 export function liveTimelineEvents(events: AgentHostEvent[]): AgentHostEvent[] {
-  return events.filter((event) => event.type !== "reasoning.delta");
+  const result: AgentHostEvent[] = [];
+  const lastReasoningDelta = new Map<string, number>();
+  for (const event of events) {
+    if (event.type !== "reasoning.delta") {
+      lastReasoningDelta.delete(event.runId);
+      result.push(event);
+      continue;
+    }
+    const previousIndex = lastReasoningDelta.get(event.runId);
+    const previous = previousIndex === undefined ? undefined : result[previousIndex];
+    if (previousIndex !== undefined && previous?.type === "reasoning.delta") {
+      result[previousIndex] = { ...previous, content: previous.content + event.content, timestamp: event.timestamp };
+      continue;
+    }
+    lastReasoningDelta.set(event.runId, result.length);
+    result.push(event);
+  }
+  return result;
+}
+
+const LIVE_REASONING_LIMIT = 640;
+
+/** 实时行只保留可用于预览的前缀，终态刷新后再从 session 恢复完整内容。 */
+function appendLiveReasoning(existing: string, next: string): string {
+  if (!next || existing.endsWith("…")) return existing;
+  const combined = existing + next;
+  return combined.length <= LIVE_REASONING_LIMIT
+    ? combined
+    : `${combined.slice(0, LIVE_REASONING_LIMIT - 1).trimEnd()}…`;
 }
 
 /** 合成完整时间线；末尾过滤掉完全空的轮次（只有元信息、没有任何可展示内容）。 */
@@ -470,8 +498,8 @@ function buildLiveTurns(events: AgentHostEvent[], initialUserMessageIndex: numbe
       startReasoning(event);
     } else if (event.type === "reasoning.delta") {
       const step = reasoningStepFor(event);
-      step.content += event.content;
-      turn.reasoning += event.content;
+      step.content = appendLiveReasoning(step.content, event.content);
+      turn.reasoning = appendLiveReasoning(turn.reasoning, event.content);
     } else if (event.type === "reasoning.completed") {
       turn.reasoningStatus = "分析完成";
       const step = activeReasoning.get(event.runId);
