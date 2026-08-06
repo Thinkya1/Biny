@@ -11,6 +11,8 @@ import type { PermissionMode } from "../../permission/PermissionManager.js";
 import { createCommandRuntime, type CommandRuntime } from "../../runtime/CommandRuntime.js";
 import { ExecutionService } from "../../runtime/ExecutionService.js";
 import { SessionLeaseStore, type SessionLease } from "../../runtime/SessionLease.js";
+import { connectRuntimeHost, RuntimeHostClient } from "../../runtime/RuntimeHost.js";
+import { runtimeIsBusy } from "../../runtime/agentEvents.js";
 import type { UsageSummary } from "../../session/metadata.js";
 import { withCliAbortSignal } from "../sigint.js";
 
@@ -44,6 +46,10 @@ export interface RunCommandResult {
 
 export async function runCommand(workspaceRoot: string, input: string, options: RunCommandOptions = {}): Promise<RunCommandResult> {
   validateRunOptions(options);
+  const attached = canAttachRun(options)
+    ? await connectRuntimeHost(workspaceRoot, { surface: "cli", clientId: `run-${process.pid}` })
+    : undefined;
+  if (attached) return await runAttachedCommand(attached, input, options);
   let runtime: CommandRuntime | undefined;
   let leases: SessionLeaseStore | undefined;
   let lease: SessionLease | undefined;
@@ -94,6 +100,59 @@ export async function runCommand(workspaceRoot: string, input: string, options: 
   if (!machineResult) throw new Error("Biny run ended without a structured result.");
   if (options.json) console.log(JSON.stringify(machineResult));
   return machineResult;
+}
+
+async function runAttachedCommand(
+  runtime: RuntimeHostClient,
+  input: string,
+  options: RunCommandOptions
+): Promise<RunCommandResult> {
+  try {
+    if (runtimeIsBusy(runtime.getSnapshot())) throw new Error("Runtime Host is already running another task.");
+    const submitted = runtime.submitPrompt(input, "chat");
+    const turn = await withCliAbortSignal(async (signal) => {
+      const onAbort = (): void => {
+        runtime.cancelRun(submitted.runId);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        return await submitted.completion;
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+      }
+    });
+    const info = runtime.getSnapshot().info;
+    const usage = (await runtime.usage()).summary as UsageSummary;
+    const result: RunCommandResult = {
+      status: turn.status,
+      stopReason: turn.stopReason,
+      steps: turn.steps,
+      error: turn.error,
+      sessionId: info.sessionId,
+      sessionFile: info.sessionFile,
+      modelAlias: info.modelAlias,
+      provider: info.provider,
+      model: info.modelLabel,
+      usage
+    };
+    if (!options.json) {
+      if (turn.output) console.log(turn.output);
+      console.log(`\nSession: ${info.sessionFile}`);
+      assertCompletedCliRun(turn);
+    }
+    if (options.json) console.log(JSON.stringify(result));
+    return result;
+  } finally {
+    await runtime.close();
+  }
+}
+
+function canAttachRun(options: RunCommandOptions): boolean {
+  return options.model === undefined
+    && options.maxSteps === undefined
+    && options.softSteps === undefined
+    && options.permissionMode === undefined
+    && options.headless !== true;
 }
 
 function createRunConfigStore(workspaceRoot: string, options: RunCommandOptions): AgentConfigStore {

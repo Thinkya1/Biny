@@ -14,9 +14,10 @@ import { runCommand, type RunCommandOptions } from "./commands/run.js";
 import { chatCommand, type ChatCommandOptions } from "./commands/chat.js";
 import { evalCompareCommand, evalRunCommand } from "./commands/evals.js";
 import { resumeCommand } from "./commands/resume.js";
-import { sessionsCommand } from "./commands/sessions.js";
+import { sessionsCommand, type SessionsCommandOptions } from "./commands/sessions.js";
 import { planCommand } from "./commands/plan.js";
 import { tuiCommand } from "./commands/tui.js";
+import { runtimeHostCommand } from "./commands/runtimeHost.js";
 
 const program = new Command();
 // CLI 的工作区以用户执行 biny 时的当前目录为准。
@@ -39,7 +40,25 @@ program
   .option("-s, --session <id>", "continue a specific session id or .jsonl path")
   .action((options: ChatCommandOptions) => wrap(() => chatCommand(workspaceRoot, options))());
 program.command("tui").description("Start terminal UI mode").action(wrap(() => tuiCommand(workspaceRoot, cliVersion)));
-program.command("sessions").description("List recorded sessions").action(wrap(() => sessionsCommand(workspaceRoot)));
+program
+  .command("runtime-host")
+  .description("Run the shared Runtime Host process")
+  .option("--workspace-root <path>", "workspace root")
+  .option("--persistence-root <path>", "session and runtime persistence root")
+  .option("--config-dir <path>", "global config directory")
+  .option("--attachment-root <path>", "attachment directory")
+  .option("--session-id <id>", "session to resume")
+  .option("--resume-interrupted", "resume the latest interrupted turn")
+  .allowUnknownOption()
+  .action(() => wrap(runtimeHostCommand)());
+program
+  .command("sessions")
+  .description("List recorded sessions")
+  .option("--limit <count>", "maximum sessions in one page", parsePositiveInteger)
+  .option("--cursor <cursor>", "continue from a previous page")
+  .option("--parent <session-id>", "only list direct children of a session")
+  .option("--json", "print the page as JSON")
+  .action((options: SessionsCommandOptions) => wrap(() => sessionsCommand(workspaceRoot, options))());
 program
   .command("plan")
   .description("Create a plan without executing write, edit, or command tools")
