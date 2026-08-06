@@ -1,8 +1,9 @@
 /**
  * 桌面端 agent 运行时管理。
  *
- * 每个项目一个 `InteractiveAgentRuntime`，按需懒创建并缓存在 `runtimes` 里；
- * 一个项目同一时刻只能有一个活动会话在跑，切换会话前必须先停掉当前运行。
+ * 每个项目一个 runtime handle，按需懒创建并缓存在 `runtimes` 里；当前进程可能是
+ * Runtime Host owner，也可能 attach 到其它 Desktop/TUI owner。一个项目同一时刻只能
+ * 有一个活动会话在跑，切换会话前必须先停掉当前运行。
  *
  * 几处需要注意的状态：
  * - `runtimeInitializations` 缓存正在创建中的 promise，避免并发请求把同一个项目初始化两次；
@@ -16,6 +17,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { providerDefinition } from "../../../ai/provider.js";
 import { loadProjectSettings } from "../../../config/projectSettings.js";
+import { globalConfigDir } from "../../../config/paths.js";
 import { configSchema, type AgentConfig, type ProviderConfig } from "../../../config/schema.js";
 import type { AgentConfigStore } from "../../../config/store.js";
 import { createNativeModelSettings, validateModelConfiguration } from "../../../llm/nativeFactory.js";
@@ -28,11 +30,20 @@ import { executeRuntimeCommand } from "../../../runtime/commands.js";
 import {
   createInteractiveAgentHost,
   type AgentRunOutcome,
-  type InteractiveAgentRuntime
+  type InteractiveAgentHost,
+  type InteractiveRuntimeHandle
 } from "../../../runtime/InteractiveAgentRuntime.js";
 import type { CommandRuntime } from "../../../runtime/CommandRuntime.js";
+import {
+  connectOrSpawnRuntimeHost,
+  findLatestInterruptedSession,
+  startRuntimeHost,
+  RuntimeHostClient,
+  type RuntimeHostFactory,
+  type RuntimeHostServer
+} from "../../../runtime/RuntimeHost.js";
 import { SessionLeaseError } from "../../../runtime/SessionLease.js";
-import { runtimeIsBusy, type AgentHostEvent, type AgentRuntimeUpdate } from "../../../runtime/agentEvents.js";
+import { isTerminalRunEvent, runtimeIsBusy, type AgentHostEvent, type AgentRuntimeUpdate } from "../../../runtime/agentEvents.js";
 import { withAttachmentReferences } from "../../attachmentReferences.js";
 import type {
   DesktopAttachment,
@@ -49,6 +60,8 @@ import type {
   DesktopRunReceipt,
   DesktopSessionDocument,
   DesktopSessionSummary,
+  DesktopSessionTreePage,
+  DesktopSessionTreePageOptions,
   DesktopSlashResult,
   DesktopWebSearchSettings,
   DesktopWebSearchSettingsInput,
@@ -59,8 +72,9 @@ import { DesktopModelLoginService, type AuthenticatedModelLogin } from "./Deskto
 import { DesktopStateStore } from "./DesktopStateStore.js";
 
 interface ManagedRuntime {
-  runtime: InteractiveAgentRuntime;
-  commands: CommandRuntime;
+  runtime: InteractiveRuntimeHandle;
+  commands?: CommandRuntime;
+  host?: RuntimeHostServer;
   unsubscribe(): void;
 }
 
@@ -91,14 +105,16 @@ export class DesktopAgentManager {
     // Keep lastOpenedAt stable on select/refresh so the sidebar order does not jump.
     await this.state.upsertProject(project);
     const runtime = this.runtimes.get(projectId)?.runtime;
-    const [config, sessions] = await Promise.all([
+    const [config, sessions, sessionPage] = await Promise.all([
       this.configStore.load(project.path).catch(() => undefined),
-      this.projects.listSessions(project, runtime?.getSnapshot(), this.projectEvents(projectId))
+      this.projects.listSessions(project, runtime?.getSnapshot(), this.projectEvents(projectId)),
+      this.projects.listSessionTreePage(project, runtime?.getSnapshot(), this.projectEvents(projectId))
     ]);
     const models = config ? listConfiguredModelChoices(config) : [];
     return {
       project,
       sessions,
+      sessionPage,
       selectedSessionId: this.state.selectedSessionId(projectId),
       runtime: runtime?.getSnapshot(),
       runtimeError: this.runtimeErrors.get(projectId),
@@ -109,17 +125,23 @@ export class DesktopAgentManager {
   }
 
   /**
-   * 侧栏需要一次展示所有项目的任务，但不应该因此初始化每个项目的 runtime。
-   * 当前项目复用已经加载的 workspace，其余项目只读取落盘会话摘要。
+   * 侧栏首屏只读取每个项目的根会话；子节点通过 listSessionTreePage 单独按需读取。
+   * 这不会初始化其它项目的 runtime。
    */
   async sidebarSessions(workspace?: DesktopWorkspaceSnapshot): Promise<DesktopSessionSummary[]> {
     const sessionGroups = await Promise.all(this.state.projects().map(async (storedProject) => {
-      if (workspace?.project.id === storedProject.id) return workspace.sessions;
+      if (workspace?.project.id === storedProject.id) return workspace.sessionPage?.sessions ?? workspace.sessions;
       const project = await this.projects.inspectProject(storedProject);
       const runtime = this.runtimes.get(project.id)?.runtime;
-      return await this.projects.listSessions(project, runtime?.getSnapshot(), this.projectEvents(project.id));
+      return (await this.projects.listSessionTreePage(project, runtime?.getSnapshot(), this.projectEvents(project.id))).sessions;
     }));
     return sessionGroups.flat();
+  }
+
+  async listSessionTreePage(projectId: string, options: DesktopSessionTreePageOptions = {}): Promise<DesktopSessionTreePage> {
+    const project = await this.projects.inspectProject(this.projects.requireProject(projectId));
+    const runtime = this.runtimes.get(projectId)?.runtime;
+    return await this.projects.listSessionTreePage(project, runtime?.getSnapshot(), this.projectEvents(projectId), options);
   }
 
   async startDraft(projectId: string): Promise<DesktopWorkspaceSnapshot> {
@@ -128,9 +150,12 @@ export class DesktopAgentManager {
       throw new Error("当前项目仍有任务运行。请先停止它，或稍后再开始新任务。");
     }
     if (managed) {
-      managed.unsubscribe();
-      await managed.runtime.close();
-      this.runtimes.delete(projectId);
+      if (managed.runtime instanceof RuntimeHostClient) {
+        await managed.runtime.restartRuntime();
+      } else {
+        await this.closeManagedRuntime(managed);
+        this.runtimes.delete(projectId);
+      }
     }
     await this.state.setSelectedSession(projectId, undefined);
     this.runtimeErrors.delete(projectId);
@@ -151,7 +176,29 @@ export class DesktopAgentManager {
     await this.state.setSelectedSession(projectId, sessionId);
     const project = this.projects.requireProject(projectId);
     const runtime = this.runtimes.get(projectId)?.runtime;
-    return await this.projects.openSession(project, sessionId, runtime?.getSnapshot(), this.projectEvents(projectId));
+    const document = await this.projects.openSession(project, sessionId, runtime?.getSnapshot(), this.projectEvents(projectId));
+    await this.projects.markSessionRead(project, sessionId);
+    return { ...document, session: { ...document.session, unread: false } };
+  }
+
+  async renameSession(projectId: string, sessionId: string, title: string, expectedRevision?: string): Promise<DesktopWorkspaceSnapshot> {
+    await this.projects.updateSessionMetadata(this.projects.requireProject(projectId), sessionId, { title }, expectedRevision);
+    return await this.workspaceSnapshot(projectId);
+  }
+
+  async pinSession(projectId: string, sessionId: string, pinned: boolean, expectedRevision?: string): Promise<DesktopWorkspaceSnapshot> {
+    await this.projects.updateSessionMetadata(this.projects.requireProject(projectId), sessionId, { pinned }, expectedRevision);
+    return await this.workspaceSnapshot(projectId);
+  }
+
+  async archiveSession(projectId: string, sessionId: string, archived: boolean, expectedRevision?: string): Promise<DesktopWorkspaceSnapshot> {
+    await this.projects.updateSessionMetadata(this.projects.requireProject(projectId), sessionId, { archived }, expectedRevision);
+    return await this.workspaceSnapshot(projectId);
+  }
+
+  async markSessionRead(projectId: string, sessionId: string, expectedRevision?: string): Promise<DesktopWorkspaceSnapshot> {
+    await this.projects.markSessionRead(this.projects.requireProject(projectId), sessionId, expectedRevision);
+    return await this.workspaceSnapshot(projectId);
   }
 
   async sendPrompt(
@@ -162,7 +209,8 @@ export class DesktopAgentManager {
     attachments: DesktopAttachment[],
     delivery?: "steer" | "followUp"
   ): Promise<DesktopRunReceipt> {
-    const { runtime } = await this.ensureRuntime(projectId);
+    const managed = await this.ensureRuntime(projectId);
+    const { runtime } = managed;
     const snapshot = runtime.getSnapshot();
     if (runtimeIsBusy(snapshot)) {
       if (sessionId && snapshot.info.sessionId !== sessionId) {
@@ -203,6 +251,24 @@ export class DesktopAgentManager {
     };
   }
 
+  async resumeInterruptedTurn(projectId: string, sessionId: string): Promise<DesktopRunReceipt | undefined> {
+    const { runtime } = await this.ensureRuntime(projectId);
+    const snapshot = runtime.getSnapshot();
+    if (snapshot.info.sessionId !== sessionId) {
+      if (runtimeIsBusy(snapshot)) throw new Error("当前项目仍有另一条会话正在运行，请先停止任务。");
+      await runtime.resumeSession(sessionId);
+    }
+    const submitted = await runtime.startInterruptedTurn();
+    if (!submitted) return undefined;
+    await this.state.setSelectedSession(projectId, sessionId);
+    this.observeRunCompletion(projectId, submitted.completion);
+    return {
+      sessionId,
+      runId: submitted.runId,
+      messageId: submitted.messageId
+    };
+  }
+
   /**
    * 编辑并重发某条用户消息。
    *
@@ -217,7 +283,8 @@ export class DesktopAgentManager {
     mode: InteractiveAgentRunMode,
     attachments: DesktopAttachment[]
   ): Promise<DesktopRunReceipt> {
-    const { runtime } = await this.ensureRuntime(projectId);
+    const managed = await this.ensureRuntime(projectId);
+    const { runtime } = managed;
     if (runtime.getSnapshot().info.sessionId !== sessionId) {
       const snapshot = runtime.getSnapshot();
       if (runtimeIsBusy(snapshot)) {
@@ -230,13 +297,19 @@ export class DesktopAgentManager {
       runtime.cancelCurrentRun();
       await runtime.waitForIdle();
     }
-    await this.disposeRuntime(projectId);
     const project = this.projects.requireProject(projectId);
     const targetSessionId = await this.projects.forkSessionAtUserMessage(project, sessionId, userMessageIndex);
     await this.state.setSelectedSession(projectId, targetSessionId);
     this.runtimeErrors.delete(projectId);
 
-    const { runtime: nextRuntime } = await this.ensureRuntime(projectId);
+    let nextRuntime: InteractiveRuntimeHandle;
+    if (runtime instanceof RuntimeHostClient) {
+      await runtime.restartRuntime(targetSessionId);
+      nextRuntime = runtime;
+    } else {
+      await this.disposeRuntime(projectId);
+      nextRuntime = (await this.ensureRuntime(projectId)).runtime;
+    }
     const info = nextRuntime.getSnapshot().info;
     const prompt = withAttachmentReferences(input, attachments);
     const nativeAttachments = await loadNativeAttachments(this.projects.attachmentsRoot(project), attachments);
@@ -261,19 +334,26 @@ export class DesktopAgentManager {
 
   async setPermissionMode(projectId: string, mode: PermissionMode): Promise<DesktopWorkspaceSnapshot> {
     const { runtime, commands } = await this.ensureRuntime(projectId);
-    await runtime.runExclusiveOperation(
-      "permission",
-      async () => await commands.agent.setPermissionMode(mode)
-    );
+    if (commands) {
+      await runtime.runExclusiveOperation(
+        "permission",
+        async () => await commands.agent.setPermissionMode(mode)
+      );
+    } else {
+      await requireRemoteRuntime(runtime).setPermissionMode(mode);
+    }
     return await this.workspaceSnapshot(projectId);
   }
 
   async switchModel(projectId: string, alias: string, thinking: ThinkingSelection): Promise<ModelRuntimeInfo> {
     const { runtime, commands } = await this.ensureRuntime(projectId);
-    return await runtime.runExclusiveOperation(
-      "switch_model",
-      async () => await commands.agent.switchModel(alias, thinking)
-    );
+    if (commands) {
+      return await runtime.runExclusiveOperation(
+        "switch_model",
+        async () => await commands.agent.switchModel(alias, thinking)
+      );
+    }
+    return await requireRemoteRuntime(runtime).switchModel(alias, thinking);
   }
 
   async startModelLogin(projectId: string, provider: DesktopModelLoginProvider): Promise<DesktopModelLoginStartResult> {
@@ -299,11 +379,7 @@ export class DesktopAgentManager {
     if (!test.ok) throw new Error(`账号已授权，但模型验证失败：${test.message}`);
     await this.saveProjectConfig(projectId, candidate);
     this.runtimeErrors.delete(projectId);
-    if (managed) {
-      managed.unsubscribe();
-      await managed.runtime.close();
-      this.runtimes.delete(projectId);
-    }
+    if (managed) await this.rebuildManagedRuntime(projectId, managed);
     return await this.workspaceSnapshot(projectId);
   }
 
@@ -325,11 +401,7 @@ export class DesktopAgentManager {
     if (input.makeDefault || next.defaultModel === input.alias) validateModelConfiguration(next, input.alias);
     await this.saveProjectConfig(projectId, next);
     this.runtimeErrors.delete(projectId);
-    if (managed) {
-      managed.unsubscribe();
-      await managed.runtime.close();
-      this.runtimes.delete(projectId);
-    }
+    if (managed) await this.rebuildManagedRuntime(projectId, managed);
     return await this.workspaceSnapshot(projectId);
   }
 
@@ -355,11 +427,7 @@ export class DesktopAgentManager {
     });
     await this.saveProjectConfig(projectId, next);
     this.runtimeErrors.delete(projectId);
-    if (managed) {
-      managed.unsubscribe();
-      await managed.runtime.close();
-      this.runtimes.delete(projectId);
-    }
+    if (managed) await this.rebuildManagedRuntime(projectId, managed);
     return await this.workspaceSnapshot(projectId);
   }
 
@@ -396,11 +464,7 @@ export class DesktopAgentManager {
     });
     await this.saveProjectConfig(projectId, next);
     // 工具注册表在 runtime 装配时读取搜索配置，关闭后下次使用即按新配置重建。
-    if (managed) {
-      managed.unsubscribe();
-      await managed.runtime.close();
-      this.runtimes.delete(projectId);
-    }
+    if (managed) await this.rebuildManagedRuntime(projectId, managed);
     return describeWebSearchSettings(next.web.search);
   }
 
@@ -411,10 +475,12 @@ export class DesktopAgentManager {
     const settings = describeMemorySettings(config);
     if (!settings.enabled) return { settings, totalEntries: 0, topics: [], entries: [] };
     const { runtime, commands } = await this.ensureRuntime(projectId);
-    const entries = await runtime.runExclusiveOperation(
-      "memory",
-      async () => await requireLocalMemory(commands).listEntries()
-    );
+    const entries = commands
+      ? await runtime.runExclusiveOperation(
+        "memory",
+        async () => await requireLocalMemory(commands).listEntries()
+      )
+      : await requireRemoteRuntime(runtime).memory<DesktopMemoryOverview["entries"]>("list");
     const topicCounts = new Map<string, number>();
     for (const entry of entries) topicCounts.set(entry.topic, (topicCounts.get(entry.topic) ?? 0) + 1);
     return {
@@ -446,37 +512,39 @@ export class DesktopAgentManager {
     });
     await this.saveProjectConfig(projectId, next);
     // 记忆配置在 runtime 装配时读取；关闭后下次使用即按新配置重建。
-    if (managed) {
-      managed.unsubscribe();
-      await managed.runtime.close();
-      this.runtimes.delete(projectId);
-    }
+    if (managed) await this.rebuildManagedRuntime(projectId, managed);
     return await this.memoryOverview(projectId);
   }
 
   async searchMemory(projectId: string, query: string): Promise<DesktopMemorySearchMatch[]> {
     this.projects.requireProject(projectId);
     const { runtime, commands } = await this.ensureRuntime(projectId);
-    return await runtime.runExclusiveOperation(
-      "memory",
-      async () => await requireLocalMemory(commands).findRelevant(query, [], 8)
-    );
+    if (commands) {
+      return await runtime.runExclusiveOperation(
+        "memory",
+        async () => await requireLocalMemory(commands).findRelevant(query, [], 8)
+      );
+    }
+    return await requireRemoteRuntime(runtime).memory<DesktopMemorySearchMatch[]>("search", { query });
   }
 
   async addMemoryEntry(projectId: string, topic: string, note: string): Promise<DesktopMemoryOverview> {
     this.projects.requireProject(projectId);
     const { runtime, commands } = await this.ensureRuntime(projectId);
-    const result = await runtime.runExclusiveOperation(
-      "memory",
-      async () => await requireLocalMemory(commands).write({
-        topic,
-        title: note.split("\n", 1)[0]?.slice(0, 120) ?? "Project note",
-        summary: note,
-        decisions: [],
-        paths: [],
-        keywords: []
-      })
-    );
+    const entry = {
+      topic,
+      title: note.split("\n", 1)[0]?.slice(0, 120) ?? "Project note",
+      summary: note,
+      decisions: [],
+      paths: [],
+      keywords: []
+    };
+    const result = commands
+      ? await runtime.runExclusiveOperation(
+        "memory",
+        async () => await requireLocalMemory(commands).write(entry)
+      )
+      : await requireRemoteRuntime(runtime).memory<{ written: boolean; path?: string }>("write", { entry });
     if (!result.written) {
       throw new Error(result.path ? "已存在等价的记忆条目，未重复保存。" : "内容太短，至少需要 20 个字符才能作为持久记忆。");
     }
@@ -486,10 +554,12 @@ export class DesktopAgentManager {
   async deleteMemoryEntry(projectId: string, topic: string, index: number): Promise<DesktopMemoryOverview> {
     this.projects.requireProject(projectId);
     const { runtime, commands } = await this.ensureRuntime(projectId);
-    const removed = await runtime.runExclusiveOperation(
-      "memory",
-      async () => await requireLocalMemory(commands).deleteEntry(topic, index)
-    );
+    const removed = commands
+      ? await runtime.runExclusiveOperation(
+        "memory",
+        async () => await requireLocalMemory(commands).deleteEntry(topic, index)
+      )
+      : await requireRemoteRuntime(runtime).memory<boolean>("delete", { topic, index });
     if (!removed) throw new Error("未找到该记忆条目，可能已被删除。");
     return await this.memoryOverview(projectId);
   }
@@ -497,20 +567,27 @@ export class DesktopAgentManager {
   async clearMemory(projectId: string): Promise<DesktopMemoryOverview> {
     this.projects.requireProject(projectId);
     const { runtime, commands } = await this.ensureRuntime(projectId);
-    await runtime.runExclusiveOperation("memory", async () => {
-      const memory = requireLocalMemory(commands);
-      for (const topic of await memory.listTopics()) await memory.forgetTopic(topic);
-    });
+    if (commands) {
+      await runtime.runExclusiveOperation("memory", async () => {
+        const memory = requireLocalMemory(commands);
+        for (const topic of await memory.listTopics()) await memory.forgetTopic(topic);
+      });
+    } else {
+      await requireRemoteRuntime(runtime).memory("clear");
+    }
     return await this.memoryOverview(projectId);
   }
 
   async compactMemory(projectId: string): Promise<DesktopMemoryCompactionResult[]> {
     this.projects.requireProject(projectId);
     const { runtime, commands } = await this.ensureRuntime(projectId);
-    return await runtime.runExclusiveOperation(
-      "memory",
-      async () => await requireLocalMemory(commands).compactTopics()
-    );
+    if (commands) {
+      return await runtime.runExclusiveOperation(
+        "memory",
+        async () => await requireLocalMemory(commands).compactTopics()
+      );
+    }
+    return await requireRemoteRuntime(runtime).memory<DesktopMemoryCompactionResult[]>("compact");
   }
 
   /**
@@ -673,7 +750,9 @@ export class DesktopAgentManager {
       const snapshot = runtime.getSnapshot();
       if (!runtimeIsBusy(snapshot)) await runtime.resumeSession(sessionId);
     }
-    const result = await executeRuntimeCommand(runtime, commands, input, "desktop");
+    const result = commands
+      ? await executeRuntimeCommand(runtime, commands, input, "desktop")
+      : await requireRemoteRuntime(runtime).executeCommand(input, "desktop");
     if (!result) throw new Error(`未知命令：${input.trim().split(/\s+/, 1)[0] ?? input}`);
     return result;
   }
@@ -690,9 +769,13 @@ export class DesktopAgentManager {
     if (managed?.runtime.getSnapshot().info.sessionId === sessionId) {
       const snapshot = managed.runtime.getSnapshot();
       if (runtimeIsBusy(snapshot)) throw new Error("Stop the running task before deleting this session.");
-      managed.unsubscribe();
-      await managed.runtime.close();
-      this.runtimes.delete(projectId);
+      if (managed.runtime instanceof RuntimeHostClient) {
+        // 先让 owner 切到新会话，再删除旧文件，避免 detached host 继续持有已删除 JSONL。
+        await managed.runtime.restartRuntime();
+      } else {
+        await this.closeManagedRuntime(managed);
+        this.runtimes.delete(projectId);
+      }
     }
     await this.projects.deleteSession(this.projects.requireProject(projectId), sessionId);
     if (this.state.selectedSessionId(projectId) === sessionId) {
@@ -704,8 +787,7 @@ export class DesktopAgentManager {
   async disposeProject(projectId: string): Promise<void> {
     const managed = this.runtimes.get(projectId);
     if (!managed) return;
-    managed.unsubscribe();
-    await managed.runtime.close();
+    await this.closeManagedRuntime(managed);
     this.runtimes.delete(projectId);
   }
 
@@ -735,16 +817,30 @@ export class DesktopAgentManager {
     await Promise.allSettled(this.runtimeInitializations.values());
     const managedRuntimes = [...this.runtimes.values()];
     this.runtimes.clear();
-    for (const managed of managedRuntimes) managed.unsubscribe();
-    await Promise.all(managedRuntimes.map(async ({ runtime }) => await runtime.close()));
+    await Promise.all(managedRuntimes.map(async (managed) => await this.closeManagedRuntime(managed)));
   }
 
   private async disposeRuntime(projectId: string): Promise<void> {
     const managed = this.runtimes.get(projectId);
     if (!managed) return;
-    managed.unsubscribe();
-    await managed.runtime.close();
+    await this.closeManagedRuntime(managed);
     this.runtimes.delete(projectId);
+  }
+
+  /** 配置变更需要 owner 重建 CommandRuntime；远端 client 通过 Host RPC 完成同一件事。 */
+  private async rebuildManagedRuntime(projectId: string, managed: ManagedRuntime): Promise<void> {
+    if (managed.runtime instanceof RuntimeHostClient) {
+      await managed.runtime.restartRuntime();
+      return;
+    }
+    await this.closeManagedRuntime(managed);
+    this.runtimes.delete(projectId);
+  }
+
+  private async closeManagedRuntime(managed: ManagedRuntime): Promise<void> {
+    managed.unsubscribe();
+    await managed.host?.close();
+    await managed.runtime.close();
   }
 
   /**
@@ -789,16 +885,57 @@ export class DesktopAgentManager {
     if (project.missing) throw new Error(`Project path is unavailable: ${project.path}`);
     // session 走全局项目目录，附件仍在项目 `.biny`；三端通过同一个 workspace 定位同一份历史。
     const persistenceRoot = await this.projects.dataRoot(project);
-    const { runtime, commands } = await createInteractiveAgentHost(project.path, {
-      persistenceRoot,
-      configStore: this.configStore,
-      attachmentRoot: this.projects.attachmentsRoot(project)
-    });
-    const initialSessionFile = runtime.getSnapshot().info.sessionFile;
+    let runtime: InteractiveRuntimeHandle;
+    let commands: CommandRuntime | undefined;
+    let host: RuntimeHostServer | undefined;
+    let attached: RuntimeHostClient | undefined;
+    try {
+      attached = await connectOrSpawnRuntimeHost(persistenceRoot, {
+        workspaceRoot: project.path,
+        configDir: globalConfigDir(),
+        attachmentRoot: this.projects.attachmentsRoot(project),
+        sessionId: this.state.selectedSessionId(projectId),
+        resumeInterrupted: true,
+        clientId: `desktop-${process.pid}`,
+        surface: "desktop"
+      });
+    } catch {
+      // 独立 Host 不是可用配置时，保留同进程 owner fallback，并让下面的真实初始化给出错误。
+      attached = undefined;
+    }
+    if (attached) {
+      runtime = attached;
+    } else {
+      const explicitSelectedSession = this.state.selectedSessionId(projectId);
+      const selectedSession = explicitSelectedSession ?? await findLatestInterruptedSession(persistenceRoot);
+      const createLocalRuntime: RuntimeHostFactory = async (sessionId?: string): Promise<InteractiveAgentHost> => {
+        const local = await createInteractiveAgentHost(project.path, {
+          persistenceRoot,
+          configStore: this.configStore,
+          attachmentRoot: this.projects.attachmentsRoot(project)
+        });
+        try {
+          if (sessionId !== undefined) await local.runtime.resumeSession(sessionId);
+          return local;
+        } catch (error) {
+          await local.runtime.close();
+          throw error;
+        }
+      };
+      const local = await createLocalRuntime(explicitSelectedSession === undefined ? selectedSession : undefined);
+      runtime = local.runtime;
+      commands = local.commands;
+    }
+    const initialSessionFile = commands ? runtime.getSnapshot().info.sessionFile : undefined;
     const selectedSessionId = this.state.selectedSessionId(projectId);
     if (selectedSessionId) {
       try {
-        await runtime.resumeSession(selectedSessionId);
+        if (runtime.getSnapshot().info.sessionId !== selectedSessionId) {
+          if (runtimeIsBusy(runtime.getSnapshot())) {
+            throw new Error("当前项目的另一条会话仍在运行，请返回该会话或先停止任务。");
+          }
+          await runtime.resumeSession(selectedSessionId);
+        }
       } catch (error) {
         // 会话文件已被删除：清掉选中项，让运行时留在刚创建的新会话上。
         if (isMissingSession(error)) {
@@ -806,9 +943,47 @@ export class DesktopAgentManager {
         } else {
           // 其他错误则整体回滚，包括删掉刚创建但没用上的空 session 文件，避免留下垃圾会话。
           await runtime.close();
-          await fs.rm(initialSessionFile, { force: true });
+          if (initialSessionFile) await fs.rm(initialSessionFile, { force: true });
           throw error;
         }
+      }
+    }
+    if (commands) {
+      try {
+        const createLocalRuntime: RuntimeHostFactory = async (sessionId?: string): Promise<InteractiveAgentHost> => {
+          const local = await createInteractiveAgentHost(project.path, {
+            persistenceRoot,
+            configStore: this.configStore,
+            attachmentRoot: this.projects.attachmentsRoot(project)
+          });
+          try {
+            if (sessionId !== undefined) await local.runtime.resumeSession(sessionId);
+            return local;
+          } catch (error) {
+            await local.runtime.close();
+            throw error;
+          }
+        };
+        host = await startRuntimeHost(persistenceRoot, runtime, commands, {
+          createRuntime: createLocalRuntime,
+          resumeInterrupted: true
+        });
+      } catch (error) {
+        // 两个入口同时启动时，只有抢到 Host lock 的一方创建 owner；另一方丢弃
+        // 刚装配的本地 runtime，再接回已存在的 owner，避免第二份 AgentSession 抢写。
+        await runtime.close();
+        const retry = await connectOrSpawnRuntimeHost(persistenceRoot, {
+          workspaceRoot: project.path,
+          configDir: globalConfigDir(),
+          attachmentRoot: this.projects.attachmentsRoot(project),
+          sessionId: this.state.selectedSessionId(projectId),
+          resumeInterrupted: true,
+          clientId: `desktop-${process.pid}`,
+          surface: "desktop"
+        });
+        if (!retry) throw error;
+        runtime = retry;
+        commands = undefined;
       }
     }
     const unsubscribe = runtime.subscribe((update) => {
@@ -820,10 +995,13 @@ export class DesktopAgentManager {
         // 实时事件只为「重新打开会话时补上本轮内容」，按会话保留最近 4000 条，防止长跑占满内存。
         if (sessionEvents.length > 4_000) sessionEvents.splice(0, sessionEvents.length - 4_000);
         projectEvents.set(event.sessionId, sessionEvents);
+        if (isTerminalRunEvent(event) && this.state.selectedSessionId(projectId) !== event.sessionId) {
+          void this.projects.updateSessionMetadata(project, event.sessionId, { unread: true }).catch(() => undefined);
+        }
       }
       this.emit(projectId, update);
     });
-    const managed = { runtime, commands, unsubscribe };
+    const managed: ManagedRuntime = { runtime, commands, host, unsubscribe };
     this.runtimes.set(projectId, managed);
     this.runtimeErrors.delete(projectId);
     return managed;
@@ -962,6 +1140,11 @@ function requireLocalMemory(services: CommandRuntime) {
   const memory = services.agent.getLocalMemory();
   if (!memory) throw new Error("Local memory is disabled (context.memory.enabled = false).");
   return memory;
+}
+
+function requireRemoteRuntime(runtime: InteractiveRuntimeHandle): RuntimeHostClient {
+  if (!(runtime instanceof RuntimeHostClient)) throw new Error("Remote runtime client is unavailable.");
+  return runtime;
 }
 
 function formatModelConnectionError(error: unknown): string {

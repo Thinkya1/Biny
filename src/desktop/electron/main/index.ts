@@ -42,6 +42,11 @@ if (!app.requestSingleInstanceLock()) {
 
 async function startDesktopApplication(): Promise<void> {
   await app.whenReady();
+  // Electron 主进程不是 Runtime owner；给可独立启动的 Node Host 一个稳定入口。
+  process.env.BINY_RUNTIME_HOST_ENTRY ??= path.join(
+    app.getAppPath(),
+    app.isPackaged ? "dist/runtime/hostProcess.js" : "src/runtime/hostProcess.ts"
+  );
   setDesktopIcon();
   const userDataRoot = app.getPath("userData");
   const desktopRoot = path.join(userDataRoot, "workspaces", "default");

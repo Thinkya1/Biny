@@ -21,9 +21,20 @@ import {
   type AgentHostEvent,
   type InteractiveRuntimeSnapshot
 } from "../../../runtime/agentEvents.js";
-import { listSessionSummaries, readStoredSessionEvents } from "../../../session/events.js";
+import { readStoredSessionEvents } from "../../../session/events.js";
+import {
+  listSessionCatalog,
+  querySessionCatalog,
+  registerSessionBranch,
+  updateSessionCatalogMetadata,
+  type SessionCatalogItem,
+  type SessionCatalogMetadataPatch,
+  type SessionCatalogQuery
+} from "../../../session/catalog.js";
+import { deleteSessionArtifacts } from "../../../session/cleanup.js";
 import { createSessionId, type SessionTurnStatus } from "../../../session/recorder.js";
-import { createSessionFile, deleteSessionFile, duplicateSessionFile, ensureAgentDirs } from "../../../session/store.js";
+import { SessionRunLedger, type SessionRunRecord } from "../../../session/runLedger.js";
+import { createSessionFile, duplicateSessionFile, ensureAgentDirs } from "../../../session/store.js";
 import { gitInspectionEnvironment } from "../../../tools/git/environment.js";
 import { resolveWorkspaceDirectory, resolveWorkspacePath, toWorkspaceRelative } from "../../../workspace/resolvePath.js";
 import { attachmentFilePath, attachmentPathPrefix, saveAttachment as saveProjectAttachment } from "../../../attachments/store.js";
@@ -31,6 +42,8 @@ import type {
   DesktopAttachment,
   DesktopProject,
   DesktopSessionDocument,
+  DesktopSessionTreePage,
+  DesktopSessionTreePageOptions,
   DesktopSessionStatus,
   DesktopWorkspaceDirectory,
   DesktopWorkspaceDirectoryEntry,
@@ -146,35 +159,50 @@ export class DesktopProjectService {
     if (project.missing) return [];
     const dataRoot = await this.storage.ensureProjectData(project);
     await ensureAgentDirs(dataRoot);
-    const summaries = await listSessionSummaries(dataRoot);
-    const sessions = summaries.map((summary) => {
-      const id = summary.fileName.replace(/\.jsonl$/, "");
+    const catalog = await listSessionCatalog(dataRoot);
+    const runLedger = new SessionRunLedger(dataRoot);
+    const latestRuns = await Promise.all(catalog.map(async (item) => await runLedger.latestSessionRun(item.id)));
+    const sessions = catalog.map((item, index) => {
+      const summary = item.summary;
+      const id = item.id;
+      const latestRun = latestRuns[index];
       const metadata = this.state.sessionMetadata(project.id, id);
       return {
         id,
         projectId: project.id,
         fileName: summary.fileName,
-        title: metadata.title ?? sessionTitle(summary.firstUserMessage),
+        title: item.title ?? metadata.title ?? sessionTitle(summary.firstUserMessage),
         firstUserMessage: summary.firstUserMessage,
         lastAssistantMessage: summary.lastAssistantMessage,
         eventCount: summary.eventCount,
         createdAt: summary.createdAt,
         updatedAt: summary.updatedAt,
-        pinned: metadata.pinned ?? false,
+        pinned: item.pinned ?? metadata.pinned ?? false,
+        archived: item.archived ?? false,
+        unread: item.unread ?? false,
+        labels: item.labels,
+        metadataRevision: item.metadataRevision,
+        hasChildren: item.hasChildren,
+        rootSessionId: item.rootSessionId,
+        parentSessionId: item.parentSessionId,
+        branchPoint: item.branchPoint,
+        latestRun: latestRun ? desktopRunSummary(latestRun) : undefined,
         status: sessionStatus(
           id,
           summary.lastAssistantMessage,
           summary.lastTurnStatus?.status,
           runtime,
-          liveEvents.get(id)
+          liveEvents.get(id),
+          latestRun?.status
         ),
-        resumable: sessionResumable(summary.lastTurnStatus?.resumable, liveEvents.get(id))
+        resumable: sessionResumable(summary.lastTurnStatus?.resumable, liveEvents.get(id), latestRun?.resumable)
       } satisfies DesktopSessionSummary;
     });
 
     const runtimeInfo = runtime?.info;
     const runtimeEvents = runtimeInfo ? liveEvents.get(runtimeInfo.sessionId) : undefined;
     if (runtimeInfo && runtimeEvents?.some((event) => event.type === "message.user") && !sessions.some((session) => session.id === runtimeInfo.sessionId)) {
+      const runtimeLatestRun = await runLedger.latestSessionRun(runtimeInfo.sessionId);
       const metadata = this.state.sessionMetadata(project.id, runtimeInfo.sessionId);
       const now = new Date().toISOString();
       sessions.push({
@@ -188,7 +216,16 @@ export class DesktopProjectService {
         createdAt: now,
         updatedAt: now,
         pinned: metadata.pinned ?? false,
-        status: sessionStatus(runtimeInfo.sessionId, "", undefined, runtime, liveEvents.get(runtimeInfo.sessionId)),
+        archived: false,
+        unread: false,
+        labels: undefined,
+        metadataRevision: undefined,
+        hasChildren: false,
+        rootSessionId: runtimeInfo.sessionId,
+        parentSessionId: undefined,
+        branchPoint: undefined,
+        latestRun: runtimeLatestRun ? desktopRunSummary(runtimeLatestRun) : undefined,
+        status: sessionStatus(runtimeInfo.sessionId, "", undefined, runtime, liveEvents.get(runtimeInfo.sessionId), runtimeLatestRun?.status),
         resumable: undefined
       });
     }
@@ -197,6 +234,73 @@ export class DesktopProjectService {
       if (left.pinned !== right.pinned) return left.pinned ? -1 : 1;
       return Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
     });
+  }
+
+  /** 只读取某一层的一个页面；子节点由 Renderer 在展开父节点时再请求。 */
+  async listSessionTreePage(
+    project: DesktopProject,
+    runtime: InteractiveRuntimeSnapshot | undefined,
+    liveEvents: ReadonlyMap<string, AgentHostEvent[]>,
+    options: DesktopSessionTreePageOptions = {}
+  ): Promise<DesktopSessionTreePage> {
+    if (project.missing) {
+      return {
+        projectId: project.id,
+        parentSessionId: options.parentSessionId,
+        revision: "sha256:empty",
+        sessions: [],
+        nextCursor: undefined,
+        revisionChanged: false
+      };
+    }
+    const dataRoot = await this.storage.ensureProjectData(project);
+    await ensureAgentDirs(dataRoot);
+    const page = await querySessionCatalog(dataRoot, options satisfies SessionCatalogQuery);
+    const runLedger = new SessionRunLedger(dataRoot);
+    const latestRuns = await Promise.all(page.items.map(async (item) => await runLedger.latestSessionRun(item.id)));
+    const sessions = page.items.map((item, index) => {
+      const summary = item.summary;
+      const latestRun = latestRuns[index];
+      const metadata = this.state.sessionMetadata(project.id, item.id);
+      return {
+        id: item.id,
+        projectId: project.id,
+        fileName: summary.fileName,
+        title: item.title ?? metadata.title ?? sessionTitle(summary.firstUserMessage),
+        firstUserMessage: summary.firstUserMessage,
+        lastAssistantMessage: summary.lastAssistantMessage,
+        eventCount: summary.eventCount,
+        createdAt: summary.createdAt,
+        updatedAt: summary.updatedAt,
+        pinned: item.pinned ?? metadata.pinned ?? false,
+        archived: item.archived ?? false,
+        unread: item.unread ?? false,
+        labels: item.labels,
+        metadataRevision: item.metadataRevision,
+        hasChildren: item.hasChildren,
+        rootSessionId: item.rootSessionId,
+        parentSessionId: item.parentSessionId,
+        branchPoint: item.branchPoint,
+        latestRun: latestRun ? desktopRunSummary(latestRun) : undefined,
+        status: sessionStatus(
+          item.id,
+          summary.lastAssistantMessage,
+          summary.lastTurnStatus?.status,
+          runtime,
+          liveEvents.get(item.id),
+          latestRun?.status
+        ),
+        resumable: sessionResumable(summary.lastTurnStatus?.resumable, liveEvents.get(item.id), latestRun?.resumable)
+      } satisfies DesktopSessionSummary;
+    });
+    return {
+      projectId: project.id,
+      parentSessionId: options.parentSessionId,
+      revision: page.revision,
+      sessions,
+      nextCursor: page.nextCursor,
+      revisionChanged: page.revisionChanged
+    };
   }
 
   async openSession(
@@ -215,10 +319,34 @@ export class DesktopProjectService {
     return { session, events, liveEvents: [...(liveEvents.get(sessionId) ?? [])] };
   }
 
+  async updateSessionMetadata(
+    project: DesktopProject,
+    sessionId: string,
+    patch: SessionCatalogMetadataPatch,
+    expectedRevision?: string
+  ): Promise<void> {
+    const dataRoot = await this.storage.ensureProjectData(project);
+    await updateSessionCatalogMetadata(dataRoot, sessionId, patch, expectedRevision);
+    // 旧桌面状态仍保留作无 catalog 会话的兜底；catalog 成功后它不再是新值的来源。
+    if (patch.title !== undefined) await this.state.setSessionTitle(project.id, sessionId, patch.title);
+    if (patch.pinned !== undefined) await this.state.setSessionPinned(project.id, sessionId, patch.pinned);
+  }
+
+  async markSessionRead(project: DesktopProject, sessionId: string, expectedRevision?: string): Promise<void> {
+    await this.updateSessionMetadata(project, sessionId, { unread: false }, expectedRevision);
+  }
+
   async duplicateSession(project: DesktopProject, sessionId: string): Promise<string> {
     const targetSessionId = createSessionId();
     const dataRoot = await this.storage.ensureProjectData(project);
     await duplicateSessionFile(dataRoot, sessionId, targetSessionId);
+    const sourceCatalog = (await listSessionCatalog(dataRoot)).find((item) => item.id === sessionId);
+    await registerSessionBranch(dataRoot, {
+      sessionId: targetSessionId,
+      parentSessionId: sessionId,
+      branchPoint: { kind: "event", index: sourceCatalog?.summary.eventCount ?? 0 }
+    });
+    await this.copyCatalogMetadata(dataRoot, sourceCatalog, targetSessionId);
     await this.state.copySessionMetadata(project.id, sessionId, targetSessionId);
     return targetSessionId;
   }
@@ -238,13 +366,40 @@ export class DesktopProjectService {
     const prefix = events.slice(0, targetEventIndex);
     const content = prefix.length ? `${prefix.map((event) => JSON.stringify(event)).join("\n")}\n` : "";
     await createSessionFile(dataRoot, targetSessionId, Buffer.from(content, "utf8"));
+    const targetEvent = events[targetEventIndex];
+    await registerSessionBranch(dataRoot, {
+      sessionId: targetSessionId,
+      parentSessionId: sessionId,
+      branchPoint: {
+        kind: "user_message",
+        index: userMessageIndex,
+        messageId: targetEvent?.type === "user_message" ? targetEvent.messageId : undefined
+      }
+    });
+    const sourceCatalog = (await listSessionCatalog(dataRoot)).find((item) => item.id === sessionId);
+    await this.copyCatalogMetadata(dataRoot, sourceCatalog, targetSessionId);
     await this.state.copySessionMetadata(project.id, sessionId, targetSessionId);
     return targetSessionId;
   }
 
   async deleteSession(project: DesktopProject, sessionId: string): Promise<void> {
-    await deleteSessionFile(await this.storage.ensureProjectData(project), sessionId);
+    const dataRoot = await this.storage.ensureProjectData(project);
+    await deleteSessionArtifacts(dataRoot, sessionId);
     await this.state.deleteSessionMetadata(project.id, sessionId);
+  }
+
+  private async copyCatalogMetadata(
+    dataRoot: string,
+    source: SessionCatalogItem | undefined,
+    targetSessionId: string
+  ): Promise<void> {
+    await updateSessionCatalogMetadata(dataRoot, targetSessionId, {
+      title: source?.title === undefined ? undefined : `${source.title} 副本`,
+      pinned: false,
+      archived: false,
+      unread: false,
+      labels: source?.labels === undefined ? undefined : [...source.labels]
+    });
   }
 
   /**
@@ -409,7 +564,8 @@ function sessionStatus(
   lastAssistantMessage: string,
   persistedStatus: SessionTurnStatus | undefined,
   runtime: InteractiveRuntimeSnapshot | undefined,
-  events: AgentHostEvent[] | undefined
+  events: AgentHostEvent[] | undefined,
+  latestRunStatus: SessionRunRecord["status"] | undefined
 ): DesktopSessionStatus {
   if (pendingPermission(runtime)?.sessionId === sessionId) return "waiting_permission";
   if (activeRun(runtime)?.sessionId === sessionId) return "running";
@@ -421,18 +577,33 @@ function sessionStatus(
   if (finalEvent?.type === "run.aborted") return "aborted";
   if (finalEvent?.type === "run.completed") return "completed";
   if (persistedStatus) return persistedStatus;
+  if (latestRunStatus) return latestRunStatus;
   return lastAssistantMessage ? "completed" : "idle";
 }
 
 function sessionResumable(
   persisted: boolean | undefined,
-  events: AgentHostEvent[] | undefined
+  events: AgentHostEvent[] | undefined,
+  ledgerResumable: boolean | undefined
 ): boolean | undefined {
   const finalEvent = events ? [...events].reverse().find(isTerminalRunEvent) : undefined;
-  if (!finalEvent) return persisted;
+  if (!finalEvent) return persisted ?? ledgerResumable;
   return finalEvent.type === "run.blocked" || finalEvent.type === "run.incomplete"
     ? finalEvent.resumable
     : undefined;
+}
+
+function desktopRunSummary(run: SessionRunRecord): NonNullable<DesktopSessionSummary["latestRun"]> {
+  return {
+    runId: run.runId,
+    status: run.status,
+    startedAt: run.startedAt,
+    updatedAt: run.updatedAt,
+    endedAt: run.endedAt,
+    durationMs: run.durationMs,
+    stopReason: run.stopReason,
+    resumable: run.resumable
+  };
 }
 
 function isNotFound(error: unknown): boolean {

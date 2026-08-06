@@ -14,7 +14,9 @@ import type { ModelChoice, ModelRuntimeInfo, ThinkingSelection } from "../llm/Mo
 import type { PermissionMode, PermissionResult } from "../permission/PermissionManager.js";
 import type { AgentHostEvent, AgentRuntimeUpdate, InteractiveRuntimeSnapshot } from "../runtime/agentEvents.js";
 import { slashCommandsForSurface, type SlashCommandDefinition } from "../runtime/commandRegistry.js";
+import type { SessionBranchPoint } from "../session/catalog.js";
 import type { SessionEvent } from "../session/recorder.js";
+import type { SessionRunStatus } from "../session/runLedger.js";
 
 export const desktopIpc = {
   bootstrap: "desktop:bootstrap",
@@ -30,12 +32,16 @@ export const desktopIpc = {
   openProjectTerminal: "desktop:project:terminal",
   startDraft: "desktop:session:draft",
   openSession: "desktop:session:open",
+  listSessionTreePage: "desktop:session:tree-page",
   renameSession: "desktop:session:rename",
   pinSession: "desktop:session:pin",
+  archiveSession: "desktop:session:archive",
+  markSessionRead: "desktop:session:mark-read",
   duplicateSession: "desktop:session:duplicate",
   deleteSession: "desktop:session:delete",
   sessionMenu: "desktop:session:menu",
   sendPrompt: "desktop:agent:send",
+  resumeInterruptedTurn: "desktop:agent:resume-interrupted",
   editPrompt: "desktop:agent:edit",
   cancelRun: "desktop:agent:cancel",
   runSlashCommand: "desktop:agent:slash",
@@ -128,6 +134,28 @@ export interface DesktopSessionSummary {
   pinned: boolean;
   status: DesktopSessionStatus;
   resumable?: boolean;
+  /** 分支关系来自 session catalog；旧会话没有 parent 时视为根会话。 */
+  rootSessionId?: string;
+  parentSessionId?: string;
+  branchPoint?: SessionBranchPoint;
+  archived?: boolean;
+  unread?: boolean;
+  labels?: string[];
+  metadataRevision?: string;
+  hasChildren?: boolean;
+  /** 最近一次运行来自 run ledger；live runtime 仍优先于这个历史投影。 */
+  latestRun?: DesktopSessionRunSummary;
+}
+
+export interface DesktopSessionRunSummary {
+  runId: string;
+  status: SessionRunStatus;
+  startedAt: string;
+  updatedAt: string;
+  endedAt?: string;
+  durationMs?: number;
+  stopReason?: string;
+  resumable?: boolean;
 }
 
 /**
@@ -141,9 +169,27 @@ export interface DesktopSessionDocument {
   liveEvents: AgentHostEvent[];
 }
 
+export interface DesktopSessionTreePageOptions {
+  parentSessionId?: string;
+  cursor?: string;
+  limit?: number;
+  includeArchived?: boolean;
+}
+
+export interface DesktopSessionTreePage {
+  projectId: string;
+  parentSessionId?: string;
+  revision: string;
+  sessions: DesktopSessionSummary[];
+  nextCursor?: string;
+  revisionChanged?: boolean;
+}
+
 export interface DesktopWorkspaceSnapshot {
   project: DesktopProject;
   sessions: DesktopSessionSummary[];
+  /** 侧栏首屏只包含根节点；子节点通过 listSessionTreePage 按需加载。 */
+  sessionPage?: DesktopSessionTreePage;
   selectedSessionId?: string;
   runtime?: InteractiveRuntimeSnapshot;
   runtimeError?: string;
@@ -373,7 +419,7 @@ export interface DesktopSlashResult {
 }
 
 export type DesktopMenuAction = "new-task" | "open-project" | "search" | "settings" | "toggle-sidebar" | "focus-composer";
-export type DesktopSessionMenuAction = "rename" | "pin" | "unpin" | "duplicate" | "delete";
+export type DesktopSessionMenuAction = "rename" | "pin" | "unpin" | "archive" | "unarchive" | "duplicate" | "delete";
 
 /** 内嵌终端创建结果。`replay` 是复用已有终端时回放的最近输出。 */
 export interface DesktopTerminalHandle {
@@ -405,12 +451,16 @@ export interface DesktopApi {
   openProjectTerminal(projectId: string): Promise<void>;
   startDraft(projectId: string): Promise<DesktopWorkspaceSnapshot>;
   openSession(projectId: string, sessionId: string): Promise<DesktopSessionDocument>;
-  renameSession(projectId: string, sessionId: string, title: string): Promise<DesktopWorkspaceSnapshot>;
-  pinSession(projectId: string, sessionId: string, pinned: boolean): Promise<DesktopWorkspaceSnapshot>;
+  listSessionTreePage(projectId: string, options?: DesktopSessionTreePageOptions): Promise<DesktopSessionTreePage>;
+  renameSession(projectId: string, sessionId: string, title: string, expectedRevision?: string): Promise<DesktopWorkspaceSnapshot>;
+  pinSession(projectId: string, sessionId: string, pinned: boolean, expectedRevision?: string): Promise<DesktopWorkspaceSnapshot>;
+  archiveSession(projectId: string, sessionId: string, archived: boolean, expectedRevision?: string): Promise<DesktopWorkspaceSnapshot>;
+  markSessionRead(projectId: string, sessionId: string, expectedRevision?: string): Promise<DesktopWorkspaceSnapshot>;
   duplicateSession(projectId: string, sessionId: string): Promise<DesktopWorkspaceSnapshot>;
   deleteSession(projectId: string, sessionId: string): Promise<DesktopWorkspaceSnapshot>;
-  showSessionMenu(projectId: string, sessionId: string, pinned: boolean): Promise<DesktopSessionMenuAction | undefined>;
+  showSessionMenu(projectId: string, sessionId: string, pinned: boolean, archived?: boolean): Promise<DesktopSessionMenuAction | undefined>;
   sendPrompt(projectId: string, sessionId: string | undefined, input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[], delivery?: "steer" | "followUp"): Promise<DesktopRunReceipt>;
+  resumeInterruptedTurn(projectId: string, sessionId: string): Promise<DesktopRunReceipt | undefined>;
   editPrompt(projectId: string, sessionId: string, userMessageIndex: number, input: string, mode: InteractiveAgentRunMode, attachments: DesktopAttachment[]): Promise<DesktopRunReceipt>;
   cancelRun(projectId: string): Promise<void>;
   runSlashCommand(projectId: string, sessionId: string | undefined, command: string): Promise<DesktopSlashResult>;

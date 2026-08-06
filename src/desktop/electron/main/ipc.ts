@@ -46,6 +46,13 @@ const idSchema = z.string().min(1).max(240);
 const promptSchema = z.string().min(1).max(1_000_000);
 const userMessageIndexSchema = z.number().int().nonnegative();
 const titleSchema = z.string().trim().min(1).max(120);
+const revisionSchema = z.string().max(200).optional();
+const sessionTreePageOptionsSchema = z.object({
+  parentSessionId: idSchema.optional(),
+  cursor: z.string().max(4_000).optional(),
+  limit: z.number().int().min(1).max(50).optional(),
+  includeArchived: z.boolean().optional()
+}).optional();
 const permissionModeSchema = z.enum(["ask", "read-only", "auto", "full-access"]);
 const terminalSizeSchema = z.number().int().min(2).max(1_000);
 const terminalDataSchema = z.string().max(1_000_000);
@@ -226,16 +233,28 @@ export function registerDesktopIpc(context: IpcContext): void {
     return await context.agents.openSession(idSchema.parse(projectId), idSchema.parse(sessionId));
   });
 
-  handle(desktopIpc.renameSession, async (_event, projectId: unknown, sessionId: unknown, title: unknown) => {
-    const parsedProjectId = idSchema.parse(projectId);
-    await context.state.setSessionTitle(parsedProjectId, idSchema.parse(sessionId), titleSchema.parse(title));
-    return await context.agents.workspaceSnapshot(parsedProjectId);
+  handle(desktopIpc.listSessionTreePage, async (_event, projectId: unknown, options: unknown) => {
+    return await context.agents.listSessionTreePage(idSchema.parse(projectId), sessionTreePageOptionsSchema.parse(options) ?? {});
   });
 
-  handle(desktopIpc.pinSession, async (_event, projectId: unknown, sessionId: unknown, pinned: unknown) => {
+  handle(desktopIpc.renameSession, async (_event, projectId: unknown, sessionId: unknown, title: unknown, expectedRevision: unknown) => {
     const parsedProjectId = idSchema.parse(projectId);
-    await context.state.setSessionPinned(parsedProjectId, idSchema.parse(sessionId), z.boolean().parse(pinned));
-    return await context.agents.workspaceSnapshot(parsedProjectId);
+    return await context.agents.renameSession(parsedProjectId, idSchema.parse(sessionId), titleSchema.parse(title), revisionSchema.parse(expectedRevision));
+  });
+
+  handle(desktopIpc.pinSession, async (_event, projectId: unknown, sessionId: unknown, pinned: unknown, expectedRevision: unknown) => {
+    const parsedProjectId = idSchema.parse(projectId);
+    return await context.agents.pinSession(parsedProjectId, idSchema.parse(sessionId), z.boolean().parse(pinned), revisionSchema.parse(expectedRevision));
+  });
+
+  handle(desktopIpc.archiveSession, async (_event, projectId: unknown, sessionId: unknown, archived: unknown, expectedRevision: unknown) => {
+    const parsedProjectId = idSchema.parse(projectId);
+    return await context.agents.archiveSession(parsedProjectId, idSchema.parse(sessionId), z.boolean().parse(archived), revisionSchema.parse(expectedRevision));
+  });
+
+  handle(desktopIpc.markSessionRead, async (_event, projectId: unknown, sessionId: unknown, expectedRevision: unknown) => {
+    const parsedProjectId = idSchema.parse(projectId);
+    return await context.agents.markSessionRead(parsedProjectId, idSchema.parse(sessionId), revisionSchema.parse(expectedRevision));
   });
 
   handle(desktopIpc.duplicateSession, async (_event, projectId: unknown, sessionId: unknown) => {
@@ -263,10 +282,10 @@ export function registerDesktopIpc(context: IpcContext): void {
     return await context.agents.deleteSession(parsedProjectId, parsedSessionId);
   });
 
-  handle(desktopIpc.sessionMenu, async (_event, projectId: unknown, sessionId: unknown, pinned: unknown) => {
+  handle(desktopIpc.sessionMenu, async (_event, projectId: unknown, sessionId: unknown, pinned: unknown, archived: unknown) => {
     idSchema.parse(projectId);
     idSchema.parse(sessionId);
-    return await showSessionMenu(context.getWindow(), z.boolean().parse(pinned));
+    return await showSessionMenu(context.getWindow(), z.boolean().parse(pinned), z.boolean().optional().default(false).parse(archived));
   });
 
   handle(desktopIpc.sendPrompt, async (_event, projectId: unknown, sessionId: unknown, input: unknown, mode: unknown, attachments: unknown, delivery: unknown) => {
@@ -278,6 +297,10 @@ export function registerDesktopIpc(context: IpcContext): void {
       z.array(attachmentSchema).max(20).parse(attachments),
       z.enum(["steer", "followUp"]).optional().parse(delivery)
     );
+  });
+
+  handle(desktopIpc.resumeInterruptedTurn, async (_event, projectId: unknown, sessionId: unknown) => {
+    return await context.agents.resumeInterruptedTurn(idSchema.parse(projectId), idSchema.parse(sessionId));
   });
 
   handle(desktopIpc.editPrompt, async (_event, projectId: unknown, sessionId: unknown, userMessageIndex: unknown, input: unknown, mode: unknown, attachments: unknown) => {
@@ -416,7 +439,7 @@ export function registerDesktopIpc(context: IpcContext): void {
   });
 
   handle(desktopIpc.saveAttachment, async (_event, projectId: unknown, name: unknown, mimeType: unknown, bytes: unknown) => {
-    if (!ArrayBuffer.isView(bytes) || bytes.byteLength > 25 * 1024 * 1024) throw new Error("Attachment is invalid or larger than 25 MB.");
+    if (!ArrayBuffer.isView(bytes) || bytes.byteLength > 50 * 1024 * 1024) throw new Error("Attachment is invalid or larger than 50 MB.");
     return await context.projects.saveAttachment(
       context.projects.requireProject(idSchema.parse(projectId)),
       z.string().min(1).max(240).parse(name),
@@ -484,7 +507,7 @@ function applyNativeThemePreference(preference: DesktopThemePreference): void {
 
 function themeBackgroundColor(preference: DesktopThemePreference): string {
   const dark = preference === "dark" || (preference === "system" && nativeTheme.shouldUseDarkColors);
-  return dark ? "#15171c" : "#ffffff";
+  return dark ? "#2a2828" : "#f4f5f7";
 }
 
 /** 先移除同名 handler 再注册：重复注册会被 Electron 直接拒绝（开发期热重载会遇到）。 */
@@ -499,7 +522,7 @@ function handle(channel: string, listener: Parameters<typeof ipcMain.handle>[1])
  * Electron 的菜单项 click 与关闭回调是分开的：click 只记下选择，等 popup 的 callback 触发
  * （菜单真正关闭）才 resolve，所以直接点空白处关闭会得到 undefined。
  */
-async function showSessionMenu(window: BrowserWindow | undefined, pinned: boolean): Promise<DesktopSessionMenuAction | undefined> {
+async function showSessionMenu(window: BrowserWindow | undefined, pinned: boolean, archived: boolean): Promise<DesktopSessionMenuAction | undefined> {
   return await new Promise((resolve) => {
     let selected: DesktopSessionMenuAction | undefined;
     const choose = (action: DesktopSessionMenuAction): void => {
@@ -508,6 +531,7 @@ async function showSessionMenu(window: BrowserWindow | undefined, pinned: boolea
     const template: MenuItemConstructorOptions[] = [
       { label: "重命名", click: () => choose("rename") },
       { label: pinned ? "取消置顶" : "置顶", click: () => choose(pinned ? "unpin" : "pin") },
+      { label: archived ? "取消归档" : "归档", click: () => choose(archived ? "unarchive" : "archive") },
       { label: "复制会话", click: () => choose("duplicate") },
       { type: "separator" },
       { label: "删除", click: () => choose("delete") }
