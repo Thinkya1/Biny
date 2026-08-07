@@ -2055,7 +2055,19 @@
   --cindy-chat-content-width: min(820px, calc(100% - 32px));
 }
 
+/* 固定窗口 chrome 占用顶部 46px；聊天信息行从它下面开始，避免被 chrome 背景盖住。 */
+.cindy-root:not([data-sidebar-mode="collapsed"]):not([data-sidebar-mode="peek"]) .cindy-workspace-chat {
+  box-sizing: border-box;
+  padding-top: 46px;
+}
+
 .cindy-chat-toolbar {
+  position: fixed;
+  z-index: 101;
+  top: 0;
+  right: 0;
+  left: max(150px, var(--cindy-sidebar-visual-width));
+  box-sizing: border-box;
   display: flex;
   height: 46px;
   min-height: 46px;
@@ -2065,9 +2077,9 @@
   border-bottom: 1px solid transparent;
   background: var(--cindy-surface);
   transition: padding-left var(--cindy-sidebar-transition), opacity var(--cindy-sidebar-content-fade);
-  /* 左侧浮动 chrome 位于这一行上方；工具栏整行不能成为底层拖拽命中区。 */
-  -webkit-app-region: no-drag;
-  app-region: no-drag;
+  /* 信息行和窗口 chrome 共用一行；按钮单独退出拖拽区。 */
+  -webkit-app-region: drag;
+  app-region: drag;
 }
 
 .cindy-root[data-sidebar-resizing="true"] .cindy-chat-toolbar {
@@ -2081,9 +2093,10 @@
   padding-top: 46px;
 }
 
+/* 收起侧栏后保留会话信息行；它位于窗口 chrome 下方，不重新引入独立的主内容 pane。 */
 .cindy-root[data-sidebar-mode="collapsed"] .cindy-chat-toolbar,
 .cindy-root[data-sidebar-mode="peek"] .cindy-chat-toolbar {
-  display: none;
+  border-bottom-color: var(--cindy-border);
 }
 
 .cindy-chat-navigation {
@@ -2141,26 +2154,6 @@
 .cindy-usage-control {
   position: relative;
   display: inline-flex;
-}
-
-.cindy-usage-toolbar-button {
-  width: auto;
-  min-width: 26px;
-  gap: 5px;
-  padding: 0 8px;
-  border-radius: 8px;
-}
-
-.cindy-usage-toolbar-button.is-open,
-.cindy-usage-toolbar-button[aria-expanded="true"] {
-  background: var(--cindy-surface-selected);
-  color: var(--cindy-text);
-}
-
-.cindy-usage-toolbar-label {
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
 }
 
 .cindy-usage-popover {
@@ -2262,22 +2255,6 @@
 
 .cindy-usage-warning {
   color: var(--cindy-text);
-}
-
-@media (max-width: 620px) {
-  .cindy-usage-toolbar-button {
-    width: 26px;
-    padding: 0;
-  }
-
-  .cindy-usage-toolbar-label {
-    display: none;
-  }
-}
-
-.cindy-runtime-toolbar-button[aria-expanded="true"] {
-  color: var(--cindy-text);
-  background: var(--cindy-surface-selected);
 }
 
 .cindy-runtime-panel {
@@ -2589,12 +2566,67 @@
 }
 
 .cindy-chat-composer {
+  position: relative;
   width: var(--cindy-chat-content-width);
   max-width: 100%;
   margin: 0 auto;
   padding: 0 0 18px;
   -webkit-app-region: no-drag;
   app-region: no-drag;
+}
+
+.cindy-composer-status {
+  display: flex;
+  min-height: 24px;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 2px 8px 0;
+  color: var(--cindy-text-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cindy-composer-status-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.cindy-composer-status-button {
+  display: inline-flex;
+  height: 24px;
+  min-width: 26px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--cindy-text-secondary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.cindy-composer-status-button:hover:not(:disabled),
+.cindy-composer-status-button.is-open,
+.cindy-composer-status-button[aria-expanded="true"] {
+  background: var(--cindy-surface-hover);
+  color: var(--cindy-text);
+}
+
+.cindy-composer-status-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.cindy-composer-status .cindy-usage-popover {
+  top: auto;
+  right: 0;
+  bottom: calc(100% + 8px);
 }
 
 .cindy-chat-composer .cindy-composer {

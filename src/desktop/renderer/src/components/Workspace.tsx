@@ -100,31 +100,6 @@ export function Workspace({
             {project ? <span>{project.name}{project.branch ? ` · ${project.branch}` : ""}</span> : <span>打开一个本地项目开始</span>}
           </div>
           <div className="cindy-chat-actions">
-            <div className="cindy-usage-control" ref={usageControlRef}>
-              <button
-                aria-expanded={usageOpen}
-                aria-label="查看本会话费用"
-                className={`cindy-toolbar-button cindy-usage-toolbar-button${usageOpen ? " is-open" : ""}`}
-                onClick={() => setUsageOpen((current) => !current)}
-                title="本会话费用"
-                type="button"
-              >
-                <Icon name="chart" size={14} />
-                <span className="cindy-usage-toolbar-label">{sessionUsage.calls ? formatUsageCost(sessionUsage) : "费用"}</span>
-              </button>
-              {usageOpen ? <UsageSummaryPopover anchorRef={usageControlRef} onClose={closeUsage} summary={sessionUsage} /> : null}
-            </div>
-            <button
-              aria-expanded={runtimePanelOpen}
-              aria-label="打开后台运行面板"
-              className="cindy-toolbar-button cindy-runtime-toolbar-button"
-              disabled={!projectId}
-              onClick={() => setRuntimePanelOpen((current) => !current)}
-              title="后台运行"
-              type="button"
-            >
-              <Icon name="activity" size={15} />
-            </button>
             <button
               aria-label="打开文件面板"
               className="cindy-toolbar-button"
@@ -166,7 +141,38 @@ export function Workspace({
             <div className="cindy-chat-empty"><Icon name="message" size={20} /><span>开始一段新的对话</span></div>
           )}
         </div>
-        <div className="cindy-chat-composer">{children}</div>
+        <div className="cindy-chat-composer">
+          {children}
+          <div className="cindy-composer-status" aria-label="会话状态">
+            <div className="cindy-composer-status-actions">
+              <div className="cindy-usage-control" ref={usageControlRef}>
+                <button
+                  aria-expanded={usageOpen}
+                  aria-label="查看本会话费用"
+                  className={`cindy-composer-status-button${usageOpen ? " is-open" : ""}`}
+                  onClick={() => setUsageOpen((current) => !current)}
+                  title="本会话费用"
+                  type="button"
+                >
+                  <Icon name="chart" size={13} />
+                  <span>{sessionUsage.calls ? formatUsageCost(sessionUsage) : "费用"}</span>
+                </button>
+                {usageOpen ? <UsageSummaryPopover anchorRef={usageControlRef} onClose={closeUsage} summary={sessionUsage} /> : null}
+              </div>
+              <button
+                aria-expanded={runtimePanelOpen}
+                aria-label="打开后台运行面板"
+                className={`cindy-composer-status-button${runtimePanelOpen ? " is-open" : ""}`}
+                disabled={!projectId}
+                onClick={() => setRuntimePanelOpen((current) => !current)}
+                title="后台运行"
+                type="button"
+              >
+                <Icon name="activity" size={13} />
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
       {streaming ? <span className="cindy-streaming-state" aria-hidden="true" /> : null}
     </div>
