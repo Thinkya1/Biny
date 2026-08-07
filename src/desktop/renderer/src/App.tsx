@@ -49,6 +49,7 @@ import { useDesktopEventBridge } from "./app/useDesktopEventBridge.js";
 import { useDesktopSettingsActions } from "./app/useDesktopSettingsActions.js";
 import { useSidebarLayout } from "./app/useSidebarLayout.js";
 import { Composer, type ContextUsage } from "./components/Composer.js";
+import { summarizeTimelineUsage } from "./usagePresentation.js";
 import { DesktopShell } from "./components/DesktopShell.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { Workspace } from "./components/Workspace.js";
@@ -678,6 +679,7 @@ export function App(): React.JSX.Element {
   });
 
   const turns = useMemo(() => document ? buildSessionTimeline(document.events, document.liveEvents) : [], [document]);
+  const sessionUsage = useMemo(() => summarizeTimelineUsage(turns), [turns]);
   const messageScope = `${workspace?.project.id ?? "none"}:${document?.session.id ?? "draft"}`;
   const visibleTurns = useMemo(() => turns
     .map((turn) => deletedUserMessages.has(`${messageScope}:${turn.id}`) ? { ...turn, user: "" } : turn)
@@ -843,6 +845,7 @@ export function App(): React.JSX.Element {
         runtimeProjection={workspace?.runtimeProjection}
         sessionId={selectedSessionId}
         sessionTitle={sessionSummary?.title}
+        sessionUsage={sessionUsage}
         turns={visibleTurns}
         onRuntimeError={reportRuntimeError}
         onRuntimeMutation={mutateRuntime}

@@ -12,6 +12,7 @@ import { copyToClipboard } from "../copyToClipboard.js";
 import { useInlineImage } from "../inlineImage.js";
 import { listChangedFiles, type TimelineReasoningStep, type TimelineStep, type TimelineTurn } from "../sessionTimeline.js";
 import { reasoningDetailText } from "../reasoningPresentation.js";
+import { formatTurnCost } from "../usagePresentation.js";
 import { speak, speechSupported } from "../speech.js";
 import { CopyButton } from "./CopyButton.js";
 import { Icon } from "./Icon.js";
@@ -586,6 +587,8 @@ function turnSummary(turn: TimelineTurn): string {
   const parts: string[] = [];
   if (turn.durationMs !== undefined) parts.push(formatDuration(turn.durationMs));
   if (turn.usage?.totalTokens !== undefined) parts.push(`${turn.usage.totalTokens.toLocaleString()} tokens`);
+  const cost = formatTurnCost(turn.usage);
+  if (cost) parts.push(cost);
   if (changedFiles.length) parts.push(`${String(changedFiles.length)} 个文件`);
   if (commands) parts.push(`${String(commands)} 条命令`);
   return parts.join(" · ");

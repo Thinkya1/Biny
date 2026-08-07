@@ -5,13 +5,16 @@
  * 权限和文件检查器回调。页面层只负责把这些能力放到正确的视觉区域。
  */
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
-import { useEffect, useRef, useState } from "react";
+import type { UsageSummary } from "../../../../session/metadata.js";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ThinkingOrb } from "thinking-orbs";
 import type { DesktopProject, DesktopRuntimeMutation, DesktopRuntimeProjection } from "../../../protocol.js";
 import type { TimelineTurn } from "../sessionTimeline.js";
+import { formatUsageCost } from "../usagePresentation.js";
 import { Icon } from "./Icon.js";
 import { MessageTimeline } from "./MessageTimeline.js";
 import { RuntimePanel } from "./RuntimePanel.js";
+import { UsageSummaryPopover } from "./UsageSummaryPopover.js";
 
 interface WorkspaceProps {
   project?: DesktopProject;
@@ -22,6 +25,7 @@ interface WorkspaceProps {
   loading: boolean;
   runtimeError?: string;
   runtimeProjection?: DesktopRuntimeProjection;
+  sessionUsage: UsageSummary;
   onOpenProject(): void;
   onPreviewFile(path: string): void;
   onToggleFiles(): void;
@@ -48,6 +52,7 @@ export function Workspace({
   loading,
   runtimeError,
   runtimeProjection,
+  sessionUsage,
   onOpenProject,
   onPreviewFile,
   onToggleFiles,
@@ -65,6 +70,9 @@ export function Workspace({
   children
 }: WorkspaceProps): React.JSX.Element {
   const [runtimePanelOpen, setRuntimePanelOpen] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
+  const usageControlRef = useRef<HTMLDivElement>(null);
+  const closeUsage = useCallback(() => setUsageOpen(false), []);
   const streaming = turns.some((turn) => turn.status === "running" || turn.status === "waiting_permission");
   const isHome = !loading && !runtimeError && turns.length === 0;
 
@@ -92,6 +100,20 @@ export function Workspace({
             {project ? <span>{project.name}{project.branch ? ` · ${project.branch}` : ""}</span> : <span>打开一个本地项目开始</span>}
           </div>
           <div className="cindy-chat-actions">
+            <div className="cindy-usage-control" ref={usageControlRef}>
+              <button
+                aria-expanded={usageOpen}
+                aria-label="查看本会话费用"
+                className={`cindy-toolbar-button cindy-usage-toolbar-button${usageOpen ? " is-open" : ""}`}
+                onClick={() => setUsageOpen((current) => !current)}
+                title="本会话费用"
+                type="button"
+              >
+                <Icon name="chart" size={14} />
+                <span className="cindy-usage-toolbar-label">{sessionUsage.calls ? formatUsageCost(sessionUsage) : "费用"}</span>
+              </button>
+              {usageOpen ? <UsageSummaryPopover anchorRef={usageControlRef} onClose={closeUsage} summary={sessionUsage} /> : null}
+            </div>
             <button
               aria-expanded={runtimePanelOpen}
               aria-label="打开后台运行面板"

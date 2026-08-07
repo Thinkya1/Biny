@@ -39,7 +39,8 @@ import {
   pushNavigation,
   replaceNavigation
 } from "../src/desktop/renderer/src/navigationHistory.js";
-import { activeTimelineTool, buildSessionTimeline, listChangedFiles, listTimelineFiles, liveTimelineEvents, timelineToolEntries } from "../src/desktop/renderer/src/sessionTimeline.js";
+import { activeTimelineTool, buildSessionTimeline, listChangedFiles, listTimelineFiles, liveTimelineEvents, timelineToolEntries, type TimelineTurn } from "../src/desktop/renderer/src/sessionTimeline.js";
+import { formatTurnCost, formatUsageCost, summarizeTimelineUsage } from "../src/desktop/renderer/src/usagePresentation.js";
 import { reasoningDetailText } from "../src/desktop/renderer/src/reasoningPresentation.js";
 import { projectWebSearchView } from "../src/desktop/renderer/src/webSearchPresentation.js";
 import type { TimelineTool } from "../src/desktop/renderer/src/sessionTimeline.js";
@@ -51,6 +52,7 @@ import { workspaceFileMarker } from "../src/desktop/renderer/src/workspaceFileMa
 import { listModelChoices, ModelManager } from "../src/llm/ModelManager.js";
 import { FileModelsStore } from "../src/llm/ModelsStore.js";
 import type { SessionEvent } from "../src/session/recorder.js";
+import type { SessionUsage } from "../src/session/metadata.js";
 import { SessionRecorder } from "../src/session/recorder.js";
 import { listSessionSummaries, readStoredSessionEvents } from "../src/session/events.js";
 import { ensureAgentDirs, resolveSessionFile, sessionFilePath } from "../src/session/store.js";
@@ -99,6 +101,7 @@ testProviderCatalogResolution();
 testModelChoicesDeduplicateEquivalentAliases();
 testHistoricalAbortProjection();
 testHistoricalUsageProjection();
+testDesktopUsagePresentation();
 testHistoricalToolProjection();
 testWebSearchProjection();
 testHistoricalReasoningAndSkillProjection();
@@ -1610,6 +1613,43 @@ function testHistoricalUsageProjection(): void {
   assert.equal(timeline[0]?.model?.alias, "primary");
   assert.equal(timeline[0]?.model?.label, "openai/gpt-test");
   assert.equal(timeline[0]?.usage?.totalTokens, 42);
+}
+
+function testDesktopUsagePresentation(): void {
+  const pricedUsage: SessionUsage = {
+    operation: "agent",
+    modelAlias: "primary",
+    provider: "openai",
+    model: "gpt-test",
+    inputTokens: 100,
+    outputTokens: 20,
+    totalTokens: 120,
+    costUsd: 0.000002,
+    pricingKnown: true
+  };
+  const unpricedUsage: SessionUsage = { ...pricedUsage, costUsd: undefined, pricingKnown: false };
+  const toTurn = (id: string, usage: SessionUsage): TimelineTurn => ({
+    id,
+    user: "hello",
+    assistant: "hi",
+    reasoning: "",
+    skills: [],
+    status: "completed",
+    tools: [],
+    steps: [],
+    usage
+  });
+
+  const pricedSummary = summarizeTimelineUsage([toTurn("priced", pricedUsage)]);
+  assert.equal(formatUsageCost(pricedSummary), "$0.000002");
+  assert.equal(formatTurnCost(pricedUsage), "$0.000002");
+
+  const mixedSummary = summarizeTimelineUsage([toTurn("priced", pricedUsage), toTurn("unknown", unpricedUsage)]);
+  assert.equal(mixedSummary.calls, 2);
+  assert.equal(mixedSummary.pricedCalls, 1);
+  assert.equal(mixedSummary.unpricedCalls, 1);
+  assert.equal(formatUsageCost(mixedSummary), "未知");
+  assert.equal(formatTurnCost(unpricedUsage), "费用未知");
 }
 
 function testHistoricalToolProjection(): void {
