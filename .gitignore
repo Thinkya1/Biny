@@ -26,3 +26,9 @@ AGENTS.md
 
 # Product showcase site (separate project, own toolchain)
 /website/
+
+# 本地生成文件和测试产物
+*.log
+*.tsbuildinfo
+**pycache**/
+*.pyc
