@@ -87,6 +87,7 @@ export function sessionEventsToTranscript(events: SessionEvent[]): TranscriptIte
     if (event.type === "agent_message") continue;
     if (event.type === "tool_execution") continue;
     if (event.type === "context_checkpoint") continue;
+    if (event.type === "model_request") continue;
 
     while (pendingTools.length > 0) {
       const pending = pendingTools.shift();

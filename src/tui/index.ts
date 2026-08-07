@@ -6,11 +6,17 @@
  */
 import { ProcessTerminal, TUI } from "@earendil-works/pi-tui";
 import { BinyTui } from "./app.js";
+import type { TuiLaunchMode } from "./types.js";
 
-export async function startTui(workspaceRoot: string, version?: string, initialSession?: string): Promise<void> {
+export async function startTui(
+  workspaceRoot: string,
+  version?: string,
+  initialSession?: string,
+  launchMode: TuiLaunchMode = "new"
+): Promise<void> {
   const terminal = new ProcessTerminal();
   const ui = new TUI(terminal);
-  const app = new BinyTui(ui, workspaceRoot, version, initialSession);
+  const app = new BinyTui(ui, workspaceRoot, version, initialSession, launchMode);
 
   const onSignal = (): void => {
     void app.exit();
@@ -31,9 +37,8 @@ export async function startTui(workspaceRoot: string, version?: string, initialS
       `Session: ${summary.sessionId}`,
       `File: ${summary.sessionFile}`,
       "",
-      "Resume:",
-      "  biny",
-      `  /resume ${summary.sessionId}`,
+      "Continue explicitly:",
+      `  biny resume ${summary.sessionId}`,
       ""
     ].join("\n"));
   }

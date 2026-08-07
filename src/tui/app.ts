@@ -18,6 +18,7 @@ import {
 import { formatPermissionModeChanged } from "../permission/commands.js";
 import type { PermissionMode } from "../permission/PermissionManager.js";
 import { parseThinkingSelection, type ThinkingSelection } from "../llm/ModelManager.js";
+import { globalConfigDir } from "../config/paths.js";
 import { slashCommandsForSurface } from "../runtime/commandRegistry.js";
 import { withAttachmentReferences } from "../attachments/references.js";
 import { forkSession } from "../session/fork.js";
@@ -29,7 +30,6 @@ import {
 import type { CommandRuntime } from "../runtime/CommandRuntime.js";
 import {
   connectOrSpawnRuntimeHost,
-  findLatestInterruptedSession,
   startRuntimeHost,
   RuntimeHostClient,
   type RuntimeHostFactory,
@@ -51,12 +51,13 @@ import { permissionModeOptions } from "./permissionModeOptions.js";
 import { pasteTuiClipboard } from "./runtime/clipboard.js";
 import { permissionChoiceToResult } from "./runtime/permissionChoice.js";
 import { readGitBranch } from "./runtime/gitBranch.js";
+import { openDesktopSession } from "./runtime/desktopHandoff.js";
 import { sessionEventsToTranscript } from "./sessionTranscript.js";
 import { modelThinkingOptions } from "./modelOptions.js";
 import { createInitialTuiState, tuiReducer } from "./reducer.js";
 import { editorTheme, theme } from "./theme/index.js";
 import { formatSessionAge } from "./transcriptText.js";
-import type { PermissionChoice, TuiPermissionRequest, TuiState, TuiStatus } from "./types.js";
+import type { PermissionChoice, TuiLaunchMode, TuiPermissionRequest, TuiState, TuiStatus } from "./types.js";
 import type { AgentAttachment, AgentRunMode } from "../agent/AgentSession.js";
 import type { SkillDefinition } from "../extensions/skills.js";
 
@@ -67,6 +68,7 @@ export interface TuiExitSummary {
 
 const TUI_SLASH_COMMANDS = slashCommandsForSurface("tui");
 const TUI_AUTOCOMPLETE_COMMANDS = TUI_SLASH_COMMANDS.filter((command) => command.name !== "/skills");
+const TUI_SHUTDOWN_DRAIN_MS = 1_500;
 
 /** 把已加载 Skill 的元数据投影成 Pi 风格的 `skill:<name>` 补全项。 */
 export function skillSlashCommandItems(
@@ -88,6 +90,7 @@ export class BinyTui {
   private readonly workspaceRoot: string;
   private readonly version: string | undefined;
   private readonly initialSession: string | undefined;
+  private readonly launchMode: TuiLaunchMode;
 
   private state: TuiState;
   private runtime: InteractiveRuntimeHandle | undefined;
@@ -120,11 +123,12 @@ export class BinyTui {
   private unsubscribe: (() => void) | undefined;
   private resolveExit: (() => void) | undefined;
 
-  constructor(ui: TUI, workspaceRoot: string, version?: string, initialSession?: string) {
+  constructor(ui: TUI, workspaceRoot: string, version?: string, initialSession?: string, launchMode: TuiLaunchMode = "new") {
     this.ui = ui;
     this.workspaceRoot = workspaceRoot;
     this.version = version;
     this.initialSession = initialSession;
+    this.launchMode = launchMode;
     this.state = createInitialTuiState(workspaceRoot);
     this.status = new StatusIndicatorComponent(ui);
     this.footer = new FooterComponent(this.footerData());
@@ -168,6 +172,9 @@ export class BinyTui {
     this.ui.start();
 
     await this.startRuntime();
+    // Ctrl+C 可能在 runtime 初始化期间到达；此时 exit 没有等待者可唤醒，
+    // 初始化完成后必须直接结束，不能再把 TUI 留在半关闭状态。
+    if (this.exiting) return this.exitSummary;
     this.refreshChrome();
 
     await new Promise<void>((resolve) => {
@@ -182,8 +189,9 @@ export class BinyTui {
       try {
         attached = await connectOrSpawnRuntimeHost(this.workspaceRoot, {
           workspaceRoot: this.workspaceRoot,
+          configDir: globalConfigDir(),
           sessionId: this.initialSession,
-          resumeInterrupted: true,
+          resumeInterrupted: false,
           clientId: `tui-${process.pid}`,
           surface: "tui"
         });
@@ -195,7 +203,7 @@ export class BinyTui {
       if (attached) {
         runtime = attached;
       } else {
-        const selectedSession = this.initialSession ?? await findLatestInterruptedSession(this.workspaceRoot);
+        const selectedSession = this.initialSession;
         const createLocalRuntime: RuntimeHostFactory = async (sessionId?: string) => {
           const local = await createInteractiveAgentHost(this.workspaceRoot);
           if (sessionId !== undefined) await local.runtime.resumeSession(sessionId);
@@ -207,14 +215,15 @@ export class BinyTui {
         try {
           this.runtimeHost = await startRuntimeHost(this.workspaceRoot, runtime, commands, {
             createRuntime: createLocalRuntime,
-            resumeInterrupted: true
+            resumeInterrupted: false
           });
         } catch (error) {
           await runtime.close();
           const retry = await connectOrSpawnRuntimeHost(this.workspaceRoot, {
             workspaceRoot: this.workspaceRoot,
+            configDir: globalConfigDir(),
             sessionId: this.initialSession,
-            resumeInterrupted: true,
+            resumeInterrupted: false,
             clientId: `tui-${process.pid}`,
             surface: "tui"
           });
@@ -225,6 +234,16 @@ export class BinyTui {
       }
       this.runtime = runtime;
       this.commands = commands;
+      // 普通进入 TUI 等价于 Codex 的新交互会话：已有 Host 空闲时只重建空白
+      // AgentSession，不读取旧 transcript，也不续跑 checkpoint。运行中的 Host
+      // 则必须保留，避免打开第二个 owner 或打断用户正在观察的任务。
+      if ((this.launchMode === "new" || this.launchMode === "resume-picker")
+        && this.initialSession === undefined
+        && !runtimeIsBusy(runtime.getSnapshot())) {
+        await this.restartRuntimeForNewChat();
+        runtime = this.runtime;
+        commands = this.commands;
+      }
       this.runtimeSnapshot = runtime.getSnapshot();
       const { info, permissionMode } = this.runtimeSnapshot;
       this.permissionMode = permissionMode;
@@ -246,15 +265,7 @@ export class BinyTui {
         })
         .catch((error) => this.notify(`读取输入历史失败：${describeError(error)}`));
 
-      this.unsubscribe = runtime.subscribe((update) => {
-        this.runtimeSnapshot = update.snapshot;
-        if (update.event) this.dispatch(update.event);
-        else if (update.snapshot.state.kind === "maintenance") this.dispatch({ type: "maintenance.started" });
-        else this.refreshChrome();
-        if (isTerminalRunEvent(update.event)) {
-          void this.refreshContextUsage();
-        }
-      });
+      this.subscribeRuntime(runtime);
       this.dispatch({
         type: "session.started",
         sessionId: info.sessionId,
@@ -264,12 +275,90 @@ export class BinyTui {
         modelLabel: info.modelLabel,
         reasoningLabel: info.reasoningLabel
       });
-      // 独立 Host 可能已经在启动阶段续跑了显式 session；运行中不能再次 resume，避免把
-      // 正在恢复的 turn 误判成普通会话切换。
-      if (this.initialSession && !runtimeIsBusy(this.runtimeSnapshot)) await this.resumeSession(this.initialSession);
+      // 显式 session 必须走完整 transcript 加载；如果当前 Host 正在运行另一条
+      // session，resumeSession 会拒绝切换，不能静默显示错误会话。
+      if (this.initialSession) await this.resumeSession(this.initialSession);
+      if (this.launchMode === "resume-picker" && this.initialSession === undefined) await this.showSessionPicker();
       void this.refreshContextUsage();
     } catch (error) {
       this.notify(`TUI startup failed: ${describeError(error)}`);
+    }
+  }
+
+  private subscribeRuntime(runtime: InteractiveRuntimeHandle): void {
+    this.unsubscribe?.();
+    this.unsubscribe = runtime.subscribe((update) => {
+      this.runtimeSnapshot = update.snapshot;
+      if (update.event) this.dispatch(update.event);
+      else if (update.snapshot.state.kind === "maintenance") this.dispatch({ type: "maintenance.started" });
+      else this.refreshChrome();
+      if (isTerminalRunEvent(update.event)) void this.refreshContextUsage();
+    });
+  }
+
+  /** 创建一个新聊天；只有显式 `/new` 或普通入口才会调用，绝不等同于续跑。 */
+  private async restartRuntimeForNewChat(): Promise<void> {
+    const runtime = this.runtime;
+    if (!runtime) throw new Error("TUI runtime is not ready.");
+    if (runtimeIsBusy(runtime.getSnapshot())) {
+      throw new Error("当前任务仍在运行，请先取消后再创建新聊天。");
+    }
+
+    if (runtime instanceof RuntimeHostClient) {
+      await runtime.restartRuntime();
+      this.runtimeSnapshot = runtime.getSnapshot();
+      return;
+    }
+
+    const host = this.runtimeHost;
+    if (!host) throw new Error("新聊天需要可重建的 Runtime Host。");
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
+    await host.restartRuntime();
+    this.runtime = host.getCurrentRuntime();
+    this.commands = host.getCurrentCommands();
+    this.runtimeSnapshot = this.runtime.getSnapshot();
+    this.subscribeRuntime(this.runtime);
+  }
+
+  private announceCurrentSession(): void {
+    const runtime = this.runtime;
+    if (!runtime) return;
+    const info = runtime.getSnapshot().info;
+    this.dispatch({
+      type: "session.started",
+      sessionId: info.sessionId,
+      sessionFile: info.sessionFile,
+      cwd: info.workspaceRoot,
+      provider: info.provider,
+      modelLabel: info.modelLabel,
+      reasoningLabel: info.reasoningLabel
+    });
+  }
+
+  private async startNewChat(): Promise<void> {
+    try {
+      await this.restartRuntimeForNewChat();
+      this.chatContainer.reset();
+      this.dispatch({ type: "transcript.replaced", items: [], viewingSessionId: this.runtimeSnapshot?.info.sessionId });
+      this.mode = "chat";
+      this.announceCurrentSession();
+      this.setEditorText("");
+      await this.refreshContextUsage();
+      this.notify("New chat started.");
+    } catch (error) {
+      this.showTextViewer("New chat", describeError(error));
+    }
+  }
+
+  private async openCurrentSessionInDesktop(): Promise<void> {
+    const info = this.runtime?.getSnapshot().info;
+    if (!info) return;
+    try {
+      await openDesktopSession(info.workspaceRoot, info.sessionId);
+      this.notify("已将当前会话交给 Biny Desktop。");
+    } catch (error) {
+      this.showTextViewer("Desktop", describeError(error));
     }
   }
 
@@ -432,20 +521,19 @@ export class BinyTui {
       return undefined;
     }
     if (matchesKey(data, "ctrl+c")) {
-      if (busy) {
-        this.lastCtrlCAt = 0;
-        this.dismissAutocomplete();
-        this.runtime?.cancelCurrentRun();
-        return { consume: true };
-      }
       const now = Date.now();
-      if (isDoubleCtrlC(this.lastCtrlCAt, now)) {
+      if (ctrlCAction(this.lastCtrlCAt, now) === "exit") {
         this.lastCtrlCAt = 0;
         void this.exit();
       } else {
         this.lastCtrlCAt = now;
-        this.setEditorText("");
-        this.setPendingAttachments([]);
+        if (busy) {
+          this.dismissAutocomplete();
+          this.runtime?.cancelCurrentRun();
+        } else {
+          this.setEditorText("");
+          this.setPendingAttachments([]);
+        }
       }
       return { consume: true };
     }
@@ -675,6 +763,16 @@ export class BinyTui {
       return;
     }
 
+    if (command === "/new") {
+      await this.startNewChat();
+      return;
+    }
+
+    if (command === "/app") {
+      await this.openCurrentSessionInDesktop();
+      return;
+    }
+
     if (command === "/model") {
       await this.handleModelCommand(args);
       return;
@@ -719,6 +817,19 @@ export class BinyTui {
       this.showTextViewer("Permissions", result);
       this.permissionMode = runtime.getSnapshot().permissionMode;
       this.refreshChrome();
+      return;
+    }
+
+    if (command === "/automation" && args[0]?.toLowerCase() === "run") {
+      const automationId = args[1]?.trim();
+      if (!automationId) {
+        this.notify("Usage: /automation run <automation-id>");
+        return;
+      }
+      const fire = runtime instanceof RuntimeHostClient
+        ? await runtime.automationRun(automationId)
+        : await this.runtimeHost?.runAutomation(automationId);
+      this.showTextViewer("Automation", JSON.stringify(fire, null, 2));
       return;
     }
 
@@ -897,16 +1008,7 @@ export class BinyTui {
     const runtime = this.runtime;
     if (!runtime || !session) return;
     const resumed = await runtime.resumeSession(session);
-    const info = runtime.getSnapshot().info;
-    this.dispatch({
-      type: "session.started",
-      sessionId: info.sessionId,
-      sessionFile: info.sessionFile,
-      cwd: info.workspaceRoot,
-      provider: info.provider,
-      modelLabel: info.modelLabel,
-      reasoningLabel: info.reasoningLabel
-    });
+    this.announceCurrentSession();
     this.chatContainer.reset();
     this.dispatch({
       type: "transcript.replaced",
@@ -923,13 +1025,31 @@ export class BinyTui {
     // 幂等：Ctrl+C 和外部关闭可能同时触发。
     if (this.exiting) return;
     this.exiting = true;
-    this.unsubscribe?.();
     this.status.dispose();
-    if (this.runtime) {
-      const info = this.runtime.getSnapshot().info;
-      this.exitSummary = { sessionId: info.sessionId, sessionFile: info.sessionFile };
+    const runtime = this.runtime;
+    if (runtime) {
+      let snapshot = this.runtimeSnapshot;
+      try {
+        snapshot ??= runtime.getSnapshot();
+      } catch {
+        // runtime 可能正处于 Host 断线或初始化失败；仍需继续清理 TUI。
+      }
+      if (snapshot) {
+        const { info } = snapshot;
+        this.exitSummary = { sessionId: info.sessionId, sessionFile: info.sessionFile };
+      }
+      // 只有当前进程创建的 owner 才能在退出时取消自己的 AgentRun。附着到共享 Host
+      // 的 TUI 只是观察者，断开时不能结束其他客户端正在执行的任务。
+      if (snapshot && runtimeIsBusy(snapshot) && !(runtime instanceof RuntimeHostClient)) {
+        await drainRuntimeBeforeExit(runtime);
+      }
+      this.unsubscribe?.();
+      this.unsubscribe = undefined;
       await this.runtimeHost?.close();
-      await this.runtime.close();
+      await runtime.close();
+    } else {
+      this.unsubscribe?.();
+      this.unsubscribe = undefined;
     }
     this.ui.stop();
     this.resolveExit?.();
@@ -948,6 +1068,27 @@ export function shouldConfirmAutocompleteOnEnter(
 /** 判断两次 Ctrl+C 是否处于 pi 的 500ms 退出窗口内。 */
 export function isDoubleCtrlC(lastCtrlCAt: number, now: number): boolean {
   return lastCtrlCAt > 0 && now >= lastCtrlCAt && now - lastCtrlCAt < 500;
+}
+
+export function ctrlCAction(lastCtrlCAt: number, now: number): "cancel" | "exit" {
+  return isDoubleCtrlC(lastCtrlCAt, now) ? "exit" : "cancel";
+}
+
+async function drainRuntimeBeforeExit(runtime: InteractiveRuntimeHandle): Promise<void> {
+  runtime.cancelCurrentRun();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      runtime.waitForIdle(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, TUI_SHUTDOWN_DRAIN_MS);
+      })
+    ]);
+  } catch {
+    // 退出路径 fail-closed：取消或等待失败不能阻止 TUI 断开连接。
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function sessionLabel(summary: SessionSummary, nowMs: number): string {

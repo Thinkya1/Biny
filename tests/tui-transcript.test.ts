@@ -21,7 +21,7 @@ import {
   statusMessage,
   visibleShortcutHints
 } from "../src/tui/components/chrome.js";
-import { isDoubleCtrlC, runtimeStatus, selectDialogRow, shouldConfirmAutocompleteOnEnter, skillSlashCommandItems } from "../src/tui/app.js";
+import { ctrlCAction, isDoubleCtrlC, runtimeStatus, selectDialogRow, shouldConfirmAutocompleteOnEnter, skillSlashCommandItems } from "../src/tui/app.js";
 import type { PermissionChoice, ToolTranscriptItem, TranscriptState, TuiPermissionRequest, TuiState } from "../src/tui/types.js";
 import {
   ansi256ToHex,
@@ -179,6 +179,9 @@ function testDoubleCtrlCGuard(): void {
   assert.equal(isDoubleCtrlC(1_000, 1_499), true);
   assert.equal(isDoubleCtrlC(1_000, 1_500), false);
   assert.equal(isDoubleCtrlC(1_000, 1_501), false);
+  assert.equal(ctrlCAction(0, 100), "cancel");
+  assert.equal(ctrlCAction(1_000, 1_499), "exit");
+  assert.equal(ctrlCAction(1_000, 1_500), "cancel");
 }
 
 function testAutocompleteEnterOnlyConfirmsSkillSelection(): void {
@@ -251,13 +254,15 @@ function testSlashCommandParity(): void {
   const tuiCommands = slashCommandsForSurface("tui");
   const desktopCommands = slashCommandsForSurface("desktop");
   const desktopNames = new Set(desktopCommands.map((command) => command.name));
-  assert.equal(tuiCommands.length, 20);
+  assert.equal(tuiCommands.length, 27);
   assert.equal(tuiCommands.some((command) => command.name === "/plan"), false);
   assert.equal(tuiCommands.some((command) => command.name === "/mode"), false);
   assert.ok(tuiCommands.some((command) => command.name === "/memory"));
   assert.ok(tuiCommands.some((command) => command.name === "/undo"));
   assert.equal(tuiCommands.some((command) => command.name === "/continue"), false);
   assert.ok(tuiCommands.some((command) => command.name === "/fork"));
+  assert.ok(tuiCommands.some((command) => command.name === "/new"));
+  assert.ok(tuiCommands.some((command) => command.name === "/app"));
   assert.ok(["/status", "/usage", "/memory", "/subagent"].every((name) => desktopNames.has(name)));
   assert.equal(desktopNames.has("/context"), false);
 }
@@ -291,6 +296,8 @@ function testStatusReportUsesRuntimeAndContextFields(): void {
       contextWindow: 1_000_000,
       maxOutputTokens: 32_768,
       modelAlias: "deepseek-pro",
+      estimatedTokens: 12_600,
+      providerInputTokens: 12_345,
       omitted: [],
       autoCompacted: false,
       source: "provider",
@@ -319,6 +326,7 @@ function testStatusReportUsesRuntimeAndContextFields(): void {
   assert.match(report, /Token usage: 24,000 total/u);
   assert.match(report, /Context window: 12,345 used \/ 1,000,000/u);
   assert.match(report, /Input budget: 12,345 \/ 981,056/u);
+  assert.match(report, /Input measurement: estimated 12,600; provider 12,345; delta -255/u);
   assert.match(report, /Instructions: 1 loaded/u);
   assert.doesNotMatch(report, /^Context$/mu);
 }

@@ -6,6 +6,8 @@
  */
 import type { ToolInputDisplay } from "../tools/types.js";
 
+export type TuiLaunchMode = "new" | "resume-picker" | "resume-session";
+
 export type TuiStatus = "idle" | "thinking" | "running" | "waiting_permission";
 
 interface TranscriptItemBase {
