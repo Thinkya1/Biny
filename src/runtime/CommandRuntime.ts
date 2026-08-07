@@ -36,6 +36,11 @@ import { subagentAccessMode } from "./subagentAccess.js";
 import { modelReasoningConfig } from "../ai/capabilities.js";
 import { attachmentRoot, ensureAttachmentRoot } from "../attachments/store.js";
 import { AiRegistry } from "../llm/AiRegistry.js";
+import { RuntimeEventAuthority } from "./RuntimeAuthority.js";
+import { DurableTaskRunStore } from "./TaskRunStore.js";
+import { AutomationStore } from "./AutomationScheduler.js";
+import { GoalGraphStore } from "./GoalGraphStore.js";
+import { CapabilityStore } from "./CapabilityStore.js";
 
 export interface CommandRuntime {
   workspaceRoot: string;
@@ -46,6 +51,11 @@ export interface CommandRuntime {
   managedProcesses: ManagedProcessService;
   checkpoints: CheckpointStore | undefined;
   mcp: McpToolHost;
+  runtimeAuthority: RuntimeEventAuthority;
+  taskRuns: DurableTaskRunStore;
+  automationStore: AutomationStore;
+  graphs: GoalGraphStore;
+  capabilities: CapabilityStore;
   subagents: SubagentTaskManager | undefined;
   extensionReport(section?: ExtensionSection): string;
   /** 当前可用于 TUI 补全的 Skill 元数据；正文仍按需加载。 */
@@ -76,7 +86,12 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
   const ai = new AiRegistry();
   await ensureAgentDirs(persistenceRoot);
   await ensureAttachmentRoot(persistenceRoot);
-  const recorder = new SessionRecorder(persistenceRoot);
+  const runtimeAuthority = await RuntimeEventAuthority.open(persistenceRoot);
+  const taskRuns = await DurableTaskRunStore.open(persistenceRoot, runtimeAuthority);
+  const automationStore = await AutomationStore.open(persistenceRoot, runtimeAuthority);
+  const graphs = await GoalGraphStore.open(persistenceRoot, runtimeAuthority);
+  const capabilities = await CapabilityStore.open(persistenceRoot, runtimeAuthority);
+  const recorder = new SessionRecorder(persistenceRoot, undefined, undefined, runtimeAuthority.asSink());
   const managedProcesses = new ManagedProcessService({ workspaceRoot, persistenceRoot });
   await managedProcesses.initialize();
   const toolRegistry = createToolRegistry(
@@ -123,6 +138,9 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
       maxConcurrentSubagents: config.extensions.subagent.maxConcurrentSubagents,
       maxPendingSubagents: config.extensions.subagent.maxPendingSubagents,
       timeoutMs: config.extensions.subagent.timeoutMs,
+      onSnapshot: (snapshot) => {
+        taskRuns.syncSubagentSnapshot(snapshot);
+      },
       execute: async (task, context) => await executeSubagentTask(subagentOptions, task, context.signal, context.accessMode, context.agent)
     })
     : undefined;
@@ -149,6 +167,16 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
       // 记忆工具通过闭包延迟取 LocalMemory：注册发生在 AgentSession 创建前，调用发生在其后。
       for (const tool of createMemoryTools(() => agent?.getLocalMemory())) toolRegistry.registerBuiltinTool(tool);
     }
+    // MCP/Plugin 仍由 Host 持有连接和执行权，但先把工具能力注册进统一 envelope，
+    // 这样 Desktop/TUI 查询 capability projection 时能看到已加载的 Host-owned 能力。
+    for (const entry of toolRegistry.listEntries()) {
+      if (entry.source !== "mcp" && entry.source !== "plugin") continue;
+      try {
+        capabilities.ensureHostCapability(`host:${entry.source}:${entry.tool.name}`, entry.tool.parameters);
+      } catch {
+        // 扩展 schema 不合法时保留原有工具加载行为；实际调用会由 coordinator 记录失败。
+      }
+    }
     agent = new AgentSession({
       workspaceRoot,
       persistenceRoot,
@@ -167,7 +195,9 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
       completionState,
       managedProcesses,
       createCheckpoint: checkpoints ? async (label) => await checkpoints.create(label) : undefined,
-      attachmentRoot: projectAttachmentRoot
+      attachmentRoot: projectAttachmentRoot,
+      runtimeEventSink: runtimeAuthority.asSink(),
+      capabilities
     });
     await agent.initialize();
   } catch (error) {
@@ -175,6 +205,11 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     await managedProcesses.close();
     await mcpHost.close();
     await recorder.close();
+    automationStore.close();
+    graphs.close();
+    capabilities.close();
+    taskRuns.close();
+    runtimeAuthority.close();
     throw error;
   }
   if (!agent || !skills) throw new Error("Failed to initialize Biny agent runtime.");
@@ -243,6 +278,11 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
     managedProcesses,
     checkpoints,
     mcp: mcpHost,
+    runtimeAuthority,
+    taskRuns,
+    automationStore,
+    graphs,
+    capabilities,
     subagents: subagentTaskManager,
     extensionReport: (section?: ExtensionSection): string => formatExtensionReport(extensionStatus(), section),
     listSkills: (): SkillDefinition[] => [...requireSkillBundle(skills).skills],
@@ -266,7 +306,27 @@ export async function createCommandRuntime(workspaceRoot: string, options: Comma
         try {
           await managedProcesses.close();
         } finally {
-          await mcpHost.close();
+          try {
+            await mcpHost.close();
+          } finally {
+            try {
+              automationStore.close();
+            } finally {
+              try {
+                graphs.close();
+              } finally {
+                try {
+                  capabilities.close();
+                } finally {
+                  try {
+                    taskRuns.close();
+                  } finally {
+                    runtimeAuthority.close();
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }

@@ -7,6 +7,7 @@ import type { ToolExecutionResultStatus, ToolInputDisplay, ToolUpdate } from "..
 import type { PermissionManager, PermissionPrompt, PermissionResult } from "../permission/PermissionManager.js";
 import type { SessionUsage } from "../session/metadata.js";
 import type { ContextMemory } from "./context/ContextMemory.js";
+import type { CapabilityStore } from "../runtime/CapabilityStore.js";
 
 // Preserve Agent-facing event names while the shared permission contract lives in permission/.
 export type AgentPermissionRequest = PermissionPrompt;
@@ -93,6 +94,10 @@ export interface AgentRuntimeContext {
   beforeWorkspaceMutation?: () => Promise<void>;
   quarantineExternalTool?: (tool: string, toolCallId: string, settlement: Promise<unknown>) => void;
   abortSignal?: AbortSignal;
+  /** Host-owned MCP/Plugin invocation 的统一 authority envelope。 */
+  capabilities?: CapabilityStore;
+  runId?: string;
+  turnId?: string;
 }
 
 export type AgentStatus =

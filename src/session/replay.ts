@@ -9,10 +9,11 @@
  * 服务端会拒绝的消息序列。
  */
 import path from "node:path";
-import type { AgentMessage, AgentReasoningContent } from "../agent/core/types.js";
+import type { AgentMessage, AgentReasoningContent, ModelRequestMetrics } from "../agent/core/types.js";
 import { createToolOperationId, type ToolExecutionState } from "../tools/types.js";
 import { readSessionEvents, readStoredSessionEvents } from "./events.js";
 import type { ReasoningBlock, SessionContextCheckpoint, SessionContextState, SessionContextUsage, SessionEvent, SessionUsage } from "./recorder.js";
+import { validateRuntimeEventStream, type RuntimeHighWater } from "./runtimeEvent.js";
 
 export interface SessionReplay {
   events: SessionEvent[];
@@ -31,13 +32,16 @@ export interface SessionReplay {
   contextState?: SessionContextState;
   contextCheckpoint?: SessionContextCheckpoint;
   usage: SessionUsage[];
+  modelRequests: ModelRequestMetrics[];
   recoveredToolResults: Array<Extract<SessionEvent, { type: "tool_result" }>>;
   discardedToolCalls: SessionDiscardedToolCall[];
   messageTree: SessionMessageNode[];
+  runtimeHighWater?: RuntimeHighWater;
 }
 
 export interface SessionReplayOptions {
   sessionId?: string;
+  expectedRuntimeHighWater?: RuntimeHighWater;
 }
 
 export interface SessionDiscardedToolCall {
@@ -71,6 +75,18 @@ export async function replayStoredSession(workspaceRoot: string, session: string
 }
 
 export function replaySessionEvents(recordedEvents: SessionEvent[], options: SessionReplayOptions = {}): SessionReplay {
+  const runtimeHighWater = validateRuntimeEventStream(recordedEvents);
+  validateCanonicalToolPairing(recordedEvents);
+  const expectedRuntimeHighWater = options.expectedRuntimeHighWater;
+  if (expectedRuntimeHighWater) {
+    const found = recordedEvents.some((event) =>
+      event.runtime?.eventId === expectedRuntimeHighWater.eventId
+      && event.runtime.eventSeq === expectedRuntimeHighWater.eventSeq
+      && event.runtime.runId === expectedRuntimeHighWater.runId
+      && event.runtime.turnId === expectedRuntimeHighWater.turnId
+    );
+    if (!found) throw new Error("Session runtime high-water is not present in the recorded event stream.");
+  }
   const recovery = interruptedToolResults(recordedEvents, options);
   const recoveredToolResults = recovery.results;
   const events = orderRecoveredToolResults(recordedEvents, recoveredToolResults);
@@ -104,10 +120,56 @@ export function replaySessionEvents(recordedEvents: SessionEvent[], options: Ses
     contextState,
     contextCheckpoint,
     usage: sessionUsage(events),
+    modelRequests: sessionModelRequests(events),
     recoveredToolResults,
     discardedToolCalls: recovery.discarded,
-    messageTree: sessionMessageTree(events)
+    messageTree: sessionMessageTree(events),
+    runtimeHighWater
   };
+}
+
+/**
+ * 新事件流中的工具事实必须能沿 toolCallId/operationId 闭合。旧 session 没有
+ * runtime metadata 时继续按历史事实读取，避免把旧格式迁移问题伪装成恢复失败。
+ */
+function validateCanonicalToolPairing(events: readonly SessionEvent[]): void {
+  const canonicalEvents = events.filter((event) => event.runtime !== undefined);
+  if (!canonicalEvents.length) return;
+  const calls = new Map<string, { tool: string; operationId?: string; canonical: boolean }>();
+  for (const event of events) {
+    if (event.type !== "tool_call" || !event.toolCallId || event.runtime !== undefined || calls.has(event.toolCallId)) continue;
+    calls.set(event.toolCallId, { tool: event.tool, canonical: false });
+  }
+  const results = new Set<string>();
+  for (const event of canonicalEvents) {
+    if (event.type === "tool_call" && event.toolCallId) {
+      const existing = calls.get(event.toolCallId);
+      if (existing?.canonical) throw new Error(`Duplicate canonical tool call: ${event.toolCallId}`);
+      calls.set(event.toolCallId, { tool: event.tool, canonical: true });
+      continue;
+    }
+    if (event.type === "tool_execution") {
+      const call = calls.get(event.toolCallId);
+      if (!call) throw new Error(`Tool execution has no matching tool call: ${event.toolCallId}`);
+      if (call.tool !== event.tool) throw new Error(`Tool call ${event.toolCallId} changed tool identity.`);
+      if (call.operationId !== undefined && call.operationId !== event.operationId) {
+        throw new Error(`Tool call ${event.toolCallId} changed operation identity.`);
+      }
+      call.operationId = event.operationId;
+      continue;
+    }
+    if (event.type === "tool_result" && event.toolCallId) {
+      const call = calls.get(event.toolCallId);
+      if (!call) throw new Error(`Tool result has no matching tool call: ${event.toolCallId}`);
+      if (call.tool !== event.tool) throw new Error(`Tool result ${event.toolCallId} changed tool identity.`);
+      if (results.has(event.toolCallId)) throw new Error(`Duplicate canonical tool result: ${event.toolCallId}`);
+      if (event.operationId !== undefined && call.operationId !== undefined && event.operationId !== call.operationId) {
+        throw new Error(`Tool result ${event.toolCallId} has a mismatched operation identity.`);
+      }
+      if (event.operationId !== undefined) call.operationId = event.operationId;
+      results.add(event.toolCallId);
+    }
+  }
 }
 
 type ToolResultEvent = Extract<SessionEvent, { type: "tool_result" }>;
@@ -462,6 +524,10 @@ function sessionUsage(events: SessionEvent[]): SessionUsage[] {
     const relatedUsage = "relatedUsage" in event && event.relatedUsage !== undefined ? event.relatedUsage : [];
     return [...usage, ...preparationUsage, ...relatedUsage];
   });
+}
+
+function sessionModelRequests(events: SessionEvent[]): ModelRequestMetrics[] {
+  return events.flatMap((event) => event.type === "model_request" ? [event.metrics] : []);
 }
 
 /**

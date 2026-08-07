@@ -12,6 +12,7 @@ import { formatStatusReport } from "./statusReport.js";
 import type { CommandRuntime } from "./CommandRuntime.js";
 import type { InteractiveRuntimeHandle } from "./InteractiveAgentRuntime.js";
 import type { CommandSurface } from "./commandRegistry.js";
+import type { TaskRunStatus } from "./TaskRunStore.js";
 
 export interface RuntimeCommandResult {
   command: string;
@@ -38,10 +39,62 @@ export async function executeRuntimeCommand(
       snapshot.permissionMode,
       context,
       services.agent.usageSummary(),
-      services.extensionReport()
+      services.extensionReport(),
+      typeof services.agent.modelRequestSummary === "function" ? services.agent.modelRequestSummary() : undefined
     ));
   }
   if (command === "/usage") return result(command, "Usage", services.agent.usageReport());
+  if (command === "/tasks") {
+    const page = services.taskRuns.list({ status: args[0] === undefined ? undefined : readTaskStatus(args[0]) });
+    return result(command, "Tasks", JSON.stringify(page, null, 2));
+  }
+  if (command === "/automation") {
+    const action = args[0]?.toLowerCase();
+    if (!action || action === "list") return result(command, "Automation", JSON.stringify(services.automationStore.list(), null, 2));
+    const automationId = args[1]?.trim();
+    if (!automationId) throw new Error("Usage: /automation list | pause <id> | resume <id> | run <id> | delete <id>");
+    if (action === "pause") return result(command, "Automation", JSON.stringify(services.automationStore.pause(automationId), null, 2));
+    if (action === "resume") return result(command, "Automation", JSON.stringify(services.automationStore.resume(automationId), null, 2));
+    if (action === "delete") {
+      services.automationStore.delete(automationId);
+      return result(command, "Automation", `Deleted ${automationId}.`);
+    }
+    if (action === "run") throw new Error("Use `biny automation run` or the Desktop automation action to execute a fire.");
+    throw new Error("Usage: /automation list | pause <id> | resume <id> | run <id> | delete <id>");
+  }
+  if (command === "/goal") {
+    const action = args[0]?.toLowerCase() ?? "get";
+    const goalId = action === "get" ? args[1] ?? args[0] : args[1];
+    if (!goalId) throw new Error("Usage: /goal get <id> | pause <id> | resume <id> | cancel <id>");
+    if (action === "get") return result(command, "Goal", JSON.stringify(services.graphs.getGoal(goalId), null, 2));
+    if (action === "pause") return result(command, "Goal", JSON.stringify(services.graphs.updateGoal(goalId, "paused"), null, 2));
+    if (action === "resume") return result(command, "Goal", JSON.stringify(services.graphs.updateGoal(goalId, "active"), null, 2));
+    if (action === "cancel") return result(command, "Goal", JSON.stringify(services.graphs.updateGoal(goalId, "cancelled"), null, 2));
+    throw new Error("Usage: /goal get <id> | pause <id> | resume <id> | cancel <id>");
+  }
+  if (command === "/graph") {
+    const action = args[0]?.toLowerCase() ?? "inspect";
+    const graphId = action === "inspect" || action === "events" ? args[1] ?? args[0] : args[1];
+    if (!graphId) throw new Error("Usage: /graph inspect <id> | start <id> | pause <id> | resume <id> | cancel <id> | events <id>");
+    if (action === "inspect") return result(command, "Graph", JSON.stringify(services.graphs.inspectGraph(graphId), null, 2));
+    if (action === "events") return result(command, "Graph events", JSON.stringify(services.graphs.listGraphEvents(graphId), null, 2));
+    if (action === "start") {
+      const graph = services.graphs.startGraph(graphId);
+      services.graphs.createWake(graph.graphId, "graph_started");
+      return result(command, "Graph", JSON.stringify(graph, null, 2));
+    }
+    if (action === "pause") return result(command, "Graph", JSON.stringify(services.graphs.pauseGraph(graphId), null, 2));
+    if (action === "resume") {
+      const graph = services.graphs.resumeGraph(graphId);
+      services.graphs.createWake(graph.graphId, "graph_resumed");
+      return result(command, "Graph", JSON.stringify(graph, null, 2));
+    }
+    if (action === "cancel") return result(command, "Graph", JSON.stringify(services.graphs.cancelGraph(graphId), null, 2));
+    throw new Error("Usage: /graph inspect <id> | start <id> | pause <id> | resume <id> | cancel <id> | events <id>");
+  }
+  if (command === "/capabilities") {
+    return result(command, "Capabilities", JSON.stringify(services.capabilities.list(), null, 2));
+  }
   if (command === "/mcp") {
     if (args[0]?.toLowerCase() !== "reconnect") {
       return result(command, "MCP", services.extensionReport("mcp").replace(/^MCP\n/, ""));
@@ -168,4 +221,9 @@ async function runForegroundSubagent(
 
 function result(command: string, title: string, content: string): RuntimeCommandResult {
   return { command, title, content };
+}
+
+function readTaskStatus(value: string): TaskRunStatus {
+  if (value === "queued" || value === "created" || value === "running" || value === "verifying" || value === "completed" || value === "failed" || value === "incomplete" || value === "blocked" || value === "policy_denied" || value === "budget_exhausted" || value === "needs_approval" || value === "aborted" || value === "cancelled") return value;
+  throw new Error(`Unknown TaskRun status: ${value}`);
 }

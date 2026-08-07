@@ -15,12 +15,15 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { AgentMessage } from "../agent/core/types.js";
 import type { ToolExecutionState, ToolRetrySafety } from "../tools/types.js";
+import type { RuntimeHighWater } from "./runtimeEvent.js";
 import { agentDir, ensureAgentDirs } from "./store.js";
 
-const turnStateVersion = 3;
+const turnStateVersion = 4;
 
 export interface InterruptedTurn {
   sessionId: string;
+  /** 同一个用户任务及其所有 continuation 共用的身份。旧断点可能没有该字段。 */
+  turnId?: string;
   /** 触发这个回合的用户输入，用于向用户描述要续跑的是什么。 */
   prompt: string;
   /** 最后一个完成的步结束时的完整 context。 */
@@ -36,6 +39,8 @@ export interface InterruptedTurn {
   /** 只记录恢复审计需要的工具断点，不作为会话事实的替代。 */
   lastToolSequence?: number;
   pendingToolExecutions?: InterruptedToolExecutionCheckpoint[];
+  /** 最后一个已写入 session JSONL 的 runtime event 高水位。 */
+  runtimeHighWater?: RuntimeHighWater;
   updatedAt: string;
 }
 
@@ -68,11 +73,13 @@ export class TurnStore {
     facts?: unknown,
     terminal?: InterruptedTurnTerminal,
     previousTerminals?: readonly InterruptedTurnTerminal[],
-    pendingToolExecutions?: readonly InterruptedToolExecutionCheckpoint[]
+    pendingToolExecutions?: readonly InterruptedToolExecutionCheckpoint[],
+    runtimeHighWater?: RuntimeHighWater
   ): Promise<void> {
     await ensureAgentDirs(this.persistenceRoot);
     const payload: InterruptedTurn = {
       sessionId: this.sessionId,
+      turnId: runtimeHighWater?.turnId,
       prompt,
       systemPrompt,
       messages: [...messages],
@@ -82,18 +89,26 @@ export class TurnStore {
       previousTerminals: previousTerminals ? [...previousTerminals] : undefined,
       lastToolSequence: pendingToolExecutions?.reduce((maximum, checkpoint) => Math.max(maximum, checkpoint.sequence), 0) || undefined,
       pendingToolExecutions: pendingToolExecutions?.length ? [...pendingToolExecutions] : undefined,
+      runtimeHighWater,
       updatedAt: new Date().toISOString()
     };
     const target = this.filePath();
-    await fs.writeFile(`${target}.tmp`, `${JSON.stringify({ version: turnStateVersion, turn: payload })}\n`, { encoding: "utf8", mode: 0o600 });
-    await fs.rename(`${target}.tmp`, target);
+    const temporary = `${target}.tmp`;
+    await fs.writeFile(temporary, `${JSON.stringify({ version: turnStateVersion, turn: payload })}\n`, { encoding: "utf8", mode: 0o600 });
+    const handle = await fs.open(temporary, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fs.rename(temporary, target);
   }
 
   async load(): Promise<InterruptedTurn | undefined> {
     try {
       const parsed: unknown = JSON.parse(await fs.readFile(this.filePath(), "utf8"));
       const version = (parsed as { version?: unknown }).version;
-      if (version !== turnStateVersion && version !== 2) return undefined;
+      if (version !== turnStateVersion && version !== 3 && version !== 2) return undefined;
       const turn = (parsed as { turn?: unknown }).turn;
       return isInterruptedTurn(turn) ? turn : undefined;
     } catch {
@@ -119,6 +134,7 @@ function isInterruptedTurn(value: unknown): value is InterruptedTurn {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Partial<InterruptedTurn>;
   return typeof candidate.sessionId === "string"
+    && (candidate.turnId === undefined || typeof candidate.turnId === "string" && candidate.turnId.length > 0)
     && typeof candidate.prompt === "string"
     && (candidate.systemPrompt === undefined || typeof candidate.systemPrompt === "string")
     && Array.isArray(candidate.messages)
@@ -134,7 +150,19 @@ function isInterruptedTurn(value: unknown): value is InterruptedTurn {
     && (candidate.pendingToolExecutions === undefined
       || Array.isArray(candidate.pendingToolExecutions)
       && candidate.pendingToolExecutions.every(isInterruptedToolExecutionCheckpoint))
+    && (candidate.runtimeHighWater === undefined || isRuntimeHighWater(candidate.runtimeHighWater))
     && typeof candidate.updatedAt === "string";
+}
+
+function isRuntimeHighWater(value: unknown): value is RuntimeHighWater {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Partial<RuntimeHighWater>;
+  return typeof candidate.eventId === "string"
+    && candidate.eventId.length > 0
+    && Number.isSafeInteger(candidate.eventSeq)
+    && (candidate.eventSeq ?? 0) > 0
+    && (candidate.runId === undefined || typeof candidate.runId === "string" && candidate.runId.length > 0)
+    && (candidate.turnId === undefined || typeof candidate.turnId === "string" && candidate.turnId.length > 0);
 }
 
 function isInterruptedToolExecutionCheckpoint(value: unknown): value is InterruptedToolExecutionCheckpoint {

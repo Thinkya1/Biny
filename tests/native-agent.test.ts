@@ -16,10 +16,11 @@ import { ModelRuntime } from "../src/llm/ModelRuntime.js";
 import { FileModelsStore, restoreProviderCatalogs } from "../src/llm/ModelsStore.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
 import { SessionRecorder } from "../src/session/recorder.js";
+import { replaySession } from "../src/session/replay.js";
 import { ensureAgentDirs } from "../src/session/store.js";
 import { ToolRegistry } from "../src/tools/registry.js";
 import type { Tool } from "../src/tools/types.js";
-import type { AgentModel, ModelStreamContext } from "../src/agent/core/types.js";
+import type { AgentModel, ModelRequestMetrics, ModelStreamContext } from "../src/agent/core/types.js";
 import type { AgentSessionEvent } from "../src/agent/types.js";
 
 async function main(): Promise<void> {
@@ -114,15 +115,40 @@ async function main(): Promise<void> {
     assert.equal(done?.content, "native answer");
     assert.equal(events.some((event) => event.type === "assistant.delta" && event.content === "native answer"), true);
     assert.equal(events.some((event) => event.type === "tool.completed" && event.tool === "echo"), true);
+    const requestSummary = agent.modelRequestSummary();
+    assert.equal(requestSummary.calls, 2);
+    assert.equal(requestSummary.failed, 0);
+    assert.equal(requestSummary.totalAttempts, 2);
+    assert.equal(requestSummary.retries, 0);
+    assert.equal(requestSummary.averageTimeToFirstEventMs !== undefined, true);
     await agent.close();
     closed = true;
     const storedEvents = (await readFile(recorder.filePath, "utf8"))
       .trim()
       .split("\n")
       .filter(Boolean)
-      .map((line) => JSON.parse(line) as { type: string; reasoningContent?: string });
+      .map((line) => JSON.parse(line) as {
+        type: string;
+        reasoningContent?: string;
+        metrics?: {
+          requestContext?: {
+            sessionId?: string;
+            runId?: string;
+            turnId?: string;
+            step?: number;
+            relatedToolCallIds?: string[];
+          };
+        };
+      });
     assert.equal(storedEvents.find((event) => event.type === "tool_call")?.reasoningContent, "先检查当前状态。");
     assert.equal([...storedEvents].reverse().find((event) => event.type === "assistant_message")?.reasoningContent, "根据结果整理回复。");
+    const requestEvents = storedEvents.filter((event) => event.type === "model_request");
+    assert.equal(requestEvents.length, 2);
+    assert.deepEqual(requestEvents.map((event) => event.metrics?.requestContext?.step), [1, 2]);
+    assert.equal(requestEvents[0]?.metrics?.requestContext?.sessionId, recorder.sessionId);
+    assert.equal(requestEvents[0]?.metrics?.requestContext?.runId, requestEvents[1]?.metrics?.requestContext?.runId);
+    assert.deepEqual(requestEvents[1]?.metrics?.requestContext?.relatedToolCallIds, ["call-1"]);
+    assert.equal((await replaySession(recorder.filePath)).modelRequests.length, 2);
   } finally {
     globalThis.fetch = originalFetch;
     if (!closed) await agent.close();
@@ -780,6 +806,7 @@ async function testAnthropicSubscriptionAndHistory(): Promise<void> {
 }
 
 async function testNativeTimeout(): Promise<void> {
+  let observedMetrics: ModelRequestMetrics | undefined;
   const model = createNativeModel({
     provider: "timeout-test",
     modelId: "timeout-model",
@@ -801,10 +828,17 @@ async function testNativeTimeout(): Promise<void> {
     })
   });
   await assert.rejects(async () => {
-    for await (const _event of await model.stream({ messages: [{ role: "user", content: "wait" }], tools: [] }, { timeoutMs: 20 })) {
+    for await (const _event of await model.stream({ messages: [{ role: "user", content: "wait" }], tools: [] }, {
+      timeoutMs: 20,
+      onRequestMetrics: (metrics) => {
+        observedMetrics = metrics;
+      }
+    })) {
       // The request must abort before yielding a response.
     }
   }, /timeout|aborted/iu);
+  assert.equal(observedMetrics?.errorCode, "timeout");
+  assert.equal(observedMetrics?.errorPhase, "request");
 }
 
 async function testCompatibleReasoningPayloads(): Promise<void> {

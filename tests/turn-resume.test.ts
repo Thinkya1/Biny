@@ -13,8 +13,11 @@ import type { AgentTurnOutcome } from "../src/agent/types.js";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
 import { createNativeModelForConfig } from "../src/llm/nativeFactory.js";
 import { PermissionManager } from "../src/permission/PermissionManager.js";
+import { RuntimeEventAuthority } from "../src/runtime/RuntimeAuthority.js";
 import { SessionRecorder } from "../src/session/recorder.js";
-import { ensureAgentDirs } from "../src/session/store.js";
+import { readSessionEvents } from "../src/session/events.js";
+import { validateRuntimeEventStream } from "../src/session/runtimeEvent.js";
+import { ensureAgentDirs, sessionFilePath } from "../src/session/store.js";
 import { TurnStore } from "../src/session/turnStore.js";
 import { ToolRegistry } from "../src/tools/registry.js";
 import type { Tool } from "../src/tools/types.js";
@@ -170,6 +173,33 @@ async function testAgentSessionCrashRecovery(
     assert.equal(outcome.steps, crash === "during-tool-b" ? 2 : 3);
     assert.equal(await new TurnStore(workspaceRoot, sessionId).load(), undefined);
 
+    const sessionEvents = await readSessionEvents(isolatedSessionFilePath(workspaceRoot, sessionId));
+    const runtimeEvents = sessionEvents.filter((event) => event.runtime !== undefined);
+    assert.equal(runtimeEvents.length, sessionEvents.length, "new session facts must carry runtime identity");
+    assert.deepEqual(
+      runtimeEvents.map((event) => event.runtime?.eventSeq),
+      runtimeEvents.map((_event, index) => index + 1),
+      "event sequence must be continuous after crash recovery"
+    );
+    assert.equal(new Set(runtimeEvents.map((event) => event.runtime?.eventId)).size, runtimeEvents.length);
+    validateRuntimeEventStream(sessionEvents);
+    const turnIds = new Set(runtimeEvents.map((event) => event.runtime?.turnId).filter((turnId): turnId is string => turnId !== undefined));
+    const runIds = new Set(runtimeEvents.map((event) => event.runtime?.runId).filter((runId): runId is string => runId !== undefined));
+    assert.equal(turnIds.size, 1, "initial run and continuation must share one turnId");
+    assert.equal(runIds.size, 2, "resume must allocate a new runId");
+    const terminalByRun = new Map<string, number>();
+    const operations = new Map<string, string>();
+    for (const event of runtimeEvents) {
+      if (event.type === "turn_status" && event.runtime?.runId) {
+        terminalByRun.set(event.runtime.runId, (terminalByRun.get(event.runtime.runId) ?? 0) + 1);
+      }
+      if (event.type === "tool_execution") operations.set(event.toolCallId, event.operationId);
+      if (event.type === "tool_result" && event.toolCallId && event.operationId) {
+        assert.equal(operations.get(event.toolCallId), event.operationId, "tool result identity must match its execution");
+      }
+    }
+    assert.equal([...terminalByRun.values()].every((count) => count === 1), true);
+
     const executions = (await readFile(executionLog, "utf8")).trim().split("\n");
     assert.equal(executions.filter((entry) => entry === "tool-a:done").length, 1);
     assert.equal(executions.filter((entry) => entry === "tool-b:done").length, crash === "during-tool-b" ? 0 : 1);
@@ -185,6 +215,23 @@ async function testAgentSessionCrashRecovery(
       true,
       "recovery must expose tool B's assistant call and its persisted or recovered result"
     );
+
+    const previousAgentDir = process.env.BINY_AGENT_DIR;
+    process.env.BINY_AGENT_DIR = path.join(workspaceRoot, "global-agent");
+    try {
+      const authority = await RuntimeEventAuthority.open(workspaceRoot);
+      const projected = authority.readEvents({ sessionId }).events;
+      assert.equal(projected.length, runtimeEvents.length, "authority projection must contain every JSONL fact after restart");
+      assert.deepEqual(
+        projected.map((event) => event.eventSeq),
+        runtimeEvents.map((event) => event.runtime?.eventSeq),
+        "authority must preserve the session high-water sequence"
+      );
+      authority.close();
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.BINY_AGENT_DIR;
+      else process.env.BINY_AGENT_DIR = previousAgentDir;
+    }
   } finally {
     await provider.close();
     await rm(workspaceRoot, { recursive: true, force: true });
@@ -349,6 +396,7 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
 
 async function runAgentWorker(options: WorkerOptions): Promise<void> {
   await ensureAgentDirs(options.workspaceRoot);
+  const authority = await RuntimeEventAuthority.open(options.workspaceRoot);
   const config = configSchema.parse({
     ...defaultConfig,
     defaultModel: "test-model",
@@ -374,28 +422,33 @@ async function runAgentWorker(options: WorkerOptions): Promise<void> {
   registry.register(crashTestTool("tool_a", options));
   registry.register(crashTestTool("tool_b", options));
   const recorder = options.phase === "initial"
-    ? new SessionRecorder(options.workspaceRoot, options.sessionId)
-    : new SessionRecorder(options.workspaceRoot);
+    ? new SessionRecorder(options.workspaceRoot, options.sessionId, undefined, authority.asSink())
+    : new SessionRecorder(options.workspaceRoot, undefined, undefined, authority.asSink());
   const agent = new AgentSession({
     workspaceRoot: options.workspaceRoot,
     config,
     model: createNativeModelForConfig(config),
     toolRegistry: registry,
     permissionManager: new PermissionManager(config.permission),
-    recorder
+    recorder,
+    runtimeEventSink: authority.asSink()
   });
-  await agent.initialize();
-  if (options.phase === "resumed") await agent.resume(options.sessionId);
-  let outcome: AgentTurnOutcome | undefined;
-  const stream = options.phase === "initial"
-    ? agent.prompt("run tool A and tool B")
-    : agent.continueInterruptedTurn();
-  for await (const event of stream) {
-    if (event.type === "done") outcome = event.outcome;
+  try {
+    await agent.initialize();
+    if (options.phase === "resumed") await agent.resume(options.sessionId);
+    let outcome: AgentTurnOutcome | undefined;
+    const stream = options.phase === "initial"
+      ? agent.prompt("run tool A and tool B")
+      : agent.continueInterruptedTurn();
+    for await (const event of stream) {
+      if (event.type === "done") outcome = event.outcome;
+    }
+    await agent.close();
+    if (!outcome) throw new Error("Agent worker ended without an outcome.");
+    process.stdout.write(`${JSON.stringify(outcome)}\n`);
+  } finally {
+    authority.close();
   }
-  await agent.close();
-  if (!outcome) throw new Error("Agent worker ended without an outcome.");
-  process.stdout.write(`${JSON.stringify(outcome)}\n`);
 }
 
 function crashTestTool(name: "tool_a" | "tool_b", options: WorkerOptions): Tool<Record<string, never>> {
@@ -421,6 +474,17 @@ function crashTestTool(name: "tool_a" | "tool_b", options: WorkerOptions): Tool<
       };
     }
   };
+}
+
+function isolatedSessionFilePath(workspaceRoot: string, sessionId: string): string {
+  const previous = process.env.BINY_AGENT_DIR;
+  process.env.BINY_AGENT_DIR = path.join(workspaceRoot, "global-agent");
+  try {
+    return sessionFilePath(workspaceRoot, sessionId);
+  } finally {
+    if (previous === undefined) delete process.env.BINY_AGENT_DIR;
+    else process.env.BINY_AGENT_DIR = previous;
+  }
 }
 
 const workerIndex = process.argv.indexOf("--agent-worker");

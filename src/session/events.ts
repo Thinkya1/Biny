@@ -15,7 +15,9 @@ import {
 } from "./limits.js";
 import { listSessionFiles, readSessionSnapshot } from "./store.js";
 import type { SessionEvent, SessionTurnStatusEvent } from "./recorder.js";
+export type { SessionEvent } from "./recorder.js";
 import { publicUserMessage } from "./publicMessage.js";
+import { validateRuntimeEventRecord, type RuntimeEventIdentity } from "./runtimeEvent.js";
 
 const sessionListReadConcurrency = 8;
 const sessionUsageSchema = z.record(z.unknown());
@@ -30,6 +32,49 @@ const attachmentReferenceSchema = z.object({
   path: z.string(),
   size: z.number().int().nonnegative().optional()
 });
+const modelRequestAttemptSchema = z.object({
+  attempt: z.number().int().positive(),
+  durationMs: z.number().finite().nonnegative(),
+  status: z.number().int().optional(),
+  error: z.string().optional(),
+  willRetry: z.boolean(),
+  retryDelayMs: z.number().finite().nonnegative().optional()
+}).passthrough();
+const modelRequestContextSchema = z.object({
+  sessionId: z.string().optional(),
+  runId: z.string().optional(),
+  turnId: z.string().optional(),
+  step: z.number().int().nonnegative().optional(),
+  operation: z.enum(["agent", "plan", "compaction", "memory", "subagent"]).optional(),
+  relatedToolCallIds: z.array(z.string()).optional()
+}).passthrough();
+const modelRequestMetricsSchema = z.object({
+  requestId: z.string(),
+  provider: z.string(),
+  modelId: z.string(),
+  startedAt: z.string(),
+  durationMs: z.number().finite().nonnegative(),
+  timeToFirstEventMs: z.number().finite().nonnegative().optional(),
+  timeToFirstOutputMs: z.number().finite().nonnegative().optional(),
+  attempts: z.array(modelRequestAttemptSchema),
+  status: z.number().int().optional(),
+  finishReason: z.enum(["stop", "tool-calls", "length", "error", "aborted", "other"]).optional(),
+  usage: sessionUsageSchema.optional(),
+  error: z.string().optional(),
+  errorCode: z.enum([
+    "aborted",
+    "timeout",
+    "context_overflow",
+    "http_error",
+    "network_error",
+    "protocol_error",
+    "provider_error",
+    "unknown"
+  ]).optional(),
+  errorPhase: z.enum(["request", "stream"]).optional(),
+  eventCount: z.number().int().nonnegative(),
+  requestContext: modelRequestContextSchema.optional()
+}).passthrough();
 const agentTextContentSchema = z.object({ type: z.literal("text"), text: z.string() }).passthrough();
 const agentImageContentSchema = z.object({ type: z.literal("image"), data: z.string(), mimeType: z.string() }).passthrough();
 const agentReasoningContentSchema = z.object({
@@ -146,9 +191,15 @@ const sessionEventSchema = z.discriminatedUnion("type", [
     time: z.string().optional()
   }).passthrough(),
   z.object({
+    type: z.literal("model_request"),
+    metrics: modelRequestMetricsSchema,
+    time: z.string().optional()
+  }).passthrough(),
+  z.object({
     type: z.literal("turn_status"),
     status: z.enum(["completed", "incomplete", "blocked", "cancelled", "failed", "aborted"]),
     stopReason: z.string(),
+    finishReason: z.string().optional(),
     steps: z.number().int().nonnegative(),
     summary: z.string().optional(),
     resumable: z.boolean().optional(),
@@ -244,11 +295,19 @@ export function parseSessionEvents(raw: string, options: ParseSessionEventsOptio
       // 保留最近的事件：恢复会话时有用的是尾部，不是开头。
       events.shift();
     }
-    events.push(validateSessionEvent(parsed, lineNumber));
+    const event = validateSessionEvent(parsed, lineNumber);
+    if (!validateRuntimeEventRecord(event.runtime)) {
+      throw new Error(`Invalid runtime event metadata at line ${String(lineNumber)}.`);
+    }
+    events.push(event);
     if (!terminated) break;
     lineStart = lineEnd + 1;
   }
   return events;
+}
+
+export function runtimeEventIdentity(event: SessionEvent): RuntimeEventIdentity | undefined {
+  return event.runtime;
 }
 
 /**

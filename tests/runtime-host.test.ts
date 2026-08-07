@@ -35,6 +35,7 @@ async function main(): Promise<void> {
   const listeners = new Set<(update: AgentRuntimeUpdate) => void>();
   let currentSnapshot = snapshot;
   let switchedThinking: string | undefined;
+  let interruptedStarts = 0;
   const runtime: FakeRuntime = {
     publish(update): void {
       currentSnapshot = update.snapshot;
@@ -70,7 +71,10 @@ async function main(): Promise<void> {
     steer: () => { throw new Error("not used"); },
     followUp: () => { throw new Error("not used"); },
     continueInterruptedTurn: async () => undefined,
-    startInterruptedTurn: async () => undefined,
+    startInterruptedTurn: async () => {
+      interruptedStarts += 1;
+      return undefined;
+    },
     waitForIdle: async () => undefined,
     cancelCurrentRun: () => undefined,
     cancelRun: () => false,
@@ -101,6 +105,7 @@ async function main(): Promise<void> {
     }
   } as unknown as CommandRuntime;
   const host = await startRuntimeHost(workspace, runtime, commands);
+  assert.equal(interruptedStarts, 0, "普通 Host 启动不得自动恢复中断回合");
   const client = await connectRuntimeHost(workspace, { clientId: "test-client", surface: "tui" });
   assert.ok(client);
   assert.equal(client.getSnapshot().info.sessionId, "session-host-test");
@@ -154,6 +159,9 @@ async function main(): Promise<void> {
   await secondClient.close();
   await client.close();
   await host.close();
+  const explicitResumeHost = await startRuntimeHost(workspace, runtime, commands, { resumeInterrupted: true });
+  assert.equal(interruptedStarts, 1, "只有显式恢复开关才允许启动中断回合");
+  await explicitResumeHost.close();
   assert.equal(await connectRuntimeHost(workspace, { clientId: "after-close", surface: "tui" }), undefined);
 
   const spawnedWorkspace = await mkdtemp(path.join(os.tmpdir(), "biny-runtime-host-process-test-"));

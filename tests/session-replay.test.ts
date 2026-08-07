@@ -202,6 +202,21 @@ function main(): void {
     { type: "user_message", content: "legacy kept" }
   ]);
   assert.deepEqual(legacyCheckpoint.messages, [{ role: "user", content: "legacy kept" }]);
+
+  assert.throws(() => replaySessionEvents([
+    { type: "user_message", content: "duplicate", runtime: { eventId: "event-1", eventSeq: 1 } },
+    { type: "user_message", content: "duplicate again", runtime: { eventId: "event-1", eventSeq: 2 } }
+  ]), /Duplicate runtime event id/u);
+  assert.throws(() => replaySessionEvents([
+    { type: "user_message", content: "gap", runtime: { eventId: "event-1", eventSeq: 1 } },
+    { type: "user_message", content: "gap again", runtime: { eventId: "event-2", eventSeq: 3 } }
+  ]), /not continuous/u);
+  assert.throws(() => replaySessionEvents([
+    { type: "user_message", content: "pairing", runtime: { eventId: "event-1", eventSeq: 1 } },
+    { type: "tool_call", tool: "write_file", args: {}, toolCallId: "call-1", runtime: { eventId: "event-2", eventSeq: 2 } },
+    { type: "tool_execution", tool: "write_file", toolCallId: "call-1", sequence: 1, operationId: "operation-1", state: "running", runtime: { eventId: "event-3", eventSeq: 3 } },
+    { type: "tool_result", tool: "write_file", toolCallId: "call-1", sequence: 1, operationId: "operation-2", result: {}, runtime: { eventId: "event-4", eventSeq: 4 } }
+  ]), /mismatched operation identity/u);
 }
 
 function hasToolCall(message: AgentMessage, toolCallId: string): boolean {

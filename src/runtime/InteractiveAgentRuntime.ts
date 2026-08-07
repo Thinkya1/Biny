@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentAttachment, AgentRunMode, AgentSessionInfo, ResumedAgentSession } from "../agent/AgentSession.js";
 import type { BlockedReason } from "../agent/completionGate.js";
-import type { AgentPermissionResult, AgentSessionEvent, AgentTurnOutcome } from "../agent/types.js";
+import type { AgentPermissionResult, AgentSessionEvent, AgentTurnOutcome, AgentTurnStatus, AgentTurnStopReason } from "../agent/types.js";
 import { isFullYesConfirmation } from "../permission/confirmation.js";
 import type { PermissionResult } from "../permission/PermissionManager.js";
 import type { ToolInputDisplay } from "../tools/types.js";
@@ -11,6 +11,7 @@ import { createCommandRuntime, type CommandRuntime, type CommandRuntimeOptions }
 import { resolveSessionFile, sessionIdFromFile } from "../session/store.js";
 import { SessionRunLedger, type FinishSessionRunOptions } from "../session/runLedger.js";
 import { SessionLeaseStore, type SessionLease } from "./SessionLease.js";
+import type { RuntimeEventAuthority, RuntimeRunRecord } from "./RuntimeAuthority.js";
 import type {
   ActiveRunSnapshot,
   AgentHostEvent,
@@ -36,6 +37,9 @@ export interface SubmittedAgentRun {
 export interface RuntimeRequestIds {
   runId?: string;
   messageId?: string;
+  turnId?: string;
+  parentRunId?: string;
+  continuationSource?: string;
 }
 
 export interface QueuedAgentMessage {
@@ -55,6 +59,8 @@ export interface InteractiveAgentRuntimeOptions {
   sessionLeases?: SessionLeaseStore;
   /** 运行 ledger 可注入，未提供时由真实 CommandRuntime 的 persistenceRoot 创建。 */
   runLedger?: SessionRunLedger;
+  /** 新 RuntimeEvent 先进入 SQLite authority，再由 SessionRecorder 写 JSONL。 */
+  runtimeAuthority?: RuntimeEventAuthority;
 }
 
 export interface InteractiveAgentHost {
@@ -90,6 +96,7 @@ interface BackgroundOperation {
 }
 
 interface AgentRun extends ActiveRunSnapshot {
+  turnId: string;
   startedAtMs: number;
   continuation: boolean;
   attachments: AgentAttachment[];
@@ -118,6 +125,7 @@ export class InteractiveAgentRuntime {
   private readonly updates = new AgentEventBus<AgentRuntimeUpdate>();
   private readonly sessionLeases: SessionLeaseStore | undefined;
   private readonly runLedger: SessionRunLedger | undefined;
+  private readonly runtimeAuthority: RuntimeEventAuthority | undefined;
   private sessionLease: SessionLease | undefined;
   private lastInfo: AgentSessionInfo | undefined;
   private state: InteractiveRunState = { kind: "idle" };
@@ -147,6 +155,7 @@ export class InteractiveAgentRuntime {
       ?? (typeof commandRuntime.persistenceRoot === "string"
         ? new SessionRunLedger(commandRuntime.persistenceRoot)
         : undefined);
+    this.runtimeAuthority = options.runtimeAuthority ?? commandRuntime.runtimeAuthority;
   }
 
   private getInfo(): AgentSessionInfo {
@@ -200,7 +209,7 @@ export class InteractiveAgentRuntime {
     }
     const interrupted = await this.commandRuntime.agent.interruptedTurn();
     if (!interrupted) return undefined;
-    return this.startRun(interrupted.prompt, "chat", [], true, requestIds);
+    return this.startRun(interrupted.prompt, "chat", [], true, requestIds, interrupted.turnId);
   }
 
   private startRun(
@@ -208,7 +217,8 @@ export class InteractiveAgentRuntime {
     mode: AgentRunMode,
     attachments: AgentAttachment[],
     continuation: boolean,
-    requestIds?: RuntimeRequestIds
+    requestIds?: RuntimeRequestIds,
+    continuationTurnId?: string
   ): SubmittedAgentRun {
     if (this.closed) throw new Error("Agent runtime is closed.");
     if (this.state.kind === "maintenance") {
@@ -223,11 +233,14 @@ export class InteractiveAgentRuntime {
     const sessionId = this.getInfo().sessionId;
     this.acquireSessionLease(sessionId);
     const runId = requestIds?.runId ?? randomUUID();
+    const existingAuthorityRun = this.runtimeAuthority?.getRun(runId);
+    const turnId = continuationTurnId ?? requestIds?.turnId ?? existingAuthorityRun?.turnId ?? randomUUID();
     const messageId = requestIds?.messageId ?? randomUUID();
     const startedAtMs = Date.now();
     const run: AgentRun = {
       sessionId,
       runId,
+      turnId,
       messageId,
       input,
       mode,
@@ -238,6 +251,30 @@ export class InteractiveAgentRuntime {
       continuation
     };
     const controller = new AbortController();
+    try {
+      const admission = this.runtimeAuthority?.startRun({
+        runId,
+        sessionId,
+        turnId,
+        createdAt: run.startedAt,
+        parentRunId: requestIds?.parentRunId,
+        continuationSource: requestIds?.continuationSource,
+        payload: {
+          input,
+          mode,
+          continuation,
+          messageId
+        }
+      });
+      if (admission && !admission.created) {
+        this.releaseSessionLeaseIfIdle();
+        if (admission.terminalStatus !== undefined) return submittedExistingRun(admission, messageId);
+        throw new Error(`Runtime run ${runId} was already admitted; refusing to execute it again.`);
+      }
+    } catch (error) {
+      this.releaseSessionLeaseIfIdle();
+      throw error;
+    }
     this.activeRun = run;
     this.activeRunController = controller;
     const execution = this.executeRun(run, controller.signal);
@@ -504,7 +541,6 @@ export class InteractiveAgentRuntime {
     const message = redactSecrets(error instanceof Error ? error.message : String(error));
     const durationMs = Math.max(0, Date.now() - run.startedAtMs);
     run.status = "failed";
-    this.emit({ ...this.eventBase(run), type: "run.failed", durationMs, error: message });
     const outcome: AgentRunOutcome = {
       runId: run.runId,
       status: "failed",
@@ -514,28 +550,80 @@ export class InteractiveAgentRuntime {
       durationMs,
       error: message
     };
-    await this.finishRunLedger(run, {
+    await this.commitTerminal(run, outcome, {
       status: "failed",
       durationMs,
       stopReason: outcome.stopReason,
       steps: outcome.steps,
       error: message
     });
+    this.emit({ ...this.eventBase(run), type: "run.failed", durationMs, error: message });
     return outcome;
   }
 
   private async startRunLedger(run: AgentRun): Promise<void> {
+    this.runtimeAuthority?.markRunRunning(run.runId, run.startedAt);
     await this.runLedger?.start({
       runId: run.runId,
       sessionId: run.sessionId,
       messageId: run.messageId,
       runtimeId: this.sessionLeases?.runtimeId,
+      turnId: run.turnId,
       startedAt: run.startedAt
     }).catch(() => undefined);
   }
 
   private async finishRunLedger(run: ActiveRunSnapshot, options: FinishSessionRunOptions): Promise<void> {
     await this.runLedger?.finish(run.runId, options).catch(() => undefined);
+  }
+
+  /**
+   * Canonical terminal fact must exist before the control-plane projection and
+   * before any host terminal event becomes visible to a client.
+   */
+  private async commitTerminal(
+    run: AgentRun,
+    outcome: AgentTurnOutcome,
+    projection: Omit<FinishSessionRunOptions, "terminal">
+  ): Promise<void> {
+    const ensureTerminalOutcome = (this.commandRuntime.agent as unknown as {
+      ensureTerminalOutcome?: (runId: string, turnId: string, value: AgentTurnOutcome) => Promise<unknown>;
+    }).ensureTerminalOutcome;
+    if (!ensureTerminalOutcome) {
+      // Lightweight embedded test hosts may provide only the historical
+      // AgentSession surface. The real AgentSession always implements this
+      // canonical commit boundary.
+      this.runtimeAuthority?.finishRun({
+        runId: run.runId,
+        status: outcome.status,
+        payload: {
+          stopReason: outcome.stopReason,
+          finishReason: outcome.finishReason,
+          steps: outcome.steps,
+          output: outcome.output,
+          error: outcome.error,
+          projection
+        }
+      });
+      await this.finishRunLedger(run, projection);
+      return;
+    }
+    const terminal = await ensureTerminalOutcome.call(this.commandRuntime.agent, run.runId, run.turnId, outcome) as FinishSessionRunOptions["terminal"];
+    if (!terminal) throw new Error(`Run ${run.runId} terminal commit returned no runtime identity.`);
+    this.runtimeAuthority?.finishRun({
+      runId: run.runId,
+      status: outcome.status,
+      terminalEventId: terminal.eventId,
+      payload: {
+        stopReason: outcome.stopReason,
+        finishReason: outcome.finishReason,
+        steps: outcome.steps,
+        output: outcome.output,
+        error: outcome.error,
+        projection
+      }
+    });
+    await this.finishRunLedger(run, { ...projection, terminal });
   }
 
   private async executeRun(run: AgentRun, signal: AbortSignal): Promise<AgentRunOutcome> {
@@ -581,7 +669,9 @@ export class InteractiveAgentRuntime {
         abortSignal: signal,
         confirmPermission: async (request: AgentPermissionEventRequest) => await this.waitForPermission(run, request),
         mode: run.mode,
-        attachments: run.attachments
+        attachments: run.attachments,
+        runId: run.runId,
+        turnId: run.turnId
       };
       const stream = run.continuation
         ? agent.continueInterruptedTurn(runOptions)
@@ -638,8 +728,16 @@ export class InteractiveAgentRuntime {
     }
   }
 
-  private async completeRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): Promise<AgentRunOutcome> {
+  private async completeRun(run: AgentRun, durationMs: number, turn: AgentTurnOutcome): Promise<AgentRunOutcome> {
     run.status = "completed";
+    const outcome = { runId: run.runId, durationMs, ...turn };
+    await this.commitTerminal(run, turn, {
+      status: "completed",
+      durationMs,
+      stopReason: turn.stopReason,
+      finishReason: turn.finishReason,
+      steps: turn.steps
+    });
     this.emit({
       ...this.eventBase(run),
       type: "run.completed",
@@ -649,20 +747,22 @@ export class InteractiveAgentRuntime {
       steps: turn.steps,
       usage: turn.usage
     });
-    const outcome = { runId: run.runId, durationMs, ...turn };
-    await this.finishRunLedger(run, {
-      status: "completed",
-      durationMs,
-      stopReason: turn.stopReason,
-      finishReason: turn.finishReason,
-      steps: turn.steps
-    });
     return outcome;
   }
 
-  private async incompleteRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): Promise<AgentRunOutcome> {
+  private async incompleteRun(run: AgentRun, durationMs: number, turn: AgentTurnOutcome): Promise<AgentRunOutcome> {
     const reason = turn.error ?? incompleteReason(turn);
     run.status = "incomplete";
+    const outcome = { runId: run.runId, durationMs, ...turn, error: turn.error ?? redactSecrets(reason) };
+    await this.commitTerminal(run, turn, {
+      status: "incomplete",
+      durationMs,
+      stopReason: turn.stopReason,
+      finishReason: turn.finishReason,
+      steps: turn.steps,
+      resumable: turn.resumable,
+      error: outcome.error
+    });
     this.emit({
       ...this.eventBase(run),
       type: "run.incomplete",
@@ -674,23 +774,31 @@ export class InteractiveAgentRuntime {
       steps: turn.steps,
       usage: turn.usage
     });
-    const outcome = { runId: run.runId, durationMs, ...turn, error: turn.error ?? redactSecrets(reason) };
-    await this.finishRunLedger(run, {
-      status: "incomplete",
+    return outcome;
+  }
+
+  private async blockRun(run: AgentRun, durationMs: number, turn: AgentTurnOutcome): Promise<AgentRunOutcome> {
+    const summary = redactSecrets(turn.error ?? "The current task is blocked.");
+    const requiredAction = turn.requiredAction === undefined ? undefined : redactSecrets(turn.requiredAction);
+    run.status = "blocked";
+    const outcome = {
+      runId: run.runId,
+      durationMs,
+      ...turn,
+      error: summary,
+      requiredAction
+    };
+    await this.commitTerminal(run, turn, {
+      status: "blocked",
       durationMs,
       stopReason: turn.stopReason,
       finishReason: turn.finishReason,
       steps: turn.steps,
       resumable: turn.resumable,
-      error: outcome.error
+      blockedReason: normalizeBlockedReason(turn.blockedReason),
+      requiredAction,
+      error: summary
     });
-    return outcome;
-  }
-
-  private async blockRun(run: ActiveRunSnapshot, durationMs: number, turn: AgentTurnOutcome): Promise<AgentRunOutcome> {
-    const summary = redactSecrets(turn.error ?? "The current task is blocked.");
-    const requiredAction = turn.requiredAction === undefined ? undefined : redactSecrets(turn.requiredAction);
-    run.status = "blocked";
     this.emit({
       ...this.eventBase(run),
       type: "run.blocked",
@@ -705,45 +813,17 @@ export class InteractiveAgentRuntime {
       steps: turn.steps,
       usage: turn.usage
     });
-    const outcome = {
-      runId: run.runId,
-      durationMs,
-      ...turn,
-      error: summary,
-      requiredAction
-    };
-    await this.finishRunLedger(run, {
-      status: "blocked",
-      durationMs,
-      stopReason: turn.stopReason,
-      finishReason: turn.finishReason,
-      steps: turn.steps,
-      resumable: turn.resumable,
-      blockedReason: normalizeBlockedReason(turn.blockedReason),
-      requiredAction,
-      error: summary
-    });
     return outcome;
   }
 
   private async cancelledRun(
-    run: ActiveRunSnapshot,
+    run: AgentRun,
     durationMs: number,
     reason: string,
     turn?: AgentTurnOutcome
   ): Promise<AgentRunOutcome> {
     const publicReason = redactSecrets(reason);
     run.status = "cancelled";
-    this.emit({
-      ...this.eventBase(run),
-      type: "run.cancelled",
-      durationMs,
-      reason: publicReason,
-      stopReason: turn?.stopReason ?? "cancelled",
-      finishReason: turn?.finishReason,
-      steps: turn?.steps ?? 0,
-      usage: turn?.usage
-    });
     const outcome: AgentRunOutcome = {
       runId: run.runId,
       status: "cancelled",
@@ -755,7 +835,7 @@ export class InteractiveAgentRuntime {
       usage: turn?.usage,
       error: publicReason
     };
-    await this.finishRunLedger(run, {
+    await this.commitTerminal(run, outcome, {
       status: "cancelled",
       durationMs,
       stopReason: turn?.stopReason ?? "cancelled",
@@ -763,26 +843,27 @@ export class InteractiveAgentRuntime {
       steps: turn?.steps ?? 0,
       error: publicReason
     });
+    this.emit({
+      ...this.eventBase(run),
+      type: "run.cancelled",
+      durationMs,
+      reason: publicReason,
+      stopReason: turn?.stopReason ?? "cancelled",
+      finishReason: turn?.finishReason,
+      steps: turn?.steps ?? 0,
+      usage: turn?.usage
+    });
     return outcome;
   }
 
   private async abortRun(
-    run: ActiveRunSnapshot,
+    run: AgentRun,
     durationMs: number,
     reason: string,
     turn?: AgentTurnOutcome
   ): Promise<AgentRunOutcome> {
     const publicReason = redactSecrets(reason);
     run.status = "aborted";
-    this.emit({
-      ...this.eventBase(run),
-      type: "run.aborted",
-      durationMs,
-      reason: publicReason,
-      stopReason: turn?.stopReason ?? "aborted",
-      finishReason: turn?.finishReason,
-      steps: turn?.steps ?? 0
-    });
     const outcome: AgentRunOutcome = {
       runId: run.runId,
       status: "aborted",
@@ -794,7 +875,7 @@ export class InteractiveAgentRuntime {
       usage: turn?.usage,
       error: publicReason
     };
-    await this.finishRunLedger(run, {
+    await this.commitTerminal(run, outcome, {
       status: "aborted",
       durationMs,
       stopReason: turn?.stopReason ?? "aborted",
@@ -802,26 +883,26 @@ export class InteractiveAgentRuntime {
       steps: turn?.steps ?? 0,
       error: publicReason
     });
+    this.emit({
+      ...this.eventBase(run),
+      type: "run.aborted",
+      durationMs,
+      reason: publicReason,
+      stopReason: turn?.stopReason ?? "aborted",
+      finishReason: turn?.finishReason,
+      steps: turn?.steps ?? 0
+    });
     return outcome;
   }
 
   private async failRun(
-    run: ActiveRunSnapshot,
+    run: AgentRun,
     durationMs: number,
     error: string,
     turn?: AgentTurnOutcome
   ): Promise<AgentRunOutcome> {
     const publicError = redactSecrets(error);
     run.status = "failed";
-    this.emit({
-      ...this.eventBase(run),
-      type: "run.failed",
-      durationMs,
-      error: publicError,
-      stopReason: turn?.stopReason ?? "provider_error",
-      finishReason: turn?.finishReason,
-      steps: turn?.steps ?? 0
-    });
     const outcome: AgentRunOutcome = {
       runId: run.runId,
       status: "failed",
@@ -833,13 +914,22 @@ export class InteractiveAgentRuntime {
       usage: turn?.usage,
       error: publicError
     };
-    await this.finishRunLedger(run, {
+    await this.commitTerminal(run, outcome, {
       status: "failed",
       durationMs,
       stopReason: turn?.stopReason ?? "provider_error",
       finishReason: turn?.finishReason,
       steps: turn?.steps ?? 0,
       error: publicError
+    });
+    this.emit({
+      ...this.eventBase(run),
+      type: "run.failed",
+      durationMs,
+      error: publicError,
+      stopReason: turn?.stopReason ?? "provider_error",
+      finishReason: turn?.finishReason,
+      steps: turn?.steps ?? 0
     });
     return outcome;
   }
@@ -856,6 +946,12 @@ export class InteractiveAgentRuntime {
           : event.status === "error"
             ? "failed"
             : event.status;
+      if (isTerminalAgentSessionStatus(event.status)) {
+        // AgentSession writes the canonical turn_status before yielding this
+        // status. Host terminal events are emitted by terminal handlers only
+        // after the ledger projection has been attempted.
+        return event.status === "error" ? "Agent run failed." : undefined;
+      }
       // AgentSession 的 status 事件没有对应的 host event，但它仍然是前台状态的事实来源。
       // 收尾阶段可能还要清理断点或写入终态；如果这里不发布快照，UI 会一直停在上一个
       // reasoning/tool 状态，直到后续的 run.completed 才有机会重新同步。
@@ -1070,7 +1166,7 @@ export async function createInteractiveAgentHost(workspaceRoot: string, options?
   try {
     commandRuntime = await createCommandRuntime(workspaceRoot, options);
     return {
-      runtime: new InteractiveAgentRuntime(commandRuntime, { sessionLeases }),
+      runtime: new InteractiveAgentRuntime(commandRuntime, { sessionLeases, runtimeAuthority: commandRuntime.runtimeAuthority }),
       commands: commandRuntime
     };
   } catch (error) {
@@ -1078,6 +1174,66 @@ export async function createInteractiveAgentHost(workspaceRoot: string, options?
     sessionLeases.close();
     throw error;
   }
+}
+
+function submittedExistingRun(record: RuntimeRunRecord, fallbackMessageId: string): SubmittedAgentRun {
+  const terminalStatus = readAgentTurnStatus(record.terminalStatus);
+  if (!terminalStatus) throw new Error(`Runtime run ${record.runId} has no usable terminal status.`);
+  const terminalPayload = recordObject(record.terminalPayload);
+  const projection = recordObject(terminalPayload.projection);
+  const admissionPayload = recordObject(record.payload);
+  const messageId = typeof admissionPayload.messageId === "string" ? admissionPayload.messageId : fallbackMessageId;
+  const outcome: AgentRunOutcome = {
+    runId: record.runId,
+    status: terminalStatus,
+    stopReason: readAgentTurnStopReason(terminalPayload.stopReason, terminalStatus),
+    finishReason: typeof terminalPayload.finishReason === "string" ? terminalPayload.finishReason : undefined,
+    steps: typeof terminalPayload.steps === "number" ? terminalPayload.steps : 0,
+    output: typeof terminalPayload.output === "string" ? terminalPayload.output : "",
+    durationMs: typeof projection.durationMs === "number" ? projection.durationMs : 0,
+    error: typeof terminalPayload.error === "string" ? terminalPayload.error : undefined,
+    resumable: typeof projection.resumable === "boolean" ? projection.resumable : undefined,
+    blockedReason: typeof projection.blockedReason === "string" ? projection.blockedReason : undefined,
+    requiredAction: typeof projection.requiredAction === "string" ? projection.requiredAction : undefined,
+    affectedTodoIds: Array.isArray(projection.affectedTodoIds)
+      ? projection.affectedTodoIds.filter((value): value is string => typeof value === "string")
+      : undefined
+  };
+  return { runId: record.runId, messageId, completion: Promise.resolve(outcome) };
+}
+
+function readAgentTurnStatus(value: unknown): AgentTurnStatus | undefined {
+  return value === "completed" || value === "incomplete" || value === "blocked" || value === "cancelled" || value === "failed" || value === "aborted"
+    ? value
+    : undefined;
+}
+
+function readAgentTurnStopReason(value: unknown, status: AgentTurnStatus): AgentTurnStopReason {
+  if (
+    value === "model_stop"
+    || value === "completion_gate"
+    || value === "step_limit"
+    || value === "hard_step_limit"
+    || value === "tool_call_limit"
+    || value === "completion_continuation_limit"
+    || value === "no_progress_after_continuation"
+    || value === "repeated_action_limit"
+    || value === "tool_pending"
+    || value === "timeout"
+    || value === "verification_failed"
+    || value === "model_length"
+    || value === "content_filter"
+    || value === "provider_error"
+    || value === "blocked"
+    || value === "cancelled"
+    || value === "aborted"
+    || value === "budget_exhausted"
+  ) return value;
+  return status === "cancelled" ? "cancelled" : status === "aborted" ? "aborted" : status === "blocked" ? "blocked" : "provider_error";
+}
+
+function recordObject(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
 function cloneRunState(state: InteractiveRunState): InteractiveRunState {
@@ -1094,6 +1250,17 @@ function cloneRunState(state: InteractiveRunState): InteractiveRunState {
     };
   }
   return { ...state };
+}
+
+function isTerminalAgentSessionStatus(
+  status: Extract<AgentSessionEvent, { type: "status" }> ["status"]
+): boolean {
+  return status === "completed"
+    || status === "incomplete"
+    || status === "blocked"
+    || status === "cancelled"
+    || status === "aborted"
+    || status === "error";
 }
 
 function redactPermissionRequest(request: AgentPermissionEventRequest): AgentPermissionEventRequest {

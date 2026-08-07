@@ -8,6 +8,7 @@
 import type { AgentSessionInfo } from "../agent/AgentSession.js";
 import type { ContextStatus } from "../agent/context/types.js";
 import type { UsageSummary } from "../session/metadata.js";
+import { formatDuration, formatModelRequestSummary, type ModelRequestSummary } from "../observability/modelRequests.js";
 
 const numberFormatter = new Intl.NumberFormat("en-US");
 
@@ -16,7 +17,15 @@ export function formatStatusReport(
   permissionMode: string,
   context: ContextStatus,
   usage: UsageSummary,
-  extensionReport: string
+  extensionReport: string,
+  modelRequests: ModelRequestSummary = {
+    calls: 0,
+    succeeded: 0,
+    failed: 0,
+    totalAttempts: 0,
+    retries: 0,
+    totalDurationMs: 0
+  }
 ): string {
   const budget = context.budget;
   const contextWindow = budget.contextWindow ?? budget.maxTokens;
@@ -39,6 +48,14 @@ export function formatStatusReport(
   const usageSummary = usage.calls
     ? `${formatCount(usage.totalTokens)} total (${formatCount(usage.inputTokens)} input + ${formatCount(usage.outputTokens)} output; ${formatCount(usage.reasoningTokens)} reasoning)`
     : "no model calls recorded";
+  const contextComposition = context.budget.components?.filter((component) => component.requestedTokens > 0) ?? [];
+  const reserveSummary = [
+    context.budget.outputReserveTokens === undefined ? "" : `output ${formatCount(context.budget.outputReserveTokens)}`,
+    context.budget.reasoningReserveTokens === undefined ? "" : `reasoning ${formatCount(context.budget.reasoningReserveTokens)}`,
+    context.budget.toolSchemaReserveTokens === undefined ? "" : `tools ${formatCount(context.budget.toolSchemaReserveTokens)}`,
+    context.budget.systemPromptReserveTokens === undefined ? "" : `system ${formatCount(context.budget.systemPromptReserveTokens)}`
+  ].filter(Boolean).join(", ");
+  const inputMeasurement = formatInputMeasurement(budget.estimatedTokens, budget.providerInputTokens);
 
   return [
     `Model: ${info.modelLabel} (${info.reasoningLabel})`,
@@ -48,8 +65,12 @@ export function formatStatusReport(
     `Session: ${info.sessionId}`,
     "",
     `Token usage: ${usageSummary}`,
+    `Provider requests: ${formatModelRequestSummary(modelRequests)}`,
+    ...(modelRequests.totalDurationMs > 0 ? [`Provider time: ${formatDuration(modelRequests.totalDurationMs)} total`] : []),
     `Context window: ${formatCount(contextUsed)} used / ${formatCount(contextWindow)} (${String(contextRemainingPercent)}% remaining; ${source})`,
     `Input budget: ${formatCount(contextUsed)} / ${formatCount(budget.maxTokens)} (${formatCount(inputRemaining)} remaining)`,
+    ...(inputMeasurement ? [`Input measurement: ${inputMeasurement}`] : []),
+    ...(reserveSummary ? [`Context reserves: ${reserveSummary}`] : []),
     ...(budget.maxOutputTokens !== undefined
       ? [`Output limit: ${formatCount(budget.maxOutputTokens)} tokens`]
       : []),
@@ -58,6 +79,14 @@ export function formatStatusReport(
     `Instructions: ${instructionSummary}; ${formatCount(context.instructionBytes)}/${formatCount(context.instructionCapBytes)} bytes`,
     `Repo map: ${repoMapSummary}`,
     `Memory: ${memorySummary}`,
+    ...(contextComposition.length
+      ? [
+        "Context composition:",
+        ...contextComposition.map((component) =>
+          `  ${contextComponentLabel(component.id)}: ${formatCount(component.usedTokens)}/${formatCount(component.requestedTokens)} tokens (${component.disposition})`
+        )
+      ]
+      : []),
     ...(context.activePaths.length ? [`Active paths: ${context.activePaths.join(", ")}`] : []),
     ...(budget.omitted.length ? [`Omitted: ${budget.omitted.join(", ")}`] : []),
     "",
@@ -67,4 +96,37 @@ export function formatStatusReport(
 
 function formatCount(value: number): string {
   return numberFormatter.format(Math.max(0, Math.round(value)));
+}
+
+function formatInputMeasurement(estimatedTokens: number | undefined, providerInputTokens: number | undefined): string | undefined {
+  if (estimatedTokens === undefined && providerInputTokens === undefined) return undefined;
+  if (estimatedTokens === undefined) return `provider ${formatCount(providerInputTokens ?? 0)} tokens`;
+  if (providerInputTokens === undefined) return `estimated ${formatCount(estimatedTokens)} tokens`;
+  const delta = Math.round(providerInputTokens - estimatedTokens);
+  const signedDelta = delta > 0 ? `+${formatCount(delta)}` : delta < 0 ? `-${formatCount(Math.abs(delta))}` : "0";
+  return `estimated ${formatCount(estimatedTokens)}; provider ${formatCount(providerInputTokens)}; delta ${signedDelta}`;
+}
+
+function contextComponentLabel(id: string): string {
+  return {
+    task: "task",
+    history: "history",
+    "system rules": "system rules",
+    "project instructions": "project instructions",
+    "conversation summary": "conversation summary",
+    "explicit paths": "explicit paths",
+    "recent workspace activity": "recent activity",
+    "stable memory": "stable memory",
+    "RepoMap candidates": "repo map",
+    "project snapshot": "project snapshot",
+    system_rules: "system rules",
+    project_instructions: "project instructions",
+    conversation_summary: "conversation summary",
+    explicit_paths: "explicit paths",
+    recent_workspace_activity: "recent activity",
+    stable_memory: "stable memory",
+    repo_map: "repo map",
+    project_snapshot: "project snapshot",
+    tool_schema: "tool schema"
+  }[id] ?? id;
 }

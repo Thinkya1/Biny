@@ -31,18 +31,67 @@ import {
   type SubmittedAgentRun
 } from "./InteractiveAgentRuntime.js";
 import type { AgentRuntimeUpdate, InteractiveRuntimeSnapshot, RuntimeOperation } from "./agentEvents.js";
+import type { RuntimeRunStatus } from "./RuntimeAuthority.js";
+import { isTaskRunTerminal, type TaskRunStatus } from "./TaskRunStore.js";
+import { evaluateTaskRetry } from "./TaskRetryPolicy.js";
+import { AutomationScheduler, type AutomationCreateInput } from "./AutomationScheduler.js";
+import { GraphSupervisor, type GraphNodeInput } from "./GoalGraphStore.js";
+import type {
+  CapabilityInvocation,
+  CapabilityInvocationInput,
+  CapabilityRegistration,
+  CapabilityRegistrationInput,
+  CapabilityStore
+} from "./CapabilityStore.js";
 import { executeRuntimeCommand } from "./commands.js";
 import { listSessionSummaries } from "../session/events.js";
-import { sessionIdFromFile } from "../session/store.js";
+import { ensureAgentDirs, sessionIdFromFile } from "../session/store.js";
 import { TurnStore } from "../session/turnStore.js";
 
-const protocolVersion = 1;
+const protocolVersion = 2;
 const eventHistoryLimit = 4_000;
 const maxFrameBytes = 8 * 1024 * 1024;
 const reconnectDelayMs = 250;
 const maxUnixSocketPathLength = 90;
 const hostStartupTimeoutMs = 8_000;
 const hostJournalFile = "runtime-host-events.jsonl";
+
+const hostCapabilities = [
+  "runtime.authority",
+  "runtime.events.cursor",
+  "runtime.run.admission",
+  "runtime.run.reconnect",
+  "runtime.run.continuation",
+  "task.ledger",
+  "automation.scheduler",
+  "agent.graph",
+  "capability.channel"
+] as const;
+
+type OperationLane = "query" | "mutation" | "admission" | "control" | "run";
+
+export interface HostOperationResult<T = unknown> {
+  accepted: boolean;
+  revision: number;
+  result?: T;
+  reason?: string;
+}
+
+class OperationDispatcher {
+  private readonly tails: Record<OperationLane, Promise<void>> = {
+    query: Promise.resolve(),
+    mutation: Promise.resolve(),
+    admission: Promise.resolve(),
+    control: Promise.resolve(),
+    run: Promise.resolve()
+  };
+
+  dispatch<T>(lane: OperationLane, work: () => Promise<T>): Promise<T> {
+    const result = this.tails[lane].then(work, work);
+    this.tails[lane] = result.then(() => undefined, () => undefined);
+    return result;
+  }
+}
 
 type HostSurface = CommandSurface | "cli";
 
@@ -67,6 +116,7 @@ interface HostHelloFrame {
   token: string;
   clientId: string;
   surface: HostSurface;
+  capabilities?: string[];
 }
 
 interface HostRequestFrame {
@@ -104,13 +154,20 @@ interface HostGapFrame {
   snapshot: InteractiveRuntimeSnapshot;
 }
 
-type HostFrame = HostHelloFrame | HostRequestFrame | HostResponseFrame | HostEventFrame | HostCompletionFrame | HostGapFrame;
+interface HostCapabilityOfferFrame {
+  kind: "capability-offer";
+  invocation: CapabilityInvocation;
+  registration: CapabilityRegistration;
+}
+
+type HostFrame = HostHelloFrame | HostRequestFrame | HostResponseFrame | HostEventFrame | HostCompletionFrame | HostGapFrame | HostCapabilityOfferFrame;
 
 export interface RuntimeHostSpawnOptions {
   workspaceRoot: string;
   configDir?: string;
   attachmentRoot?: string;
   sessionId?: string;
+  /** 仅显式恢复命令可以打开；普通 Host 启动必须保持 false。 */
   resumeInterrupted?: boolean;
   /** Electron 打包时由主进程显式提供；CLI/TUI 会自动推导 source/dist 路径。 */
   entryPath?: string;
@@ -158,6 +215,8 @@ export interface RuntimeHostInfo {
   hostEpoch: string;
   sequence: number;
   persistenceRoot: string;
+  protocolRevision: number;
+  capabilities: readonly string[];
 }
 
 /** Runtime Host 重建 runtime 时使用的 composition root。 */
@@ -166,7 +225,7 @@ export type RuntimeHostFactory = (sessionId?: string) => Promise<InteractiveAgen
 export interface RuntimeHostStartOptions {
   /** 远端请求新会话、配置重载或编辑分支时，按 sessionId 重建 owner。 */
   createRuntime?: RuntimeHostFactory;
-  /** owner 进程启动后自动检查并续跑在途 turn。 */
+  /** 显式要求 owner 进程启动后检查并续跑在途 turn。默认不续跑。 */
   resumeInterrupted?: boolean;
 }
 
@@ -264,7 +323,7 @@ export function spawnRuntimeHostProcess(
     ...(options.configDir === undefined ? [] : ["--config-dir", path.resolve(options.configDir)]),
     ...(options.attachmentRoot === undefined ? [] : ["--attachment-root", path.resolve(options.attachmentRoot)]),
     ...(options.sessionId === undefined ? [] : ["--session-id", options.sessionId]),
-    ...(options.resumeInterrupted === false ? [] : ["--resume-interrupted"])
+    ...(options.resumeInterrupted === true ? ["--resume-interrupted"] : [])
   ], {
     cwd: moduleRoot,
     detached: true,
@@ -280,6 +339,9 @@ export function spawnRuntimeHostProcess(
 
 /** 在途状态按最近更新的会话选择；显式 sessionId 仍由调用方优先。 */
 export async function findLatestInterruptedSession(persistenceRoot: string): Promise<string | undefined> {
+  // Runtime Host 可能是当前工作区第一次启动；在扫描 session 之前先建立全局
+  // session 目录，否则 `resumeInterrupted` 会在空工作区被不存在的目录阻断。
+  await ensureAgentDirs(persistenceRoot);
   const summaries = await listSessionSummaries(persistenceRoot);
   for (const summary of summaries) {
     const sessionId = sessionIdFromFile(summary.fileName);
@@ -319,6 +381,7 @@ export async function startRuntimeHost(
     await server.initialize();
     await server.listen();
     await writeRegistration(registration);
+    server.startAutomationScheduler();
     if (options.resumeInterrupted) await server.resumeInterruptedTurn();
     return server;
   } catch (error) {
@@ -336,13 +399,16 @@ export class RuntimeHostServer {
   private readonly history: Array<{ sequence: number; update: AgentRuntimeUpdate }> = [];
   private readonly journalPath: string;
   private sequence = 0;
-  private operationTail: Promise<void> = Promise.resolve();
+  private readonly dispatcher = new OperationDispatcher();
+  private readonly automationScheduler: AutomationScheduler | undefined;
+  private readonly graphSupervisor: GraphSupervisor | undefined;
   private journalTail: Promise<void> = Promise.resolve();
   private unsubscribe: () => void;
   private runtime: InteractiveRuntimeHandle;
   private commands: CommandRuntime;
   private readonly createRuntime: RuntimeHostFactory | undefined;
   private closePromise: Promise<void> | undefined;
+  private runtimeRestartPromise: Promise<{ snapshot: InteractiveRuntimeSnapshot; sequence: number }> | undefined;
   private listening = false;
   private initialized = false;
 
@@ -357,7 +423,36 @@ export class RuntimeHostServer {
     this.commands = commands;
     this.createRuntime = createRuntime;
     this.journalPath = path.join(registration.persistenceRoot, ".biny", "runs", hostJournalFile);
+    if (commands.automationStore) {
+      this.automationScheduler = new AutomationScheduler({
+        getRuntime: () => this.runtime,
+        getStore: () => this.commands.automationStore,
+        createFreshRuntime: createRuntime === undefined
+          ? undefined
+          : async () => {
+            await this.restartRuntime(undefined);
+            return this.runtime;
+          }
+      });
+    }
+    if (commands.graphs) {
+      this.graphSupervisor = new GraphSupervisor({
+        getStore: () => this.commands.graphs,
+        getRuntime: () => this.runtime,
+        getTaskRuns: () => this.commands.taskRuns
+      });
+    }
     this.unsubscribe = runtime.subscribe((update) => this.publish(update));
+  }
+
+  startAutomationScheduler(): void {
+    this.automationScheduler?.start();
+    this.graphSupervisor?.start();
+  }
+
+  async runAutomation(automationId: string): Promise<unknown> {
+    if (!this.automationScheduler) throw new Error("Automation scheduler is unavailable.");
+    return await this.automationScheduler.runNow(automationId);
   }
 
   get info(): RuntimeHostInfo {
@@ -365,7 +460,9 @@ export class RuntimeHostServer {
       endpoint: this.registration.endpoint,
       hostEpoch: this.registration.hostEpoch,
       sequence: this.sequence,
-      persistenceRoot: this.registration.persistenceRoot
+      persistenceRoot: this.registration.persistenceRoot,
+      protocolRevision: protocolVersion,
+      capabilities: hostCapabilities
     };
   }
 
@@ -399,10 +496,20 @@ export class RuntimeHostServer {
     this.initialized = true;
   }
 
-  /** Host owner 启动后的自动续跑；无断点时是 no-op。 */
+  /** 由显式恢复入口触发续跑；普通 Host 启动不会调用此方法。 */
   async resumeInterruptedTurn(): Promise<void> {
     const submitted = await this.runtime.startInterruptedTurn();
     if (submitted) this.trackCompletion(submitted);
+  }
+
+  /** 当前 owner runtime；仅供同进程的 TUI fallback 在重建 session 后重新绑定。 */
+  getCurrentRuntime(): InteractiveRuntimeHandle {
+    return this.runtime;
+  }
+
+  /** 当前 owner command runtime；与 getCurrentRuntime() 成对使用。 */
+  getCurrentCommands(): CommandRuntime {
+    return this.commands;
   }
 
   /** 独立 Host 进程退出时同时关闭当前 owner runtime。 */
@@ -434,6 +541,8 @@ export class RuntimeHostServer {
     if (this.closePromise) return await this.closePromise;
     this.closePromise = (async () => {
       this.unsubscribe();
+      this.automationScheduler?.stop();
+      this.graphSupervisor?.stop();
       for (const connection of this.connections) connection.socket.destroy();
       this.connections.clear();
       if (this.listening) {
@@ -461,9 +570,11 @@ export class RuntimeHostServer {
     socket.on("data", (chunk: string) => this.read(connection, chunk));
     socket.once("close", () => {
       this.connections.delete(connection);
+      if (connection.clientId) this.commands.capabilities?.releaseOwner(connection.clientId);
     });
     socket.once("error", () => {
       this.connections.delete(connection);
+      if (connection.clientId) this.commands.capabilities?.releaseOwner(connection.clientId);
     });
   }
 
@@ -514,7 +625,10 @@ export class RuntimeHostServer {
         result: {
           hostEpoch: this.registration.hostEpoch,
           persistenceRoot: this.registration.persistenceRoot,
-          sequence: this.sequence
+          sequence: this.sequence,
+          protocolRevision: protocolVersion,
+          capabilities: hostCapabilities,
+          eventCursor: this.sequence
         }
       });
       return;
@@ -524,7 +638,7 @@ export class RuntimeHostServer {
       return;
     }
     try {
-      const result = await this.enqueue(async () => await this.execute(connection, frame));
+      const result = await this.dispatcher.dispatch(operationLane(frame.operation), async () => await this.execute(connection, frame));
       this.send(connection, { kind: "response", requestId: frame.requestId, ok: true, result });
     } catch (error) {
       this.send(connection, {
@@ -534,12 +648,6 @@ export class RuntimeHostServer {
         error: publicError(error)
       });
     }
-  }
-
-  private enqueue<T>(work: () => Promise<T>): Promise<T> {
-    const result = this.operationTail.then(work, work);
-    this.operationTail = result.then(() => undefined, () => undefined);
-    return result;
   }
 
   private async execute(connection: HostConnection, frame: HostRequestFrame): Promise<unknown> {
@@ -568,6 +676,19 @@ export class RuntimeHostServer {
           messageId: submitted.messageId
         };
       }
+      case "run.submit":
+        return await this.executeAdmission(async () => {
+          this.assertRevision(payload);
+          const ids = readRequestIds(payload);
+          const submitted = this.runtime.submitPrompt(
+            requiredString(payload.input, "input"),
+            readRunMode(payload.mode),
+            readAttachments(payload.attachments),
+            ids
+          );
+          this.trackCompletion(submitted);
+          return { runId: submitted.runId, messageId: submitted.messageId };
+        });
       case "queue": {
         this.assertRevision(payload);
         const ids = readRequestIds(payload);
@@ -579,6 +700,17 @@ export class RuntimeHostServer {
           : this.runtime.followUp(input, attachments, ids);
         return queued;
       }
+      case "run.queue":
+        return await this.executeAdmission(async () => {
+          this.assertRevision(payload);
+          const ids = readRequestIds(payload);
+          const input = requiredString(payload.input, "input");
+          const attachments = readAttachments(payload.attachments);
+          const delivery = payload.delivery === "steer" ? "steer" : "followUp";
+          return delivery === "steer"
+            ? this.runtime.steer(input, attachments, ids)
+            : this.runtime.followUp(input, attachments, ids);
+        });
       case "resume":
         this.assertRevision(payload);
         return await this.runtime.resumeSession(requiredString(payload.session, "session"));
@@ -599,6 +731,243 @@ export class RuntimeHostServer {
         this.assertRevision(payload);
         this.runtime.answerPermission(requiredString(payload.requestId, "requestId"), readPermissionResult(payload.result));
         return undefined;
+      case "run.cancel":
+        return await this.executeControl(async () => {
+          this.assertRevision(payload);
+          const runId = optionalString(payload.runId);
+          const accepted = runId === undefined ? (this.runtime.cancelCurrentRun(), true) : this.runtime.cancelRun(runId);
+          if (!accepted) throw new Error(`Run ${runId ?? "current"} is not active.`);
+          return { runId };
+        });
+      case "run.permission":
+        return await this.executeControl(async () => {
+          this.assertRevision(payload);
+          this.runtime.answerPermission(requiredString(payload.requestId, "requestId"), readPermissionResult(payload.result));
+          return { requestId: requiredString(payload.requestId, "requestId") };
+        });
+      case "run.continue":
+        return await this.executeAdmission(async () => await this.continueRun(payload));
+      case "run.inspect": {
+        const authority = this.commands.runtimeAuthority;
+        if (!authority) return undefined;
+        return authority.getRun(requiredString(payload.runId, "runId"));
+      }
+      case "run.list": {
+        const authority = this.commands.runtimeAuthority;
+        if (!authority) return { runs: [], hasMore: false };
+        return authority.listRuns({
+          sessionId: optionalString(payload.sessionId),
+          status: readOptionalRunStatus(payload.status),
+          limit: optionalSafeInteger(payload.limit),
+          cursor: optionalString(payload.cursor)
+        });
+      }
+      case "runtime.events": {
+        const authority = this.commands.runtimeAuthority;
+        if (!authority) return { events: [], hasMore: false, gap: false };
+        return authority.readEvents({
+          afterSequence: optionalSafeInteger(payload.afterSequence),
+          limit: optionalSafeInteger(payload.limit),
+          runId: optionalString(payload.runId),
+          sessionId: optionalString(payload.sessionId)
+        });
+      }
+      case "task.create":
+        return await this.executeAdmission(async () => {
+          const task = this.commands.taskRuns;
+          const record = task.create({
+            task: payload.task,
+            sessionId: optionalString(payload.sessionId) ?? this.runtime.getSnapshot().info.sessionId,
+            parentRunId: optionalString(payload.parentRunId)
+          });
+          return record;
+        });
+      case "task.start":
+        return await this.executeAdmission(async () => {
+          throw new Error("TaskRun start is unavailable until a TaskRun execution adapter is attached; use an explicit AgentRun, Automation, or Graph entrypoint.");
+        });
+      case "task.cancel":
+        return await this.executeControl(async () => {
+          const taskRunId = requiredString(payload.taskRunId, "taskRunId");
+          const reason = optionalString(payload.reason) ?? "TaskRun cancelled.";
+          const task = this.commands.taskRuns.get(taskRunId);
+          const subagent = this.commands.subagents?.getSnapshot(taskRunId);
+          const cancelledSubagent = this.commands.subagents?.cancelTask(taskRunId, reason) ?? false;
+          const runId = task?.attempts.at(-1)?.runId;
+          if (runId !== undefined) this.runtime.cancelRun(runId);
+          const subagentActive = subagent !== undefined && !["completed", "failed", "aborted", "timed_out"].includes(subagent.status);
+          if (subagentActive && !cancelledSubagent && !isTaskRunTerminal(task?.status ?? "created")) {
+            throw new Error(`Unable to cancel active subagent task ${taskRunId}.`);
+          }
+          if (task === undefined) throw new Error(`TaskRun ${taskRunId} does not exist.`);
+          const current = this.commands.taskRuns.get(taskRunId);
+          if (!current) throw new Error(`TaskRun ${taskRunId} does not exist.`);
+          if (isTaskRunTerminal(current.status)) return current;
+          return this.commands.taskRuns.transition(taskRunId, "cancelled");
+        });
+      case "task.approve":
+        return await this.executeAdmission(async () => {
+          throw new Error("TaskRun approval cannot start execution without an attached TaskRun execution adapter.");
+        });
+      case "task.resume":
+        return await this.executeAdmission(async () => {
+          throw new Error("TaskRun resume requires an explicit safe-boundary continuation admission; it cannot be inferred from a TaskRun status.");
+        });
+      case "task.retry":
+        return await this.executeAdmission(async () => {
+          const taskRunId = requiredString(payload.taskRunId, "taskRunId");
+          const decision = evaluateTaskRetry(this.commands.taskRuns.get(taskRunId));
+          if (!decision.allowed) throw new Error(`Task retry rejected (${decision.code}): ${decision.reason}`);
+          throw new Error(`Task retry admitted for ${decision.failureClass}, but no TaskRun execution adapter is attached; refusing to mark the task running without starting a new AgentRun.`);
+        });
+      case "task.get":
+        return this.commands.taskRuns.get(requiredString(payload.taskRunId, "taskRunId"));
+      case "task.list":
+        return this.commands.taskRuns.list({
+          status: readOptionalTaskStatus(payload.status),
+          limit: optionalSafeInteger(payload.limit),
+          cursor: optionalSafeInteger(payload.cursor)
+        });
+      case "task.events":
+        return this.commands.taskRuns.events(requiredString(payload.taskRunId, "taskRunId"), optionalSafeInteger(payload.limit) ?? 100);
+      case "automation.create":
+        return await this.executeAdmission(async () => this.commands.automationStore.create(readAutomationCreateInput(payload)));
+      case "automation.list":
+        return this.commands.automationStore.list();
+      case "automation.pause":
+        return await this.executeControl(async () => this.commands.automationStore.pause(requiredString(payload.automationId, "automationId")));
+      case "automation.resume":
+        return await this.executeControl(async () => this.commands.automationStore.resume(requiredString(payload.automationId, "automationId")));
+      case "automation.delete":
+        return await this.executeControl(async () => {
+          this.commands.automationStore.delete(requiredString(payload.automationId, "automationId"));
+          return undefined;
+        });
+      case "automation.run":
+        return await this.executeAdmission(async () => {
+          if (!this.automationScheduler) throw new Error("Automation scheduler is unavailable.");
+          return await this.automationScheduler.runNow(requiredString(payload.automationId, "automationId"));
+        });
+      case "automation.pending":
+        return this.commands.automationStore.listPending(optionalString(payload.automationId));
+      case "goal.create":
+        return await this.executeAdmission(async () => this.commands.graphs.createGoal(
+          requiredString(payload.title, "title"),
+          payload.payload,
+          optionalString(payload.goalId)
+        ));
+      case "goal.get":
+        return this.commands.graphs.getGoal(requiredString(payload.goalId, "goalId"));
+      case "goal.list":
+        return this.commands.graphs.listGoals();
+      case "goal.pause":
+        return await this.executeControl(async () => this.commands.graphs.updateGoal(requiredString(payload.goalId, "goalId"), "paused"));
+      case "goal.resume":
+        return await this.executeAdmission(async () => this.commands.graphs.updateGoal(requiredString(payload.goalId, "goalId"), "active"));
+      case "goal.cancel":
+        return await this.executeControl(async () => this.commands.graphs.updateGoal(requiredString(payload.goalId, "goalId"), "cancelled"));
+      case "graph.create":
+        return await this.executeAdmission(async () => this.commands.graphs.createGraph(
+          optionalString(payload.goalId),
+          readGraphNodes(payload.nodes),
+          payload.payload,
+          optionalString(payload.graphId)
+        ));
+      case "graph.start":
+        return await this.executeAdmission(async () => {
+          const graph = this.commands.graphs.startGraph(requiredString(payload.graphId, "graphId"));
+          this.commands.graphs.createWake(graph.graphId, "graph_started");
+          return graph;
+        });
+      case "graph.pause":
+        return await this.executeControl(async () => this.commands.graphs.pauseGraph(requiredString(payload.graphId, "graphId")));
+      case "graph.resume":
+        return await this.executeAdmission(async () => {
+          const graph = this.commands.graphs.resumeGraph(requiredString(payload.graphId, "graphId"));
+          this.commands.graphs.createWake(graph.graphId, "graph_resumed");
+          return graph;
+        });
+      case "graph.cancel":
+        return await this.executeControl(async () => await this.cancelGraph(requiredString(payload.graphId, "graphId")));
+      case "graph.inspect":
+        return this.commands.graphs.inspectGraph(requiredString(payload.graphId, "graphId"));
+      case "graph.list":
+        return this.commands.graphs.listGraphs();
+      case "graph.events":
+        return this.commands.graphs.listGraphEvents(requiredString(payload.graphId, "graphId"));
+      case "capability.register":
+        return await this.executeAdmission(async () => {
+          const ownerType = readCapabilityOwnerType(payload.ownerType);
+          if (ownerType !== "client") throw new Error("Remote clients may only register client-owned capabilities.");
+          const input: CapabilityRegistrationInput = {
+            registrationId: optionalString(payload.registrationId),
+            ownerType,
+            ownerId: connection.clientId,
+            capabilityName: requiredString(payload.capabilityName, "capabilityName"),
+            schema: payload.schema,
+            expiresAt: optionalString(payload.expiresAt)
+          };
+          return this.commands.capabilities.register(input);
+        });
+      case "capability.replace":
+        return await this.executeAdmission(async () => this.withCapabilityRegistrationOwner(
+          connection,
+          requiredString(payload.registrationId, "registrationId"),
+          (capabilities, registrationId) => capabilities.replace(registrationId, payload.schema, optionalString(payload.expiresAt))
+        ));
+      case "capability.admit":
+        return await this.executeAdmission(async () => this.withCapabilityRegistrationOwner(
+          connection,
+          requiredString(payload.registrationId, "registrationId"),
+          (capabilities, registrationId) => capabilities.admit(registrationId)
+        ));
+      case "capability.reject":
+        return await this.executeControl(async () => this.withCapabilityRegistrationOwner(
+          connection,
+          requiredString(payload.registrationId, "registrationId"),
+          (capabilities, registrationId) => capabilities.reject(registrationId, optionalString(payload.reason) ?? "rejected")
+        ));
+      case "capability.release":
+        return await this.executeControl(async () => this.withCapabilityRegistrationOwner(
+          connection,
+          requiredString(payload.registrationId, "registrationId"),
+          (capabilities, registrationId) => capabilities.release(registrationId, optionalString(payload.reason) ?? "released")
+        ));
+      case "capability.list":
+        return this.commands.capabilities.list(payload.ownerId === undefined ? undefined : connection.clientId);
+      case "capability.invoke":
+        return await this.executeAdmission(async () => {
+          const registrationId = requiredString(payload.registrationId, "registrationId");
+          const registration = this.commands.capabilities.get(registrationId);
+          if (!registration || registration.ownerType !== "client") {
+            throw new Error("Remote clients may only invoke client-owned capabilities.");
+          }
+          const invocation = this.commands.capabilities.invoke({
+            registrationId,
+            offerId: optionalString(payload.offerId),
+            sessionId: optionalString(payload.sessionId),
+            turnId: optionalString(payload.turnId),
+            toolCallId: optionalString(payload.toolCallId),
+            request: payload.request
+          }, optionalString(payload.invocationId));
+          const owner = [...this.connections].find((candidate) => candidate.clientId === registration.ownerId && candidate.authenticated);
+          if (owner) this.send(owner, { kind: "capability-offer", invocation, registration });
+          return invocation;
+        });
+      case "capability.accept":
+        return await this.executeAdmission(async () => this.withCapabilityOwner(connection, requiredString(payload.invocationId, "invocationId"), (capabilities, invocationId) => capabilities.accept(invocationId)));
+      case "capability.start":
+        return await this.executeAdmission(async () => this.withCapabilityOwner(connection, requiredString(payload.invocationId, "invocationId"), (capabilities, invocationId) => capabilities.start(invocationId)));
+      case "capability.result":
+        return await this.executeAdmission(async () => this.withCapabilityOwner(connection, requiredString(payload.invocationId, "invocationId"), (capabilities, invocationId) => capabilities.result(invocationId, payload.result)));
+      case "capability.chunk":
+        return await this.executeAdmission(async () => this.withCapabilityOwner(connection, requiredString(payload.invocationId, "invocationId"), (capabilities, invocationId) => capabilities.chunk(invocationId, requiredInteger(payload.chunkIndex, "chunkIndex"), payload.data, payload.final === true)));
+      case "capability.fail":
+        return await this.executeControl(async () => this.withCapabilityOwner(connection, requiredString(payload.invocationId, "invocationId"), (capabilities, invocationId) => capabilities.fail(invocationId, optionalString(payload.error) ?? "capability failed")));
+      case "capability.cancel":
+        return await this.executeControl(async () => this.withCapabilityOwner(connection, requiredString(payload.invocationId, "invocationId"), (capabilities, invocationId) => capabilities.cancel(invocationId, optionalString(payload.reason) ?? "capability cancelled")));
+      case "capability.get":
+        return this.commands.capabilities.getInvocation(requiredString(payload.invocationId, "invocationId"));
       case "wait-idle":
         await this.runtime.waitForIdle();
         return undefined;
@@ -619,7 +988,11 @@ export class RuntimeHostServer {
       case "agent.context":
         return await this.commands.agent.contextStatus();
       case "agent.usage":
-        return { summary: this.commands.agent.usageSummary(), report: this.commands.agent.usageReport() };
+        return {
+          summary: this.commands.agent.usageSummary(),
+          report: this.commands.agent.usageReport(),
+          modelRequests: this.commands.agent.modelRequestSummary()
+        };
       case "agent.models":
         return this.commands.agent.listModels();
       case "agent.refresh-model":
@@ -662,11 +1035,114 @@ export class RuntimeHostServer {
     }
   }
 
+  private async executeAdmission<T>(execute: () => Promise<T>): Promise<HostOperationResult<T>> {
+    try {
+      const result = await execute();
+      return { accepted: true, revision: this.runtime.getSnapshot().revision, result };
+    } catch (error) {
+      return { accepted: false, revision: this.runtime.getSnapshot().revision, reason: publicError(error) };
+    }
+  }
+
+  private async executeControl<T>(execute: () => Promise<T>): Promise<HostOperationResult<T>> {
+    try {
+      const result = await execute();
+      return { accepted: true, revision: this.runtime.getSnapshot().revision, result };
+    } catch (error) {
+      return { accepted: false, revision: this.runtime.getSnapshot().revision, reason: publicError(error) };
+    }
+  }
+
+  private withCapabilityOwner<T>(connection: HostConnection, invocationId: string, execute: (capabilities: CapabilityStore, invocationId: string) => T): T {
+    const invocation = this.commands.capabilities.getInvocation(invocationId);
+    if (!invocation) throw new Error(`Capability invocation ${invocationId} was not found.`);
+    const registration = this.commands.capabilities.get(invocation.registrationId);
+    if (!registration || registration.ownerType !== "client" || registration.ownerId !== connection.clientId) {
+      throw new Error("Capability invocation owner mismatch.");
+    }
+    return execute(this.commands.capabilities, invocationId);
+  }
+
+  private withCapabilityRegistrationOwner<T>(
+    connection: HostConnection,
+    registrationId: string,
+    execute: (capabilities: CapabilityStore, registrationId: string) => T
+  ): T {
+    const registration = this.commands.capabilities.get(registrationId);
+    if (!registration || registration.ownerType !== "client" || registration.ownerId !== connection.clientId) {
+      throw new Error("Capability registration owner mismatch.");
+    }
+    return execute(this.commands.capabilities, registrationId);
+  }
+
+  private async cancelGraph(graphId: string): Promise<unknown> {
+    const graph = this.commands.graphs.inspectGraph(graphId);
+    const activeRuns = graph.nodes
+      .filter((node) => node.status === "running" && node.taskRunId !== undefined)
+      .map((node) => {
+        const task = this.commands.taskRuns.get(node.taskRunId!);
+        return {
+          taskRunId: node.taskRunId!,
+          runId: task?.attempts.at(-1)?.runId
+        };
+      });
+    const result = this.commands.graphs.cancelGraph(graphId);
+    for (const active of activeRuns) {
+      this.commands.subagents?.cancelTask(active.taskRunId, "Graph cancelled.");
+      if (active.runId !== undefined) this.runtime.cancelRun(active.runId);
+      try {
+        const task = this.commands.taskRuns.get(active.taskRunId);
+        if (task && !isTaskRunTerminal(task.status)) this.commands.taskRuns.transition(active.taskRunId, "cancelled");
+      } catch {
+        // Graph cancellation is already durable; a late task snapshot must not undo it.
+      }
+    }
+    return result;
+  }
+
+  private async continueRun(payload: Record<string, unknown>): Promise<{ runId: string; messageId: string }> {
+    const authority = this.commands.runtimeAuthority;
+    const sourceRunId = requiredString(payload.sourceRunId, "sourceRunId");
+    const source = authority?.getRun(sourceRunId);
+    if (!source) throw new Error(`Continuation source run ${sourceRunId} was not found.`);
+    if (source.terminalStatus !== "incomplete" && source.terminalStatus !== "blocked" && source.terminalStatus !== "unknown") {
+      throw new Error(`Run ${sourceRunId} is not resumable.`);
+    }
+    const ids = readRequestIds(payload);
+    const childRunId = ids.runId ?? randomUUID();
+    const claim = authority?.claimContinuation(sourceRunId, childRunId);
+    const existingChild = claim === undefined ? undefined : authority?.getRun(claim.childRunId);
+    if (existingChild) {
+      const childPayload = asRecord(existingChild.payload);
+      return {
+        runId: existingChild.runId,
+        messageId: typeof childPayload.messageId === "string" ? childPayload.messageId : ids.messageId ?? randomUUID()
+      };
+    }
+    try {
+      const submitted = await this.runtime.startInterruptedTurn({
+        ...ids,
+        runId: claim?.childRunId ?? childRunId,
+        turnId: source.turnId,
+        parentRunId: sourceRunId,
+        continuationSource: "safe_boundary_continuation"
+      });
+      if (!submitted) throw new Error("There is no interrupted turn available for continuation.");
+      this.trackCompletion(submitted);
+      return { runId: submitted.runId, messageId: submitted.messageId };
+    } catch (error) {
+      // claim 发生在真正读取断点之前；读取失败或没有断点时必须释放它，否则
+      // 后续恢复请求会被旧 childRunId 永久挡住。若 child 已经落库，release 会保留 claim。
+      if (claim) authority?.releaseContinuationClaim(sourceRunId, claim.childRunId, "continuation admission failed");
+      throw error;
+    }
+  }
+
   private subscribeConnection(
     connection: HostConnection,
     afterSequence: number | undefined,
     afterHostEpoch: string | undefined
-  ): { hostEpoch: string; snapshot: InteractiveRuntimeSnapshot; sequence: number; replayed: boolean } {
+  ): { hostEpoch: string; snapshot: InteractiveRuntimeSnapshot; sequence: number; replayed: boolean; capabilities: readonly string[] } {
     connection.subscribed = true;
     const sameEpoch = afterHostEpoch === undefined || afterHostEpoch === this.registration.hostEpoch;
     const replayed = sameEpoch && (afterSequence === undefined || this.canReplay(afterSequence));
@@ -686,7 +1162,7 @@ export class RuntimeHostServer {
         snapshot: this.runtime.getSnapshot()
       });
     }
-    return { hostEpoch: this.registration.hostEpoch, snapshot: this.runtime.getSnapshot(), sequence: this.sequence, replayed };
+    return { hostEpoch: this.registration.hostEpoch, snapshot: this.runtime.getSnapshot(), sequence: this.sequence, replayed, capabilities: hostCapabilities };
   }
 
   private canReplay(afterSequence: number): boolean {
@@ -757,7 +1233,18 @@ export class RuntimeHostServer {
     }
   }
 
-  private async restartRuntime(sessionId: string | undefined): Promise<{ snapshot: InteractiveRuntimeSnapshot; sequence: number }> {
+  async restartRuntime(sessionId?: string): Promise<{ snapshot: InteractiveRuntimeSnapshot; sequence: number }> {
+    if (this.runtimeRestartPromise) return await this.runtimeRestartPromise;
+    const restart = this.performRuntimeRestart(sessionId);
+    this.runtimeRestartPromise = restart;
+    try {
+      return await restart;
+    } finally {
+      if (this.runtimeRestartPromise === restart) this.runtimeRestartPromise = undefined;
+    }
+  }
+
+  private async performRuntimeRestart(sessionId?: string): Promise<{ snapshot: InteractiveRuntimeSnapshot; sequence: number }> {
     if (!this.createRuntime) throw new Error("Runtime Host owner cannot rebuild its runtime.");
     if (this.runtime.getSnapshot().state.kind !== "idle") throw new Error("Cannot rebuild the Runtime Host while it is busy.");
     const next = await this.createRuntime(sessionId);
@@ -766,6 +1253,7 @@ export class RuntimeHostServer {
     this.runtime = next.runtime;
     this.commands = next.commands;
     this.unsubscribe = next.runtime.subscribe((update) => this.publish(update));
+    this.commands.graphs.recoverRunningNodes(this.commands.taskRuns);
     await previous.close();
     this.history.splice(0);
     this.publish({ snapshot: this.runtime.getSnapshot() });
@@ -781,6 +1269,7 @@ export class RuntimeHostServer {
 /** 可重连的 owner client。实时事件使用 host sequence，重连后优先从内存历史补发。 */
 export class RuntimeHostClient implements InteractiveRuntimeHandle {
   readonly persistenceRoot: string;
+  readonly clientId: string;
   private socket: net.Socket | undefined;
   private buffer = "";
   private readyPromise: Promise<void> | undefined;
@@ -788,10 +1277,12 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
   private readonly pending = new Map<string, PendingRequest<unknown>>();
   private readonly completions = new Map<string, PendingCompletion>();
   private readonly listeners = new Set<(update: AgentRuntimeUpdate) => void>();
+  private readonly capabilityOfferListeners = new Set<(offer: { invocation: CapabilityInvocation; registration: CapabilityRegistration }) => void>();
   private readonly pendingUpdates: AgentRuntimeUpdate[] = [];
   private snapshot: InteractiveRuntimeSnapshot | undefined;
   private sequence = 0;
   private hostEpoch: string | undefined;
+  private capabilities: readonly string[] = [];
   private closed = false;
   private lastError: Error | undefined;
   private reconnectInProgress = false;
@@ -799,6 +1290,7 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
 
   private constructor(private readonly options: RuntimeHostClientOptions) {
     this.persistenceRoot = options.registration.persistenceRoot;
+    this.clientId = options.clientId ?? `client-${randomUUID()}`;
   }
 
   static async connect(options: RuntimeHostClientOptions): Promise<RuntimeHostClient> {
@@ -813,7 +1305,9 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
       endpoint: this.options.registration.endpoint,
       hostEpoch: this.hostEpoch,
       sequence: this.sequence,
-      persistenceRoot: this.persistenceRoot
+      persistenceRoot: this.persistenceRoot,
+      protocolRevision: protocolVersion,
+      capabilities: this.capabilities
     };
   }
 
@@ -827,10 +1321,270 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
       attachments,
       runId: ids.runId,
       messageId: ids.messageId,
+      turnId: ids.turnId,
+      parentRunId: ids.parentRunId,
+      continuationSource: ids.continuationSource,
       expectedRevision: this.currentRevision()
     })
-      .catch((error) => this.rejectCompletion(ids.runId, error));
+      .catch((error) => {
+        if (isTransientHostError(error)) {
+          this.reportError(error);
+          this.scheduleReconnect();
+        } else {
+          this.rejectCompletion(ids.runId, error);
+        }
+      });
     return { runId: ids.runId, messageId: ids.messageId, completion };
+  }
+
+  /** 明确返回 admission 结果的跨进程 API；旧 submitPrompt 保持乐观同步句柄兼容。 */
+  async submitRun(
+    input: string,
+    mode: AgentRunMode = "chat",
+    attachments: AgentAttachment[] = [],
+    requestIds?: RuntimeRequestIds
+  ): Promise<HostOperationResult<{ runId: string; messageId: string }>> {
+    if (!input.trim()) throw new Error("Agent prompt cannot be empty.");
+    const ids = normalizeRequestIds(requestIds);
+    return await this.request("run.submit", {
+      input,
+      mode,
+      attachments,
+      runId: ids.runId,
+      messageId: ids.messageId,
+      turnId: ids.turnId,
+      parentRunId: ids.parentRunId,
+      continuationSource: ids.continuationSource,
+      expectedRevision: this.currentRevision()
+    });
+  }
+
+  async queueRunMessage(
+    input: string,
+    delivery: "steer" | "followUp",
+    attachments: AgentAttachment[] = [],
+    requestIds?: RuntimeRequestIds
+  ): Promise<HostOperationResult<QueuedAgentMessage>> {
+    const ids = normalizeRequestIds(requestIds);
+    return await this.request("run.queue", {
+      input,
+      delivery,
+      attachments,
+      messageId: ids.messageId,
+      expectedRevision: this.currentRevision()
+    });
+  }
+
+  async cancelRunRequest(runId?: string): Promise<HostOperationResult<{ runId?: string }>> {
+    return await this.request("run.cancel", { runId, expectedRevision: this.currentRevision() });
+  }
+
+  async answerPermissionRequest(requestId: string, result: PermissionResult): Promise<HostOperationResult<{ requestId: string }>> {
+    return await this.request("run.permission", { requestId, result, expectedRevision: this.currentRevision() });
+  }
+
+  async continueRun(sourceRunId: string, requestIds?: RuntimeRequestIds): Promise<HostOperationResult<{ runId: string; messageId: string }>> {
+    const ids = normalizeRequestIds(requestIds);
+    return await this.request("run.continue", {
+      sourceRunId,
+      runId: ids.runId,
+      messageId: ids.messageId,
+      turnId: ids.turnId,
+      expectedRevision: this.currentRevision()
+    });
+  }
+
+  async inspectRun(runId: string): Promise<unknown> {
+    return await this.request("run.inspect", { runId });
+  }
+
+  async listRuns(options: { sessionId?: string; status?: string; limit?: number; cursor?: string } = {}): Promise<unknown> {
+    return await this.request("run.list", options);
+  }
+
+  async subscribeRuntimeEvents(options: { afterSequence?: number; runId?: string; sessionId?: string; limit?: number } = {}): Promise<unknown> {
+    return await this.request("runtime.events", options);
+  }
+
+  async taskCreate(input: { task: unknown; taskRunId?: string; sessionId?: string; parentRunId?: string }): Promise<HostOperationResult<unknown>> {
+    return await this.request("task.create", input);
+  }
+
+  async taskStart(taskRunId: string, input: { attemptId?: string; runId?: string; turnId?: string; retrySafety?: string } = {}): Promise<HostOperationResult<unknown>> {
+    return await this.request("task.start", { taskRunId, ...input });
+  }
+
+  async taskCancel(taskRunId: string, reason?: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("task.cancel", { taskRunId, reason });
+  }
+
+  async taskApprove(taskRunId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("task.approve", { taskRunId });
+  }
+
+  async taskResume(taskRunId: string, input: { runId?: string; turnId?: string; retrySafety?: string } = {}): Promise<HostOperationResult<unknown>> {
+    return await this.request("task.resume", { taskRunId, ...input });
+  }
+
+  async taskRetry(taskRunId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("task.retry", { taskRunId });
+  }
+
+  async taskGet(taskRunId: string): Promise<unknown> {
+    return await this.request("task.get", { taskRunId });
+  }
+
+  async taskList(options: { status?: string; limit?: number; cursor?: number } = {}): Promise<unknown> {
+    return await this.request("task.list", options);
+  }
+
+  async taskEvents(taskRunId: string, limit?: number): Promise<unknown> {
+    return await this.request("task.events", { taskRunId, limit });
+  }
+
+  async automationCreate(input: AutomationCreateInput): Promise<HostOperationResult<unknown>> {
+    return await this.request("automation.create", input);
+  }
+
+  async automationList(): Promise<unknown> {
+    return await this.request("automation.list", {});
+  }
+
+  async automationPause(automationId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("automation.pause", { automationId });
+  }
+
+  async automationResume(automationId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("automation.resume", { automationId });
+  }
+
+  async automationDelete(automationId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("automation.delete", { automationId });
+  }
+
+  async automationRun(automationId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("automation.run", { automationId });
+  }
+
+  async automationPending(automationId?: string): Promise<unknown> {
+    return await this.request("automation.pending", { automationId });
+  }
+
+  async goalCreate(title: string, payload?: unknown, goalId?: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("goal.create", { title, payload, goalId });
+  }
+
+  async goalGet(goalId: string): Promise<unknown> {
+    return await this.request("goal.get", { goalId });
+  }
+
+  async goalList(): Promise<unknown> {
+    return await this.request("goal.list", {});
+  }
+
+  async goalPause(goalId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("goal.pause", { goalId });
+  }
+
+  async goalResume(goalId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("goal.resume", { goalId });
+  }
+
+  async goalCancel(goalId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("goal.cancel", { goalId });
+  }
+
+  async graphCreate(input: { goalId?: string; nodes: GraphNodeInput[]; payload?: unknown; graphId?: string }): Promise<HostOperationResult<unknown>> {
+    return await this.request("graph.create", input);
+  }
+
+  async graphStart(graphId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("graph.start", { graphId });
+  }
+
+  async graphPause(graphId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("graph.pause", { graphId });
+  }
+
+  async graphResume(graphId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("graph.resume", { graphId });
+  }
+
+  async graphCancel(graphId: string): Promise<HostOperationResult<unknown>> {
+    return await this.request("graph.cancel", { graphId });
+  }
+
+  async graphInspect(graphId: string): Promise<unknown> {
+    return await this.request("graph.inspect", { graphId });
+  }
+
+  async graphList(): Promise<unknown> {
+    return await this.request("graph.list", {});
+  }
+
+  async graphEvents(graphId: string): Promise<unknown> {
+    return await this.request("graph.events", { graphId });
+  }
+
+  async capabilityRegister(input: Omit<CapabilityRegistrationInput, "ownerId">): Promise<HostOperationResult<CapabilityRegistration>> {
+    return await this.request("capability.register", input);
+  }
+
+  async capabilityReplace(registrationId: string, schema: unknown, expiresAt?: string): Promise<HostOperationResult<CapabilityRegistration>> {
+    return await this.request("capability.replace", { registrationId, schema, expiresAt });
+  }
+
+  async capabilityAdmit(registrationId: string): Promise<HostOperationResult<CapabilityRegistration>> {
+    return await this.request("capability.admit", { registrationId });
+  }
+
+  async capabilityReject(registrationId: string, reason?: string): Promise<HostOperationResult<CapabilityRegistration>> {
+    return await this.request("capability.reject", { registrationId, reason });
+  }
+
+  async capabilityRelease(registrationId: string, reason?: string): Promise<HostOperationResult<CapabilityRegistration>> {
+    return await this.request("capability.release", { registrationId, reason });
+  }
+
+  async capabilityList(): Promise<CapabilityRegistration[]> {
+    return await this.request("capability.list", {});
+  }
+
+  async capabilityInvoke(input: Omit<CapabilityInvocationInput, "invocationId">): Promise<HostOperationResult<CapabilityInvocation>> {
+    return await this.request("capability.invoke", input);
+  }
+
+  async capabilityAccept(invocationId: string): Promise<HostOperationResult<CapabilityInvocation>> {
+    return await this.request("capability.accept", { invocationId });
+  }
+
+  async capabilityStart(invocationId: string): Promise<HostOperationResult<CapabilityInvocation>> {
+    return await this.request("capability.start", { invocationId });
+  }
+
+  async capabilityResult(invocationId: string, result: unknown): Promise<HostOperationResult<CapabilityInvocation>> {
+    return await this.request("capability.result", { invocationId, result });
+  }
+
+  async capabilityChunk(invocationId: string, chunkIndex: number, data: unknown, final = false): Promise<HostOperationResult<CapabilityInvocation>> {
+    return await this.request("capability.chunk", { invocationId, chunkIndex, data, final });
+  }
+
+  async capabilityFail(invocationId: string, error: string): Promise<HostOperationResult<CapabilityInvocation>> {
+    return await this.request("capability.fail", { invocationId, error });
+  }
+
+  async capabilityCancel(invocationId: string, reason?: string): Promise<HostOperationResult<CapabilityInvocation>> {
+    return await this.request("capability.cancel", { invocationId, reason });
+  }
+
+  async capabilityGet(invocationId: string): Promise<CapabilityInvocation | undefined> {
+    return await this.request("capability.get", { invocationId });
+  }
+
+  onCapabilityOffer(listener: (offer: { invocation: CapabilityInvocation; registration: CapabilityRegistration }) => void): () => void {
+    this.capabilityOfferListeners.add(listener);
+    return () => this.capabilityOfferListeners.delete(listener);
   }
 
   steer(input: string, attachments: AgentAttachment[] = [], requestIds?: RuntimeRequestIds): QueuedAgentMessage {
@@ -872,10 +1626,14 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
       result = await this.request<{ runId: string; messageId: string } | undefined>("start-interrupted", {
         runId: ids.runId,
         messageId: ids.messageId,
+        turnId: ids.turnId,
+        parentRunId: ids.parentRunId,
+        continuationSource: ids.continuationSource,
         expectedRevision: this.currentRevision()
       });
     } catch (error) {
-      this.rejectCompletion(ids.runId, error);
+      if (!isTransientHostError(error)) this.rejectCompletion(ids.runId, error);
+      else this.scheduleReconnect();
       throw error;
     }
     if (!result) {
@@ -966,8 +1724,8 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
     return await this.request<ContextStatus>("agent.context", {});
   }
 
-  async usage(): Promise<{ summary: unknown; report: string }> {
-    return await this.request<{ summary: unknown; report: string }>("agent.usage", {});
+  async usage(): Promise<{ summary: unknown; report: string; modelRequests?: unknown }> {
+    return await this.request<{ summary: unknown; report: string; modelRequests?: unknown }>("agent.usage", {});
   }
 
   async listModels(): Promise<ModelChoice[]> {
@@ -1040,9 +1798,10 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
 
   private async open(): Promise<void> {
     await this.openSocket();
-    const result = await this.request<{ hostEpoch: string; persistenceRoot: string; snapshot: InteractiveRuntimeSnapshot; sequence: number }>("subscribe", { afterSequence: undefined });
+    const result = await this.request<{ hostEpoch: string; persistenceRoot: string; snapshot: InteractiveRuntimeSnapshot; sequence: number; capabilities?: string[] }>("subscribe", { afterSequence: undefined });
     this.hostEpoch = result.hostEpoch;
     this.sequence = result.sequence;
+    this.capabilities = result.capabilities ?? [];
     this.snapshot = result.snapshot;
     if (!this.snapshot) {
       const snapshot = await this.request<{ snapshot: InteractiveRuntimeSnapshot; sequence: number }>("snapshot", {});
@@ -1053,6 +1812,8 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
 
   private openSocket(): Promise<void> {
     if (this.readyPromise) return this.readyPromise;
+    // 旧 socket 可能只收到半个 JSON 帧；新握手必须从干净的 JSONL 边界开始。
+    this.buffer = "";
     this.readyPromise = new Promise<void>((resolve, reject) => {
       const socket = net.createConnection(this.options.registration.endpoint);
       this.socket = socket;
@@ -1074,20 +1835,22 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
           protocolVersion,
           rootHash: this.options.registration.rootHash,
           token: this.options.registration.token,
-          clientId: this.options.clientId ?? randomUUID(),
-          surface: this.options.surface ?? "cli"
+          clientId: this.clientId,
+          surface: this.options.surface ?? "cli",
+          capabilities: ["runtime.events.cursor", "runtime.run.reconnect"]
         });
       });
-      socket.on("data", (chunk: string) => this.readClientData(chunk));
+      socket.on("data", (chunk: string) => this.readClientData(socket, chunk));
       socket.once("error", (error: Error) => {
         this.lastError = error;
         fail(error);
       });
       socket.once("close", () => {
+        if (this.socket !== socket) return;
         if (!settled) fail(new Error("Runtime Host connection closed during handshake."));
         const error = new Error("Runtime Host connection closed.");
         this.rejectPendingRequests(error);
-        if (!this.closed) this.rejectCompletions(error);
+        this.buffer = "";
         this.socket = undefined;
         this.readyPromise = undefined;
         if (!this.closed && !this.reconnectInProgress) this.scheduleReconnect();
@@ -1095,9 +1858,10 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
       this.pending.set(helloRequestId, {
         resolve: (value) => {
           settled = true;
-          const result = value as { hostEpoch: string; persistenceRoot: string; sequence: number };
+          const result = value as { hostEpoch: string; persistenceRoot: string; sequence: number; capabilities?: string[] };
           this.hostEpoch = result.hostEpoch;
           this.sequence = result.sequence;
+          this.capabilities = result.capabilities ?? [];
           resolve();
         },
         reject: fail
@@ -1130,13 +1894,54 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
     const previousHostEpoch = this.hostEpoch;
     this.options.registration = registration;
     await this.openSocket();
-    const result = await this.request<{ hostEpoch: string; snapshot: InteractiveRuntimeSnapshot; sequence: number; replayed: boolean }>("subscribe", {
+    const result = await this.request<{ hostEpoch: string; snapshot: InteractiveRuntimeSnapshot; sequence: number; replayed: boolean; capabilities?: string[] }>("subscribe", {
       afterSequence: this.sequence,
       afterHostEpoch: previousHostEpoch
     });
     this.hostEpoch = result.hostEpoch;
     this.snapshot = result.snapshot;
     this.sequence = result.sequence;
+    this.capabilities = result.capabilities ?? [];
+    await this.recoverCompletions();
+  }
+
+  private async recoverCompletions(): Promise<void> {
+    for (const [runId, pending] of [...this.completions.entries()]) {
+      try {
+        const inspected = await this.inspectRun(runId);
+        if (inspected === undefined) {
+          this.completions.delete(runId);
+          pending.reject(new Error(`Runtime run ${runId} was not admitted before the Host connection was lost.`));
+          continue;
+        }
+        const record = asRecord(inspected);
+        const terminalStatus = record.terminalStatus;
+        if (typeof terminalStatus !== "string") {
+          if (this.activeRunId() !== runId) {
+            this.completions.delete(runId);
+            pending.reject(new Error(`Runtime run ${runId} was admitted, but no active Host execution could be recovered.`));
+          }
+          continue;
+        }
+        const terminalPayload = asRecord(record.terminalPayload);
+        const projection = asRecord(terminalPayload.projection);
+        const outcome: AgentRunOutcome = {
+          runId,
+          status: terminalStatus as AgentRunOutcome["status"],
+          stopReason: readRecoveryStopReason(terminalPayload.stopReason),
+          finishReason: typeof terminalPayload.finishReason === "string" ? terminalPayload.finishReason : undefined,
+          steps: typeof terminalPayload.steps === "number" ? terminalPayload.steps : 0,
+          output: typeof terminalPayload.output === "string" ? terminalPayload.output : "",
+          durationMs: typeof projection.durationMs === "number" ? projection.durationMs : 0,
+          error: typeof terminalPayload.error === "string" ? terminalPayload.error : undefined
+        };
+        if (!isAgentRunOutcome(outcome)) continue;
+        this.completions.delete(runId);
+        pending.resolve(outcome);
+      } catch (error) {
+        if (!isTransientHostError(error)) this.reportError(error);
+      }
+    }
   }
 
   private async replaceOwner(): Promise<void> {
@@ -1191,7 +1996,8 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
     });
   }
 
-  private readClientData(chunk: string): void {
+  private readClientData(socket: net.Socket, chunk: string): void {
+    if (this.socket !== socket) return;
     this.buffer += chunk;
     if (Buffer.byteLength(this.buffer, "utf8") > maxFrameBytes) {
       this.socket?.destroy(new Error("Runtime Host frame is too large."));
@@ -1237,6 +2043,10 @@ export class RuntimeHostClient implements InteractiveRuntimeHandle {
       if (!pending) return;
       this.completions.delete(frame.runId);
       pending.resolve(frame.outcome);
+      return;
+    }
+    if (isCapabilityOfferFrame(frame)) {
+      for (const listener of this.capabilityOfferListeners) listener({ invocation: frame.invocation, registration: frame.registration });
       return;
     }
     if (isGapFrame(frame)) {
@@ -1379,6 +2189,53 @@ function isHelloFrame(value: unknown): value is HostHelloFrame {
     && isSurface(record.surface);
 }
 
+function operationLane(operation: string): OperationLane {
+  // Admission 与取消/审批共享一条因果队列。这样客户端先发 submit、随后立即发
+  // cancel 时，取消不会在 activeRun 建立前先执行成一个无效 no-op。
+  if (
+    operation === "cancel"
+    || operation === "permission"
+    || operation === "run.cancel"
+    || operation === "run.permission"
+    || operation === "submit"
+    || operation === "start-interrupted"
+    || operation === "run.submit"
+    || operation === "run.continue"
+    || operation === "queue"
+    || operation === "run.queue"
+  ) return "run";
+  if (
+    operation === "snapshot"
+    || operation === "subscribe"
+    || operation === "wait-idle"
+    || operation === "agent.context"
+    || operation === "agent.usage"
+    || operation === "agent.models"
+    || operation === "agent.sessions"
+    || operation === "skills.list"
+    || operation === "run.inspect"
+    || operation === "run.list"
+    || operation === "runtime.events"
+    || operation === "task.get"
+    || operation === "task.list"
+    || operation === "task.events"
+    || operation === "automation.list"
+    || operation === "automation.pending"
+    || operation === "goal.get"
+    || operation === "goal.list"
+    || operation === "graph.inspect"
+    || operation === "graph.events"
+    || operation === "graph.list"
+    || operation === "capability.list"
+    || operation === "capability.get"
+    || operation === "host.info"
+  ) return "query";
+  if (operation === "capability.cancel" || operation === "capability.fail" || operation === "capability.release" || operation === "capability.reject") return "control";
+  if (operation === "goal.pause" || operation === "goal.cancel" || operation === "graph.pause" || operation === "graph.cancel") return "control";
+  if (operation === "capability.register" || operation === "capability.replace" || operation === "capability.invoke" || operation === "capability.accept" || operation === "capability.start" || operation === "capability.result" || operation === "capability.chunk" || operation === "capability.admit" || operation === "graph.start" || operation === "graph.resume" || operation === "goal.resume") return "admission";
+  return "mutation";
+}
+
 function isRequestFrame(value: unknown): value is HostRequestFrame {
   const record = asRecord(value);
   return record.kind === "request" && typeof record.requestId === "string" && typeof record.operation === "string";
@@ -1402,6 +2259,15 @@ function isCompletionFrame(value: unknown): value is HostCompletionFrame {
 function isGapFrame(value: unknown): value is HostGapFrame {
   const record = asRecord(value);
   return record.kind === "gap" && typeof record.hostEpoch === "string" && typeof record.sequence === "number" && isSnapshot(record.snapshot);
+}
+
+function isCapabilityOfferFrame(value: unknown): value is HostCapabilityOfferFrame {
+  const record = asRecord(value);
+  const invocation = asRecord(record.invocation);
+  const registration = asRecord(record.registration);
+  return record.kind === "capability-offer"
+    && typeof invocation.invocationId === "string"
+    && typeof registration.registrationId === "string";
 }
 
 function isRuntimeUpdate(value: unknown): value is AgentRuntimeUpdate {
@@ -1479,13 +2345,99 @@ function readAttachments(value: unknown): AgentAttachment[] {
 function readRequestIds(payload: Record<string, unknown>): RuntimeRequestIds {
   const runId = optionalString(payload.runId);
   const messageId = optionalString(payload.messageId);
-  return { runId, messageId };
+  const turnId = optionalString(payload.turnId);
+  const parentRunId = optionalString(payload.parentRunId);
+  const continuationSource = optionalString(payload.continuationSource);
+  return { runId, messageId, turnId, parentRunId, continuationSource };
 }
 
-function normalizeRequestIds(ids: RuntimeRequestIds | undefined): Required<RuntimeRequestIds> {
+function readOptionalRunStatus(value: unknown): RuntimeRunStatus | undefined {
+  if (value === undefined) return undefined;
+  if (value === "admitted" || value === "running" || value === "completed" || value === "blocked" || value === "incomplete" || value === "cancelled" || value === "aborted" || value === "failed" || value === "unknown") return value;
+  throw new Error("Runtime Host run status is invalid.");
+}
+
+function readOptionalTaskStatus(value: unknown): TaskRunStatus | undefined {
+  if (value === undefined) return undefined;
+  if (value === "queued" || value === "created" || value === "running" || value === "verifying" || value === "completed" || value === "failed" || value === "incomplete" || value === "blocked" || value === "policy_denied" || value === "budget_exhausted" || value === "needs_approval" || value === "aborted" || value === "cancelled") return value;
+  throw new Error("Runtime Host TaskRun status is invalid.");
+}
+
+function readCapabilityOwnerType(value: unknown): "host" | "client" {
+  if (value === "host" || value === "client") return value;
+  throw new Error("Capability owner type must be host or client.");
+}
+
+function readAutomationCreateInput(payload: Record<string, unknown>): AutomationCreateInput {
+  const schedule = asRecord(payload.schedule);
+  const template = asRecord(payload.executionTemplate);
+  const triggerType = payload.triggerType;
+  if (triggerType !== "heartbeat" && triggerType !== "cron" && triggerType !== "interval" && triggerType !== "once") {
+    throw new Error("Automation trigger type is invalid.");
+  }
+  const mode = template.mode;
+  if (mode !== undefined && mode !== "chat" && mode !== "plan") throw new Error("Automation mode is invalid.");
+  const intervalMs = schedule.intervalMs;
+  if (intervalMs !== undefined && !Number.isSafeInteger(intervalMs)) throw new Error("Automation intervalMs is invalid.");
+  const jitterMs = schedule.jitterMs;
+  if (jitterMs !== undefined && !Number.isSafeInteger(jitterMs)) throw new Error("Automation jitterMs is invalid.");
+  const maxFires = payload.maxFires;
+  if (maxFires !== undefined && !Number.isSafeInteger(maxFires)) throw new Error("Automation maxFires is invalid.");
+  return {
+    automationId: optionalString(payload.automationId),
+    name: requiredString(payload.name, "name"),
+    triggerType,
+    schedule: {
+      cron: optionalString(schedule.cron),
+      intervalMs: intervalMs as number | undefined,
+      at: optionalString(schedule.at),
+      jitterMs: jitterMs as number | undefined
+    },
+    executionTemplate: {
+      prompt: requiredString(template.prompt, "executionTemplate.prompt"),
+      sessionId: optionalString(template.sessionId),
+      mode,
+      modelAlias: optionalString(template.modelAlias),
+      permissionMode: optionalString(template.permissionMode),
+      workspaceRoot: optionalString(template.workspaceRoot)
+    },
+    maxFires: maxFires as number | undefined,
+    expiresAt: optionalString(payload.expiresAt)
+  };
+}
+
+function readGraphNodes(value: unknown): GraphNodeInput[] {
+  if (!Array.isArray(value) || value.length === 0) throw new Error("Graph nodes must be a non-empty array.");
+  return value.map((item, index) => {
+    const node = asRecord(item);
+    const dependencies = node.dependencies;
+    if (dependencies !== undefined && (!Array.isArray(dependencies) || dependencies.some((dependency) => typeof dependency !== "string"))) {
+      throw new Error(`Graph node ${String(index)} dependencies are invalid.`);
+    }
+    return {
+      nodeKey: requiredString(node.nodeKey, `nodes[${String(index)}].nodeKey`),
+      prompt: requiredString(node.prompt, `nodes[${String(index)}].prompt`),
+      dependencies: dependencies as string[] | undefined,
+      intent: node.intent
+    };
+  });
+}
+
+interface NormalizedRequestIds {
+  runId: string;
+  messageId: string;
+  turnId: string;
+  parentRunId?: string;
+  continuationSource?: string;
+}
+
+function normalizeRequestIds(ids: RuntimeRequestIds | undefined): NormalizedRequestIds {
   return {
     runId: ids?.runId ?? randomUUID(),
-    messageId: ids?.messageId ?? randomUUID()
+    messageId: ids?.messageId ?? randomUUID(),
+    turnId: ids?.turnId ?? randomUUID(),
+    parentRunId: ids?.parentRunId,
+    continuationSource: ids?.continuationSource
   };
 }
 
@@ -1533,6 +2485,38 @@ function publicError(error: unknown): string {
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function isTransientHostError(error: unknown): boolean {
+  const message = asError(error).message;
+  return message.includes("connection closed")
+    || message.includes("disconnected")
+    || message.includes("registration is not available")
+    || message.includes("did not become ready");
+}
+
+function readRecoveryStopReason(value: unknown): AgentRunOutcome["stopReason"] {
+  if (
+    value === "model_stop"
+    || value === "completion_gate"
+    || value === "step_limit"
+    || value === "hard_step_limit"
+    || value === "tool_call_limit"
+    || value === "completion_continuation_limit"
+    || value === "no_progress_after_continuation"
+    || value === "repeated_action_limit"
+    || value === "tool_pending"
+    || value === "timeout"
+    || value === "verification_failed"
+    || value === "model_length"
+    || value === "content_filter"
+    || value === "provider_error"
+    || value === "blocked"
+    || value === "cancelled"
+    || value === "aborted"
+    || value === "budget_exhausted"
+  ) return value;
+  return "provider_error";
 }
 
 async function readRegistration(paths: RuntimeHostPaths): Promise<HostRegistration | undefined> {

@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { AgentConfig } from "../config/schema.js";
 import { createFileConfigStore, type AgentConfigStore } from "../config/store.js";
@@ -15,6 +16,8 @@ import { runPermissionCommand } from "../permission/commands.js";
 import { listSessionSummaries, parseSessionEvents, readSessionEvents, type SessionSummary } from "../session/events.js";
 import { SessionRecorder, type ReasoningBlock, type SessionEvent } from "../session/recorder.js";
 import { replaySessionEvents, type SessionMessageReference, type SessionReplay } from "../session/replay.js";
+import { runtimeEventsForRun, type RuntimeEventSink, type RuntimeHighWater } from "../session/runtimeEvent.js";
+import type { CapabilityStore } from "../runtime/CapabilityStore.js";
 import {
   TurnStore,
   type InterruptedTurn,
@@ -29,7 +32,9 @@ import type {
   AgentContext,
   AgentMessage,
   AgentUserMessage,
-  AgentUsage
+  AgentUsage,
+  ModelRequestContext,
+  ModelRequestMetrics
 } from "./core/types.js";
 import { ToolExecutionCoordinator } from "./toolExecutionCoordinator.js";
 import { buildSystemPrompt, refreshRuntimeSystemPrompt, withActiveRunCompactionSummary } from "./prompts.js";
@@ -46,6 +51,7 @@ import { runMemoryCommand } from "./context/memoryCommands.js";
 import { WorkspaceContext } from "./context/WorkspaceContext.js";
 import type { CompactionResult, ContextStatus } from "./context/types.js";
 import { recordNativeTelemetry } from "../observability/telemetry.js";
+import { summarizeModelRequests, type ModelRequestSummary } from "../observability/modelRequests.js";
 import { createSessionUsage, formatUsageSummary, sumSessionUsage, summarizeUsage, type UsageModelInfo } from "../observability/usage.js";
 import type { SessionContextCheckpoint, SessionUsage, UsageSummary } from "../session/metadata.js";
 import { defaultModelContextWindow } from "../ai/capabilities.js";
@@ -113,6 +119,10 @@ export interface AgentSessionOptions {
   createCheckpoint?: (label: string) => Promise<unknown>;
   /** 会话恢复时按虚拟路径重新读取项目级附件。 */
   attachmentRoot?: string;
+  /** Host composition root 注入 SQLite authority；独立 AgentSession 可省略。 */
+  runtimeEventSink?: RuntimeEventSink;
+  /** Host-owned MCP/Plugin 调用的统一 Capability authority。 */
+  capabilities?: CapabilityStore;
 }
 
 export interface AgentRunOptions {
@@ -135,11 +145,15 @@ export interface AgentRunOptions {
   /** 宿主提供的结构化验证条件，会与模型通过 request_verification 声明的条件合并。 */
   verificationChecks?: StructuredVerificationCheck[];
   attachments?: AgentAttachment[];
+  /** Runtime host 为本次执行分配的 invocation identity。 */
+  runId?: string;
+  /** 同一个根任务及其 continuation 共用的稳定 turn identity。 */
+  turnId?: string;
 }
 
 export type AgentPromptOptions = Pick<
   AgentRunOptions,
-  "abortSignal" | "confirmPermission" | "mode" | "verificationRequired" | "verificationChecks" | "attachments"
+  "abortSignal" | "confirmPermission" | "mode" | "verificationRequired" | "verificationChecks" | "attachments" | "runId" | "turnId"
 >;
 
 export type { AgentAttachment } from "../attachments/store.js";
@@ -212,6 +226,7 @@ export class AgentSession {
   private readonly contextMemory: ContextMemory;
   private readonly localMemory: LocalMemory | undefined;
   private usageRecords: SessionUsage[] = [];
+  private modelRequestRecords: ModelRequestMetrics[] = [];
   private unpersistedRelatedUsage: SessionUsage[] = [];
   private recorder: SessionRecorder;
   private turnStore: TurnStore;
@@ -237,6 +252,9 @@ export class AgentSession {
     const onUsage = async (usage: AgentUsage, operation: "agent" | "plan" | "compaction" | "memory" | "subagent"): Promise<void> => {
       this.recordModelUsage(usage, operation);
     };
+    const onModelRequest = async (metrics: ModelRequestMetrics): Promise<void> => {
+      await this.recordModelRequest(metrics);
+    };
     const memoryConfig = options.config.context.memory;
     const memoryModelAlias = memoryConfig.model;
     // 记忆抽取/整理可以指定专用小模型；未配置时跟随会话模型。懒创建并缓存，避免每次写记忆都重建 adapter。
@@ -246,7 +264,14 @@ export class AgentSession {
       : getModel;
     const initialContextBudget = options.modelManager?.getContextBudget();
     this.localMemory = memoryConfig.enabled
-      ? new LocalMemory(persistenceRoot, getMemoryModel, onUsage, memoryConfig.maxRecalled)
+      ? new LocalMemory(
+        persistenceRoot,
+        getMemoryModel,
+        onUsage,
+        memoryConfig.maxRecalled,
+        onModelRequest,
+        () => this.sideModelRequestContext()
+      )
       : undefined;
     this.contextMemory = new ContextMemory(
       getModel,
@@ -261,7 +286,9 @@ export class AgentSession {
         const fallback = options.config.context.maxInputTokens ?? defaultModelContextWindow;
         return { contextWindow: fallback, maxInputTokens: fallback, maxOutputTokens: undefined };
       },
-      options.config.context.compaction
+      options.config.context.compaction,
+      onModelRequest,
+      () => this.sideModelRequestContext()
     );
     this.recorder = options.recorder;
     this.turnStore = new TurnStore(this.persistenceRoot(), options.recorder.sessionId);
@@ -304,10 +331,13 @@ export class AgentSession {
   }
 
   /** 只补齐 session 中缺失的协议结果；恢复过程不调用任何工具执行函数。 */
-  private async reconcileInterruptedToolExecutions(): Promise<SessionReplay> {
+  private async reconcileInterruptedToolExecutions(expectedRuntimeHighWater?: RuntimeHighWater): Promise<SessionReplay> {
     await this.recorder.flush().catch(() => undefined);
     const events = await readSessionEvents(this.recorder.filePath);
-    const replay = replaySessionEvents(events, { sessionId: this.recorder.sessionId });
+    const replay = replaySessionEvents(events, {
+      sessionId: this.recorder.sessionId,
+      expectedRuntimeHighWater
+    });
     for (const event of replay.recoveredToolResults) await this.recorder.recordAndFlush(event);
     return replay;
   }
@@ -321,62 +351,94 @@ export class AgentSession {
   async *continueInterruptedTurn(runOptions: AgentRunOptions = {}): AsyncGenerator<AgentSessionEvent> {
     const turn = await this.turnStore.load();
     if (!turn) throw new Error("There is no interrupted turn to continue.");
-    const replay = await this.reconcileInterruptedToolExecutions();
-    if (
-      turn.terminal?.status === "blocked"
-      && (turn.terminal.blockedReason === "missing_user_input"
-        || turn.terminal.blockedReason === "unsafe_action_required")
-    ) {
-      throw new Error(
-        turn.terminal.requiredAction
-          ? `This blocked turn requires a new user message: ${turn.terminal.requiredAction}`
-          : "This blocked turn requires a new user message before it can continue."
+    const runId = runOptions.runId ?? randomUUID();
+    const turnId = turn.turnId ?? runOptions.turnId ?? randomUUID();
+    const previousContext = this.recorder.runtimeContextSnapshot();
+    this.recorder.setRuntimeContext({ runId, turnId });
+    try {
+      let replay: SessionReplay;
+      try {
+        replay = await this.reconcileInterruptedToolExecutions(turn.runtimeHighWater);
+      } catch (error) {
+        const message = `Recovery is blocked because the session runtime high-water could not be verified: ${errorMessage(error)}`;
+        const outcome: AgentTurnOutcome = {
+          status: "blocked",
+          stopReason: "blocked",
+          steps: turn.completedSteps,
+          output: "",
+          error: message,
+          resumable: false,
+          blockedReason: "environment_unavailable",
+          requiredAction: "Inspect the session facts and explicitly start a new turn after resolving the recovery mismatch."
+        };
+        this.recordError(message);
+        await this.turnStore.clear().catch(() => undefined);
+        await this.recordTurnOutcome(outcome);
+        yield { type: "error", message };
+        yield { type: "status", status: "blocked" };
+        yield doneEvent(outcome);
+        return;
+      }
+      if (
+        turn.terminal?.status === "blocked"
+        && (turn.terminal.blockedReason === "missing_user_input"
+          || turn.terminal.blockedReason === "unsafe_action_required")
+      ) {
+        throw new Error(
+          turn.terminal.requiredAction
+            ? `This blocked turn requires a new user message: ${turn.terminal.requiredAction}`
+            : "This blocked turn requires a new user message before it can continue."
+        );
+      }
+      const turnLimit = runOptions.maxSteps ?? resolveRunBudget(this.options.config.agent).hardStepLimit;
+      const remainingSteps = turnLimit - turn.completedSteps;
+      if (remainingSteps < 1) {
+        await this.turnStore.clear().catch(() => undefined);
+        throw new Error(
+          `The interrupted turn already reached its ${String(turnLimit)}-step limit. `
+          + "Send a new user message to start another turn."
+        );
+      }
+      if (turn.terminal?.status === "blocked") this.options.completionState?.clearBlocked();
+      const replayMessages = await this.rehydrateSessionAttachments(
+        replay.messages,
+        replay.events,
+        replay.contextStartUserMessageIndex
       );
+      const recoveredMessages = replayMessages.length ? replayMessages : turn.messages;
+      const recoveredReferences = replay.messages.length
+        ? replay.messageReferences
+        : turn.messages.map(() => undefined);
+      const continuationMessages = turn.terminal
+        ? [...recoveredMessages, runtimeContinuationMessage(turn.terminal)]
+        : recoveredMessages;
+      const continuationReferences = turn.terminal
+        ? [...recoveredReferences, undefined]
+        : recoveredReferences;
+      this.contextMemory.restore(recoveredMessages, replay.contextState ?? replay.contextUsage);
+      if (replay.contextCheckpoint) this.contextMemory.setCheckpoint(replay.contextCheckpoint);
+      this.contextMessageReferences = recoveredReferences.map((reference) => reference === undefined ? undefined : { ...reference });
+      this.nextSessionMessageIndex = replay.totalMessageCount;
+      const previousTerminals = [
+        ...(turn.previousTerminals ?? []),
+        ...(turn.terminal ? [turn.terminal] : [])
+      ];
+      yield* this.runTurn(turn.prompt, {
+        ...runOptions,
+        runId,
+        turnId,
+        maxSteps: remainingSteps,
+        continueFrom: continuationMessages,
+        continueMessageReferences: continuationReferences,
+        continueSystemPrompt: turn.systemPrompt,
+        recordSessionUserMessage: false,
+        completedStepsBeforeRun: turn.completedSteps,
+        initialRunFacts: restartRunFactsBudget(readRunFacts(turn.facts), turn.completedSteps === 0),
+        previousTerminals
+      });
+    } finally {
+      this.recorder.setRuntimeContext(previousContext);
     }
-    const turnLimit = runOptions.maxSteps ?? resolveRunBudget(this.options.config.agent).hardStepLimit;
-    const remainingSteps = turnLimit - turn.completedSteps;
-    if (remainingSteps < 1) {
-      await this.turnStore.clear().catch(() => undefined);
-      throw new Error(
-        `The interrupted turn already reached its ${String(turnLimit)}-step limit. `
-        + "Send a new user message to start another turn."
-      );
-    }
-    if (turn.terminal?.status === "blocked") this.options.completionState?.clearBlocked();
-    const replayMessages = await this.rehydrateSessionAttachments(
-      replay.messages,
-      replay.events,
-      replay.contextStartUserMessageIndex
-    );
-    const recoveredMessages = replayMessages.length ? replayMessages : turn.messages;
-    const recoveredReferences = replay.messages.length
-      ? replay.messageReferences
-      : turn.messages.map(() => undefined);
-    const continuationMessages = turn.terminal
-      ? [...recoveredMessages, runtimeContinuationMessage(turn.terminal)]
-      : recoveredMessages;
-    const continuationReferences = turn.terminal
-      ? [...recoveredReferences, undefined]
-      : recoveredReferences;
-    this.contextMemory.restore(recoveredMessages, replay.contextState ?? replay.contextUsage);
-    if (replay.contextCheckpoint) this.contextMemory.setCheckpoint(replay.contextCheckpoint);
-    this.contextMessageReferences = recoveredReferences.map((reference) => reference === undefined ? undefined : { ...reference });
-    this.nextSessionMessageIndex = replay.totalMessageCount;
-    const previousTerminals = [
-      ...(turn.previousTerminals ?? []),
-      ...(turn.terminal ? [turn.terminal] : [])
-    ];
-    yield* this.runTurn(turn.prompt, {
-      ...runOptions,
-      maxSteps: remainingSteps,
-      continueFrom: continuationMessages,
-      continueMessageReferences: continuationReferences,
-      continueSystemPrompt: turn.systemPrompt,
-      recordSessionUserMessage: false,
-      completedStepsBeforeRun: turn.completedSteps,
-      initialRunFacts: restartRunFactsBudget(readRunFacts(turn.facts), turn.completedSteps === 0),
-      previousTerminals
-    });
   }
 
   /** 持久记忆存储句柄；记忆工具与 /memory 命令共用（禁用时为 undefined）。 */
@@ -448,6 +510,10 @@ export class AgentSession {
       ? AbortSignal.any([runOptions.abortSignal, turnController.signal])
       : turnController.signal;
     const continuing = Boolean(runOptions.continueFrom?.length);
+    const runtimeRunId = runOptions.runId ?? randomUUID();
+    const runtimeTurnId = runOptions.turnId ?? randomUUID();
+    runOptions = { ...runOptions, runId: runtimeRunId, turnId: runtimeTurnId };
+    this.recorder.setRuntimeContext({ runId: runtimeRunId, turnId: runtimeTurnId });
     const completedStepsBeforeRun = continuing ? runOptions.completedStepsBeforeRun ?? 0 : 0;
     if (!continuing) this.options.completionState?.reset();
     if (!Number.isSafeInteger(completedStepsBeforeRun) || completedStepsBeforeRun < 0) {
@@ -492,7 +558,7 @@ export class AgentSession {
       recordUserMessage();
       const outcome = cancelledTurn("Current turn cancelled before execution.", completedStepsBeforeRun);
       await this.turnStore.clear().catch(() => undefined);
-      this.recordTurnOutcome(outcome);
+      await this.recordTurnOutcome(outcome);
       yield { type: "error", message: outcome.error ?? "Current turn interrupted." };
       yield { type: "status", status: "cancelled" };
       yield doneEvent(outcome);
@@ -507,7 +573,7 @@ export class AgentSession {
         : failedTurn(errorMessage(error), completedStepsBeforeRun, "provider_error");
       this.recordError(outcome.error);
       if (outcome.status === "cancelled") await this.turnStore.clear().catch(() => undefined);
-      this.recordTurnOutcome(outcome);
+      await this.recordTurnOutcome(outcome);
       yield { type: "error", message: outcome.error ?? "Agent run failed." };
       yield { type: "status", status: outcome.status === "cancelled" ? "cancelled" : "error" };
       yield doneEvent(outcome);
@@ -518,7 +584,7 @@ export class AgentSession {
       recordUserMessage();
       const outcome = failedTurn("Native model runtime is not configured.", completedStepsBeforeRun);
       this.recordError(outcome.error);
-      this.recordTurnOutcome(outcome);
+      await this.recordTurnOutcome(outcome);
       yield { type: "error", message: outcome.error ?? "Agent run failed." };
       yield { type: "status", status: "error" };
       yield doneEvent(outcome);
@@ -574,7 +640,7 @@ export class AgentSession {
         : failedTurn(errorMessage(error), completedStepsBeforeRun, isTimeoutFailure(error) ? "timeout" : "provider_error");
       this.recordError(outcome.error);
       if (outcome.status === "cancelled") await this.turnStore.clear().catch(() => undefined);
-      this.recordTurnOutcome(outcome);
+      await this.recordTurnOutcome(outcome);
       yield { type: "error", message: outcome.error ?? "Agent run failed." };
       yield { type: "status", status: outcome.status === "cancelled" ? "cancelled" : "error" };
       yield doneEvent(outcome);
@@ -586,23 +652,29 @@ export class AgentSession {
       const outcome = cancelledTurn("Current turn cancelled during context preparation.", completedStepsBeforeRun);
       this.recordError(outcome.error);
       await this.turnStore.clear().catch(() => undefined);
-      this.recordTurnOutcome(outcome);
+      await this.recordTurnOutcome(outcome);
       yield { type: "error", message: outcome.error ?? "Current turn interrupted." };
       yield { type: "status", status: "cancelled" };
       yield doneEvent(outcome);
       return;
     }
     if (!continuing) {
-      await this.recorder.flush().catch(() => undefined);
-      await this.turnStore.save(
-        input,
-        systemPrompt,
-        messages,
-        completedStepsBeforeRun,
-        undefined,
-        undefined,
-        runOptions.previousTerminals
-      ).catch(() => undefined);
+      try {
+        await this.recorder.flush();
+        await this.turnStore.save(
+          input,
+          systemPrompt,
+          messages,
+          completedStepsBeforeRun,
+          undefined,
+          undefined,
+          runOptions.previousTerminals,
+          undefined,
+          this.recorder.runtimeHighWater()
+        );
+      } catch {
+        // 初始断点写入失败时不伪装成可恢复；真正的终态仍由下面的 durable commit 记录。
+      }
     }
     const configuredBudget = resolveRunBudget(this.options.config.agent);
     const remainingConfiguredSteps = configuredBudget.hardStepLimit - completedStepsBeforeRun;
@@ -638,6 +710,7 @@ export class AgentSession {
     });
     return;
     } finally {
+      this.recorder.setRuntimeContext(undefined);
       messageQueues.accepting = false;
       if (this.activeRunMessageQueues === messageQueues) this.activeRunMessageQueues = undefined;
       release();
@@ -671,13 +744,22 @@ export class AgentSession {
     if (!nativeSettings) {
       const outcome = failedTurn("Native model runtime is not configured.", completedStepsBeforeRun);
       this.recordError(outcome.error);
-      this.recordTurnOutcome(outcome);
+      await this.recordTurnOutcome(outcome);
       yield { type: "error", message: outcome.error ?? "Native model runtime is not configured." };
       yield { type: "status", status: "error" };
       yield doneEvent(outcome);
       return;
     }
     let activeModelSettings = nativeSettings;
+    let relatedToolCallIds: string[] = [];
+    const modelRequestContext = (step: number): ModelRequestContext => ({
+      sessionId: this.recorder.sessionId,
+      runId: args.runOptions.runId,
+      turnId: args.runOptions.turnId,
+      step,
+      operation: mode === "plan" ? "plan" : "agent",
+      relatedToolCallIds: [...relatedToolCallIds]
+    });
 
     const permissionManager = this.options.permissionManager;
     const facts = new RunFactsCollector(runOptions.initialRunFacts);
@@ -727,6 +809,7 @@ export class AgentSession {
           { sessionId: this.recorder.sessionId }
         );
         if (!replay.messages.length) return;
+        await this.recorder.flush();
         await this.turnStore.save(
           input,
           systemPrompt,
@@ -735,7 +818,8 @@ export class AgentSession {
           facts.snapshot(false),
           undefined,
           runOptions.previousTerminals,
-          coordinator.getExecutionCheckpoints()
+          coordinator.getExecutionCheckpoints(),
+          this.recorder.runtimeHighWater()
         );
       });
       toolResultCheckpointBarrier = current.catch(() => undefined);
@@ -792,6 +876,7 @@ export class AgentSession {
 
     const nativeContext: AgentContext = { systemPrompt, messages: [...messages], tools: [] };
     nativeContext.tools = activeModelSettings.model.supportsTools === false ? [] : coordinator.createAgentTools();
+    this.contextMemory.recordToolSchema(nativeContext.tools);
     let completionDecision: CompletionDecision | undefined;
     let pendingSteering: AgentMessage[] = [];
     let lastAssistant: AgentAssistantMessage | undefined;
@@ -825,7 +910,9 @@ export class AgentSession {
           maxOutputTokens: activeModelSettings.maxOutputTokens,
           reasoning: activeModelSettings.reasoning,
           providerOptions: activeModelSettings.providerOptions,
-          timeoutMs: activeModelSettings.timeoutMs
+          timeoutMs: activeModelSettings.timeoutMs,
+          onRequestMetrics: (metrics) => this.recordModelRequest(metrics),
+          requestContext: modelRequestContext(completedStepsBeforeRun + 1)
         },
         maxSteps: runBudget.hardStepLimit - completedStepsBeforeRun,
         prepareNextTurn: async ({ context }) => {
@@ -838,6 +925,7 @@ export class AgentSession {
             this.extensionPrompt(),
             this.promptTools(tools.map((tool) => tool.name))
           );
+          this.contextMemory.recordToolSchema(tools);
           return {
             context,
             model: settings.model,
@@ -846,7 +934,9 @@ export class AgentSession {
               maxOutputTokens: settings.maxOutputTokens,
               reasoning: settings.reasoning,
               providerOptions: settings.providerOptions,
-              timeoutMs: settings.timeoutMs
+              timeoutMs: settings.timeoutMs,
+              onRequestMetrics: (metrics) => this.recordModelRequest(metrics),
+              requestContext: modelRequestContext(completedStepsBeforeRun + observedSteps + 1)
             }
           };
         },
@@ -980,6 +1070,7 @@ export class AgentSession {
             }
           }
         } else if (event.type === "turn_end") {
+          relatedToolCallIds = event.toolResults.map((toolResult) => toolResult.toolCallId);
           for (const toolResult of event.toolResults) {
             referenceByMessage.set(
               toolResult,
@@ -1009,16 +1100,22 @@ export class AgentSession {
             event.toolResults.length > 0
             && completedStepsBeforeRun + observedSteps < runBudget.hardStepLimit
           ) {
-            await this.turnStore.save(
-              input,
-              systemPrompt,
-              event.messages,
-              completedStepsBeforeRun + observedSteps,
-              facts.snapshot(false),
-              undefined,
-              runOptions.previousTerminals,
-              coordinator.getExecutionCheckpoints()
-            ).catch(() => undefined);
+            try {
+              await this.recorder.flush();
+              await this.turnStore.save(
+                input,
+                systemPrompt,
+                event.messages,
+                completedStepsBeforeRun + observedSteps,
+                facts.snapshot(false),
+                undefined,
+                runOptions.previousTerminals,
+                coordinator.getExecutionCheckpoints(),
+                this.recorder.runtimeHighWater()
+              );
+            } catch {
+              // 步间 checkpoint 失败时不伪装为可恢复；工具结果和最终终态仍照常提交。
+            }
           }
         } else if (event.type === "agent_end") {
           newMessages = event.messages;
@@ -1095,7 +1192,7 @@ export class AgentSession {
         relatedUsage: this.takeRelatedUsage(),
         contextState: this.contextMemory.snapshot()
       });
-      const outcome = completionOutcome(
+      let outcome = completionOutcome(
         finalDecision,
         content,
         lastAssistant?.stopReason,
@@ -1105,6 +1202,49 @@ export class AgentSession {
       if (content && (outcome.status === "completed" || outcome.status === "incomplete" || outcome.status === "blocked")) {
         yield { type: "assistant.completed", content };
       }
+      if (outcome.status === "blocked" || outcome.status === "incomplete" && outcome.resumable === true) {
+        try {
+          await this.recorder.flush();
+          await this.turnStore.save(
+            input,
+            systemPrompt,
+            finalMessages,
+            0,
+            facts.snapshot(false),
+            {
+              status: outcome.status,
+              stopReason: outcome.stopReason,
+              summary: outcome.error ?? `${outcome.status} (${outcome.stopReason})`,
+              blockedReason: outcome.blockedReason,
+              requiredAction: outcome.requiredAction
+            },
+            runOptions.previousTerminals,
+            coordinator.getExecutionCheckpoints(),
+            this.recorder.runtimeHighWater()
+          );
+        } catch (error) {
+          outcome = {
+            ...outcome,
+            resumable: false,
+            error: `${outcome.error ?? `${outcome.status} (${outcome.stopReason})`} Checkpoint persistence failed: ${errorMessage(error)}`
+          };
+        }
+      } else {
+        try {
+          await this.turnStore.clear();
+        } catch (error) {
+          outcome = {
+            ...outcome,
+            status: "failed",
+            stopReason: "provider_error",
+            resumable: false,
+            blockedReason: undefined,
+            requiredAction: undefined,
+            error: `Turn checkpoint cleanup failed: ${errorMessage(error)}`
+          };
+        }
+      }
+      await this.recordTurnOutcome(outcome);
       if (outcome.status === "completed") {
         this.rememberSuccessfulTask(input, content);
         yield { type: "status", status: "completed" };
@@ -1119,27 +1259,6 @@ export class AgentSession {
         yield { type: "error", message: outcome.error ?? "Native agent run failed." };
         yield { type: "status", status: "error" };
       }
-      if (outcome.status === "blocked" || outcome.status === "incomplete" && outcome.resumable === true) {
-        await this.turnStore.save(
-          input,
-          systemPrompt,
-          finalMessages,
-          0,
-          facts.snapshot(false),
-          {
-            status: outcome.status,
-            stopReason: outcome.stopReason,
-            summary: outcome.error ?? `${outcome.status} (${outcome.stopReason})`,
-            blockedReason: outcome.blockedReason,
-            requiredAction: outcome.requiredAction
-          },
-          runOptions.previousTerminals,
-          coordinator.getExecutionCheckpoints()
-        ).catch(() => undefined);
-      } else {
-        await this.turnStore.clear().catch(() => undefined);
-      }
-      this.recordTurnOutcome(outcome);
       yield doneEvent(outcome);
     } catch (error) {
       const message = errorMessage(error);
@@ -1155,7 +1274,7 @@ export class AgentSession {
         : failedTurn(message, completedStepsBeforeRun + observedSteps, isTimeoutFailure(error) ? "timeout" : "provider_error");
       this.recordError(message);
       if (outcome.status === "cancelled") await this.turnStore.clear().catch(() => undefined);
-      this.recordTurnOutcome(outcome);
+      await this.recordTurnOutcome(outcome);
       if (!streamFailureReported) yield { type: "error", message };
       yield { type: "status", status: outcome.status === "cancelled" ? "cancelled" : "error" };
       yield doneEvent(outcome);
@@ -1191,7 +1310,7 @@ export class AgentSession {
         previousClosed = true;
         await previousRecorder.close();
       }
-      replacementRecorder = new SessionRecorder(this.persistenceRoot(), sessionIdFromFile(filePath), filePath);
+      replacementRecorder = new SessionRecorder(this.persistenceRoot(), sessionIdFromFile(filePath), filePath, this.options.runtimeEventSink);
       replacementRecorder.repairTailForAppend();
       const replay = replaySessionEvents(parseSessionEvents(replacementRecorder.readText()), { sessionId: replacementRecorder.sessionId });
       replacementRecorder.restoreToolCallSequence(maxToolCallSequence(replay.events));
@@ -1204,6 +1323,18 @@ export class AgentSession {
       for (const event of replay.recoveredToolResults) await replacementRecorder.recordAndFlush(event);
       this.options.permissionManager.resetSession();
       this.usageRecords = [...replay.usage];
+      this.modelRequestRecords = replay.modelRequests.map((metrics) => ({
+        ...metrics,
+        attempts: metrics.attempts.map((attempt) => ({ ...attempt })),
+        requestContext: metrics.requestContext === undefined
+          ? undefined
+          : {
+            ...metrics.requestContext,
+            relatedToolCallIds: metrics.requestContext.relatedToolCallIds === undefined
+              ? undefined
+              : [...metrics.requestContext.relatedToolCallIds]
+          }
+      }));
       this.unpersistedRelatedUsage = [];
       const messages = await this.rehydrateSessionAttachments(
         replay.messages,
@@ -1222,7 +1353,7 @@ export class AgentSession {
     } catch (error) {
       await replacementRecorder?.close().catch(() => undefined);
       if (previousClosed) {
-        this.recorder = new SessionRecorder(this.persistenceRoot());
+        this.recorder = new SessionRecorder(this.persistenceRoot(), undefined, undefined, this.options.runtimeEventSink);
       }
       throw error;
     }
@@ -1242,6 +1373,19 @@ export class AgentSession {
   /** 本会话累计用量的快照；evals 和宿主用它做度量，拿到的是副本不是内部数组。 */
   usageSummary(): UsageSummary {
     return summarizeUsage(this.usageRecords);
+  }
+
+  /** 当前 AgentSession 内原生 Provider 请求的性能快照；正文不进入该汇总。 */
+  modelRequestSummary(): ModelRequestSummary {
+    return summarizeModelRequests(this.modelRequestRecords);
+  }
+
+  private sideModelRequestContext(): ModelRequestContext | undefined {
+    if (this.activeOperation !== "agent turn") return undefined;
+    const runtime = this.recorder.runtimeContextSnapshot();
+    return runtime === undefined
+      ? undefined
+      : { runId: runtime.runId, turnId: runtime.turnId };
   }
 
   usageReport(): string {
@@ -1423,11 +1567,45 @@ export class AgentSession {
     });
   }
 
-  private recordTurnOutcome(outcome: AgentTurnOutcome): void {
-    this.recorder.record({
+  private async recordModelRequest(metrics: ModelRequestMetrics): Promise<void> {
+    const requestContext = {
+      sessionId: this.recorder.sessionId,
+      ...(metrics.requestContext ?? {}),
+      relatedToolCallIds: metrics.requestContext?.relatedToolCallIds === undefined
+        ? undefined
+        : [...metrics.requestContext.relatedToolCallIds]
+    };
+    const recordedMetrics: ModelRequestMetrics = {
+      ...metrics,
+      attempts: metrics.attempts.map((attempt) => ({ ...attempt })),
+      requestContext
+    };
+    this.modelRequestRecords.push(recordedMetrics);
+    if (this.modelRequestRecords.length > 2_000) this.modelRequestRecords.shift();
+    const runtime = requestContext.runId !== undefined && requestContext.turnId !== undefined
+      ? { runId: requestContext.runId, turnId: requestContext.turnId }
+      : undefined;
+    try {
+      this.recorder.recordWithRuntimeContext({ type: "model_request", metrics: recordedMetrics }, runtime);
+    } catch {
+      // 请求观测是旁路；session/authority 写入失败不能改变 provider 结果。
+    }
+    await recordNativeTelemetry(this.options.config, this.options.workspaceRoot, {
+      type: "request",
+      provider: recordedMetrics.provider,
+      modelId: recordedMetrics.modelId,
+      metrics: recordedMetrics
+    });
+  }
+
+  private async recordTurnOutcome(outcome: AgentTurnOutcome): Promise<RuntimeHighWater | undefined> {
+    const context = this.recorder.runtimeContextSnapshot();
+    if (context) return await this.ensureTerminalOutcome(context.runId, context.turnId, outcome);
+    const recorded = await this.recorder.recordAndFlush({
       type: "turn_status",
       status: outcome.status,
       stopReason: outcome.stopReason,
+      finishReason: outcome.finishReason,
       steps: outcome.steps,
       summary: outcome.error,
       resumable: outcome.resumable,
@@ -1435,6 +1613,48 @@ export class AgentSession {
       requiredAction: outcome.requiredAction,
       affectedTodoIds: outcome.affectedTodoIds
     });
+    return recorded.runtime;
+  }
+
+  /**
+   * Host 层收尾时的幂等终态入口。正常 Agent Loop 已经写过 turn_status；
+   * 未捕获异常等宿主级失败则由这里补一条 canonical terminal fact。
+   */
+  async ensureTerminalOutcome(runId: string, turnId: string, outcome: AgentTurnOutcome): Promise<RuntimeHighWater> {
+    await this.recorder.flush();
+    const events = await readSessionEvents(this.recorder.filePath);
+    const terminals = runtimeEventsForRun(events, runId)
+      .filter((event): event is Extract<SessionEvent, { type: "turn_status" }> => event.type === "turn_status");
+    if (terminals.length > 1) throw new Error(`Run ${runId} has multiple canonical terminal events.`);
+    const existing = terminals[0]?.runtime;
+    if (existing) {
+      if (existing.turnId !== turnId) throw new Error(`Run ${runId} terminal event belongs to another turn.`);
+      const existingTerminal = terminals[0];
+      if (!existingTerminal || !sameTerminalOutcome(existingTerminal, outcome)) {
+        throw new Error(`Run ${runId} already has a conflicting terminal outcome.`);
+      }
+      return existing;
+    }
+    const previousContext = this.recorder.runtimeContextSnapshot();
+    this.recorder.setRuntimeContext({ runId, turnId });
+    try {
+      const recorded = await this.recorder.recordAndFlush({
+        type: "turn_status",
+        status: outcome.status,
+        stopReason: outcome.stopReason,
+        finishReason: outcome.finishReason,
+        steps: outcome.steps,
+        summary: outcome.error,
+        resumable: outcome.resumable,
+        blockedReason: outcome.blockedReason,
+        requiredAction: outcome.requiredAction,
+        affectedTodoIds: outcome.affectedTodoIds
+      });
+      if (!recorded.runtime) throw new Error(`Run ${runId} terminal event has no runtime identity.`);
+      return recorded.runtime;
+    } finally {
+      this.recorder.setRuntimeContext(previousContext);
+    }
   }
 
   recordHostedUserMessage(content: string): void {
@@ -1609,7 +1829,10 @@ export class AgentSession {
           () => this.lingeringExternalTools.delete(settlement)
         );
       },
-      abortSignal: runOptions.abortSignal
+      abortSignal: runOptions.abortSignal,
+      capabilities: this.options.capabilities,
+      runId: runOptions.runId,
+      turnId: runOptions.turnId
     };
   }
 
@@ -2063,6 +2286,26 @@ function isTimeoutFailure(error: unknown): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function sameTerminalOutcome(
+  event: Extract<SessionEvent, { type: "turn_status" }>,
+  outcome: AgentTurnOutcome
+): boolean {
+  return event.status === outcome.status
+    && event.stopReason === outcome.stopReason
+    && event.finishReason === outcome.finishReason
+    && event.steps === outcome.steps
+    && event.summary === outcome.error
+    && event.resumable === outcome.resumable
+    && event.blockedReason === outcome.blockedReason
+    && event.requiredAction === outcome.requiredAction
+    && sameStringArray(event.affectedTodoIds, outcome.affectedTodoIds);
+}
+
+function sameStringArray(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function sessionAttachments(attachments: AgentAttachment[] | undefined): AttachmentReference[] | undefined {

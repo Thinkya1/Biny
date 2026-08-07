@@ -6,7 +6,10 @@
  */
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { agentDir, ensureAgentDirs } from "./store.js";
+import { readSessionEvents } from "./events.js";
+import { runtimeEventsForRun, type RuntimeHighWater } from "./runtimeEvent.js";
+import { resolveSessionFile, agentDir, ensureAgentDirs } from "./store.js";
+import type { SessionEvent } from "./recorder.js";
 
 const ledgerVersion = 1 as const;
 
@@ -25,6 +28,7 @@ export interface SessionRunRecord {
   sessionId: string;
   messageId?: string;
   runtimeId?: string;
+  turnId?: string;
   pid: number;
   status: SessionRunStatus;
   startedAt: string;
@@ -38,6 +42,8 @@ export interface SessionRunRecord {
   blockedReason?: string;
   requiredAction?: string;
   error?: string;
+  terminalEventId?: string;
+  terminalEventSeq?: number;
 }
 
 export interface StartSessionRunOptions {
@@ -45,6 +51,7 @@ export interface StartSessionRunOptions {
   sessionId: string;
   messageId?: string;
   runtimeId?: string;
+  turnId?: string;
   pid?: number;
   startedAt?: string;
 }
@@ -60,6 +67,7 @@ export interface FinishSessionRunOptions {
   requiredAction?: string;
   error?: string;
   endedAt?: string;
+  terminal?: RuntimeHighWater;
 }
 
 export class SessionRunLedger {
@@ -68,6 +76,14 @@ export class SessionRunLedger {
   async start(options: StartSessionRunOptions): Promise<SessionRunRecord> {
     assertId(options.runId, "run");
     assertId(options.sessionId, "session");
+    const existing = await this.read(options.runId);
+    if (existing) {
+      if (existing.sessionId !== options.sessionId
+        || existing.turnId !== undefined && options.turnId !== undefined && existing.turnId !== options.turnId) {
+        throw new Error(`Run ${options.runId} is already bound to another session or turn.`);
+      }
+      return existing;
+    }
     const startedAt = options.startedAt ?? new Date().toISOString();
     const record: SessionRunRecord = {
       version: ledgerVersion,
@@ -75,6 +91,7 @@ export class SessionRunLedger {
       sessionId: options.sessionId,
       messageId: options.messageId,
       runtimeId: options.runtimeId,
+      turnId: options.turnId,
       pid: options.pid ?? process.pid,
       status: "running",
       startedAt,
@@ -87,14 +104,32 @@ export class SessionRunLedger {
   async finish(runId: string, options: FinishSessionRunOptions): Promise<SessionRunRecord | undefined> {
     assertId(runId, "run");
     const existing = await this.read(runId);
-    if (!existing || existing.status !== "running") return existing;
+    if (!existing) return undefined;
+    if (options.terminal?.runId !== undefined && options.terminal.runId !== runId) {
+      throw new Error(`Terminal event ${options.terminal.eventId} belongs to another run.`);
+    }
+    if (
+      existing.turnId !== undefined
+      && options.terminal?.turnId !== undefined
+      && existing.turnId !== options.terminal.turnId
+    ) {
+      throw new Error(`Terminal event ${options.terminal.eventId} belongs to another turn.`);
+    }
+    if (existing.status !== "running") {
+      if (sameTerminal(existing, options)) return existing;
+      throw new Error(`Run ${runId} already has a different terminal outcome.`);
+    }
+    const { terminal, ...projection } = options;
     const endedAt = options.endedAt ?? new Date().toISOString();
     const record: SessionRunRecord = {
       ...existing,
-      ...options,
+      ...projection,
       status: options.status,
       endedAt,
-      updatedAt: endedAt
+      updatedAt: endedAt,
+      terminalEventId: terminal?.eventId,
+      terminalEventSeq: terminal?.eventSeq,
+      turnId: terminal?.turnId ?? existing.turnId
     };
     await this.write(record);
     return record;
@@ -155,6 +190,28 @@ export class SessionRunLedger {
 
   private async reconcileStale(record: SessionRunRecord, filePath: string): Promise<SessionRunRecord> {
     if (record.status !== "running" || isProcessAlive(record.pid)) return record;
+    const terminal = await this.readCanonicalTerminal(record);
+    if (terminal) {
+      const endedAt = new Date().toISOString();
+      const repaired: SessionRunRecord = {
+        ...record,
+        status: terminal.status,
+        stopReason: terminal.stopReason,
+        finishReason: terminal.finishReason,
+        steps: terminal.steps,
+        resumable: terminal.resumable,
+        blockedReason: terminal.blockedReason,
+        requiredAction: terminal.requiredAction,
+        error: terminal.summary,
+        endedAt,
+        updatedAt: endedAt,
+        terminalEventId: terminal.runtime?.eventId,
+        terminalEventSeq: terminal.runtime?.eventSeq,
+        turnId: terminal.runtime?.turnId ?? record.turnId
+      };
+      await this.writeAt(filePath, repaired).catch(() => undefined);
+      return repaired;
+    }
     const endedAt = new Date().toISOString();
     const reconciled: SessionRunRecord = {
       ...record,
@@ -168,6 +225,18 @@ export class SessionRunLedger {
     return reconciled;
   }
 
+  private async readCanonicalTerminal(record: SessionRunRecord): Promise<Extract<SessionEvent, { type: "turn_status" }> | undefined> {
+    const filePath = await resolveSessionFile(this.persistenceRoot, record.sessionId).catch(() => undefined);
+    if (!filePath) return undefined;
+    const events = await readSessionEvents(filePath).catch(() => [] as SessionEvent[]);
+    const terminals = runtimeEventsForRun(events, record.runId)
+      .filter((event): event is Extract<SessionEvent, { type: "turn_status" }> =>
+        event.type === "turn_status"
+        && (record.turnId === undefined || event.runtime?.turnId === record.turnId)
+      );
+    return terminals.length === 1 ? terminals[0] : undefined;
+  }
+
   private async write(record: SessionRunRecord): Promise<void> {
     const directory = await this.ensureDirectory();
     await this.writeAt(path.join(directory, runFileName(record.runId)), record);
@@ -178,6 +247,12 @@ export class SessionRunLedger {
     try {
       await fs.writeFile(temporary, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600, flag: "w" });
       await fs.chmod(temporary, 0o600);
+      const handle = await fs.open(temporary, "r");
+      try {
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
       await fs.rename(temporary, filePath);
     } finally {
       await fs.rm(temporary, { force: true }).catch(() => undefined);
@@ -217,7 +292,25 @@ function isSessionRunRecord(value: unknown): value is SessionRunRecord {
     && Number.isSafeInteger(candidate.pid)
     && isSessionRunStatus(candidate.status)
     && typeof candidate.startedAt === "string"
-    && typeof candidate.updatedAt === "string";
+    && typeof candidate.updatedAt === "string"
+    && (candidate.turnId === undefined || typeof candidate.turnId === "string")
+    && (candidate.terminalEventId === undefined || typeof candidate.terminalEventId === "string")
+    && (candidate.terminalEventSeq === undefined || Number.isSafeInteger(candidate.terminalEventSeq) && candidate.terminalEventSeq > 0);
+}
+
+function sameTerminal(existing: SessionRunRecord, options: FinishSessionRunOptions): boolean {
+  return existing.status === options.status
+    && (options.stopReason === undefined || existing.stopReason === options.stopReason)
+    && (options.finishReason === undefined || existing.finishReason === options.finishReason)
+    && (options.steps === undefined || existing.steps === options.steps)
+    && (options.resumable === undefined || existing.resumable === options.resumable)
+    && (options.blockedReason === undefined || existing.blockedReason === options.blockedReason)
+    && (options.requiredAction === undefined || existing.requiredAction === options.requiredAction)
+    && (options.error === undefined || existing.error === options.error)
+    && (options.terminal === undefined
+      || existing.terminalEventId === options.terminal.eventId
+      && existing.terminalEventSeq === options.terminal.eventSeq
+      && (existing.turnId === undefined || options.terminal.turnId === undefined || existing.turnId === options.terminal.turnId));
 }
 
 function isSessionRunStatus(value: unknown): value is SessionRunStatus {

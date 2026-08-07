@@ -55,6 +55,9 @@ export interface ApprovedFileSnapshot {
 export interface ToolExecutionContext {
   toolCallId: string;
   operationId: string;
+  sessionId?: string;
+  runId?: string;
+  turnId?: string;
   signal?: AbortSignal;
   onUpdate?: (update: ToolUpdate) => void;
   onExecutionState?: (state: ToolExecutionState, evidence?: string) => void;

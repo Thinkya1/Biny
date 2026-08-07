@@ -543,7 +543,8 @@ export class ToolExecutionCoordinator {
                 operationId,
                 retrySafety,
                 (state, evidence) => recordState(state, evidence),
-                () => { executionStarted = true; }
+                () => { executionStarted = true; },
+                toolDefinition.parameters
               );
             }
           });
@@ -844,7 +845,7 @@ export class ToolExecutionCoordinator {
   }
 
   private async executeResolvedTool(
-    call: { id: string; name: string },
+    call: { id: string; name: string; args?: unknown },
     execution: RunnableToolExecution,
     source: ToolSource,
     signal?: AbortSignal,
@@ -852,7 +853,8 @@ export class ToolExecutionCoordinator {
     operationId?: string,
     retrySafety: ToolRetrySafety = "unknown",
     onExecutionState?: (state: ToolExecutionState, evidence?: string) => void,
-    onStarted?: () => void
+    onStarted?: () => void,
+    capabilitySchema?: unknown
   ): Promise<ToolExecutionOutcome> {
     const startedAt = Date.now();
     let executionPromise: Promise<unknown> | undefined;
@@ -866,16 +868,31 @@ export class ToolExecutionCoordinator {
       signal?.throwIfAborted();
       executionStarted = true;
       onStarted?.();
-      executionPromise = execution.execute({
+      const executeWithSignal = (executionSignal?: AbortSignal): Promise<unknown> => execution.execute({
         toolCallId: call.id,
         operationId: operationId ?? createToolOperationId(this.context.recorder.sessionId, call.id),
-        signal,
+        sessionId: this.context.recorder.sessionId,
+        runId: this.context.runId,
+        turnId: this.context.turnId,
+        signal: executionSignal,
         onUpdate: (update) => {
-          if (!signal?.aborted) this.emit({ type: "tool.progress", toolCallId: call.id, tool: call.name, update });
+          if (!executionSignal?.aborted) this.emit({ type: "tool.progress", toolCallId: call.id, tool: call.name, update });
         },
         onExecutionState: reportExecutionState,
         approvedFile
       });
+      executionPromise = (source === "mcp" || source === "plugin") && this.context.capabilities
+        ? this.context.capabilities.executeHostCapability({
+          capabilityName: `host:${source}:${call.name}`,
+          schema: capabilitySchema ?? { type: "object" },
+          sessionId: this.context.recorder.sessionId,
+          runId: this.context.runId,
+          turnId: this.context.turnId,
+          toolCallId: call.id,
+          offerId: operationId,
+          request: call.args ?? {}
+        }, executeWithSignal, signal)
+        : executeWithSignal(signal);
       // Built-ins own a real cancellation contract, so their scheduler resources
       // remain held until the underlying operation has actually stopped. External
       // tools get a bounded drain so a non-cooperative extension cannot hang close.

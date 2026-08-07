@@ -32,8 +32,15 @@ import { sessionFilePath } from "./store.js";
 import { projectSessionsDir } from "../config/paths.js";
 import type { SessionContextCheckpoint, SessionContextState, SessionContextUsage, SessionUsage } from "./metadata.js";
 import type { AttachmentReference } from "../attachments/store.js";
-import type { AgentMessage } from "../agent/core/types.js";
+import type { AgentMessage, ModelRequestMetrics } from "../agent/core/types.js";
 import type { ToolExecutionResultStatus, ToolExecutionState, ToolRetrySafety } from "../tools/types.js";
+import {
+  createRuntimeEventIdentity,
+  type RuntimeEventContext,
+  type RuntimeEventIdentity,
+  type RuntimeEventSink,
+  type RuntimeHighWater
+} from "./runtimeEvent.js";
 
 export type { SessionContextCheckpoint, SessionContextState, SessionContextUsage, SessionUsage, UsageOperation } from "./metadata.js";
 
@@ -45,6 +52,10 @@ export type { SessionContextCheckpoint, SessionContextState, SessionContextUsage
 export interface ReasoningBlock {
   text: string;
   providerOptions?: Record<string, unknown>;
+}
+
+export interface SessionEventRuntimeMetadata {
+  runtime?: RuntimeEventIdentity;
 }
 
 export type SessionTurnStatus = "completed" | "incomplete" | "blocked" | "cancelled" | "failed" | "aborted";
@@ -59,16 +70,18 @@ export interface SessionTurnStatusEvent {
   type: "turn_status";
   status: SessionTurnStatus;
   stopReason: string;
+  finishReason?: string;
   steps: number;
   summary?: string;
   resumable?: boolean;
   blockedReason?: string;
   requiredAction?: string;
   affectedTodoIds?: string[];
+  runtime?: RuntimeEventIdentity;
   time?: string;
 }
 
-export type SessionEvent =
+type SessionEventPayload =
   // session 事件类型要保持稳定；resume、未来上下文压缩和记忆功能都会依赖这几个基础类型。
   | { type: "user_message"; content: string; attachments?: AttachmentReference[]; skills?: string[]; contextUsage?: SessionContextUsage; contextState?: SessionContextState; preparationUsage?: SessionUsage[]; messageId?: string; parentMessageId?: string; auditOnly?: boolean; time?: string }
   | { type: "assistant_message"; content: string; reasoningContent?: string; reasoningProviderOptions?: Record<string, unknown>; reasoningBlocks?: ReasoningBlock[]; usage?: SessionUsage; relatedUsage?: SessionUsage[]; contextState?: SessionContextState; auditOnly?: boolean; time?: string }
@@ -77,8 +90,11 @@ export type SessionEvent =
   | { type: "tool_result"; tool: string; result: unknown; toolCallId?: string; sequence?: number; relatedUsage?: SessionUsage[]; executionStatus?: ToolExecutionResultStatus; recovered?: boolean; operationId?: string; evidence?: string; auditOnly?: boolean; time?: string }
   | { type: "agent_message"; message: Exclude<AgentMessage, { role: "user" }>; messageId?: string; parentMessageId?: string; time?: string }
   | ({ type: "context_checkpoint"; reason: "threshold" | "overflow" | "manual"; time?: string } & SessionContextCheckpoint)
+  | { type: "model_request"; metrics: ModelRequestMetrics; time?: string }
   | SessionTurnStatusEvent
   | { type: "error"; message: string; detail?: unknown; relatedUsage?: SessionUsage[]; time?: string };
+
+export type SessionEvent = SessionEventPayload & SessionEventRuntimeMetadata;
 
 export class SessionRecorder {
   readonly sessionId: string;
@@ -95,8 +111,17 @@ export class SessionRecorder {
   private readonly existedAtCreation: boolean;
   private lastMessageId: string | undefined;
   private persistenceBarrier: Promise<void> = Promise.resolve();
+  private runtimeContext: RuntimeEventContext | undefined;
+  private runtimeSequence = 0;
+  private runtimeSequenceInitialized = false;
+  private lastRuntimeEvent: RuntimeHighWater | undefined;
 
-  constructor(workspaceRoot: string, sessionId = createSessionId(), resolvedFilePath = sessionFilePath(workspaceRoot, sessionId)) {
+  constructor(
+    workspaceRoot: string,
+    sessionId = createSessionId(),
+    resolvedFilePath = sessionFilePath(workspaceRoot, sessionId),
+    private readonly runtimeEventSink?: RuntimeEventSink
+  ) {
     // sessionId 默认使用 UUIDv7：高位携带毫秒时间戳，既能保持 UUID 格式，也便于按字典序排序。
     this.sessionId = sessionId;
     this.filePath = canonicalSessionFilePath(workspaceRoot, sessionId, resolvedFilePath);
@@ -117,10 +142,24 @@ export class SessionRecorder {
   }
 
   record(event: SessionEvent): SessionEvent {
+    return this.recordInternal(event, this.runtimeContext, true);
+  }
+
+  /** 旁路事实可以显式绑定运行身份，避免延迟 memory/diagnostic 请求继承旧 run。 */
+  recordWithRuntimeContext(event: SessionEvent, runtimeContext?: RuntimeEventContext): SessionEvent {
+    return this.recordInternal(event, runtimeContext, true);
+  }
+
+  private recordInternal(event: SessionEvent, runtimeContext: RuntimeEventContext | undefined, project = true): SessionEvent {
     // 每个事件一行 JSON，便于追加写入，也方便后续按行读取和压缩。
     if (this.closed || this.closing) throw new Error(`Session recorder is already closed: ${this.sessionId}`);
-    const safeEvent = redactSessionEvent(this.linkCanonicalMessage(event));
-    const line = JSON.stringify({ ...safeEvent, time: event.time ?? new Date().toISOString() });
+    this.ensureRuntimeSequence();
+    const linked = this.linkCanonicalMessage(event);
+    const runtime = createRuntimeEventIdentity(this.runtimeSequence + 1, runtimeContext);
+    const safeEvent = redactSessionEvent({ ...linked, runtime });
+    const createdAt = event.time ?? new Date().toISOString();
+    const persistedEvent = { ...safeEvent, time: createdAt } as SessionEvent;
+    const line = JSON.stringify(persistedEvent);
     if (!this.stream) {
       const descriptor = this.descriptor;
       if (descriptor === undefined) throw new Error(`Session recorder has no open descriptor: ${this.sessionId}`);
@@ -139,17 +178,54 @@ export class SessionRecorder {
     }
     this.stream.write(`${line}\n`);
     this.recordedEvents += 1;
-    return safeEvent;
+    this.runtimeSequence = runtime.eventSeq;
+    this.lastRuntimeEvent = { ...runtime };
+    // JSONL 是 canonical fact；SQLite sink 失败时事实已经存在，启动时会由
+    // authority reconciliation 补投影，而不会反过来阻止事实写入。
+    if (project) {
+      this.runtimeEventSink?.appendSessionEvent({
+        sessionId: this.sessionId,
+        runtime,
+        event: persistedEvent,
+        createdAt
+      });
+    }
+    return persistedEvent;
   }
 
   /** 关键协议事件使用有序屏障，确保 JSONL 已交给文件系统后再推进执行状态。 */
-  recordAndFlush(event: SessionEvent): Promise<void> {
+  recordAndFlush(event: SessionEvent): Promise<SessionEvent> {
+    const runtimeContext = this.runtimeContextSnapshot();
+    let recorded: SessionEvent;
     const current = this.persistenceBarrier.then(async () => {
-      this.record(event);
+      recorded = this.recordInternal(event, runtimeContext, false);
       await this.flush();
+      const runtime = recorded.runtime;
+      if (runtime !== undefined) {
+        this.runtimeEventSink?.appendSessionEvent({
+          sessionId: this.sessionId,
+          runtime,
+          event: recorded,
+          createdAt: recorded.time ?? new Date().toISOString()
+        });
+      }
+      return recorded;
     });
-    this.persistenceBarrier = current.catch(() => undefined);
+    this.persistenceBarrier = current.then(() => undefined, () => undefined);
     return current;
+  }
+
+  setRuntimeContext(context: RuntimeEventContext | undefined): void {
+    this.runtimeContext = context ? { ...context } : undefined;
+  }
+
+  runtimeContextSnapshot(): RuntimeEventContext | undefined {
+    return this.runtimeContext ? { ...this.runtimeContext } : undefined;
+  }
+
+  runtimeHighWater(): RuntimeHighWater | undefined {
+    this.ensureRuntimeSequence();
+    return this.lastRuntimeEvent ? { ...this.lastRuntimeEvent } : undefined;
   }
 
   async flush(): Promise<void> {
@@ -209,6 +285,10 @@ export class SessionRecorder {
       }
     }
     this.lastMessageId = lastPersistedMessageId(raw);
+    const lastRuntime = lastPersistedRuntimeEvent(raw);
+    this.runtimeSequence = Math.max(this.runtimeSequence, lastRuntime?.eventSeq ?? 0);
+    this.lastRuntimeEvent = lastRuntime;
+    this.runtimeSequenceInitialized = true;
   }
 
   private linkCanonicalMessage(event: SessionEvent): SessionEvent {
@@ -267,6 +347,16 @@ export class SessionRecorder {
       throw new Error(`Session recorder is not available for direct file access: ${this.sessionId}`);
     }
     return this.descriptor;
+  }
+
+  private ensureRuntimeSequence(): void {
+    if (this.runtimeSequenceInitialized) return;
+    const descriptor = this.openDescriptor();
+    const stat = validateSessionDescriptor(descriptor, this.filePath);
+    const lastRuntime = lastPersistedRuntimeEvent(readDescriptor(descriptor, stat.size));
+    this.runtimeSequence = Math.max(this.runtimeSequence, lastRuntime?.eventSeq ?? 0);
+    this.lastRuntimeEvent = lastRuntime;
+    this.runtimeSequenceInitialized = true;
   }
 }
 
@@ -331,6 +421,9 @@ function redactSessionEvent(event: SessionEvent): SessionEvent {
   if (event.type === "context_checkpoint") {
     return { ...event, summary: redactSecrets(event.summary) };
   }
+  if (event.type === "model_request") {
+    return { ...event, metrics: redactModelRequestMetrics(event.metrics) };
+  }
   if (event.type === "turn_status") {
     return {
       ...event,
@@ -343,6 +436,28 @@ function redactSessionEvent(event: SessionEvent): SessionEvent {
     ...event,
     message: redactSecrets(event.message),
     detail: event.detail === undefined ? undefined : redactSensitiveValue(event.detail)
+  };
+}
+
+function redactModelRequestMetrics(metrics: ModelRequestMetrics): ModelRequestMetrics {
+  return {
+    ...metrics,
+    provider: redactSecrets(metrics.provider),
+    modelId: redactSecrets(metrics.modelId),
+    error: metrics.error === undefined ? undefined : redactSecrets(metrics.error),
+    attempts: metrics.attempts.map((attempt) => ({
+      ...attempt,
+      error: attempt.error === undefined ? undefined : redactSecrets(attempt.error)
+    })),
+    requestContext: metrics.requestContext === undefined
+      ? undefined
+      : {
+        ...metrics.requestContext,
+        sessionId: metrics.requestContext.sessionId === undefined ? undefined : redactSecrets(metrics.requestContext.sessionId),
+        runId: metrics.requestContext.runId === undefined ? undefined : redactSecrets(metrics.requestContext.runId),
+        turnId: metrics.requestContext.turnId === undefined ? undefined : redactSecrets(metrics.requestContext.turnId),
+        relatedToolCallIds: metrics.requestContext.relatedToolCallIds?.map((id) => redactSecrets(id))
+      }
   };
 }
 
@@ -489,6 +604,32 @@ function lastPersistedMessageId(raw: Buffer): string | undefined {
     }
   }
   return undefined;
+}
+
+function lastPersistedRuntimeEvent(raw: Buffer): RuntimeHighWater | undefined {
+  let last: RuntimeHighWater | undefined;
+  for (const line of raw.toString("utf8").split("\n")) {
+    if (!line) continue;
+    try {
+      const parsed = JSON.parse(line) as { runtime?: { eventId?: unknown; eventSeq?: unknown; runId?: unknown; turnId?: unknown } };
+      const runtime = parsed.runtime;
+      if (
+        typeof runtime?.eventId === "string"
+        && Number.isSafeInteger(runtime.eventSeq)
+        && (runtime.eventSeq as number) > 0
+      ) {
+        last = {
+          eventId: runtime.eventId,
+          eventSeq: runtime.eventSeq as number,
+          runId: typeof runtime.runId === "string" ? runtime.runId : undefined,
+          turnId: typeof runtime.turnId === "string" ? runtime.turnId : undefined
+        };
+      }
+    } catch {
+      // 尾部损坏由 repairTailForAppend 处理；这里仅用于初始化追加序号。
+    }
+  }
+  return last;
 }
 
 export function createSessionId(timestampMs = Date.now()): string {
