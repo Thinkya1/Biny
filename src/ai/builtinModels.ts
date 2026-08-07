@@ -1,10 +1,11 @@
 /**
  * 内置模型基线。
  *
- * 这份目录只提供离线可见的常用模型；实时 `/models` 结果和插件目录会在运行时覆盖同 ID
- * 条目，用户配置的模型别名拥有最高优先级。
+ * models.dev 的生成快照提供离线目录；旧基线只补充尚未进入快照的 Biny 专用模型。实时
+ * `/models` 结果和插件目录会在运行时补充缺失字段，用户配置的模型别名拥有最高优先级。
  */
 import { inferReasoningEfforts } from "./capabilities.js";
+import { generatedModelProviderTypes, generatedProviderModels } from "./modelMetadata.js";
 import type { ModelCatalogEntry } from "./types.js";
 
 type BuiltinModelOptions = Partial<Omit<ModelCatalogEntry, "id" | "displayName" | "provider" | "reasoningEfforts">>;
@@ -29,7 +30,7 @@ function model(id: string, displayName = id, options: BuiltinModelOptions = {}):
   };
 }
 
-export const builtinProviderModels: Record<string, ModelCatalogEntry[]> = {
+const legacyBuiltinProviderModels: Record<string, ModelCatalogEntry[]> = {
   deepseek: [
     model("deepseek-v4-flash", "DeepSeek V4 Flash", {
       contextWindow: 1_000_000,
@@ -81,3 +82,17 @@ export const builtinProviderModels: Record<string, ModelCatalogEntry[]> = {
   "lm-studio": [],
   localai: []
 };
+
+/** models.dev 是常规模型的更新来源，旧基线只补充尚未进入快照的 Biny 专用模型。 */
+export const builtinProviderModels: Record<string, ModelCatalogEntry[]> = Object.fromEntries(
+  [...new Set([...Object.keys(legacyBuiltinProviderModels), ...generatedModelProviderTypes])]
+    .map((providerType) => [providerType, mergeBuiltinModels(generatedProviderModels(providerType), legacyBuiltinProviderModels[providerType] ?? [])])
+);
+
+function mergeBuiltinModels(generated: ModelCatalogEntry[], legacy: ModelCatalogEntry[]): ModelCatalogEntry[] {
+  const models = new Map(generated.map((entry) => [entry.id, entry]));
+  for (const entry of legacy) {
+    if (!models.has(entry.id)) models.set(entry.id, entry);
+  }
+  return [...models.values()];
+}

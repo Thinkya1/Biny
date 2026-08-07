@@ -2,6 +2,7 @@ import { createFileConfigStore, type AgentConfigStore } from "../config/store.js
 import {
   configSchema,
   type AgentConfig,
+  type ModelPricing,
   type ReasoningEffort
 } from "../config/schema.js";
 import {
@@ -30,6 +31,7 @@ export interface ModelRuntimeInfo {
   thinking: ThinkingSelection;
   contextWindow?: number;
   maxInputTokens?: number;
+  pricing?: ModelPricing;
 }
 
 /** Keeps one validated native Biny model while the selected provider changes. */
@@ -212,6 +214,7 @@ function modelRuntimeInfoFromRuntime(config: AgentConfig, runtime: ModelRuntime)
     reasoningLabel: thinking === "off" ? "Off" : formatReasoningLabel(thinking),
     thinking,
     contextWindow: resolved.model.contextWindow,
+    pricing: resolved.model.pricing,
     maxInputTokens: modelContextBudget(
       resolved.model,
       config.context.maxInputTokens,

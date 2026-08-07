@@ -399,9 +399,9 @@ async function testProviderRuntimeMetadata(): Promise<void> {
     }
   });
   const providers = new ProviderRegistry(config);
-  assert.deepEqual(providers.forModel("flash-alias").model.reasoning?.efforts, ["high", "max"]);
+  assert.deepEqual(providers.forModel("flash-alias").model.reasoning?.efforts, ["low", "high", "max"]);
   assert.deepEqual(providers.forModel("pro-alias").model.reasoning?.efforts, ["high", "max"]);
-  assert.equal(providers.forModel("gemini-flash").model.capabilities?.reasoning, false);
+  assert.equal(providers.forModel("gemini-flash").model.capabilities?.reasoning, true);
   assert.equal(providers.forModel("unknown").model.capabilities?.reasoning, false);
   assert.equal(providers.forModel("unknown").model.thinkingLevelMap, undefined);
   assert.equal(providers.createModelSettings("unknown").providerOptions, undefined);
@@ -442,7 +442,7 @@ async function testProviderRuntimeMetadata(): Promise<void> {
     capabilities: { reasoning: true },
     reasoningEfforts: ["high", "max"]
   }]]]);
-  assert.equal(staleGeminiCatalog.forModel("gemini-flash").model.capabilities?.reasoning, false);
+  assert.equal(staleGeminiCatalog.forModel("gemini-flash").model.capabilities?.reasoning, true);
 
   const catalogRuntime = new ProviderRegistry(config, [["openai", [{
     id: "gpt-5.2",
@@ -455,9 +455,9 @@ async function testProviderRuntimeMetadata(): Promise<void> {
     reasoningEfforts: ["high", "max"]
   }]]]);
   const catalogResolved = catalogRuntime.forModel("gpt-alias").model;
-  assert.equal(catalogResolved.contextWindow, 128_000);
-  assert.equal(catalogResolved.maxInputTokens, 120_000);
-  assert.equal(catalogResolved.maxOutputTokens, 16_384);
+  assert.equal(catalogResolved.contextWindow, 400_000);
+  assert.equal(catalogResolved.maxInputTokens, 272_000);
+  assert.equal(catalogResolved.maxOutputTokens, 128_000);
   const catalogChoice = new ModelRuntime(config, [["openai", [{
     id: "gpt-5.2",
     displayName: "GPT-5.2 (目录)",
@@ -468,8 +468,8 @@ async function testProviderRuntimeMetadata(): Promise<void> {
     capabilities: { reasoning: true },
     reasoningEfforts: ["high", "max"]
   }]]]).listModels().find((choice) => choice.alias === "gpt-alias");
-  assert.equal(catalogChoice?.maxInputTokens, 120_000);
-  assert.ok((catalogChoice?.inputBudgetTokens ?? 0) < 120_000);
+  assert.equal(catalogChoice?.maxInputTokens, 272_000);
+  assert.ok((catalogChoice?.inputBudgetTokens ?? 0) < 400_000);
 
   const openaiSettings = providers.require("openai").createModelSettings({ ...config, defaultModel: "gpt-alias", thinking: { enabled: true, effort: "high" } }, config.models["gpt-alias"]!);
   assert.deepEqual(openaiSettings.providerOptions, { openai: { reasoningEffort: "high" } });

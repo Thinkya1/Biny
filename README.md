@@ -82,6 +82,17 @@ harbor run \
 }
 ```
 
+模型目录由仓库内的 `models.dev` 快照提供，不需要为每个模型手写 `models` 条目。更新快照时运行：
+
+```bash
+pnpm sync:model-metadata
+```
+
+脚本默认读取 `https://models.dev/api.json`，生成 `src/ai/modelMetadata.generated.ts`；也可以用
+`--input <json-file>` 做离线更新。快照只包含模型名称、能力、上下文限制和价格，不包含 provider 的
+API 地址、SDK、环境变量或密钥。Provider endpoint、协议和凭据仍由 `~/.biny/config.json` 中的
+`providers` 控制；上面的 `coder` 只是当前默认模型别名，模型选择器会同时展示该 provider 的快照目录。
+
 设置 `BINY_AGENT_DIR` 可将配置和运行数据切换到独立目录。
 
 ## 数据与会话

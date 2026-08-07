@@ -4,7 +4,7 @@
  * provider 定义、模型能力、上下文预算和模型目录条目的形状都在这里，`src/ai` 内各文件
  * 以及调用方都以这些类型为契约。
  */
-import type { ModelApiBackend, ModelCompatibility, ModelProvider, ProviderConfig, ReasoningEffort, ThinkingLevelMap } from "../config/schema.js";
+import type { ModelApiBackend, ModelCompatibility, ModelPricing, ModelProvider, ProviderConfig, ReasoningEffort, ThinkingLevelMap } from "../config/schema.js";
 
 export type AiProtocol = "anthropic" | "openai-compatible";
 export type AiAuthMode = "api-key" | "oauth-bearer";
@@ -83,6 +83,7 @@ export interface ModelCatalogEntry {
   id: string;
   displayName: string;
   provider: string;
+  description?: string;
   contextWindow: number | undefined;
   maxInputTokens?: number;
   maxOutputTokens: number | undefined;
@@ -94,6 +95,7 @@ export interface ModelCatalogEntry {
   baseUrl?: string;
   headers?: Record<string, string>;
   compatibility?: ModelCompatibility;
+  pricing?: ModelPricing;
 }
 
 export interface CatalogProviderRequest {

@@ -7,6 +7,7 @@
 import type { AgentModel, ModelStreamContext, ModelStreamEvent, ModelStreamOptions } from "../agent/core/types.js";
 import { modelCapabilities, modelReasoningConfig, modelThinkingLevelMap, nativeReasoningEffort, normalizeModelMetadata, reasoningBudgetTokens, thinkingLevelMapForModel } from "../ai/capabilities.js";
 import { fetchModelCatalogSnapshot } from "../ai/modelCatalog.js";
+import { lookupModelMetadata, type ModelMetadata } from "../ai/modelMetadata.js";
 import { providerDefinition, providerProtocol } from "../ai/provider.js";
 import type { ModelCatalogEntry, ProviderDefinition } from "../ai/types.js";
 import type { AgentConfig, ModelAliasConfig, ModelApiBackend, ModelCompatibility, ProviderConfig } from "../config/schema.js";
@@ -124,8 +125,13 @@ export class ConfiguredProviderRuntime implements ProviderRuntime {
   resolveModel(model: ModelAliasConfig): ModelAliasConfig {
     const catalog = this.mergedCatalog().find((entry) => entry.id === model.model);
     const catalogModel = catalog ? catalogEntryToModel(catalog) : undefined;
+    const generated = lookupModelMetadata(this.config.type, model.model);
+    const generatedModel = generated ? metadataToModel(this.id, model.model, generated) : undefined;
+    const catalogBase = catalogModel && generatedModel
+      ? mergeModelMetadata(generatedModel, catalogModel)
+      : catalogModel ?? generatedModel;
     return normalizeModelMetadata(
-      catalogModel ? mergeModelMetadata(catalogModel, model) : model,
+      catalogBase ? mergeModelMetadata(catalogBase, model) : model,
       this.definition.modelDefaults
     );
   }
@@ -454,6 +460,7 @@ function catalogEntryToModel(entry: ModelCatalogEntry): ModelAliasConfig {
     provider: entry.provider,
     model: entry.id,
     displayName: entry.displayName,
+    description: entry.description,
     capabilities: entry.capabilities,
     contextWindow: entry.contextWindow,
     maxInputTokens: entry.maxInputTokens,
@@ -463,7 +470,26 @@ function catalogEntryToModel(entry: ModelCatalogEntry): ModelAliasConfig {
     baseUrl: entry.baseUrl,
     headers: entry.headers,
     compatibility: entry.compatibility,
-    thinkingLevelMap
+    thinkingLevelMap,
+    pricing: entry.pricing
+  };
+}
+
+function metadataToModel(provider: string, modelId: string, metadata: ModelMetadata): ModelAliasConfig {
+  const thinkingLevelMap = metadata.reasoningEfforts.length
+    ? thinkingLevelMapForModel(modelId, true, metadata.reasoningEfforts)
+    : undefined;
+  return {
+    provider,
+    model: modelId,
+    displayName: metadata.displayName,
+    description: metadata.description,
+    capabilities: metadata.capabilities,
+    contextWindow: metadata.contextWindow,
+    maxInputTokens: metadata.maxInputTokens,
+    maxOutputTokens: metadata.maxOutputTokens,
+    thinkingLevelMap,
+    pricing: metadata.pricing
   };
 }
 
@@ -472,6 +498,7 @@ function liveCatalogMetadata(entry: ModelCatalogEntry, provider: string): ModelC
     id: entry.id,
     displayName: entry.displayName,
     provider,
+    description: entry.description,
     contextWindow: entry.contextWindow,
     maxInputTokens: entry.maxInputTokens,
     maxOutputTokens: entry.maxOutputTokens,
@@ -482,7 +509,8 @@ function liveCatalogMetadata(entry: ModelCatalogEntry, provider: string): ModelC
     apiBackend: undefined,
     baseUrl: undefined,
     headers: undefined,
-    compatibility: undefined
+    compatibility: undefined,
+    pricing: entry.pricing ? { ...entry.pricing } : undefined
   };
 }
 
@@ -491,6 +519,7 @@ function mergeCatalogMetadata(base: ModelCatalogEntry, overlay: ModelCatalogEntr
     ...overlay,
     ...base,
     displayName: base.displayName || overlay.displayName,
+    description: base.description ?? overlay.description,
     contextWindow: base.contextWindow ?? overlay.contextWindow,
     maxInputTokens: base.maxInputTokens ?? overlay.maxInputTokens,
     maxOutputTokens: base.maxOutputTokens ?? overlay.maxOutputTokens,
@@ -501,7 +530,8 @@ function mergeCatalogMetadata(base: ModelCatalogEntry, overlay: ModelCatalogEntr
     apiBackend: base.apiBackend ?? overlay.apiBackend,
     baseUrl: base.baseUrl ?? overlay.baseUrl,
     headers: mergeHeaders(base.headers, overlay.headers),
-    compatibility: mergeCompatibility(overlay.compatibility, base.compatibility)
+    compatibility: mergeCompatibility(overlay.compatibility, base.compatibility),
+    pricing: mergePricing(base.pricing, overlay.pricing)
   };
 }
 
@@ -524,6 +554,19 @@ function mergeModelMetadata(base: ModelAliasConfig, override: ModelAliasConfig):
     headers: mergeHeaders(override.headers, base.headers),
     compatibility: mergeCompatibility(base.compatibility, override.compatibility),
     pricing: override.pricing ?? base.pricing
+  };
+}
+
+function mergePricing(
+  base: ModelCatalogEntry["pricing"],
+  overlay: ModelCatalogEntry["pricing"]
+): ModelCatalogEntry["pricing"] {
+  if (!base && !overlay) return undefined;
+  return {
+    inputPerMillionTokens: base?.inputPerMillionTokens ?? overlay?.inputPerMillionTokens,
+    outputPerMillionTokens: base?.outputPerMillionTokens ?? overlay?.outputPerMillionTokens,
+    cacheReadPerMillionTokens: base?.cacheReadPerMillionTokens ?? overlay?.cacheReadPerMillionTokens,
+    cacheWritePerMillionTokens: base?.cacheWritePerMillionTokens ?? overlay?.cacheWritePerMillionTokens
   };
 }
 

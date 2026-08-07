@@ -42,6 +42,7 @@ export interface ModelChoice {
   apiBackend?: ModelApiBackend;
   baseUrl?: string;
   compatibility?: ModelCompatibility;
+  pricing?: ModelAliasConfig["pricing"];
   available: boolean;
   source: ModelSource;
 }
@@ -188,6 +189,7 @@ export class ModelRegistry {
       apiBackend: normalized.apiBackend,
       baseUrl: normalized.baseUrl ?? provider?.baseUrl ?? providerRuntime?.definition.baseUrl ?? (provider ? providerDefinition(provider.type).baseUrl : undefined),
       compatibility: normalized.compatibility ?? provider?.compatibility,
+      pricing: normalized.pricing,
       available: providerRuntime?.isConfigured(normalized) ?? false,
       source
     };
@@ -213,6 +215,7 @@ function catalogEntryToModel(entry: ModelCatalogEntry): ModelAliasConfig {
     provider: entry.provider,
     model: entry.id,
     displayName: entry.displayName,
+    description: entry.description,
     capabilities: entry.capabilities,
     contextWindow: entry.contextWindow,
     maxInputTokens: entry.maxInputTokens,
@@ -222,6 +225,7 @@ function catalogEntryToModel(entry: ModelCatalogEntry): ModelAliasConfig {
     baseUrl: entry.baseUrl,
     headers: entry.headers,
     compatibility: entry.compatibility,
-    thinkingLevelMap: levelMap
+    thinkingLevelMap: levelMap,
+    pricing: entry.pricing
   };
 }

@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { inferReasoningEfforts, modelCapabilities, modelContextBudget, modelReasoningConfig, modelThinkingLevelMap, nativeReasoningEffort, reasoningBudgetTokens, thinkingLevelMapForModel } from "../src/ai/capabilities.js";
 import { parseModelCatalog } from "../src/ai/modelCatalog.js";
+import { lookupModelMetadata } from "../src/ai/modelMetadata.js";
 import { createRetryFetch } from "../src/ai/retry.js";
 import { configSchema, defaultConfig } from "../src/config/schema.js";
 import { ModelRegistry } from "../src/llm/ModelRegistry.js";
 import { ModelResolver } from "../src/llm/ModelResolver.js";
+import { ModelRuntime } from "../src/llm/ModelRuntime.js";
 import { ProviderRegistry } from "../src/llm/ProviderRuntime.js";
 
 const config = configSchema.parse({
@@ -53,8 +55,8 @@ const deepseekUnknownAliasConfig = configSchema.parse({
 });
 const deepseekRuntime = new ProviderRegistry(deepseekUnknownAliasConfig);
 const normalizedFlash = deepseekRuntime.forModel("flash-alias").model;
-assert.deepEqual(modelReasoningConfig(normalizedFlash)?.efforts, ["high", "max"]);
-assert.deepEqual(modelThinkingLevelMap(normalizedFlash), { off: "none", high: "high", max: "max" });
+assert.deepEqual(modelReasoningConfig(normalizedFlash)?.efforts, ["low", "high", "max"]);
+assert.deepEqual(modelThinkingLevelMap(normalizedFlash), { off: "none", low: "low", high: "high", max: "max" });
 assert.equal(modelCapabilities(normalizedFlash).reasoningStream, true);
 assert.equal(normalizedFlash.contextWindow, 1_000_000);
 
@@ -71,7 +73,21 @@ const geminiFlashConfig = configSchema.parse({
   models: { "gemini-flash": { provider: "gemini", model: "gemini-3.5-flash" } }
 });
 const normalizedGeminiFlash = new ProviderRegistry(geminiFlashConfig).forModel("gemini-flash").model;
-assert.equal(modelCapabilities(normalizedGeminiFlash).reasoning, false);
+assert.equal(modelCapabilities(normalizedGeminiFlash).reasoning, true);
+
+const generatedConfig = configSchema.parse({
+  ...defaultConfig,
+  defaultModel: "generated-coder",
+  providers: { deepseek: { type: "deepseek", apiKey: "test-key" } },
+  models: { "generated-coder": { provider: "deepseek", model: "deepseek-v4-pro" } }
+});
+const generatedRuntime = new ModelRuntime(generatedConfig);
+const generatedChoice = generatedRuntime.listModels().find((choice) => choice.alias === "deepseek/deepseek-v4-flash");
+assert.equal(generatedChoice?.source, "catalog");
+assert.ok(generatedChoice?.description);
+assert.equal(typeof generatedChoice?.pricing?.inputPerMillionTokens, "number");
+assert.equal(generatedRuntime.resolve("deepseek/deepseek-v4-flash").model.baseUrl, undefined);
+assert.equal(typeof lookupModelMetadata("deepseek", "deepseek-v4-flash")?.contextWindow, "number");
 
 const unknownModelConfig = configSchema.parse({
   ...defaultConfig,

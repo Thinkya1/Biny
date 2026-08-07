@@ -1786,12 +1786,13 @@ export class AgentSession {
     const info = this.options.modelManager?.getInfo() ?? modelRuntimeInfo(this.options.config);
     const resolvedAlias = modelAlias ?? info.modelAlias;
     const resolved = this.options.config.models[resolvedAlias];
+    const catalogPricing = this.options.modelManager?.listModels().find((choice) => choice.alias === resolvedAlias)?.pricing;
     const provider = resolved ? this.options.config.providers[resolved.provider] : undefined;
     const modelInfo: UsageModelInfo = {
       modelAlias: resolvedAlias,
       provider: provider?.type ?? info.provider,
       model: resolved?.model ?? (model ? modelIdentifier(model) : info.modelLabel),
-      pricing: resolved?.pricing
+      pricing: resolved?.pricing ?? catalogPricing ?? info.pricing
     };
     const record = createSessionUsage(usage, operation, modelInfo);
     this.usageRecords.push(record);
