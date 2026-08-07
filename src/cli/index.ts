@@ -11,13 +11,34 @@ import { Command } from "commander";
 import { initCommand } from "./commands/init.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { runCommand, type RunCommandOptions } from "./commands/run.js";
-import { chatCommand, type ChatCommandOptions } from "./commands/chat.js";
+import { chatCommand } from "./commands/chat.js";
 import { evalCompareCommand, evalRunCommand } from "./commands/evals.js";
 import { resumeCommand } from "./commands/resume.js";
 import { sessionsCommand, type SessionsCommandOptions } from "./commands/sessions.js";
 import { planCommand } from "./commands/plan.js";
 import { tuiCommand } from "./commands/tui.js";
 import { runtimeHostCommand } from "./commands/runtimeHost.js";
+import {
+  automationCreateCommand,
+  automationDeleteCommand,
+  automationListCommand,
+  automationPauseCommand,
+  automationResumeCommand,
+  automationRunCommand,
+  daemonInstallCommand,
+  daemonRunCommand,
+  daemonStatusCommand,
+  daemonUninstallCommand,
+  goalActionCommand,
+  goalCreateCommand,
+  graphActionCommand,
+  graphCreateCommand,
+  taskActionCommand,
+  taskCreateCommand,
+  taskEventsCommand,
+  taskGetCommand,
+  taskListCommand
+} from "./commands/runtimeManagement.js";
 
 const program = new Command();
 // CLI 的工作区以用户执行 biny 时的当前目录为准。
@@ -35,10 +56,8 @@ program.command("init").description("Initialize config and .biny directories").a
 program.command("doctor").description("Check local environment").action(wrap(() => doctorCommand(workspaceRoot)));
 program
   .command("chat")
-  .description("Start interactive chat")
-  .option("-c, --continue", "continue the latest recorded session")
-  .option("-s, --session <id>", "continue a specific session id or .jsonl path")
-  .action((options: ChatCommandOptions) => wrap(() => chatCommand(workspaceRoot, options))());
+  .description("Start a new interactive chat")
+  .action(() => wrap(() => chatCommand(workspaceRoot, cliVersion))());
 program.command("tui").description("Start terminal UI mode").action(wrap(() => tuiCommand(workspaceRoot, cliVersion)));
 program
   .command("runtime-host")
@@ -51,6 +70,71 @@ program
   .option("--resume-interrupted", "resume the latest interrupted turn")
   .allowUnknownOption()
   .action(() => wrap(runtimeHostCommand)());
+const daemon = program.command("daemon").description("Manage the local resident Runtime Host");
+daemon.command("install").description("Install and load a user LaunchAgent").action(wrap(() => daemonInstallCommand(workspaceRoot)));
+daemon.command("uninstall").description("Unload and remove the user LaunchAgent").action(wrap(() => daemonUninstallCommand(workspaceRoot)));
+daemon.command("status").description("Show LaunchAgent and Runtime Host status").action(wrap(() => daemonStatusCommand(workspaceRoot)));
+daemon.command("run").description("Run the Runtime Host in the foreground").action(wrap(() => daemonRunCommand(workspaceRoot)));
+
+const automation = program.command("automation").description("Manage durable local automations");
+automation.command("list").option("--json", "print JSON").action((options: { json?: boolean }) => wrap(() => automationListCommand(workspaceRoot, options))());
+automation
+  .command("create")
+  .argument("<name>", "automation name")
+  .requiredOption("--prompt <text>", "prompt to execute")
+  .requiredOption("--trigger <type>", "heartbeat, cron, interval, or once")
+  .option("--cron <expression>", "five-field cron expression")
+  .option("--interval-ms <milliseconds>", "interval in milliseconds", parsePositiveInteger)
+  .option("--at <timestamp>", "ISO timestamp for once")
+  .option("--jitter-ms <milliseconds>", "maximum schedule jitter", parseNonNegativeInteger)
+  .option("--session <id>", "heartbeat target session")
+  .option("--mode <mode>", "chat or plan", "chat")
+  .option("--max-fires <count>", "maximum fire count", parsePositiveInteger)
+  .option("--expires-at <timestamp>", "ISO expiry timestamp")
+  .option("--json", "print JSON")
+  .action((name: string, options: { prompt: string; trigger: string; cron?: string; intervalMs?: number; at?: string; jitterMs?: number; session?: string; mode: "chat" | "plan"; maxFires?: number; expiresAt?: string; json?: boolean }) => wrap(() => automationCreateCommand(workspaceRoot, {
+    name,
+    triggerType: options.trigger as "heartbeat" | "cron" | "interval" | "once",
+    schedule: { cron: options.cron, intervalMs: options.intervalMs, at: options.at, jitterMs: options.jitterMs },
+    executionTemplate: { prompt: options.prompt, sessionId: options.session, mode: options.mode },
+    maxFires: options.maxFires,
+    expiresAt: options.expiresAt
+  }, options))());
+for (const [name, action] of [["pause", automationPauseCommand], ["resume", automationResumeCommand], ["run", automationRunCommand], ["delete", automationDeleteCommand]] as const) {
+  automation.command(name).argument("<automationId>", "automation id").option("--json", "print JSON").action((automationId: string, options: { json?: boolean }) => wrap(() => action(workspaceRoot, automationId, options))());
+}
+
+const task = program.command("task").description("Manage durable TaskRuns");
+task
+  .command("create")
+  .argument("<task...>", "task text")
+  .option("--session <id>", "session id")
+  .option("--parent-run <id>", "parent AgentRun id")
+  .option("--json", "print JSON")
+  .action((input: string[], options: { session?: string; parentRun?: string; json?: boolean }) => wrap(() => taskCreateCommand(workspaceRoot, input.join(" "), { json: options.json, sessionId: options.session, parentRunId: options.parentRun }))());
+for (const [name, action] of [["start", "start"], ["cancel", "cancel"], ["approve", "approve"], ["resume", "resume"], ["retry", "retry"]] as const) {
+  task
+    .command(name)
+    .argument("<taskRunId>", "TaskRun id")
+    .option("--reason <text>", "cancellation reason")
+    .option("--json", "print JSON")
+    .action((taskRunId: string, options: { reason?: string; json?: boolean }) => wrap(() => taskActionCommand(workspaceRoot, action, taskRunId, options))());
+}
+task.command("get").argument("<taskRunId>", "TaskRun id").option("--json", "print JSON").action((taskRunId: string, options: { json?: boolean }) => wrap(() => taskGetCommand(workspaceRoot, taskRunId, options))());
+task.command("list").option("--status <status>", "TaskRun status").option("--limit <count>", "maximum rows", parsePositiveInteger).option("--json", "print JSON").action((options: { status?: string; limit?: number; json?: boolean }) => wrap(() => taskListCommand(workspaceRoot, options))());
+task.command("events").argument("<taskRunId>", "TaskRun id").option("--limit <count>", "maximum events", parsePositiveInteger).option("--json", "print JSON").action((taskRunId: string, options: { limit?: number; json?: boolean }) => wrap(() => taskEventsCommand(workspaceRoot, taskRunId, options))());
+
+const goal = program.command("goal").description("Manage durable goals");
+goal.command("create").argument("<title>", "goal title").option("--payload <json>", "JSON payload").option("--goal-id <id>", "explicit goal id").option("--json", "print JSON").action((title: string, options: { payload?: string; goalId?: string; json?: boolean }) => wrap(() => goalCreateCommand(workspaceRoot, title, options))());
+for (const [name, action] of [["get", "get"], ["pause", "pause"], ["resume", "resume"], ["cancel", "cancel"]] as const) {
+  goal.command(name).argument("<goalId>", "goal id").option("--json", "print JSON").action((goalId: string, options: { json?: boolean }) => wrap(() => goalActionCommand(workspaceRoot, action, goalId, options))());
+}
+
+const graph = program.command("graph").description("Manage durable Agent Graphs");
+graph.command("create").requiredOption("--nodes <json>", "JSON node array").option("--goal-id <id>", "goal id").option("--graph-id <id>", "explicit graph id").option("--payload <json>", "JSON payload").option("--json", "print JSON").action((options: { nodes: string; goalId?: string; graphId?: string; payload?: string; json?: boolean }) => wrap(() => graphCreateCommand(workspaceRoot, options))());
+for (const [name, action] of [["start", "start"], ["pause", "pause"], ["resume", "resume"], ["cancel", "cancel"], ["inspect", "inspect"], ["events", "events"]] as const) {
+  graph.command(name).argument("<graphId>", "graph id").option("--json", "print JSON").action((graphId: string, options: { json?: boolean }) => wrap(() => graphActionCommand(workspaceRoot, action, graphId, options))());
+}
 program
   .command("sessions")
   .description("List recorded sessions")
@@ -97,9 +181,9 @@ evals
 
 program
   .command("resume")
-  .description("Print history from an existing session")
-  .argument("[session]", "session id, .jsonl path, or omit for latest")
-  .action((session: string | undefined) => wrap(() => resumeCommand(workspaceRoot, session))());
+  .description("Resume an existing session in the TUI")
+  .argument("[session]", "session id or .jsonl path; omit to choose from the session picker")
+  .action((session: string | undefined) => wrap(() => resumeCommand(workspaceRoot, cliVersion, session))());
 
 
 if (cliArgv.length <= 2) {
@@ -124,5 +208,11 @@ function wrap(fn: () => Promise<void>): () => Promise<void> {
 function parsePositiveInteger(value: string): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`Expected a positive integer, got: ${value}`);
+  return parsed;
+}
+
+function parseNonNegativeInteger(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`Expected a non-negative integer, got: ${value}`);
   return parsed;
 }

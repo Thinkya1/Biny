@@ -6,7 +6,6 @@
 import { createInteractiveAgentHost, type InteractiveAgentHost, type InteractiveRuntimeHandle } from "../../runtime/InteractiveAgentRuntime.js";
 import {
   connectOrSpawnRuntimeHost,
-  findLatestInterruptedSession,
   startRuntimeHost,
   type RuntimeHostFactory,
   type RuntimeHostServer
@@ -18,7 +17,7 @@ export async function planCommand(workspaceRoot: string, task: string): Promise<
   try {
     attached = await connectOrSpawnRuntimeHost(workspaceRoot, {
       workspaceRoot,
-      resumeInterrupted: true,
+      resumeInterrupted: false,
       surface: "cli",
       clientId: `plan-${process.pid}`
     });
@@ -30,24 +29,23 @@ export async function planCommand(workspaceRoot: string, task: string): Promise<
   if (attached) {
     runtime = attached;
   } else {
-    const selectedSession = await findLatestInterruptedSession(workspaceRoot);
     const createLocalRuntime: RuntimeHostFactory = async (sessionId?: string): Promise<InteractiveAgentHost> => {
       const local = await createInteractiveAgentHost(workspaceRoot);
       if (sessionId !== undefined) await local.runtime.resumeSession(sessionId);
       return local;
     };
-    const local = await createLocalRuntime(selectedSession);
+    const local = await createLocalRuntime();
     runtime = local.runtime;
     try {
       host = await startRuntimeHost(workspaceRoot, runtime, local.commands, {
         createRuntime: createLocalRuntime,
-        resumeInterrupted: true
+        resumeInterrupted: false
       });
     } catch (error) {
       await runtime.close();
       const retry = await connectOrSpawnRuntimeHost(workspaceRoot, {
         workspaceRoot,
-        resumeInterrupted: true,
+        resumeInterrupted: false,
         surface: "cli",
         clientId: `plan-${process.pid}`
       });

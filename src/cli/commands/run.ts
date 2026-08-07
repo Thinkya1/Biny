@@ -14,6 +14,7 @@ import { SessionLeaseStore, type SessionLease } from "../../runtime/SessionLease
 import { connectRuntimeHost, RuntimeHostClient } from "../../runtime/RuntimeHost.js";
 import { runtimeIsBusy } from "../../runtime/agentEvents.js";
 import type { UsageSummary } from "../../session/metadata.js";
+import type { ModelRequestSummary } from "../../observability/modelRequests.js";
 import { withCliAbortSignal } from "../sigint.js";
 
 export interface RunCommandOptions {
@@ -42,6 +43,7 @@ export interface RunCommandResult {
   provider: string;
   model: string;
   usage: UsageSummary;
+  modelRequests: ModelRequestSummary;
 }
 
 export async function runCommand(workspaceRoot: string, input: string, options: RunCommandOptions = {}): Promise<RunCommandResult> {
@@ -79,7 +81,8 @@ export async function runCommand(workspaceRoot: string, input: string, options: 
       modelAlias: info.modelAlias,
       provider: info.provider,
       model: info.modelLabel,
-      usage: runtime.agent.usageSummary()
+      usage: runtime.agent.usageSummary(),
+      modelRequests: runtime.agent.modelRequestSummary()
     };
     if (!options.json) {
       if (result.turn.output) console.log(result.turn.output);
@@ -122,7 +125,8 @@ async function runAttachedCommand(
       }
     });
     const info = runtime.getSnapshot().info;
-    const usage = (await runtime.usage()).summary as UsageSummary;
+    const usageReport = await runtime.usage();
+    const usage = usageReport.summary as UsageSummary;
     const result: RunCommandResult = {
       status: turn.status,
       stopReason: turn.stopReason,
@@ -133,7 +137,15 @@ async function runAttachedCommand(
       modelAlias: info.modelAlias,
       provider: info.provider,
       model: info.modelLabel,
-      usage
+      usage,
+      modelRequests: usageReport.modelRequests as ModelRequestSummary ?? {
+        calls: 0,
+        succeeded: 0,
+        failed: 0,
+        totalAttempts: 0,
+        retries: 0,
+        totalDurationMs: 0
+      }
     };
     if (!options.json) {
       if (turn.output) console.log(turn.output);
