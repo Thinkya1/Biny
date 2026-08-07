@@ -15,6 +15,7 @@
 - **模型与 Provider** —— 支持主流模型服务、OpenAI-compatible / Anthropic-compatible 网关和 Ollama；支持流式输出、推理档位和用量统计。
 - **工作区工具** —— 文件读写与补丁、代码搜索、Git、Shell、受管进程、联网搜索/抓取和 Todo。
 - **安全与恢复** —— 统一权限确认、可选的 macOS 工作区沙箱、Git checkpoint/undo；异常中断后可恢复 Session，无法确认副作用的操作不会自动重试。
+- **后台运行** —— Runtime Host 通过本地 SQLite authority 管理 AgentRun、TaskRun、Automation、Goal/Graph 和 Capability 状态；Session/Agent 回合事实仍以 JSONL 为 canonical source，SQLite 中对应的 session event 只是可重建投影。任务可在 Host 重启后继续查询；只有显式恢复或已持久化的 Automation/Graph 唤醒才会再次创建运行。
 - **扩展能力** ——
   - Skill：已支持全局/项目目录扫描、显式调用和按需读取资源；生态兼容与复杂编排仍在完善。
   - MCP：已支持配置并连接启用的 stdio/http server、发现并调用工具；配置体验、跨服务兼容和异常恢复仍在完善。
@@ -39,7 +40,7 @@ export DEEPSEEK_API_KEY="你的 key"
 pnpm dev
 ```
 
-单次任务：`biny run "总结当前项目并指出最重要的风险"`。`biny chat` 与直接运行 `biny` 都打开 TUI，完整命令见 `biny --help`。
+单次任务：`biny run "总结当前项目并指出最重要的风险"`。`biny chat`、`biny tui` 与直接运行 `biny` 都进入新的交互会话；它们不会自动加载上一次的聊天。需要恢复历史时使用 `biny resume` 选择会话，或使用 `biny resume <session-id>` 直接打开指定会话。TUI 内的 `/resume` 同样必须由用户明确选择，`/new` 创建新的空白聊天，`/app` 才会把当前会话交给 Biny Desktop。
 
 ### Harbor/Pier 评测
 
@@ -85,15 +86,37 @@ harbor run \
 
 ## 数据与会话
 
-会话和 Memory 按项目保存在 `~/.biny/agent/`，附件与工具结果归档在项目 `.biny/`。会话正文仍是 JSONL；分支关系与标题、归档、未读等列表元数据保存在同项目的 catalog，运行状态保存在 run ledger，在途回合断点保存在 turnStore。`biny resume latest` 可恢复最近会话，Desktop 的“继续运行”会沿用断点和已完成工具步骤。
+会话和 Memory 按项目保存在 `~/.biny/agent/`，附件与工具结果归档在项目 `.biny/`。对 Session/Agent 回合而言，session JSONL 是 canonical runtime facts：新事件带有唯一 `eventId`、session 内连续的 `eventSeq`，以及本次执行的 `runId` 和任务级 `turnId`；旧 session 缺少这些字段时仍按历史事实读取。`.biny/runtime.sqlite` 是后台状态 authority，同时保存可从 JSONL 重建的 session event projection；TaskRun、Automation、Goal/Graph、Capability 的 event 与 projection 在同一 SQLite 事务内提交。catalog、run ledger 和 TurnStore 分别保存列表/运行状态投影与可恢复 checkpoint。`biny resume latest` 只有在用户明确执行该命令时才会校验 checkpoint 与 runtime high-water，并为 continuation 创建新的 `runId`、复用原 `turnId`；副作用不确定的工具只进入 `unknown/blocked`，不会自动重试。终态顺序是 checkpoint、canonical `turn_status`、run ledger、UI/Host 事件；终态事实已落盘但 ledger 投影失败时，下次启动会从 JSONL 修复。
+
+模型请求也会以不含 prompt/response 正文的 `model_request` 事件写入 session，并关联 `sessionId`、`runId`、`turnId`、step、工具调用 id、首事件/首输出延迟、重试、provider usage 和结构化错误分类。`/status` 展示 provider 请求汇总以及本地输入 token 估算与 provider 实际值的对照；Runtime 事件流和 JSON 接口可供宿主或外部诊断读取。Biny 不提供用户可见的 `/trace` 命令，避免把底层事件明细变成另一套交互协议。
 
 `biny sessions` 默认列出第一页；需要机器读取或继续翻页时使用 `--json`、`--limit <count>` 和返回的 `--cursor <cursor>`，`--parent <session-id>` 可只查看某个会话的直接分支。Desktop 侧栏首屏加载根会话，展开父会话时再按页加载子节点。Desktop、TUI 和 CLI 使用同一份历史；复制、编辑重发和 fork 会保留父会话关系，删除会话会同步清理正文、catalog、断点和 run ledger。
 
-Desktop、TUI 和 `biny plan` 运行同一项目时，会通过本地 Unix socket attach 到同一个独立 Runtime Host，共享实时事件、权限请求和断点恢复；没有 owner 时会按项目自动启动 Host。一端退出不会复制出第二个 AgentSession。已有 Host 时，未带临时配置覆盖的 `biny run` 也会直接 attach。
+Desktop、TUI 和 `biny plan` 运行同一项目时，会通过本地 Unix socket attach 到同一个独立 Runtime Host，共享实时事件、权限请求和显式恢复；没有 owner 时会按项目自动启动 Host。一端退出不会复制出第二个 AgentSession。已有 Host 时，未带临时配置覆盖的 `biny run` 也会直接 attach。
+
+普通 `biny`、`biny chat`、`biny tui` 和 Desktop 启动都不会自动打开旧的空闲 session，也不会因为旧 TurnStore checkpoint 调用模型；空闲 Host 会被重建为空白聊天，运行中的 Host 也不会被 Desktop 隐式接管。需要恢复时，必须使用 `biny resume`、`biny resume <session-id>` 或 TUI 的 `/resume`；`/app` 是 TUI → Desktop 的显式会话交接入口。Automation、Agent Graph 和显式安装的 daemon pending fire/wake 仍按各自的后台调度规则运行。
+
+TUI 中，运行时第一次 `Ctrl+C` 只请求取消，500ms 内第二次才退出；空闲时也需要连续两次 `Ctrl+C` 退出。退出前会先通知 Host 取消当前 AgentRun，避免只断开终端后留下下次启动会继续显示的旧运行。
+
+TaskRun 的 `retry` 不是普通对话里的“继续”，也不能用确认参数强行重放。只有同时满足以下条件才允许进入重试准入：TaskRun 和最新 TaskAttempt 都是 `failed`；失败分类是 `RateLimit`，或已证明在 provider dispatch 之前发生了 `continuation_abandoned_before_provider_dispatch`；Attempt 的副作用安全性是 `safe` 或 `idempotent`。工具失败、超时、取消、预算耗尽、验证失败，以及 `unknown`/`unsafe` 副作用都会拒绝重试；当前通用 TaskRun 入口尚未绑定执行 adapter 时也会拒绝启动，而不会只把状态改成 `running`。需要继续普通任务时，请发送新的 prompt 或使用明确的 Session/AgentRun continuation。
 
 桌面端切换模型时，如果发现驻留 Host 是旧版本且当前项目处于空闲状态，会自动替换 owner 并重试请求；运行中的任务不会被强制重启。
 
 需要手动托管 owner 时可运行 `biny runtime-host --workspace-root <workspace> --persistence-root <data-root>`；通常不需要手动启动。
+
+后台任务和本地自动化使用同一个 Runtime Host：
+
+```bash
+biny daemon install          # 安装当前 workspace 的用户级 LaunchAgent
+biny daemon status
+biny automation list --json
+biny task list --json
+biny graph inspect <graph-id> --json
+```
+
+`biny daemon install` 只写入当前用户的 `~/Library/LaunchAgents`，不会开放网络端口，也不会自动安装系统级任务。需要前台运行 Host 时使用 `biny daemon run`；`biny daemon uninstall` 会停止并移除该 LaunchAgent。TUI 和 Desktop 可通过 `/tasks`、`/automation`、`/goal`、`/graph`、`/capabilities` 查询或控制对应的 authority 投影。
+
+Automation 的 `executionTemplate` 当前只支持 `prompt`、`sessionId` 和 `mode`；`modelAlias`、`permissionMode`、`workspaceRoot` 会在创建时明确拒绝，避免配置被静默忽略。Graph/TaskRun 在 Host 重启时会回收未能证明执行结果的节点：未开始 AgentRun 的 claim 可以回到 `ready`，已有不确定副作用的执行会进入 `blocked`，取消后的晚到结果不会恢复节点或 Graph 状态。
 
 ## 当前边界
 
