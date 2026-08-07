@@ -2,7 +2,7 @@ import { constants, promises as fs } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import type { AgentModel } from "../core/types.js";
+import type { AgentModel, ModelRequestContext, ModelRequestObserver } from "../core/types.js";
 import { generateNativeText, nativeJsonMessages, parseNativeJson } from "../../llm/nativeJson.js";
 import { globalAgentDir, projectMemoryDir } from "../../config/paths.js";
 import { redactSecrets } from "../../utils/secrets.js";
@@ -43,7 +43,9 @@ export class LocalMemory {
     private readonly getModel: () => AgentModel,
     private readonly onUsage: ModelUsageObserver = () => undefined,
     /** 每回合自动注入上下文的记忆条数上限，来自 context.memory.maxRecalled。 */
-    readonly recallLimit: number = 3
+    readonly recallLimit: number = 3,
+    private readonly onModelRequest: ModelRequestObserver = () => undefined,
+    private readonly getModelRequestContext: () => ModelRequestContext | undefined = () => undefined
   ) {}
 
   async findRelevant(query: string, paths: string[], limit: number = this.recallLimit, signal?: AbortSignal): Promise<MemoryMatch[]> {
@@ -320,7 +322,13 @@ export class LocalMemory {
     const response = await generateNativeText(model, nativeJsonMessages(
       "You consolidate project memory records without losing durable facts.",
       prompt
-    ), { signal, maxOutputTokens: 4_096, timeoutMs: memoryModelTimeoutMs });
+    ), {
+      signal,
+      maxOutputTokens: 4_096,
+      timeoutMs: memoryModelTimeoutMs,
+      onRequestMetrics: this.onModelRequest,
+      requestContext: { ...(this.getModelRequestContext() ?? {}), operation: "memory" }
+    });
     if (response.usage) await this.onUsage(response.usage, "memory");
     signal?.throwIfAborted();
     const parsed = compactedEntriesSchema.safeParse(parseNativeJson(response.text));
@@ -347,7 +355,13 @@ export class LocalMemory {
       const response = await generateNativeText(model, nativeJsonMessages(
         "You write concise project memory records, not explanations.",
         prompt
-      ), { signal, maxOutputTokens: 2_048, timeoutMs: memoryModelTimeoutMs });
+      ), {
+        signal,
+        maxOutputTokens: 2_048,
+        timeoutMs: memoryModelTimeoutMs,
+        onRequestMetrics: this.onModelRequest,
+        requestContext: { ...(this.getModelRequestContext() ?? {}), operation: "memory" }
+      });
       signal?.throwIfAborted();
       if (response.usage) await this.onUsage(response.usage, "memory");
       signal?.throwIfAborted();

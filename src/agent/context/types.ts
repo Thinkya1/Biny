@@ -5,6 +5,7 @@
  * 避免各实现文件之间循环依赖。
  */
 import type { ProjectContext } from "../../project/ProjectContext.js";
+import type { ContextComponentUsage } from "../../session/metadata.js";
 
 export interface LoadedInstruction {
   path: string;
@@ -54,12 +55,23 @@ export interface ContextBudgetStatus {
   modelAlias?: string;
   /** 本轮所有候选上下文都保留时的估算量。 */
   requestedTokens?: number;
+  /** 本地估算的实际组装输入量；与 provider 回报的 inputTokens 分开保存。 */
+  estimatedTokens?: number;
+  /** provider 回报的真实输入 token 数；未提供时为空。 */
+  providerInputTokens?: number;
   /** 在可用输入预算内为下一步增长保留的安全余量。 */
   reserveTokens?: number;
   omitted: string[];
   autoCompacted: boolean;
   source?: "estimated" | "provider";
   measuredAt?: string;
+  /** 上下文候选块的估算组成；tool schema 使用独立 reserve，不重复计入输入预算。 */
+  components?: ContextComponentUsage[];
+  outputReserveTokens?: number;
+  reasoningReserveTokens?: number;
+  toolSchemaReserveTokens?: number;
+  systemPromptReserveTokens?: number;
+  protocolSafetyMarginTokens?: number;
 }
 
 export interface CompactionStatus {

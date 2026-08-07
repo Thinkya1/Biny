@@ -10,13 +10,14 @@ import path from "node:path";
 import type { AgentConfig } from "../config/schema.js";
 import { agentDir } from "../session/store.js";
 import { redactSecrets } from "../utils/secrets.js";
-import type { AgentUsage } from "../agent/core/types.js";
+import type { AgentUsage, ModelRequestMetrics } from "../agent/core/types.js";
 
 export type NativeTelemetryEvent =
   | { type: "start"; provider: string; modelId: string; input?: unknown }
   | { type: "step"; provider: string; modelId: string; step: number; finishReason?: string; usage?: AgentUsage; output?: unknown }
   | { type: "end"; provider: string; modelId: string; steps: number; usage?: AgentUsage; output?: unknown }
-  | { type: "error"; provider: string; modelId: string; step: number; error: unknown };
+  | { type: "error"; provider: string; modelId: string; step: number; error: unknown }
+  | { type: "request"; provider: string; modelId: string; metrics: ModelRequestMetrics };
 
 /** 记录一次模型运行事件，不依赖 provider 回调协议。 */
 export async function recordNativeTelemetry(
@@ -43,7 +44,9 @@ export async function recordNativeTelemetry(
           usage: sanitizeUsage(event.usage),
           output: config.telemetry.recordOutputs ? safePayload(event.output) : undefined
         }
-        : { ...common, step: event.step, error: safePayload(event.error) };
+        : event.type === "request"
+          ? { ...common, ...sanitizeRequestMetrics(event.metrics) }
+          : { ...common, step: event.step, error: safePayload(event.error) };
   await appendSecureTelemetry(
     path.join(agentDir(workspaceRoot), "telemetry.jsonl"),
     `${JSON.stringify(payload)}\n`
@@ -106,6 +109,43 @@ function sanitizeUsage(value: AgentUsage | undefined): Record<string, unknown> |
     cacheReadTokens: value.cacheReadTokens,
     cacheWriteTokens: value.cacheWriteTokens,
     reasoningTokens: value.reasoningTokens
+  };
+}
+
+function sanitizeRequestMetrics(metrics: ModelRequestMetrics): Record<string, unknown> {
+  return {
+    requestId: metrics.requestId,
+    startedAt: metrics.startedAt,
+    durationMs: metrics.durationMs,
+    timeToFirstEventMs: metrics.timeToFirstEventMs,
+    timeToFirstOutputMs: metrics.timeToFirstOutputMs,
+    status: metrics.status,
+    finishReason: metrics.finishReason,
+    usage: sanitizeUsage(metrics.usage),
+    error: metrics.error === undefined ? undefined : redactSecrets(metrics.error),
+    errorCode: metrics.errorCode,
+    errorPhase: metrics.errorPhase,
+    eventCount: metrics.eventCount,
+    requestContext: metrics.requestContext === undefined
+      ? undefined
+      : {
+        sessionId: metrics.requestContext.sessionId,
+        runId: metrics.requestContext.runId,
+        turnId: metrics.requestContext.turnId,
+        step: metrics.requestContext.step,
+        operation: metrics.requestContext.operation,
+        relatedToolCallIds: metrics.requestContext.relatedToolCallIds === undefined
+          ? undefined
+          : [...metrics.requestContext.relatedToolCallIds]
+      },
+    attempts: metrics.attempts.map((attempt) => ({
+      attempt: attempt.attempt,
+      durationMs: attempt.durationMs,
+      status: attempt.status,
+      error: attempt.error === undefined ? undefined : redactSecrets(attempt.error),
+      willRetry: attempt.willRetry,
+      retryDelayMs: attempt.retryDelayMs
+    }))
   };
 }
 

@@ -8,7 +8,6 @@ import type { AgentModel, ModelStreamContext, ModelStreamEvent, ModelStreamOptio
 import { modelCapabilities, modelReasoningConfig, modelThinkingLevelMap, nativeReasoningEffort, normalizeModelMetadata, reasoningBudgetTokens, thinkingLevelMapForModel } from "../ai/capabilities.js";
 import { fetchModelCatalogSnapshot } from "../ai/modelCatalog.js";
 import { providerDefinition, providerProtocol } from "../ai/provider.js";
-import { createRetryFetch } from "../ai/retry.js";
 import type { ModelCatalogEntry, ProviderDefinition } from "../ai/types.js";
 import type { AgentConfig, ModelAliasConfig, ModelApiBackend, ModelCompatibility, ProviderConfig } from "../config/schema.js";
 import { createNativeModel } from "./nativeModel.js";
@@ -191,7 +190,7 @@ export class ConfiguredProviderRuntime implements ProviderRuntime {
         ...this.config.headers,
         ...normalizedModel.headers
       },
-      fetch: createRetryFetch(retry),
+      retry,
       maxTokensField: compatibility?.maxTokensField === "max_completion_tokens" ? "max_completion_tokens" : "max_tokens",
       supportsDeveloperRole: compatibility?.supportsDeveloperRole === true,
       supportsTools: capabilities.tools,
@@ -228,7 +227,9 @@ export class ConfiguredProviderRuntime implements ProviderRuntime {
       maxOutputTokens: options.maxOutputTokens ?? settings.maxOutputTokens,
       reasoning: settings.reasoning,
       providerOptions: options.providerOptions ?? settings.providerOptions,
-      timeoutMs: options.timeoutMs ?? settings.timeoutMs
+      timeoutMs: options.timeoutMs ?? settings.timeoutMs,
+      onRequestMetrics: options.onRequestMetrics,
+      requestContext: options.requestContext
     });
   }
 

@@ -9,6 +9,15 @@ import type { AgentUsage } from "../agent/core/types.js";
 export type UsageOperation = "agent" | "plan" | "compaction" | "memory" | "subagent";
 export type ContextBudgetSource = "estimated" | "provider";
 
+export type ContextComponentDisposition = "included" | "trimmed" | "omitted";
+
+export interface ContextComponentUsage {
+  id: string;
+  requestedTokens: number;
+  usedTokens: number;
+  disposition: ContextComponentDisposition;
+}
+
 export interface SessionContextUsage {
   maxTokens: number;
   usedTokens: number;
@@ -16,11 +25,22 @@ export interface SessionContextUsage {
   maxOutputTokens?: number;
   modelAlias?: string;
   requestedTokens?: number;
+  /** 本地估算的实际组装输入量；与 provider 回报的 inputTokens 分开保存。 */
+  estimatedTokens?: number;
+  /** provider 回报的真实输入 token 数；未提供时为空。 */
+  providerInputTokens?: number;
   reserveTokens?: number;
   omitted: string[];
   autoCompacted: boolean;
   source?: ContextBudgetSource;
   measuredAt?: string;
+  /** 本次上下文候选块的估算组成；旧 session 没有该字段。 */
+  components?: ContextComponentUsage[];
+  outputReserveTokens?: number;
+  reasoningReserveTokens?: number;
+  toolSchemaReserveTokens?: number;
+  systemPromptReserveTokens?: number;
+  protocolSafetyMarginTokens?: number;
 }
 
 /**

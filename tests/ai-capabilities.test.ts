@@ -157,12 +157,17 @@ assert.equal(completeCatalog[0]?.headers, undefined);
 assert.equal(completeCatalog[0]?.compatibility, undefined);
 
 let attempts = 0;
+const retryMetrics: Array<{ attempt: number; status?: number; willRetry: boolean }> = [];
 const retryingFetch = createRetryFetch({ maxAttempts: 3, initialDelayMs: 0, maxDelayMs: 0 }, async () => {
   attempts += 1;
   return new Response("ok", { status: attempts === 1 ? 503 : 200 });
-});
+}, (event) => retryMetrics.push({ attempt: event.attempt, status: event.status, willRetry: event.willRetry }));
 assert.equal((await retryingFetch("https://example.test")).status, 200);
 assert.equal(attempts, 2);
+assert.deepEqual(retryMetrics, [
+  { attempt: 1, status: 503, willRetry: true },
+  { attempt: 2, status: 200, willRetry: false }
+]);
 
 // Relays and self-hosted gateways almost never declare reasoning_efforts, so
 // well-known reasoning models must still surface thinking controls via the

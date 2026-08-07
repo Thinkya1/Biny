@@ -502,6 +502,11 @@ async function testBudgetAndCompaction(): Promise<void> {
       true,
       "assembled prompt must leave the configured compaction reserve unused"
     );
+    const componentIds = new Set(preparedStatus.budget.components?.map((component) => component.id));
+    assert.equal(componentIds.has("task"), true);
+    assert.equal(componentIds.has("history"), true);
+    assert.equal(componentIds.has("system rules"), true);
+    assert.equal(preparedStatus.budget.components?.every((component) => component.requestedTokens >= component.usedTokens), true);
     assert.equal(estimateMessageTokens([{ role: "assistant", content: [{ type: "reasoning", text: "reason ".repeat(20) }] }]) > 4, true);
 
     memory.replaceHistory(Array.from({ length: 8 }, (_, index): AgentMessage => index % 2
@@ -1268,10 +1273,47 @@ async function testCredentialAndSymlinkBoundaries(): Promise<void> {
         steps: 1,
         output: "visible-output"
       });
+      await recordNativeTelemetry(telemetryConfig, workspaceRoot, {
+        type: "request",
+        provider: "test",
+        modelId: "test",
+        metrics: {
+          requestId: "request-1",
+          provider: "test",
+          modelId: "test",
+          startedAt: "2026-08-06T00:00:00.000Z",
+          durationMs: 120,
+          timeToFirstEventMs: 20,
+          timeToFirstOutputMs: 40,
+          attempts: [{ attempt: 1, durationMs: 100, status: 200, willRetry: false }],
+          status: 200,
+          finishReason: "stop",
+          usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 },
+          eventCount: 4,
+          requestContext: {
+            sessionId: "session-1",
+            runId: "run-1",
+            turnId: "turn-1",
+            step: 2,
+            operation: "agent",
+            relatedToolCallIds: ["call-1"]
+          }
+        }
+      });
       const telemetryEvents = (await fs.readFile(telemetryPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
-      assert.deepEqual(telemetryEvents.map((event) => event.type), ["start", "step", "end"]);
+      assert.deepEqual(telemetryEvents.map((event) => event.type), ["start", "step", "end", "request"]);
       assert.equal(telemetryEvents[0]?.input, undefined);
       assert.equal(telemetryEvents[1]?.output, '"visible-output"');
+      assert.equal(telemetryEvents[3]?.requestId, "request-1");
+      assert.equal(telemetryEvents[3]?.durationMs, 120);
+      assert.deepEqual(telemetryEvents[3]?.requestContext, {
+        sessionId: "session-1",
+        runId: "run-1",
+        turnId: "turn-1",
+        step: 2,
+        operation: "agent",
+        relatedToolCallIds: ["call-1"]
+      });
       await fs.rm(telemetryPath);
       const telemetryVictim = path.join(outsideRoot, "telemetry-victim.txt");
       await fs.writeFile(telemetryVictim, "telemetry-victim-unchanged", "utf8");

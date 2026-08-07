@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentModel, AgentUsage } from "../agent/core/types.js";
+import type { AgentMessage, AgentModel, AgentUsage, ModelRequestContext, ModelRequestObserver } from "../agent/core/types.js";
 
 export interface NativeTextGenerationOptions {
   signal?: AbortSignal;
@@ -6,6 +6,8 @@ export interface NativeTextGenerationOptions {
   providerOptions?: Record<string, unknown>;
   reasoning?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   timeoutMs?: number;
+  onRequestMetrics?: ModelRequestObserver;
+  requestContext?: ModelRequestContext;
 }
 
 export interface NativeTextGenerationResult {

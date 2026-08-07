@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentModel, AgentToolResultMessage, AgentUsage } from "../core/types.js";
+import type { AgentMessage, AgentModel, AgentTool, AgentToolResultMessage, AgentUsage, ModelRequestContext, ModelRequestObserver } from "../core/types.js";
 import { generateNativeText } from "../../llm/nativeJson.js";
 import { cloneAgentMessages, messageReasoning, messageText, messageToolName } from "../modelMessages.js";
 import { formatProjectContext } from "../../project/ProjectContext.js";
@@ -6,7 +6,7 @@ import { formatMemoryMatches, LocalMemory, redactSecrets } from "./LocalMemory.j
 import { formatRepoMapCandidates, WorkspaceContext } from "./WorkspaceContext.js";
 import type { CompactionResult, CompactionStatus, ContextBudgetStatus, ContextStatus, LoadedInstruction, MemoryMatch, RecentWorkspaceActivity, WorkspaceTurnData } from "./types.js";
 import type { ModelUsageObserver } from "../../observability/usage.js";
-import type { SessionContextCheckpoint, SessionContextState } from "../../session/metadata.js";
+import type { ContextComponentUsage, SessionContextCheckpoint, SessionContextState } from "../../session/metadata.js";
 import type { ModelContextBudget } from "../../ai/types.js";
 import type { AgentAttachment } from "../AgentSession.js";
 
@@ -55,7 +55,9 @@ export class ContextMemory {
     private readonly instructionMaxBytes: number,
     private readonly onUsage: ModelUsageObserver = () => undefined,
     getBudgetLimits?: () => ModelContextBudget,
-    private readonly compactionOptions: ContextCompactionOptions = {}
+    private readonly compactionOptions: ContextCompactionOptions = {},
+    private readonly onModelRequest: ModelRequestObserver = () => undefined,
+    private readonly getModelRequestContext: () => ModelRequestContext | undefined = () => undefined
   ) {
     this.resolveBudget = getBudgetLimits ?? (() => ({
       contextWindow: maxTokens,
@@ -71,6 +73,11 @@ export class ContextMemory {
       maxOutputTokens: budget.maxOutputTokens,
       modelAlias: budget.modelAlias,
       reserveTokens: this.compactionLimits().reserveTokens,
+      outputReserveTokens: budget.outputReserveTokens,
+      reasoningReserveTokens: budget.reasoningReserveTokens,
+      toolSchemaReserveTokens: budget.toolSchemaReserveTokens,
+      systemPromptReserveTokens: budget.systemPromptReserveTokens,
+      protocolSafetyMarginTokens: budget.protocolSafetyMarginTokens,
       omitted: [],
       autoCompacted: false,
       source: "estimated",
@@ -134,7 +141,12 @@ export class ContextMemory {
       ...assembly.budget,
       contextWindow: budget.contextWindow,
       maxOutputTokens: budget.maxOutputTokens,
-      modelAlias: budget.modelAlias
+      modelAlias: budget.modelAlias,
+      outputReserveTokens: budget.outputReserveTokens,
+      reasoningReserveTokens: budget.reasoningReserveTokens,
+      toolSchemaReserveTokens: budget.toolSchemaReserveTokens,
+      systemPromptReserveTokens: budget.systemPromptReserveTokens,
+      protocolSafetyMarginTokens: budget.protocolSafetyMarginTokens
     };
     return {
       systemPrompt: assembly.systemPrompt,
@@ -191,6 +203,7 @@ export class ContextMemory {
     this.lastBudget = {
       ...this.lastBudget,
       usedTokens: Math.max(0, usage.inputTokens),
+      providerInputTokens: Math.max(0, usage.inputTokens),
       source: "provider",
       measuredAt: new Date().toISOString()
     };
@@ -321,6 +334,30 @@ export class ContextMemory {
     };
   }
 
+  /** 记录当前模型步骤会额外携带的工具 schema；该部分由模型预算单独预留。 */
+  recordToolSchema(tools: readonly AgentTool[]): void {
+    const requestedTokens = tools.length
+      ? estimateTokens(JSON.stringify(tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters
+      })))) + 4
+      : 0;
+    const components = (this.lastBudget.components ?? []).filter((component) => component.id !== "tool_schema");
+    if (requestedTokens > 0) {
+      components.push({
+        id: "tool_schema",
+        requestedTokens,
+        usedTokens: requestedTokens,
+        disposition: "included"
+      });
+    }
+    this.lastBudget = {
+      ...this.lastBudget,
+      components: components.length ? components : undefined
+    };
+  }
+
   formatCompaction(result: CompactionResult): string {
     if (!result.compacted) return "Conversation is already within the compaction threshold.";
     return `Compacted ${String(result.compactedMessageCount)} messages. The next turn will use the handoff summary and recent history.`;
@@ -406,7 +443,12 @@ export class ContextMemory {
     try {
       const result = await generateNativeText(this.getModel(), [{ role: "user", content: prompt }], {
         signal,
-        maxOutputTokens: maxSummaryTokens
+        maxOutputTokens: maxSummaryTokens,
+        onRequestMetrics: this.onModelRequest,
+        requestContext: {
+          ...(this.getModelRequestContext() ?? {}),
+          operation: "compaction"
+        }
       });
       if (result.usage) await this.onUsage(result.usage, "compaction");
       const summary = cleanModelSummary(result.text);
@@ -452,6 +494,13 @@ export class ContextMemory {
       maxOutputTokens: budget.maxOutputTokens,
       modelAlias: budget.modelAlias,
       reserveTokens: this.compactionLimits().reserveTokens,
+      estimatedTokens: usedTokens,
+      providerInputTokens: undefined,
+      outputReserveTokens: budget.outputReserveTokens,
+      reasoningReserveTokens: budget.reasoningReserveTokens,
+      toolSchemaReserveTokens: budget.toolSchemaReserveTokens,
+      systemPromptReserveTokens: budget.systemPromptReserveTokens,
+      protocolSafetyMarginTokens: budget.protocolSafetyMarginTokens,
       usedTokens,
       source: "estimated",
       measuredAt: undefined
@@ -466,7 +515,13 @@ export class ContextMemory {
       contextWindow: budget.contextWindow,
       maxOutputTokens: budget.maxOutputTokens,
       modelAlias: budget.modelAlias,
-      reserveTokens: this.compactionLimits().reserveTokens
+      reserveTokens: this.compactionLimits().reserveTokens,
+      providerInputTokens: this.lastBudget.providerInputTokens,
+      outputReserveTokens: budget.outputReserveTokens,
+      reasoningReserveTokens: budget.reasoningReserveTokens,
+      toolSchemaReserveTokens: budget.toolSchemaReserveTokens,
+      systemPromptReserveTokens: budget.systemPromptReserveTokens,
+      protocolSafetyMarginTokens: budget.protocolSafetyMarginTokens
     };
   }
 
@@ -767,7 +822,11 @@ function isContextState(value: ContextBudgetStatus | SessionContextState | undef
 }
 
 function cloneBudget(budget: ContextBudgetStatus): ContextBudgetStatus {
-  return { ...budget, omitted: [...budget.omitted] };
+  return {
+    ...budget,
+    omitted: [...budget.omitted],
+    components: budget.components?.map((component) => ({ ...component }))
+  };
 }
 
 function normalizeRestoredBudget(budget: ContextBudgetStatus, limits: ModelContextBudget): ContextBudgetStatus {
@@ -779,7 +838,10 @@ function normalizeRestoredBudget(budget: ContextBudgetStatus, limits: ModelConte
     maxOutputTokens: limits.maxOutputTokens,
     modelAlias: limits.modelAlias,
     usedTokens: source === "provider" ? Math.max(0, budget.usedTokens) : Math.min(limits.maxInputTokens, Math.max(0, budget.usedTokens)),
+    estimatedTokens: budget.estimatedTokens === undefined ? undefined : Math.max(0, budget.estimatedTokens),
+    providerInputTokens: budget.providerInputTokens === undefined ? undefined : Math.max(0, budget.providerInputTokens),
     omitted: [...budget.omitted],
+    components: budget.components?.map((component) => ({ ...component })),
     source,
     measuredAt: budget.measuredAt
   };
@@ -793,7 +855,17 @@ function estimateRestoredBudget(history: AgentMessage[], limits: ModelContextBud
     maxOutputTokens: limits.maxOutputTokens,
     modelAlias: limits.modelAlias,
     usedTokens: Math.min(limits.maxInputTokens, estimatedTokens),
+    estimatedTokens,
+    providerInputTokens: undefined,
     omitted: estimatedTokens > limits.maxInputTokens ? ["older conversation messages"] : [],
+    components: estimatedTokens > 0
+      ? [{
+        id: "history",
+        requestedTokens: estimatedTokens,
+        usedTokens: Math.min(limits.maxInputTokens, estimatedTokens),
+        disposition: estimatedTokens > limits.maxInputTokens ? "trimmed" : "included"
+      }]
+      : undefined,
     autoCompacted: false,
     source: "estimated",
     measuredAt: undefined
@@ -834,11 +906,22 @@ function assembleContext(
   attachments: AgentAttachment[]
 ): ContextAssembly {
   const omitted: string[] = [];
+  const components: ContextComponentUsage[] = [];
   // reserveTokens 是下一次 provider 输出前的运行时安全余量，不应该在 prompt 组装时重新花掉。
   const usableTokens = Math.max(1, maxTokens - reserveTokens);
   const task = input.trim() || "(empty task)";
   const taskBudget = Math.max(1, Math.min(estimateTokens(task), Math.floor(usableTokens * 0.35)));
   const taskContent = truncateTextToTokens(task, taskBudget);
+  const fullUserContent = attachments.length
+    ? [
+      { type: "text" as const, text: task },
+      ...attachments.map((attachment) => ({
+        type: attachment.mimeType.startsWith("audio/") ? "audio" as const : "image" as const,
+        data: attachment.data,
+        mimeType: attachment.mimeType
+      }))
+    ]
+    : task;
   const userContent = attachments.length
     ? [
       { type: "text" as const, text: taskContent },
@@ -849,25 +932,43 @@ function assembleContext(
       }))
     ]
     : taskContent;
+  const fullUserMessage: AgentMessage = { role: "user", content: fullUserContent };
   const userMessage: AgentMessage = { role: "user", content: userContent };
-  let remaining = Math.max(0, usableTokens - estimateMessageTokens([userMessage]));
+  const requestedTaskTokens = estimateMessageTokens([fullUserMessage]);
+  const usedTaskTokens = estimateMessageTokens([userMessage]);
+  components.push({
+    id: "task",
+    requestedTokens: requestedTaskTokens,
+    usedTokens: usedTaskTokens,
+    disposition: taskContent === task ? "included" : "trimmed"
+  });
+  let remaining = Math.max(0, usableTokens - usedTaskTokens);
   const systemParts: string[] = [];
   const addSystem = (id: string, content: string, required: boolean, blockCap?: number): void => {
     if (!content) return;
+    const requestedTokens = estimateTokens(content) + 4;
     const available = Math.min(Math.max(0, remaining - 4), blockCap ?? Number.MAX_SAFE_INTEGER);
     if (!available) {
       omitted.push(id);
+      components.push({ id, requestedTokens, usedTokens: 0, disposition: "omitted" });
       return;
     }
-    const fullCost = estimateTokens(content) + 4;
-    if (!required && fullCost > remaining) {
+    if (!required && requestedTokens > remaining) {
       omitted.push(id);
+      components.push({ id, requestedTokens, usedTokens: 0, disposition: "omitted" });
       return;
     }
     const selected = required ? truncateTextToTokens(content, available) : content;
     if (selected !== content) omitted.push(`${id} (trimmed)`);
     systemParts.push(selected);
-    remaining -= estimateTokens(selected) + 4;
+    const usedTokens = estimateTokens(selected) + 4;
+    components.push({
+      id,
+      requestedTokens,
+      usedTokens,
+      disposition: selected === content ? "included" : "trimmed"
+    });
+    remaining -= usedTokens;
   };
 
   const projectInstructions = formatInstructions(workspace.instructions);
@@ -879,7 +980,8 @@ function assembleContext(
     : "";
   const repoMap = `RepoMap candidates:\n${formatRepoMapCandidates(workspace.repoMapCandidates)}`;
   const projectSnapshot = `Project snapshot:\n${truncateTextToTokens(formatProjectContext(workspace.snapshot.context), 3_500)}`;
-  const requestedTokens = estimateMessageTokens([...history, userMessage]) + [
+  const requestedHistoryTokens = estimateMessageTokens(history);
+  const requestedTokens = requestedHistoryTokens + requestedTaskTokens + [
     systemPrompt,
     projectInstructions,
     conversationSummary,
@@ -902,8 +1004,17 @@ function assembleContext(
   addSystem("project snapshot", projectSnapshot, false);
 
   const selectedHistory = selectHistory(history, remaining);
-  remaining -= estimateMessageTokens(selectedHistory);
+  const usedHistoryTokens = estimateMessageTokens(selectedHistory);
+  remaining -= usedHistoryTokens;
   if (selectedHistory.length < history.length) omitted.push("older conversation messages");
+  if (requestedHistoryTokens > 0) {
+    components.push({
+      id: "history",
+      requestedTokens: requestedHistoryTokens,
+      usedTokens: usedHistoryTokens,
+      disposition: selectedHistory.length === history.length ? "included" : usedHistoryTokens > 0 ? "trimmed" : "omitted"
+    });
+  }
 
   const messages: AgentMessage[] = [...selectedHistory, userMessage];
   const assembledSystemPrompt = systemParts.join("\n\n") || undefined;
@@ -914,8 +1025,11 @@ function assembleContext(
       maxTokens,
       usedTokens: estimateMessageTokens(messages) + estimateTokens(assembledSystemPrompt ?? ""),
       requestedTokens,
+      estimatedTokens: estimateMessageTokens(messages) + estimateTokens(assembledSystemPrompt ?? ""),
+      providerInputTokens: undefined,
       reserveTokens,
       omitted,
+      components,
       autoCompacted,
       source: "estimated",
       measuredAt: undefined

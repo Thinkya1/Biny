@@ -10,31 +10,83 @@ export interface RetryPolicy {
   maxDelayMs: number;
 }
 
+export interface RetryAttemptMetrics {
+  attempt: number;
+  durationMs: number;
+  status?: number;
+  error?: string;
+  willRetry: boolean;
+  retryDelayMs?: number;
+}
+
+export type RetryAttemptObserver = (attempt: RetryAttemptMetrics) => void;
+
 // 只重试限流和网关类错误；4xx 里的参数/鉴权错误重试也不会变好。
 const retryableStatuses = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
 /** 只重试传输层和临时性 HTTP 失败，成功响应与客户端错误直接透传。 */
-export function createRetryFetch(policy: RetryPolicy, baseFetch: typeof fetch = fetch): typeof fetch {
+export function createRetryFetch(
+  policy: RetryPolicy,
+  baseFetch: typeof fetch = fetch,
+  onAttempt?: RetryAttemptObserver
+): typeof fetch {
   // 次数和延迟都收敛到合理区间，避免配置写错导致长时间卡住或无限重试。
   const maxAttempts = Math.max(1, Math.min(6, Math.floor(policy.maxAttempts)));
   const initialDelayMs = Math.max(0, policy.initialDelayMs);
   const maxDelayMs = Math.max(initialDelayMs, policy.maxDelayMs);
   return async (input, init) => {
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      let responseDelayMs: number | undefined;
+      const startedAt = Date.now();
+      let response: Response;
       try {
-        const response = await baseFetch(input, init);
-        if (!retryableStatuses.has(response.status) || attempt === maxAttempts) return response;
-        responseDelayMs = retryDelayMs(response);
+        response = await baseFetch(input, init);
       } catch (error) {
-        if (attempt === maxAttempts) throw error;
+        const willRetry = attempt < maxAttempts && !init?.signal?.aborted;
+        const retryDelay = willRetry
+          ? Math.min(maxDelayMs, initialDelayMs * 2 ** (attempt - 1))
+          : undefined;
+        reportAttempt(onAttempt, {
+          attempt,
+          durationMs: Math.max(0, Date.now() - startedAt),
+          error: errorMessage(error),
+          willRetry,
+          retryDelayMs: retryDelay
+        });
+        if (!willRetry) throw error;
+        init?.signal?.throwIfAborted();
+        await delay(retryDelay ?? 0, init?.signal ?? undefined);
+        continue;
       }
+      const willRetry = retryableStatuses.has(response.status) && attempt < maxAttempts;
+      const retryDelay = willRetry
+        ? Math.min(maxDelayMs, retryDelayMs(response) ?? initialDelayMs * 2 ** (attempt - 1))
+        : undefined;
+      reportAttempt(onAttempt, {
+        attempt,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        status: response.status,
+        willRetry,
+        retryDelayMs: retryDelay
+      });
+      if (!willRetry) return response;
       // 退避前先检查取消，避免用户已中断还白等一轮。
       init?.signal?.throwIfAborted();
-      await delay(Math.min(maxDelayMs, responseDelayMs ?? initialDelayMs * 2 ** (attempt - 1)), init?.signal ?? undefined);
+      await delay(retryDelay ?? 0, init?.signal ?? undefined);
     }
     throw new Error("Provider request retry loop ended unexpectedly.");
   };
+}
+
+function reportAttempt(observer: RetryAttemptObserver | undefined, metrics: RetryAttemptMetrics): void {
+  try {
+    observer?.(metrics);
+  } catch {
+    // 观测回调属于诊断旁路，不能改变 provider 请求的实际结果。
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function retryDelayMs(response: Response): number | undefined {

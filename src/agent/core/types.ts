@@ -65,6 +65,59 @@ export interface AgentUsage {
   cacheWriteTokens?: number;
 }
 
+export type ModelRequestOperation = "agent" | "plan" | "compaction" | "memory" | "subagent";
+
+export type ModelRequestErrorCode =
+  | "aborted"
+  | "timeout"
+  | "context_overflow"
+  | "http_error"
+  | "network_error"
+  | "protocol_error"
+  | "provider_error"
+  | "unknown";
+
+export type ModelRequestErrorPhase = "request" | "stream";
+
+export interface ModelRequestContext {
+  sessionId?: string;
+  runId?: string;
+  turnId?: string;
+  step?: number;
+  operation?: ModelRequestOperation;
+  relatedToolCallIds?: string[];
+}
+
+export interface ModelRequestAttempt {
+  attempt: number;
+  durationMs: number;
+  status?: number;
+  error?: string;
+  willRetry: boolean;
+  retryDelayMs?: number;
+}
+
+export interface ModelRequestMetrics {
+  requestId: string;
+  provider: string;
+  modelId: string;
+  startedAt: string;
+  durationMs: number;
+  timeToFirstEventMs?: number;
+  timeToFirstOutputMs?: number;
+  attempts: ModelRequestAttempt[];
+  status?: number;
+  finishReason?: AgentStopReason;
+  usage?: AgentUsage;
+  error?: string;
+  errorCode?: ModelRequestErrorCode;
+  errorPhase?: ModelRequestErrorPhase;
+  eventCount: number;
+  requestContext?: ModelRequestContext;
+}
+
+export type ModelRequestObserver = (metrics: ModelRequestMetrics) => Promise<void> | void;
+
 export interface AgentToolResult<TDetails = unknown> {
   content: AgentToolResultContent[];
   details?: TDetails;
@@ -108,6 +161,8 @@ export interface ModelStreamOptions {
   reasoning?: "off" | ReasoningEffort;
   providerOptions?: Record<string, unknown>;
   timeoutMs?: number;
+  onRequestMetrics?: ModelRequestObserver;
+  requestContext?: ModelRequestContext;
 }
 
 export interface AgentModel {
