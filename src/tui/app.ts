@@ -734,7 +734,7 @@ export class BinyTui {
     // 容忍多打的斜杠：`//resume` 只可能是想写 `/resume`。
     const [command = "", ...args] = value.trim().replace(/^\/+/, "/").split(/\s+/);
 
-    if (command === "/" || command === "/help") {
+    if (command === "/") {
       this.showSelect({
         title: "Commands",
         items: TUI_SLASH_COMMANDS.map((entry) => ({
@@ -751,7 +751,7 @@ export class BinyTui {
       return;
     }
 
-    if (command === "/exit" || command === "/quit") {
+    if (command === "/exit") {
       await this.exit();
       return;
     }
@@ -778,7 +778,7 @@ export class BinyTui {
       return;
     }
 
-    if (command === "/sessions" || (command === "/resume" && !args[0])) {
+    if (command === "/resume" && !args[0]) {
       await this.showSessionPicker();
       return;
     }
@@ -803,7 +803,7 @@ export class BinyTui {
       return;
     }
 
-    if (command === "/permissions" || command === "/approvals") {
+    if (command === "/permissions") {
       if (args.length === 0) {
         this.showPermissionModePicker();
         return;

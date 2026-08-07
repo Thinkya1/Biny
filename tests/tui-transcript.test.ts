@@ -254,7 +254,10 @@ function testSlashCommandParity(): void {
   const tuiCommands = slashCommandsForSurface("tui");
   const desktopCommands = slashCommandsForSurface("desktop");
   const desktopNames = new Set(desktopCommands.map((command) => command.name));
-  assert.equal(tuiCommands.length, 27);
+  assert.equal(tuiCommands.length, 23);
+  for (const removed of ["/help", "/approvals", "/sessions", "/quit"]) {
+    assert.equal(tuiCommands.some((command) => command.name === removed), false);
+  }
   assert.equal(tuiCommands.some((command) => command.name === "/plan"), false);
   assert.equal(tuiCommands.some((command) => command.name === "/mode"), false);
   assert.ok(tuiCommands.some((command) => command.name === "/memory"));
@@ -1112,7 +1115,7 @@ function testDialogsRenderAndHandleKeys(): void {
   let ctrlCCancelled = false;
   const ctrlCSelect = new SelectDialog({
     title: "Select command",
-    items: [{ value: "help", label: "/help" }],
+    items: [{ value: "model", label: "/model" }],
     onSelect: () => undefined,
     onCancel: () => { ctrlCCancelled = true; }
   });

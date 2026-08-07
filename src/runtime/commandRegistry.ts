@@ -14,7 +14,6 @@ const terminalOnly = ["tui"] as const;
 const allInteractive = ["tui", "desktop"] as const;
 
 export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
-  { name: "/help", description: "Show available commands", category: "system", surfaces: terminalOnly },
   { name: "/clear", description: "Clear visible messages", category: "system", surfaces: terminalOnly },
   { name: "/usage", description: "Show model token usage and cost", category: "system", surfaces: allInteractive },
   { name: "/compact", description: "Compact older conversation history", category: "system", acceptsArgs: true, surfaces: allInteractive },
@@ -31,16 +30,13 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
   { name: "/capabilities", description: "Inspect Host and client capabilities", category: "runtime", acceptsArgs: true, surfaces: allInteractive },
   { name: "/review", description: "Review current changes with a read-only subagent", category: "extension", acceptsArgs: true, surfaces: allInteractive },
   { name: "/memory", description: "Manage durable project memory (list/show/add/forget/search/compact)", category: "extension", acceptsArgs: true, surfaces: allInteractive },
-  { name: "/sessions", description: "List recorded sessions", category: "session", surfaces: terminalOnly },
   { name: "/resume", description: "Choose a session and resume its history", category: "session", surfaces: terminalOnly },
   { name: "/new", description: "Start a new chat", category: "session", surfaces: terminalOnly },
   { name: "/app", description: "Open the current chat in Biny Desktop", category: "session", surfaces: terminalOnly },
   { name: "/permissions", description: "View or change permission mode", category: "system", surfaces: terminalOnly },
-  { name: "/approvals", description: "Alias for /permissions", category: "system", surfaces: terminalOnly },
   { name: "/undo", description: "Restore the workspace from a Biny checkpoint", category: "system", acceptsArgs: true, surfaces: allInteractive },
   { name: "/fork", description: "Fork a session into a new one", category: "session", surfaces: terminalOnly },
-  { name: "/exit", description: "Exit Biny", category: "system", surfaces: terminalOnly },
-  { name: "/quit", description: "Exit Biny", category: "system", surfaces: terminalOnly }
+  { name: "/exit", description: "Exit Biny", category: "system", surfaces: terminalOnly }
 ];
 
 export function slashCommandsForSurface(surface: CommandSurface): SlashCommandDefinition[] {
