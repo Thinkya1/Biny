@@ -8,7 +8,7 @@
  * 事件订阅返回取消函数，组件卸载时必须调用，否则监听器会随重新挂载不断累积。
  */
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import type { DesktopAgentEventEnvelope, DesktopApi, DesktopMenuAction, DesktopTerminalEvent } from "../../protocol.js";
+import type { DesktopAgentEventEnvelope, DesktopApi, DesktopMenuAction, DesktopSessionHandoff, DesktopTerminalEvent } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
 
 const api: DesktopApi = {
@@ -49,6 +49,9 @@ const api: DesktopApi = {
   completeModelLogin: async (projectId, provider, authRequestId, pastedAuthorization) => await ipcRenderer.invoke(desktopIpc.completeModelLogin, projectId, provider, authRequestId, pastedAuthorization),
   cancelModelLogin: async (projectId, provider, authRequestId) => await ipcRenderer.invoke(desktopIpc.cancelModelLogin, projectId, provider, authRequestId),
   compact: async (projectId, hint) => await ipcRenderer.invoke(desktopIpc.compact, projectId, hint),
+  runtimeProjection: async (projectId) => await ipcRenderer.invoke(desktopIpc.runtimeProjection, projectId),
+  runtimeMutation: async (projectId, operation, payload) => await ipcRenderer.invoke(desktopIpc.runtimeMutation, projectId, operation, payload),
+  runtimeEvents: async (projectId, afterSequence, limit) => await ipcRenderer.invoke(desktopIpc.runtimeEvents, projectId, afterSequence, limit),
   webSearchSettings: async (projectId) => await ipcRenderer.invoke(desktopIpc.webSearchSettings, projectId),
   saveWebSearchSettings: async (projectId, input) => await ipcRenderer.invoke(desktopIpc.saveWebSearchSettings, projectId, input),
   openBrowser: async (url) => await ipcRenderer.invoke(desktopIpc.openBrowser, url),
@@ -89,6 +92,11 @@ const api: DesktopApi = {
     const handler = (_event: Electron.IpcRendererEvent, envelope: DesktopAgentEventEnvelope): void => listener(envelope);
     ipcRenderer.on(desktopIpc.event, handler);
     return () => ipcRenderer.removeListener(desktopIpc.event, handler);
+  },
+  onSessionHandoff(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, target: DesktopSessionHandoff): void => listener(target);
+    ipcRenderer.on(desktopIpc.sessionHandoff, handler);
+    return () => ipcRenderer.removeListener(desktopIpc.sessionHandoff, handler);
   },
   onMenuAction(listener) {
     const handler = (_event: Electron.IpcRendererEvent, action: DesktopMenuAction): void => listener(action);

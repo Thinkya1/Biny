@@ -121,6 +121,15 @@ const memorySettingsSchema = z.object({
 const memoryTopicSchema = z.string().trim().min(1).max(64);
 const memoryNoteSchema = z.string().trim().min(1).max(4_000);
 const memoryQuerySchema = z.string().trim().min(1).max(2_000);
+const runtimeMutationSchema = z.enum([
+  "task.create", "task.start", "task.cancel", "task.approve", "task.resume", "task.retry",
+  "automation.create", "automation.pause", "automation.resume", "automation.run", "automation.delete",
+  "goal.create", "goal.pause", "goal.resume", "goal.cancel",
+  "graph.create", "graph.start", "graph.pause", "graph.resume", "graph.cancel",
+  "capability.register", "capability.replace", "capability.admit", "capability.reject", "capability.release",
+  "capability.invoke", "capability.accept", "capability.start", "capability.result", "capability.chunk", "capability.fail", "capability.cancel"
+]);
+const runtimePayloadSchema = z.record(z.unknown()).optional();
 
 export function registerDesktopIpc(context: IpcContext): void {
   handle(desktopIpc.bootstrap, async () => await context.bootstrap());
@@ -373,6 +382,26 @@ export function registerDesktopIpc(context: IpcContext): void {
 
   handle(desktopIpc.compact, async (_event, projectId: unknown, hint: unknown) => {
     return await context.agents.compact(idSchema.parse(projectId), hint === undefined ? undefined : z.string().max(2_000).parse(hint));
+  });
+
+  handle(desktopIpc.runtimeProjection, async (_event, projectId: unknown) => {
+    return await context.agents.runtimeProjection(idSchema.parse(projectId));
+  });
+
+  handle(desktopIpc.runtimeMutation, async (_event, projectId: unknown, operation: unknown, payload: unknown) => {
+    return await context.agents.runtimeMutation(
+      idSchema.parse(projectId),
+      runtimeMutationSchema.parse(operation),
+      runtimePayloadSchema.parse(payload) ?? {}
+    );
+  });
+
+  handle(desktopIpc.runtimeEvents, async (_event, projectId: unknown, afterSequence: unknown, limit: unknown) => {
+    return await context.agents.runtimeEvents(
+      idSchema.parse(projectId),
+      afterSequence === undefined ? undefined : z.number().int().nonnegative().parse(afterSequence),
+      limit === undefined ? undefined : z.number().int().min(1).max(1_000).parse(limit)
+    );
   });
 
   handle(desktopIpc.webSearchSettings, async (_event, projectId: unknown) => {

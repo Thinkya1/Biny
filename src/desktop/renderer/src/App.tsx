@@ -15,6 +15,7 @@ import type {
   DesktopFontPreference,
   DesktopMenuAction,
   DesktopProject,
+  DesktopRuntimeMutation,
   DesktopSessionDocument,
   DesktopSessionSummary,
   DesktopSessionTreePage,
@@ -162,6 +163,24 @@ export function App(): React.JSX.Element {
     if (projectRef.current === snapshot.project.id) setWorkspace(snapshot);
   }, []);
 
+  const refreshRuntimeProjection = useCallback(async (): Promise<void> => {
+    const projectId = projectRef.current;
+    if (!projectId) return;
+    const runtimeProjection = await window.biny.runtimeProjection(projectId);
+    setWorkspace((current) => current?.project.id === projectId ? { ...current, runtimeProjection } : current);
+  }, []);
+
+  const mutateRuntime = useCallback(async (operation: DesktopRuntimeMutation, payload: Record<string, unknown>): Promise<void> => {
+    const projectId = projectRef.current;
+    if (!projectId) throw new Error("当前没有打开的项目。");
+    await window.biny.runtimeMutation(projectId, operation, payload);
+    await refreshRuntimeProjection();
+  }, [refreshRuntimeProjection]);
+
+  const reportRuntimeError = useCallback((error: unknown): void => {
+    setToast(errorMessage(error));
+  }, []);
+
   const loadSessionChildren = useCallback(async (
     projectId: string,
     parentSessionId: string,
@@ -233,7 +252,9 @@ export function App(): React.JSX.Element {
 
   const adoptWorkspace = useCallback(async (snapshot: DesktopWorkspaceSnapshot, preferredSessionId?: string): Promise<void> => {
     mergeWorkspaceProject(snapshot);
-    const nextSessionId = preferredSessionId ?? snapshot.selectedSessionId;
+    // 进入 Desktop 本身不等于恢复旧会话；只有用户点击会话、显式 handoff 或
+    // 正在运行的 Host 会话才允许打开聊天正文。
+    const nextSessionId = preferredSessionId;
     if (nextSessionId) await openSession(snapshot.project.id, nextSessionId);
     else {
       loadRequestRef.current += 1;
@@ -269,7 +290,9 @@ export function App(): React.JSX.Element {
       setFontPreference(bootstrap.fontPreference ?? DEFAULT_FONT_PREFERENCE);
       if (bootstrap.workspace) {
         mergeWorkspaceProject(bootstrap.workspace);
-        const nextSessionId = bootstrap.selectedSessionId ?? bootstrap.workspace.selectedSessionId;
+        // Desktop 启动本身不等于恢复或交接；只有 `/app` 的显式 handoff 才会
+        // 在 bootstrap 中带 selectedSessionId。历史 session 仍只展示在侧栏。
+        const nextSessionId = bootstrap.selectedSessionId;
         if (nextSessionId) {
           await openSession(bootstrap.workspace.project.id, nextSessionId);
           commitNavigation(pushNavigation(createNavigationState(), { projectId: bootstrap.workspace.project.id, sessionId: nextSessionId }));
@@ -297,6 +320,10 @@ export function App(): React.JSX.Element {
     setWorkspace
   });
 
+  useEffect(() => window.biny.onSessionHandoff((target) => {
+    void openNavigationTarget(target).catch((error) => setToast(errorMessage(error)));
+  }), [openNavigationTarget]);
+
   useEffect(() => window.biny.onMenuAction((action) => menuActionRef.current(action)), []);
 
   const openProject = useCallback(async (): Promise<void> => {
@@ -304,12 +331,11 @@ export function App(): React.JSX.Element {
       const snapshot = await window.biny.openProject();
       if (snapshot) {
         await adoptWorkspace(snapshot);
-        if (snapshot.selectedSessionId) commitNavigation(pushNavigation(navigationRef.current, { projectId: snapshot.project.id, sessionId: snapshot.selectedSessionId }));
       }
     } catch (error) {
       setToast(errorMessage(error));
     }
-  }, [adoptWorkspace, commitNavigation]);
+  }, [adoptWorkspace]);
 
   const createEmptyProject = useCallback(async (): Promise<void> => {
     try {
@@ -330,12 +356,11 @@ export function App(): React.JSX.Element {
     try {
       const snapshot = await window.biny.selectProject(projectId);
       await adoptWorkspace(snapshot);
-      if (snapshot.selectedSessionId) commitNavigation(pushNavigation(navigationRef.current, { projectId, sessionId: snapshot.selectedSessionId }));
     } catch (error) {
       setLoading(false);
       setToast(errorMessage(error));
     }
-  }, [adoptWorkspace, commitNavigation]);
+  }, [adoptWorkspace]);
 
   const newTask = useCallback(async (targetProjectId = projectRef.current): Promise<void> => {
     const projectId = targetProjectId;
@@ -592,13 +617,12 @@ export function App(): React.JSX.Element {
       setSidebarSessions(bootstrap.sidebarSessions);
       setWorkspace(bootstrap.workspace);
       setDocument(undefined);
-      setSelectedSessionId(bootstrap.selectedSessionId);
+      setSelectedSessionId(undefined);
       commitNavigation(createNavigationState());
-      if (bootstrap.workspace && bootstrap.selectedSessionId) await openSession(bootstrap.workspace.project.id, bootstrap.selectedSessionId);
     } catch (error) {
       setToast(errorMessage(error));
     }
-  }, [commitNavigation, openSession]);
+  }, [commitNavigation]);
 
   const setPermissionMode = useCallback(async (mode: PermissionMode): Promise<void> => {
     const projectId = projectRef.current;
@@ -816,9 +840,13 @@ export function App(): React.JSX.Element {
         project={workspace?.project}
         projectId={workspace?.project.id}
         runtimeError={workspace?.runtimeError}
+        runtimeProjection={workspace?.runtimeProjection}
         sessionId={selectedSessionId}
         sessionTitle={sessionSummary?.title}
         turns={visibleTurns}
+        onRuntimeError={reportRuntimeError}
+        onRuntimeMutation={mutateRuntime}
+        onRuntimeRefresh={refreshRuntimeProjection}
       >
         {composer}
       </Workspace>

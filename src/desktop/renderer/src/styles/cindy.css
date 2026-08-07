@@ -2138,6 +2138,150 @@
   app-region: no-drag;
 }
 
+.cindy-runtime-toolbar-button[aria-expanded="true"] {
+  color: var(--cindy-text);
+  background: var(--cindy-surface-selected);
+}
+
+.cindy-runtime-panel {
+  position: absolute;
+  z-index: 4;
+  top: 52px;
+  right: var(--cindy-chat-toolbar-inline-padding);
+  width: min(420px, calc(100% - 24px));
+  max-height: min(620px, calc(100% - 76px));
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid var(--cindy-border);
+  border-radius: 14px;
+  background: var(--cindy-surface-elevated);
+  box-shadow: 0 10px 28px var(--cindy-shadow-soft);
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.cindy-runtime-panel-header,
+.cindy-runtime-summary,
+.cindy-runtime-row,
+.cindy-runtime-panel-footer {
+  display: flex;
+  align-items: center;
+}
+
+.cindy-runtime-panel-header {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.cindy-runtime-panel-header > div,
+.cindy-runtime-row-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.cindy-runtime-panel-header span,
+.cindy-runtime-panel-footer,
+.cindy-runtime-row-copy small,
+.cindy-runtime-empty {
+  color: var(--cindy-text-secondary);
+  font-size: 11px;
+}
+
+.cindy-runtime-panel-icon,
+.cindy-runtime-row-action {
+  border: 1px solid var(--cindy-border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--cindy-text-secondary);
+  cursor: pointer;
+}
+
+.cindy-runtime-panel-icon {
+  display: inline-flex;
+  width: 26px;
+  height: 26px;
+  align-items: center;
+  justify-content: center;
+}
+
+.cindy-runtime-panel-icon:hover:not(:disabled),
+.cindy-runtime-row-action:hover:not(:disabled) {
+  color: var(--cindy-text);
+  background: var(--cindy-surface-hover);
+}
+
+.cindy-runtime-panel-icon:disabled,
+.cindy-runtime-row-action:disabled {
+  cursor: progress;
+  opacity: 0.55;
+}
+
+.cindy-runtime-summary {
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0;
+}
+
+.cindy-runtime-summary span {
+  padding: 4px 7px;
+  border-radius: 7px;
+  background: var(--cindy-surface-soft);
+  color: var(--cindy-text-secondary);
+  font-size: 11px;
+}
+
+.cindy-runtime-section {
+  margin-top: 14px;
+}
+
+.cindy-runtime-section h3 {
+  margin: 0 0 6px;
+  color: var(--cindy-text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.cindy-runtime-empty {
+  margin: 0;
+}
+
+.cindy-runtime-row {
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 34px;
+  padding: 5px 0;
+  border-top: 1px solid var(--cindy-border-subtle);
+}
+
+.cindy-runtime-row-copy > span {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.cindy-runtime-row-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+}
+
+.cindy-runtime-row-action {
+  min-height: 24px;
+  padding: 0 7px;
+  font-size: 11px;
+}
+
+.cindy-runtime-panel-footer {
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--cindy-border-subtle);
+}
+
 .cindy-chat-toolbar button,
 .cindy-chat-composer,
 .cindy-runtime-error,

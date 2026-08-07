@@ -33,7 +33,8 @@ export const ComposerActionButton = forwardRef<HTMLButtonElement, ComposerAction
   tooltip,
   ...rest
 }, ref): React.JSX.Element {
-  const content = disabledReason ?? tooltip;
+  // disabledReason 只描述不可用状态；即使调用方误传，也不能覆盖可用按钮的正常提示。
+  const content = disabled ? disabledReason ?? tooltip : tooltip;
   const keepFocusable = disabled && Boolean(disabledReason);
   const tooltipApi = useTooltip({
     delay: 200,

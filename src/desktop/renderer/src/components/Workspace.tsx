@@ -7,10 +7,11 @@
 import type { PermissionResult } from "../../../../permission/PermissionManager.js";
 import { useEffect, useRef, useState } from "react";
 import { ThinkingOrb } from "thinking-orbs";
-import type { DesktopProject } from "../../../protocol.js";
+import type { DesktopProject, DesktopRuntimeMutation, DesktopRuntimeProjection } from "../../../protocol.js";
 import type { TimelineTurn } from "../sessionTimeline.js";
 import { Icon } from "./Icon.js";
 import { MessageTimeline } from "./MessageTimeline.js";
+import { RuntimePanel } from "./RuntimePanel.js";
 
 interface WorkspaceProps {
   project?: DesktopProject;
@@ -20,6 +21,7 @@ interface WorkspaceProps {
   turns: TimelineTurn[];
   loading: boolean;
   runtimeError?: string;
+  runtimeProjection?: DesktopRuntimeProjection;
   onOpenProject(): void;
   onPreviewFile(path: string): void;
   onToggleFiles(): void;
@@ -31,6 +33,9 @@ interface WorkspaceProps {
   onCreateBranch(): void;
   onRollbackFiles(turn: TimelineTurn): void;
   onDeleteUserMessage(turnId: string): void;
+  onRuntimeError(error: unknown): void;
+  onRuntimeMutation(operation: DesktopRuntimeMutation, payload: Record<string, unknown>): Promise<void>;
+  onRuntimeRefresh(): Promise<void>;
   children?: React.ReactNode;
 }
 
@@ -42,6 +47,7 @@ export function Workspace({
   turns,
   loading,
   runtimeError,
+  runtimeProjection,
   onOpenProject,
   onPreviewFile,
   onToggleFiles,
@@ -53,8 +59,12 @@ export function Workspace({
   onCreateBranch,
   onRollbackFiles,
   onDeleteUserMessage,
+  onRuntimeError,
+  onRuntimeMutation,
+  onRuntimeRefresh,
   children
 }: WorkspaceProps): React.JSX.Element {
+  const [runtimePanelOpen, setRuntimePanelOpen] = useState(false);
   const streaming = turns.some((turn) => turn.status === "running" || turn.status === "waiting_permission");
   const isHome = !loading && !runtimeError && turns.length === 0;
 
@@ -83,6 +93,17 @@ export function Workspace({
           </div>
           <div className="cindy-chat-actions">
             <button
+              aria-expanded={runtimePanelOpen}
+              aria-label="打开后台运行面板"
+              className="cindy-toolbar-button cindy-runtime-toolbar-button"
+              disabled={!projectId}
+              onClick={() => setRuntimePanelOpen((current) => !current)}
+              title="后台运行"
+              type="button"
+            >
+              <Icon name="activity" size={15} />
+            </button>
+            <button
               aria-label="打开文件面板"
               className="cindy-toolbar-button"
               disabled={!projectId}
@@ -93,6 +114,14 @@ export function Workspace({
             </button>
           </div>
         </header>
+        {runtimePanelOpen ? (
+          <RuntimePanel
+            onError={onRuntimeError}
+            onMutation={onRuntimeMutation}
+            onRefresh={onRuntimeRefresh}
+            projection={runtimeProjection}
+          />
+        ) : null}
         <div className="cindy-chat-body">
           {loading ? <LoadingState /> : runtimeError ? <RuntimeError error={runtimeError} onOpenProject={onOpenProject} /> : turns.length > 0 && projectId ? (
             <ChatScroll>

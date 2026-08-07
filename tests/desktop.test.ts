@@ -54,6 +54,8 @@ import type { SessionEvent } from "../src/session/recorder.js";
 import { SessionRecorder } from "../src/session/recorder.js";
 import { listSessionSummaries, readStoredSessionEvents } from "../src/session/events.js";
 import { ensureAgentDirs, resolveSessionFile, sessionFilePath } from "../src/session/store.js";
+import type { AgentMessage } from "../src/agent/core/types.js";
+import { TurnStore } from "../src/session/turnStore.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -83,8 +85,9 @@ testSidebarLayoutState();
 await testSidebarStateNormalizesWidth();
 await testDesktopThemePreference();
 await testDesktopModelConfiguration();
+await testDesktopModelSwitchDoesNotResumeInterruptedTurn();
 await testDesktopSubagentSlashCommands();
-await testDesktopReportsRuntimeLeaseConflict();
+await testDesktopDoesNotResumePersistedIdleSession();
 await testDesktopCredentialsAreSeparated();
 await testDesktopWebSearchSettings();
 await testDesktopRequiresModelConfiguration();
@@ -336,10 +339,11 @@ async function testInteractiveRuntimePublishesStatusSnapshot(): Promise<void> {
   const submitted = runtime.submitPrompt("status-snapshot");
   try {
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
-    assert.equal(sawCompletedStatus, true, "AgentSession status must be visible before final done cleanup");
+    assert.equal(sawCompletedStatus, false, "terminal UI state must wait for the canonical commit");
   } finally {
     releaseStatus();
     await submitted.completion;
+    assert.equal(sawCompletedStatus, false, "terminal host events should close the active run instead of exposing a stale terminal snapshot");
     await runtime.close();
   }
 }
@@ -1101,6 +1105,56 @@ async function testDesktopModelConfiguration(): Promise<void> {
   }
 }
 
+async function testDesktopModelSwitchDoesNotResumeInterruptedTurn(): Promise<void> {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-model-switch-resume-"));
+  const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-model-switch-resume-data-"));
+  const previousHostEntry = process.env.BINY_RUNTIME_HOST_ENTRY;
+  let agents: DesktopAgentManager | undefined;
+  try {
+    const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
+    // 让跨进程尝试立即失败，进入同进程 fallback；这样使用测试注入的 configStore，
+    // 同时仍覆盖 Desktop 的完整初始化分支，不留下 detached Host。
+    process.env.BINY_RUNTIME_HOST_ENTRY = path.join(desktopRoot, "missing-runtime-host-entry.js");
+    const project = await projects.createProject(workspaceRoot);
+    const dataRoot = await projects.dataRoot(project);
+    const interruptedSessionId = "interrupted-before-model-switch";
+    const recorder = new SessionRecorder(dataRoot, interruptedSessionId);
+    recorder.record({ type: "user_message", content: "继续处理之前的任务" });
+    recorder.record({
+      type: "turn_status",
+      status: "incomplete",
+      stopReason: "hard_step_limit",
+      steps: 1_000_000,
+      summary: "测试用中断回合",
+      resumable: true
+    });
+    await recorder.close();
+
+    const interruptedMessages: AgentMessage[] = [{ role: "user", content: "继续处理之前的任务" }];
+    await new TurnStore(dataRoot, interruptedSessionId).save(
+      "继续处理之前的任务",
+      undefined,
+      interruptedMessages,
+      1_000_000
+    );
+
+    // 不选中这个会话：普通 Desktop 初始化只能创建空闲 runtime，不能把磁盘上的
+    // resumable turn 当成启动命令。只有用户点击「继续运行」才允许调用恢复入口。
+    agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
+    const switched = await agents.switchModel(project.id, "test-model", "off");
+    assert.equal(switched.modelAlias, "test-model");
+    const snapshot = await agents.workspaceSnapshot(project.id);
+    assert.notEqual(snapshot.runtime?.info.sessionId, interruptedSessionId);
+    assert.equal(snapshot.runtime?.state.kind, "idle");
+  } finally {
+    await agents?.closeAll();
+    if (previousHostEntry === undefined) delete process.env.BINY_RUNTIME_HOST_ENTRY;
+    else process.env.BINY_RUNTIME_HOST_ENTRY = previousHostEntry;
+    await rm(workspaceRoot, { recursive: true, force: true });
+    await rm(desktopRoot, { recursive: true, force: true });
+  }
+}
+
 async function testDesktopSubagentSlashCommands(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-subagent-"));
   const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-subagent-data-"));
@@ -1137,10 +1191,11 @@ async function testDesktopSubagentSlashCommands(): Promise<void> {
   }
 }
 
-async function testDesktopReportsRuntimeLeaseConflict(): Promise<void> {
+async function testDesktopDoesNotResumePersistedIdleSession(): Promise<void> {
   const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-runtime-lease-"));
   const desktopRoot = await mkdtemp(path.join(os.tmpdir(), "biny-desktop-runtime-lease-data-"));
   let owner: SessionLeaseStore | undefined;
+  let agents: DesktopAgentManager | undefined;
   try {
     const { configStore, projects, state } = await createDesktopTestServices(desktopRoot);
     const project = await projects.createProject(workspaceRoot);
@@ -1150,15 +1205,17 @@ async function testDesktopReportsRuntimeLeaseConflict(): Promise<void> {
     await recorder.close();
     await state.setSelectedSession(project.id, "session-owner");
     owner.acquire("session-owner");
-    const agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
-    await assert.rejects(
-      () => agents.setPermissionMode(project.id, "read-only"),
-      new RegExp(`当前项目正在被另一个 Biny/CLI 会话占用（进程 ${String(process.pid)}）`)
-    );
-    const snapshot = await agents.workspaceSnapshot(project.id);
-    assert.match(snapshot.runtimeError ?? "", /请先退出该会话，或切换到其他项目后重试/u);
-    await agents.closeAll();
+    agents = new DesktopAgentManager(state, projects, configStore, () => undefined);
+    const snapshot = await agents.setPermissionMode(project.id, "read-only");
+    assert.notEqual(snapshot.runtime?.info.sessionId, "session-owner");
+    assert.equal(snapshot.runtimeError, undefined);
+    assert.equal(snapshot.runtime?.permissionMode, "read-only");
+    // Desktop 启动时只看到一个新的空闲 runtime；只有用户显式打开并发送到历史
+    // session 时，才会走 resumeSession 并报告旧 session 的 lease 冲突。
+    const workspace = await agents.workspaceSnapshot(project.id);
+    assert.equal(workspace.selectedSessionId, "session-owner");
   } finally {
+    await agents?.closeAll();
     owner?.close();
     await rm(workspaceRoot, { recursive: true, force: true });
     await rm(desktopRoot, { recursive: true, force: true });

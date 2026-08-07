@@ -36,14 +36,16 @@ import {
 import type { CommandRuntime } from "../../../runtime/CommandRuntime.js";
 import {
   connectOrSpawnRuntimeHost,
-  findLatestInterruptedSession,
   startRuntimeHost,
   RuntimeHostClient,
+  type HostOperationResult,
   type RuntimeHostFactory,
   type RuntimeHostServer
 } from "../../../runtime/RuntimeHost.js";
 import { SessionLeaseError } from "../../../runtime/SessionLease.js";
 import { isTerminalRunEvent, runtimeIsBusy, type AgentHostEvent, type AgentRuntimeUpdate } from "../../../runtime/agentEvents.js";
+import { evaluateTaskRetry } from "../../../runtime/TaskRetryPolicy.js";
+import { isTaskRunTerminal } from "../../../runtime/TaskRunStore.js";
 import { withAttachmentReferences } from "../../attachmentReferences.js";
 import type {
   DesktopAttachment,
@@ -58,6 +60,8 @@ import type {
   DesktopModelLoginProvider,
   DesktopModelLoginStartResult,
   DesktopRunReceipt,
+  DesktopRuntimeMutation,
+  DesktopRuntimeProjection,
   DesktopSessionDocument,
   DesktopSessionSummary,
   DesktopSessionTreePage,
@@ -67,6 +71,8 @@ import type {
   DesktopWebSearchSettingsInput,
   DesktopWorkspaceSnapshot
 } from "../../protocol.js";
+import type { AutomationCreateInput } from "../../../runtime/AutomationScheduler.js";
+import type { GraphNodeInput } from "../../../runtime/GoalGraphStore.js";
 import { DesktopProjectService } from "./DesktopProjectService.js";
 import { DesktopModelLoginService, type AuthenticatedModelLogin } from "./DesktopModelLoginService.js";
 import { DesktopStateStore } from "./DesktopStateStore.js";
@@ -111,6 +117,7 @@ export class DesktopAgentManager {
       this.projects.listSessionTreePage(project, runtime?.getSnapshot(), this.projectEvents(projectId))
     ]);
     const models = config ? listConfiguredModelChoices(config) : [];
+    const runtimeProjection = runtime === undefined ? undefined : await this.runtimeProjection(projectId);
     return {
       project,
       sessions,
@@ -120,7 +127,8 @@ export class DesktopAgentManager {
       runtimeError: this.runtimeErrors.get(projectId),
       requiresModelConfiguration: !config || !hasUsableModelConfiguration(config),
       models,
-      connections: config ? describeModelConnections(config) : []
+      connections: config ? describeModelConnections(config) : [],
+      runtimeProjection
     };
   }
 
@@ -209,12 +217,20 @@ export class DesktopAgentManager {
     attachments: DesktopAttachment[],
     delivery?: "steer" | "followUp"
   ): Promise<DesktopRunReceipt> {
-    const managed = await this.ensureRuntime(projectId);
-    const { runtime } = managed;
-    const snapshot = runtime.getSnapshot();
+    let managed = await this.ensureRuntime(projectId);
+    let runtime = managed.runtime;
+    let snapshot = runtime.getSnapshot();
+    // 没有显式选中历史 session 时，第一条消息必须落到新聊天，而不是附加到
+    // Desktop 启动前 Host 恰好持有的旧空闲 session。运行中的 Host 仍保持可观察和可 follow-up。
+    if (!sessionId && !runtimeIsBusy(snapshot)) {
+      await this.startDraft(projectId);
+      managed = await this.ensureRuntime(projectId);
+      runtime = managed.runtime;
+      snapshot = runtime.getSnapshot();
+    }
     if (runtimeIsBusy(snapshot)) {
-      if (sessionId && snapshot.info.sessionId !== sessionId) {
-        throw new Error("当前项目的另一条会话仍在运行，请返回该会话或先停止任务。");
+      if (!sessionId || snapshot.info.sessionId !== sessionId) {
+        throw new Error("当前项目已有任务正在运行。请先在 Desktop 中明确打开该会话，或在 TUI 使用 /app 交接后再继续。");
       }
       const project = this.projects.requireProject(projectId);
       const prompt = withAttachmentReferences(input, attachments);
@@ -231,7 +247,7 @@ export class DesktopAgentManager {
     }
     // 目标会话不是运行时当前会话时需要切过去，但只能在完全空闲时切。
     if (sessionId && runtime.getSnapshot().info.sessionId !== sessionId) {
-      const snapshot = runtime.getSnapshot();
+      snapshot = runtime.getSnapshot();
       if (runtimeIsBusy(snapshot)) {
         throw new Error("The selected session is still running. Return to it or stop the task before resuming another session.");
       }
@@ -757,6 +773,133 @@ export class DesktopAgentManager {
     return result;
   }
 
+  async runtimeProjection(projectId: string): Promise<DesktopRuntimeProjection> {
+    const { runtime, commands } = await this.ensureRuntime(projectId);
+    if (commands) {
+      return {
+        tasks: commands.taskRuns.list(),
+        automations: commands.automationStore.list(),
+        pendingFires: commands.automationStore.listPending(),
+        goals: commands.graphs.listGoals(),
+        graphs: commands.graphs.listGraphs(),
+        capabilities: commands.capabilities.list()
+      };
+    }
+    const remote = requireRemoteRuntime(runtime);
+    const [tasks, automations, pendingFires, goals, graphs, capabilities] = await Promise.all([
+      remote.taskList(),
+      remote.automationList(),
+      remote.automationPending(),
+      remote.goalList(),
+      remote.graphList(),
+      remote.capabilityList()
+    ]);
+    return { tasks, automations, pendingFires, goals, graphs, capabilities };
+  }
+
+  async runtimeEvents(projectId: string, afterSequence?: number, limit?: number): Promise<unknown> {
+    const { runtime, commands } = await this.ensureRuntime(projectId);
+    if (commands) return commands.runtimeAuthority.readEvents({ afterSequence, limit });
+    return await requireRemoteRuntime(runtime).subscribeRuntimeEvents({ afterSequence, limit });
+  }
+
+  async runtimeMutation(projectId: string, operation: DesktopRuntimeMutation, payload: Record<string, unknown> = {}): Promise<unknown> {
+    const { runtime, commands, host } = await this.ensureRuntime(projectId);
+    if (!commands) return await executeRemoteRuntimeMutation(requireRemoteRuntime(runtime), operation, payload);
+    if (operation === "task.create") return commands.taskRuns.create({ task: payload.task, sessionId: optionalPayloadString(payload.sessionId), parentRunId: optionalPayloadString(payload.parentRunId) });
+    if (operation === "task.start") throw new Error("TaskRun start is unavailable until a TaskRun execution adapter is attached; use an explicit AgentRun, Automation, or Graph entrypoint.");
+    if (operation === "task.cancel") {
+      const taskRunId = requiredPayloadString(payload.taskRunId, "taskRunId");
+      const reason = optionalPayloadString(payload.reason) ?? "TaskRun cancelled.";
+      const task = commands.taskRuns.get(taskRunId);
+      const subagent = commands.subagents?.getSnapshot(taskRunId);
+      const cancelledSubagent = commands.subagents?.cancelTask(taskRunId, reason) ?? false;
+      const runId = task?.attempts.at(-1)?.runId;
+      if (runId !== undefined) runtime.cancelRun(runId);
+      const subagentActive = subagent !== undefined && !["completed", "failed", "aborted", "timed_out"].includes(subagent.status);
+      if (subagentActive && !cancelledSubagent && !isTaskRunTerminal(task?.status ?? "created")) {
+        throw new Error(`Unable to cancel active subagent task ${taskRunId}.`);
+      }
+      if (task !== undefined) {
+        const current = commands.taskRuns.get(taskRunId);
+        if (!current) throw new Error(`TaskRun ${taskRunId} does not exist.`);
+        if (isTaskRunTerminal(current.status)) return current;
+        return commands.taskRuns.transition(taskRunId, "cancelled");
+      }
+      throw new Error(`TaskRun ${taskRunId} does not exist.`);
+    }
+    if (operation === "task.approve") throw new Error("TaskRun approval cannot start execution without an attached TaskRun execution adapter.");
+    if (operation === "task.retry") {
+      const taskRunId = requiredPayloadString(payload.taskRunId, "taskRunId");
+      const decision = evaluateTaskRetry(commands.taskRuns.get(taskRunId));
+      if (!decision.allowed) throw new Error(`Task retry rejected (${decision.code}): ${decision.reason}`);
+      throw new Error(`Task retry admitted for ${decision.failureClass}, but no TaskRun execution adapter is attached; refusing to mark the task running without starting a new AgentRun.`);
+    }
+    if (operation === "task.resume") throw new Error("TaskRun resume requires an explicit safe-boundary continuation admission; it cannot be inferred from a TaskRun status.");
+    if (operation === "automation.create") return commands.automationStore.create(payload as unknown as AutomationCreateInput);
+    if (operation === "automation.pause") return commands.automationStore.pause(requiredPayloadString(payload.automationId, "automationId"));
+    if (operation === "automation.resume") return commands.automationStore.resume(requiredPayloadString(payload.automationId, "automationId"));
+    if (operation === "automation.delete") {
+      commands.automationStore.delete(requiredPayloadString(payload.automationId, "automationId"));
+      return undefined;
+    }
+    if (operation === "automation.run") {
+      if (!host) throw new Error("Automation scheduler is unavailable.");
+      return await host.runAutomation(requiredPayloadString(payload.automationId, "automationId"));
+    }
+    if (operation === "goal.create") return commands.graphs.createGoal(requiredPayloadString(payload.title, "title"), payload.payload, optionalPayloadString(payload.goalId));
+    if (operation === "goal.pause") return commands.graphs.updateGoal(requiredPayloadString(payload.goalId, "goalId"), "paused");
+    if (operation === "goal.resume") return commands.graphs.updateGoal(requiredPayloadString(payload.goalId, "goalId"), "active");
+    if (operation === "goal.cancel") return commands.graphs.updateGoal(requiredPayloadString(payload.goalId, "goalId"), "cancelled");
+    if (operation === "graph.create") return commands.graphs.createGraph(optionalPayloadString(payload.goalId), (payload.nodes ?? []) as GraphNodeInput[], payload.payload, optionalPayloadString(payload.graphId));
+    if (operation === "graph.start") {
+      const graph = commands.graphs.startGraph(requiredPayloadString(payload.graphId, "graphId"));
+      commands.graphs.createWake(graph.graphId, "graph_started");
+      return graph;
+    }
+    if (operation === "graph.pause") return commands.graphs.pauseGraph(requiredPayloadString(payload.graphId, "graphId"));
+    if (operation === "graph.resume") {
+      const graph = commands.graphs.resumeGraph(requiredPayloadString(payload.graphId, "graphId"));
+      commands.graphs.createWake(graph.graphId, "graph_resumed");
+      return graph;
+    }
+    if (operation === "graph.cancel") {
+      const graphId = requiredPayloadString(payload.graphId, "graphId");
+      const graph = commands.graphs.inspectGraph(graphId);
+      const activeRuns = graph.nodes
+        .filter((node) => node.status === "running" && node.taskRunId !== undefined)
+        .map((node) => ({
+          taskRunId: node.taskRunId!,
+          runId: commands.taskRuns.get(node.taskRunId!)?.attempts.at(-1)?.runId
+        }));
+      const result = commands.graphs.cancelGraph(graphId);
+      for (const active of activeRuns) {
+        commands.subagents?.cancelTask(active.taskRunId, "Graph cancelled.");
+        if (active.runId !== undefined) runtime.cancelRun(active.runId);
+        try {
+          const task = commands.taskRuns.get(active.taskRunId);
+          if (task && !isTaskRunTerminal(task.status)) commands.taskRuns.transition(active.taskRunId, "cancelled");
+        } catch {
+          // Graph cancellation is already durable; late AgentRun results are ignored by the store.
+        }
+      }
+      return result;
+    }
+    if (operation === "capability.register") return commands.capabilities.register({ ...(payload as { ownerType: "host" | "client"; ownerId: string; capabilityName: string; schema: unknown }), ownerId: optionalPayloadString(payload.ownerId) ?? "desktop-" + process.pid });
+    if (operation === "capability.replace") return commands.capabilities.replace(requiredPayloadString(payload.registrationId, "registrationId"), payload.schema, optionalPayloadString(payload.expiresAt));
+    if (operation === "capability.admit") return commands.capabilities.admit(requiredPayloadString(payload.registrationId, "registrationId"));
+    if (operation === "capability.reject") return commands.capabilities.reject(requiredPayloadString(payload.registrationId, "registrationId"), optionalPayloadString(payload.reason) ?? "rejected");
+    if (operation === "capability.release") return commands.capabilities.release(requiredPayloadString(payload.registrationId, "registrationId"), optionalPayloadString(payload.reason) ?? "released");
+    if (operation === "capability.invoke") return commands.capabilities.invoke(payload as never);
+    if (operation === "capability.accept") return commands.capabilities.accept(requiredPayloadString(payload.invocationId, "invocationId"));
+    if (operation === "capability.start") return commands.capabilities.start(requiredPayloadString(payload.invocationId, "invocationId"));
+    if (operation === "capability.result") return commands.capabilities.result(requiredPayloadString(payload.invocationId, "invocationId"), payload.result);
+    if (operation === "capability.chunk") return commands.capabilities.chunk(requiredPayloadString(payload.invocationId, "invocationId"), Number(payload.chunkIndex), payload.data, payload.final === true);
+    if (operation === "capability.fail") return commands.capabilities.fail(requiredPayloadString(payload.invocationId, "invocationId"), optionalPayloadString(payload.error) ?? "capability failed");
+    if (operation === "capability.cancel") return commands.capabilities.cancel(requiredPayloadString(payload.invocationId, "invocationId"), optionalPayloadString(payload.reason) ?? "capability cancelled");
+    throw new Error(`Unsupported desktop runtime mutation: ${operation}`);
+  }
+
   async duplicateSession(projectId: string, sessionId: string): Promise<DesktopWorkspaceSnapshot> {
     const project = this.projects.requireProject(projectId);
     const targetSessionId = await this.projects.duplicateSession(project, sessionId);
@@ -894,8 +1037,9 @@ export class DesktopAgentManager {
         workspaceRoot: project.path,
         configDir: globalConfigDir(),
         attachmentRoot: this.projects.attachmentsRoot(project),
-        sessionId: this.state.selectedSessionId(projectId),
-        resumeInterrupted: true,
+        // Desktop 启动本身不是恢复动作；只有用户打开会话或发送新消息时才选择 session。
+        sessionId: undefined,
+        resumeInterrupted: false,
         clientId: `desktop-${process.pid}`,
         surface: "desktop"
       });
@@ -906,8 +1050,6 @@ export class DesktopAgentManager {
     if (attached) {
       runtime = attached;
     } else {
-      const explicitSelectedSession = this.state.selectedSessionId(projectId);
-      const selectedSession = explicitSelectedSession ?? await findLatestInterruptedSession(persistenceRoot);
       const createLocalRuntime: RuntimeHostFactory = async (sessionId?: string): Promise<InteractiveAgentHost> => {
         const local = await createInteractiveAgentHost(project.path, {
           persistenceRoot,
@@ -922,31 +1064,9 @@ export class DesktopAgentManager {
           throw error;
         }
       };
-      const local = await createLocalRuntime(explicitSelectedSession === undefined ? selectedSession : undefined);
+      const local = await createLocalRuntime(undefined);
       runtime = local.runtime;
       commands = local.commands;
-    }
-    const initialSessionFile = commands ? runtime.getSnapshot().info.sessionFile : undefined;
-    const selectedSessionId = this.state.selectedSessionId(projectId);
-    if (selectedSessionId) {
-      try {
-        if (runtime.getSnapshot().info.sessionId !== selectedSessionId) {
-          if (runtimeIsBusy(runtime.getSnapshot())) {
-            throw new Error("当前项目的另一条会话仍在运行，请返回该会话或先停止任务。");
-          }
-          await runtime.resumeSession(selectedSessionId);
-        }
-      } catch (error) {
-        // 会话文件已被删除：清掉选中项，让运行时留在刚创建的新会话上。
-        if (isMissingSession(error)) {
-          await this.state.setSelectedSession(projectId, undefined);
-        } else {
-          // 其他错误则整体回滚，包括删掉刚创建但没用上的空 session 文件，避免留下垃圾会话。
-          await runtime.close();
-          if (initialSessionFile) await fs.rm(initialSessionFile, { force: true });
-          throw error;
-        }
-      }
     }
     if (commands) {
       try {
@@ -966,7 +1086,7 @@ export class DesktopAgentManager {
         };
         host = await startRuntimeHost(persistenceRoot, runtime, commands, {
           createRuntime: createLocalRuntime,
-          resumeInterrupted: true
+          resumeInterrupted: false
         });
       } catch (error) {
         // 两个入口同时启动时，只有抢到 Host lock 的一方创建 owner；另一方丢弃
@@ -976,8 +1096,8 @@ export class DesktopAgentManager {
           workspaceRoot: project.path,
           configDir: globalConfigDir(),
           attachmentRoot: this.projects.attachmentsRoot(project),
-          sessionId: this.state.selectedSessionId(projectId),
-          resumeInterrupted: true,
+          sessionId: undefined,
+          resumeInterrupted: false,
           clientId: `desktop-${process.pid}`,
           surface: "desktop"
         });
@@ -1131,11 +1251,6 @@ function describeCredentialSource(provider: ProviderConfig, apiKeyEnv: string | 
   return undefined;
 }
 
-function isMissingSession(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.startsWith("Session not found:") || message.startsWith("Session file not found:");
-}
-
 function requireLocalMemory(services: CommandRuntime) {
   const memory = services.agent.getLocalMemory();
   if (!memory) throw new Error("Local memory is disabled (context.memory.enabled = false).");
@@ -1145,6 +1260,56 @@ function requireLocalMemory(services: CommandRuntime) {
 function requireRemoteRuntime(runtime: InteractiveRuntimeHandle): RuntimeHostClient {
   if (!(runtime instanceof RuntimeHostClient)) throw new Error("Remote runtime client is unavailable.");
   return runtime;
+}
+
+async function executeRemoteRuntimeMutation(runtime: RuntimeHostClient, operation: DesktopRuntimeMutation, payload: Record<string, unknown>): Promise<unknown> {
+  if (operation === "task.create") return await unwrapHostOperationResult(runtime.taskCreate({ task: payload.task, sessionId: optionalPayloadString(payload.sessionId), parentRunId: optionalPayloadString(payload.parentRunId) }));
+  if (operation === "task.start") return await unwrapHostOperationResult(runtime.taskStart(requiredPayloadString(payload.taskRunId, "taskRunId"), { attemptId: optionalPayloadString(payload.attemptId), runId: optionalPayloadString(payload.runId), turnId: optionalPayloadString(payload.turnId), retrySafety: optionalPayloadString(payload.retrySafety) }));
+  if (operation === "task.cancel") return await unwrapHostOperationResult(runtime.taskCancel(requiredPayloadString(payload.taskRunId, "taskRunId"), optionalPayloadString(payload.reason)));
+  if (operation === "task.approve") return await unwrapHostOperationResult(runtime.taskApprove(requiredPayloadString(payload.taskRunId, "taskRunId")));
+  if (operation === "task.resume") return await unwrapHostOperationResult(runtime.taskResume(requiredPayloadString(payload.taskRunId, "taskRunId"), { runId: optionalPayloadString(payload.runId), turnId: optionalPayloadString(payload.turnId), retrySafety: optionalPayloadString(payload.retrySafety) }));
+  if (operation === "task.retry") return await unwrapHostOperationResult(runtime.taskRetry(requiredPayloadString(payload.taskRunId, "taskRunId")));
+  if (operation === "automation.create") return await unwrapHostOperationResult(runtime.automationCreate(payload as unknown as AutomationCreateInput));
+  if (operation === "automation.pause") return await unwrapHostOperationResult(runtime.automationPause(requiredPayloadString(payload.automationId, "automationId")));
+  if (operation === "automation.resume") return await unwrapHostOperationResult(runtime.automationResume(requiredPayloadString(payload.automationId, "automationId")));
+  if (operation === "automation.run") return await unwrapHostOperationResult(runtime.automationRun(requiredPayloadString(payload.automationId, "automationId")));
+  if (operation === "automation.delete") return await unwrapHostOperationResult(runtime.automationDelete(requiredPayloadString(payload.automationId, "automationId")));
+  if (operation === "goal.create") return await unwrapHostOperationResult(runtime.goalCreate(requiredPayloadString(payload.title, "title"), payload.payload, optionalPayloadString(payload.goalId)));
+  if (operation === "goal.pause") return await unwrapHostOperationResult(runtime.goalPause(requiredPayloadString(payload.goalId, "goalId")));
+  if (operation === "goal.resume") return await unwrapHostOperationResult(runtime.goalResume(requiredPayloadString(payload.goalId, "goalId")));
+  if (operation === "goal.cancel") return await unwrapHostOperationResult(runtime.goalCancel(requiredPayloadString(payload.goalId, "goalId")));
+  if (operation === "graph.create") return await unwrapHostOperationResult(runtime.graphCreate({ goalId: optionalPayloadString(payload.goalId), graphId: optionalPayloadString(payload.graphId), nodes: (payload.nodes ?? []) as GraphNodeInput[], payload: payload.payload }));
+  if (operation === "graph.start") return await unwrapHostOperationResult(runtime.graphStart(requiredPayloadString(payload.graphId, "graphId")));
+  if (operation === "graph.pause") return await unwrapHostOperationResult(runtime.graphPause(requiredPayloadString(payload.graphId, "graphId")));
+  if (operation === "graph.resume") return await unwrapHostOperationResult(runtime.graphResume(requiredPayloadString(payload.graphId, "graphId")));
+  if (operation === "graph.cancel") return await unwrapHostOperationResult(runtime.graphCancel(requiredPayloadString(payload.graphId, "graphId")));
+  if (operation === "capability.register") return await unwrapHostOperationResult(runtime.capabilityRegister({ registrationId: optionalPayloadString(payload.registrationId), ownerType: payload.ownerType as "host" | "client", capabilityName: requiredPayloadString(payload.capabilityName, "capabilityName"), schema: payload.schema, expiresAt: optionalPayloadString(payload.expiresAt) }));
+  if (operation === "capability.replace") return await unwrapHostOperationResult(runtime.capabilityReplace(requiredPayloadString(payload.registrationId, "registrationId"), payload.schema, optionalPayloadString(payload.expiresAt)));
+  if (operation === "capability.admit") return await unwrapHostOperationResult(runtime.capabilityAdmit(requiredPayloadString(payload.registrationId, "registrationId")));
+  if (operation === "capability.reject") return await unwrapHostOperationResult(runtime.capabilityReject(requiredPayloadString(payload.registrationId, "registrationId"), optionalPayloadString(payload.reason)));
+  if (operation === "capability.release") return await unwrapHostOperationResult(runtime.capabilityRelease(requiredPayloadString(payload.registrationId, "registrationId"), optionalPayloadString(payload.reason)));
+  if (operation === "capability.invoke") return await unwrapHostOperationResult(runtime.capabilityInvoke(payload as never));
+  if (operation === "capability.accept") return await unwrapHostOperationResult(runtime.capabilityAccept(requiredPayloadString(payload.invocationId, "invocationId")));
+  if (operation === "capability.start") return await unwrapHostOperationResult(runtime.capabilityStart(requiredPayloadString(payload.invocationId, "invocationId")));
+  if (operation === "capability.result") return await unwrapHostOperationResult(runtime.capabilityResult(requiredPayloadString(payload.invocationId, "invocationId"), payload.result));
+  if (operation === "capability.chunk") return await unwrapHostOperationResult(runtime.capabilityChunk(requiredPayloadString(payload.invocationId, "invocationId"), Number(payload.chunkIndex), payload.data, payload.final === true));
+  if (operation === "capability.fail") return await unwrapHostOperationResult(runtime.capabilityFail(requiredPayloadString(payload.invocationId, "invocationId"), requiredPayloadString(payload.error, "error")));
+  return await unwrapHostOperationResult(runtime.capabilityCancel(requiredPayloadString(payload.invocationId, "invocationId"), optionalPayloadString(payload.reason)));
+}
+
+async function unwrapHostOperationResult<T>(operation: Promise<HostOperationResult<T>>): Promise<T | undefined> {
+  const result = await operation;
+  if (!result.accepted) throw new Error(result.reason ?? "Runtime operation was rejected.");
+  return result.result;
+}
+
+function requiredPayloadString(value: unknown, name: string): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`Desktop runtime field ${name} must be a non-empty string.`);
+  return value;
+}
+
+function optionalPayloadString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function formatModelConnectionError(error: unknown): string {

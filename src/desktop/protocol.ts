@@ -32,6 +32,7 @@ export const desktopIpc = {
   openProjectTerminal: "desktop:project:terminal",
   startDraft: "desktop:session:draft",
   openSession: "desktop:session:open",
+  sessionHandoff: "desktop:session:handoff",
   listSessionTreePage: "desktop:session:tree-page",
   renameSession: "desktop:session:rename",
   pinSession: "desktop:session:pin",
@@ -56,6 +57,9 @@ export const desktopIpc = {
   completeModelLogin: "desktop:model:login:complete",
   cancelModelLogin: "desktop:model:login:cancel",
   compact: "desktop:agent:compact",
+  runtimeProjection: "desktop:runtime:projection",
+  runtimeMutation: "desktop:runtime:mutation",
+  runtimeEvents: "desktop:runtime:events",
   webSearchSettings: "desktop:web-search:settings",
   saveWebSearchSettings: "desktop:web-search:save",
   openBrowser: "desktop:browser:open",
@@ -169,6 +173,12 @@ export interface DesktopSessionDocument {
   liveEvents: AgentHostEvent[];
 }
 
+/** TUI 通过 `/app` 显式交给 Desktop 打开的项目会话。 */
+export interface DesktopSessionHandoff {
+  projectId: string;
+  sessionId: string;
+}
+
 export interface DesktopSessionTreePageOptions {
   parentSessionId?: string;
   cursor?: string;
@@ -196,6 +206,7 @@ export interface DesktopWorkspaceSnapshot {
   requiresModelConfiguration: boolean;
   models: ModelChoice[];
   connections: DesktopModelConnection[];
+  runtimeProjection?: DesktopRuntimeProjection;
 }
 
 /** 渲染进程启动时一次性取回的初始状态，之后的变化都通过事件推送。 */
@@ -418,6 +429,50 @@ export interface DesktopSlashResult {
   content: string;
 }
 
+/** Desktop 后台面板使用的 authority 投影；渲染层不接触 SQLite 或 Host socket。 */
+export interface DesktopRuntimeProjection {
+  tasks: unknown;
+  automations: unknown;
+  pendingFires: unknown;
+  goals: unknown;
+  graphs: unknown;
+  capabilities: unknown;
+}
+
+export type DesktopRuntimeMutation =
+  | "task.create"
+  | "task.start"
+  | "task.cancel"
+  | "task.approve"
+  | "task.resume"
+  | "task.retry"
+  | "automation.create"
+  | "automation.pause"
+  | "automation.resume"
+  | "automation.run"
+  | "automation.delete"
+  | "goal.create"
+  | "goal.pause"
+  | "goal.resume"
+  | "goal.cancel"
+  | "graph.create"
+  | "graph.start"
+  | "graph.pause"
+  | "graph.resume"
+  | "graph.cancel"
+  | "capability.register"
+  | "capability.replace"
+  | "capability.admit"
+  | "capability.reject"
+  | "capability.release"
+  | "capability.invoke"
+  | "capability.accept"
+  | "capability.start"
+  | "capability.result"
+  | "capability.chunk"
+  | "capability.fail"
+  | "capability.cancel";
+
 export type DesktopMenuAction = "new-task" | "open-project" | "search" | "settings" | "toggle-sidebar" | "focus-composer";
 export type DesktopSessionMenuAction = "rename" | "pin" | "unpin" | "archive" | "unarchive" | "duplicate" | "delete";
 
@@ -475,6 +530,9 @@ export interface DesktopApi {
   completeModelLogin(projectId: string, provider: DesktopModelLoginProvider, authRequestId: string, pastedAuthorization?: string): Promise<DesktopWorkspaceSnapshot>;
   cancelModelLogin(projectId: string, provider: DesktopModelLoginProvider, authRequestId: string): Promise<void>;
   compact(projectId: string, hint?: string): Promise<string>;
+  runtimeProjection(projectId: string): Promise<DesktopRuntimeProjection>;
+  runtimeMutation(projectId: string, operation: DesktopRuntimeMutation, payload?: Record<string, unknown>): Promise<unknown>;
+  runtimeEvents(projectId: string, afterSequence?: number, limit?: number): Promise<unknown>;
   webSearchSettings(projectId: string): Promise<DesktopWebSearchSettings>;
   saveWebSearchSettings(projectId: string, input: DesktopWebSearchSettingsInput): Promise<DesktopWebSearchSettings>;
   /** 打开内嵌浏览器窗口；`url` 省略时打开首页。登录态由浏览器 partition 保存并同步给 agent 工具。 */
@@ -508,5 +566,6 @@ export interface DesktopApi {
   disposeTerminal(terminalId: string): Promise<void>;
   onTerminalEvent(listener: (event: DesktopTerminalEvent) => void): () => void;
   onAgentEvent(listener: (envelope: DesktopAgentEventEnvelope) => void): () => void;
+  onSessionHandoff(listener: (target: DesktopSessionHandoff) => void): () => void;
   onMenuAction(listener: (action: DesktopMenuAction) => void): () => void;
 }

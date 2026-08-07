@@ -8,7 +8,7 @@
  */
 import path from "node:path";
 import { app, BrowserWindow, dialog, nativeImage, Notification, shell } from "electron";
-import type { DesktopBootstrap } from "../../protocol.js";
+import type { DesktopBootstrap, DesktopSessionHandoff } from "../../protocol.js";
 import { desktopIpc } from "../../protocol.js";
 import { DesktopAgentManager } from "./DesktopAgentManager.js";
 import { DesktopBrowserService } from "./DesktopBrowserService.js";
@@ -29,6 +29,8 @@ app.setAboutPanelOptions({
   version: app.getVersion(),
   copyright: "Biny local agent"
 });
+
+const initialHandoff = parseDesktopLaunchHandoff(process.argv);
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -74,6 +76,13 @@ async function startDesktopApplication(): Promise<void> {
       }).show();
     }
   }, async (url) => await shell.openExternal(url));
+  const prepareHandoff = async (handoff: DesktopLaunchHandoff): Promise<DesktopSessionHandoff> => {
+    const project = await projects.createProject(handoff.workspaceRoot);
+    await state.setActiveProject(project.id);
+    await state.setSelectedSession(project.id, handoff.sessionId);
+    return { projectId: project.id, sessionId: handoff.sessionId };
+  };
+  const initialTarget = initialHandoff === undefined ? undefined : await prepareHandoff(initialHandoff);
   const terminals = new DesktopTerminalManager((event) => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(desktopIpc.terminalEvent, event);
   });
@@ -90,6 +99,12 @@ async function startDesktopApplication(): Promise<void> {
     activeProjectId ??= allProjects.at(0)?.id;
     if (activeProjectId !== state.activeProjectId()) await state.setActiveProject(activeProjectId);
     const workspace = activeProjectId ? await agents.workspaceSnapshot(activeProjectId) : undefined;
+    const explicitSessionId = initialTarget !== undefined && initialTarget.projectId === activeProjectId
+      ? initialTarget.sessionId
+      : undefined;
+    const visibleWorkspace = workspace && explicitSessionId === undefined
+      ? { ...workspace, selectedSessionId: undefined }
+      : workspace;
     const sidebarSessions = await agents.sidebarSessions(workspace);
     return {
       version: app.getVersion(),
@@ -97,8 +112,8 @@ async function startDesktopApplication(): Promise<void> {
       projects: state.projects(),
       sidebarSessions,
       activeProjectId,
-      selectedSessionId: activeProjectId ? state.selectedSessionId(activeProjectId) : undefined,
-      workspace,
+      selectedSessionId: explicitSessionId,
+      workspace: visibleWorkspace,
       sidebarWidth: state.sidebarWidth(),
       filePanelWidth: state.filePanelWidth(),
       themePreference: state.themePreference(),
@@ -134,6 +149,19 @@ async function startDesktopApplication(): Promise<void> {
     return mainWindow;
   };
 
+  const handleHandoff = async (handoff: DesktopLaunchHandoff): Promise<void> => {
+    try {
+      const target = await prepareHandoff(handoff);
+      if (!mainWindow || mainWindow.isDestroyed()) createWindow();
+      mainWindow?.show();
+      mainWindow?.focus();
+      mainWindow?.webContents.send(desktopIpc.sessionHandoff, target);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      dialog.showErrorBox("无法打开会话", message);
+    }
+  };
+
   registerDesktopIpc({ state, projects, agents, terminals, browser, getWindow: () => mainWindow, bootstrap });
   installApplicationMenu(() => mainWindow);
   createWindow();
@@ -142,10 +170,12 @@ async function startDesktopApplication(): Promise<void> {
     if (!mainWindow || mainWindow.isDestroyed()) createWindow();
     else mainWindow.show();
   });
-  app.on("second-instance", () => {
+  app.on("second-instance", (_event, commandLine) => {
     if (!mainWindow || mainWindow.isDestroyed()) createWindow();
     mainWindow?.show();
     mainWindow?.focus();
+    const handoff = parseDesktopLaunchHandoff(commandLine);
+    if (handoff) void handleHandoff(handoff);
   });
   app.on("window-all-closed", () => {
     if (process.platform !== "darwin") app.quit();
@@ -185,6 +215,20 @@ async function startDesktopApplication(): Promise<void> {
       }
     })();
   });
+}
+
+interface DesktopLaunchHandoff {
+  workspaceRoot: string;
+  sessionId: string;
+}
+
+function parseDesktopLaunchHandoff(argv: readonly string[]): DesktopLaunchHandoff | undefined {
+  const workspaceIndex = argv.indexOf("--biny-workspace");
+  const sessionIndex = argv.indexOf("--biny-session");
+  const workspaceRoot = workspaceIndex >= 0 ? argv[workspaceIndex + 1] : undefined;
+  const sessionId = sessionIndex >= 0 ? argv[sessionIndex + 1] : undefined;
+  if (!workspaceRoot || !sessionId || sessionId.includes("\0") || sessionId.length > 240) return undefined;
+  return { workspaceRoot: path.resolve(workspaceRoot), sessionId };
 }
 
 function setDesktopIcon(): void {

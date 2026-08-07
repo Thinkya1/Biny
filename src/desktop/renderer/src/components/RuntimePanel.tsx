@@ -1,0 +1,202 @@
+/**
+ * Desktop 后台运行面板。
+ *
+ * 面板只消费主进程提供的 projection，并通过统一 mutation 回调请求动作；它不读取
+ * SQLite，也不持有 RuntimeHost。这样断线后刷新 projection 仍然是 authority 的结果。
+ */
+import { useEffect, useState } from "react";
+import type { DesktopRuntimeMutation, DesktopRuntimeProjection } from "../../../protocol.js";
+import { Icon } from "./Icon.js";
+
+type RuntimeRecord = Record<string, unknown>;
+
+interface RuntimePanelProps {
+  projection?: DesktopRuntimeProjection;
+  onError(error: unknown): void;
+  onMutation(operation: DesktopRuntimeMutation, payload: Record<string, unknown>): Promise<void>;
+  onRefresh(): Promise<void>;
+}
+
+export function RuntimePanel({ projection, onError, onMutation, onRefresh }: RuntimePanelProps): React.JSX.Element {
+  const [busyAction, setBusyAction] = useState<string>();
+
+  useEffect(() => {
+    void onRefresh().catch(onError);
+  }, [onError, onRefresh]);
+
+  const runAction = async (key: string, operation: DesktopRuntimeMutation, payload: Record<string, unknown>): Promise<void> => {
+    setBusyAction(key);
+    try {
+      await onMutation(operation, payload);
+    } catch (error) {
+      onError(error);
+    } finally {
+      setBusyAction(undefined);
+    }
+  };
+
+  const tasks = records(projection?.tasks);
+  const automations = records(projection?.automations);
+  const pendingFires = records(projection?.pendingFires);
+  const goals = records(projection?.goals);
+  const graphs = records(projection?.graphs);
+  const capabilities = records(projection?.capabilities);
+
+  return (
+    <aside aria-label="后台运行" className="cindy-runtime-panel">
+      <header className="cindy-runtime-panel-header">
+        <div>
+          <strong>后台运行</strong>
+          <span>任务、自动化与 Graph 由 Runtime authority 管理</span>
+        </div>
+        <button aria-label="刷新后台运行状态" className="cindy-runtime-panel-icon" disabled={busyAction !== undefined} onClick={() => void onRefresh().catch(onError)} title="刷新" type="button">
+          <Icon name="refresh" size={14} />
+        </button>
+      </header>
+
+      <div className="cindy-runtime-summary" aria-label="后台运行统计">
+        <span>任务 {tasks.length}</span>
+        <span>自动化 {automations.length}</span>
+        <span>Graph {graphs.length}</span>
+        <span>待触发 {pendingFires.length}</span>
+      </div>
+
+      <RuntimeSection title="任务" empty="暂无持久任务">
+        {tasks.map((task) => {
+          const id = recordId(task, "taskRunId", "id");
+          if (!id) return null;
+          const status = recordText(task, "status") ?? "unknown";
+          const action = taskAction(status);
+          return (
+            <RuntimeRow key={id} label={id} status={status}>
+              {action ? (
+                <button
+                  className="cindy-runtime-row-action"
+                  disabled={busyAction !== undefined}
+                  onClick={() => void runAction(`${action.operation}:${id}`, action.operation, { taskRunId: id })}
+                  type="button"
+                >
+                  {busyAction === `${action.operation}:${id}` ? "处理中…" : action.label}
+                </button>
+              ) : null}
+            </RuntimeRow>
+          );
+        })}
+      </RuntimeSection>
+
+      <RuntimeSection title="自动化" empty="暂无自动化">
+        {automations.map((automation) => {
+          const id = recordId(automation, "automationId", "id");
+          if (!id) return null;
+          const status = recordText(automation, "status") ?? "unknown";
+          const paused = status === "paused";
+          return (
+            <RuntimeRow key={id} label={recordText(automation, "name") ?? id} status={status}>
+              <button
+                className="cindy-runtime-row-action"
+                disabled={busyAction !== undefined}
+                onClick={() => void runAction(`${paused ? "automation.resume" : "automation.pause"}:${id}`, paused ? "automation.resume" : "automation.pause", { automationId: id })}
+                type="button"
+              >
+                {paused ? "恢复" : "暂停"}
+              </button>
+              <button
+                className="cindy-runtime-row-action"
+                disabled={busyAction !== undefined}
+                onClick={() => void runAction(`automation.run:${id}`, "automation.run", { automationId: id })}
+                type="button"
+              >
+                立即执行
+              </button>
+            </RuntimeRow>
+          );
+        })}
+      </RuntimeSection>
+
+      <RuntimeSection title="Goal / Graph" empty="暂无 Goal 或 Graph">
+        {goals.map((goal) => {
+          const id = recordId(goal, "goalId", "id");
+          if (!id) return null;
+          return <RuntimeRow key={`goal:${id}`} label={`Goal · ${recordText(goal, "title") ?? id}`} status={recordText(goal, "status") ?? "unknown"} />;
+        })}
+        {graphs.map((graph) => {
+          const id = recordId(graph, "graphId", "id");
+          if (!id) return null;
+          const status = recordText(graph, "status") ?? "unknown";
+          const paused = status === "paused";
+          return (
+            <RuntimeRow key={`graph:${id}`} label={`Graph · ${id}`} status={status}>
+              {paused || status === "running" ? (
+                <button
+                  className="cindy-runtime-row-action"
+                  disabled={busyAction !== undefined}
+                  onClick={() => void runAction(`${paused ? "graph.resume" : "graph.pause"}:${id}`, paused ? "graph.resume" : "graph.pause", { graphId: id })}
+                  type="button"
+                >
+                  {paused ? "恢复" : "暂停"}
+                </button>
+              ) : null}
+            </RuntimeRow>
+          );
+        })}
+      </RuntimeSection>
+
+      <div className="cindy-runtime-panel-footer">
+        <span>Capability {capabilities.length}</span>
+        <span>断线恢复从 SQLite authority 继续</span>
+      </div>
+    </aside>
+  );
+}
+
+function RuntimeSection({ children, empty, title }: { children: React.ReactNode; empty: string; title: string }): React.JSX.Element {
+  const content = Array.isArray(children) ? children.filter(Boolean) : children;
+  const isEmpty = Array.isArray(content) ? content.length === 0 : !content;
+  return (
+    <section className="cindy-runtime-section">
+      <h3>{title}</h3>
+      {isEmpty ? <p className="cindy-runtime-empty">{empty}</p> : content}
+    </section>
+  );
+}
+
+function RuntimeRow({ children, label, status }: { children?: React.ReactNode; label: string; status: string }): React.JSX.Element {
+  return (
+    <div className="cindy-runtime-row">
+      <div className="cindy-runtime-row-copy">
+        <span title={label}>{label}</span>
+        <small>{status}</small>
+      </div>
+      <div className="cindy-runtime-row-actions">{children}</div>
+    </div>
+  );
+}
+
+function taskAction(status: string): { label: string; operation: Extract<DesktopRuntimeMutation, "task.cancel"> } | undefined {
+  if (status === "queued" || status === "created" || status === "running" || status === "verifying") return { label: "取消", operation: "task.cancel" };
+  return undefined;
+}
+
+function records(value: unknown): RuntimeRecord[] {
+  if (Array.isArray(value)) return value.filter(isRecord);
+  if (!isRecord(value)) return [];
+  const tasks = value.tasks;
+  return Array.isArray(tasks) ? tasks.filter(isRecord) : [];
+}
+
+function isRecord(value: unknown): value is RuntimeRecord {
+  return typeof value === "object" && value !== null;
+}
+
+function recordId(record: RuntimeRecord, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+function recordText(record: RuntimeRecord, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
