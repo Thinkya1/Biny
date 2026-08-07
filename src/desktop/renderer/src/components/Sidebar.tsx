@@ -20,7 +20,7 @@ type SidebarSectionName = "pinned" | "projects" | "dialogue";
 type ProjectSort = "priority" | "recent" | "manual";
 type ProjectDragPlacement = "before" | "after";
 type FloatingMenuAnchor = { readonly current: HTMLElement | null };
-type SidebarNavAction = "newTask" | "settings" | "search";
+type SidebarNavAction = "newTask" | "extensions" | "settings" | "search";
 
 const SIDEBAR_NAV_ITEMS: ReadonlyArray<{
   action?: SidebarNavAction;
@@ -31,7 +31,7 @@ const SIDEBAR_NAV_ITEMS: ReadonlyArray<{
 }> = [
   { action: "newTask", icon: "circle-add", label: "新建" },
   { disabled: true, icon: "timer", label: "自动化", title: "自动化功能暂未开放" },
-  { action: "settings", icon: "plug", label: "插件" },
+  { action: "extensions", icon: "plug", label: "插件" },
   { action: "search", icon: "search", label: "搜索" }
 ];
 
@@ -64,6 +64,7 @@ interface SidebarProps {
   onRenameProject(projectId: string): void;
   onNewTask(projectId: string): void;
   onRemoveProject(projectId: string): void;
+  onExtensions(): void;
   onSearch(): void;
   onSettings(): void;
   onResizeKeyDown: React.KeyboardEventHandler<HTMLDivElement>;
@@ -93,6 +94,7 @@ export const Sidebar = memo(function Sidebar({
   onRenameProject,
   onNewTask,
   onRemoveProject,
+  onExtensions,
   onSearch,
   onSettings,
   onResizeKeyDown,
@@ -251,6 +253,7 @@ export const Sidebar = memo(function Sidebar({
 
   const navActionHandlers: Record<SidebarNavAction, () => void> = {
     newTask: createTask,
+    extensions: onExtensions,
     search: onSearch,
     settings: onSettings
   };

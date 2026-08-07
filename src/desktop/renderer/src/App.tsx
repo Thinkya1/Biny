@@ -52,6 +52,7 @@ import { Composer, type ContextUsage } from "./components/Composer.js";
 import { summarizeTimelineUsage } from "./usagePresentation.js";
 import { DesktopShell } from "./components/DesktopShell.js";
 import { Sidebar } from "./components/Sidebar.js";
+import { SkillHubView } from "./components/SkillHubView.js";
 import { Workspace } from "./components/Workspace.js";
 import { DesktopToast } from "./components/overlays/DesktopToast.js";
 import { RenameOverlay } from "./components/overlays/RenameOverlay.js";
@@ -67,6 +68,8 @@ interface RenameTarget {
   title: string;
   metadataRevision?: string;
 }
+
+type DesktopPage = "chat" | "extensions";
 
 export function App(): React.JSX.Element {
   const [version, setVersion] = useState("0.1.0");
@@ -85,6 +88,7 @@ export function App(): React.JSX.Element {
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTargetTab, setSettingsTargetTab] = useState<SettingsTab>();
+  const [page, setPage] = useState<DesktopPage>("chat");
   const [contextBudget, setContextBudget] = useState<ContextBudgetStatus>();
   const [renameTarget, setRenameTarget] = useState<RenameTarget>();
   const [slashResult, setSlashResult] = useState<DesktopSlashResult>();
@@ -126,6 +130,13 @@ export function App(): React.JSX.Element {
 
   const closeSearch = useCallback((): void => {
     setSearchOpen(false);
+  }, []);
+
+  const openExtensions = useCallback((): void => {
+    setPage("extensions");
+    setSearchOpen(false);
+    setSettingsOpen(false);
+    setSettingsTargetTab(undefined);
   }, []);
 
   useEffect(() => {
@@ -231,6 +242,7 @@ export function App(): React.JSX.Element {
   const openSession = useCallback(async (projectId: string, sessionId: string, showLoader = true): Promise<void> => {
     const request = loadRequestRef.current + 1;
     loadRequestRef.current = request;
+    setPage("chat");
     setSelectedSessionId(sessionId);
     // 上下文用量属于某一个会话，换会话就作废，等新会话跑出 context.updated 再显示。
     setContextBudget(undefined);
@@ -252,6 +264,7 @@ export function App(): React.JSX.Element {
   }, []);
 
   const adoptWorkspace = useCallback(async (snapshot: DesktopWorkspaceSnapshot, preferredSessionId?: string): Promise<void> => {
+    setPage("chat");
     mergeWorkspaceProject(snapshot);
     // 进入 Desktop 本身不等于恢复旧会话；只有用户点击会话、显式 handoff 或
     // 正在运行的 Host 会话才允许打开聊天正文。
@@ -811,6 +824,7 @@ export function App(): React.JSX.Element {
           onSelectSession={(projectId, sessionId) => void navigateToSession(projectId, sessionId)}
           onLoadSessionChildren={loadSessionChildren}
           onSessionMenu={(session) => void openSessionMenu(session)}
+          onExtensions={openExtensions}
           onSettings={() => openSettings()}
           onResizeKeyDown={onSidebarResizeKeyDown}
           onResizePointerDown={onSidebarResizePointerDown}
@@ -826,7 +840,7 @@ export function App(): React.JSX.Element {
       )}
       theme={themePreference}
     >
-      <Workspace
+      {page === "extensions" ? <SkillHubView onError={setToast} /> : <Workspace
         loading={loading}
         onCreateBranch={() => { void createBranch(); }}
         onDeleteUserMessage={deleteUserMessage}
@@ -852,7 +866,7 @@ export function App(): React.JSX.Element {
         onRuntimeRefresh={refreshRuntimeProjection}
       >
         {composer}
-      </Workspace>
+      </Workspace>}
     </DesktopShell>
   );
 }

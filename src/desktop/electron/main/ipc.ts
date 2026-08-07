@@ -27,6 +27,7 @@ import { desktopIpc } from "../../protocol.js";
 import { DesktopAgentManager } from "./DesktopAgentManager.js";
 import { DesktopBrowserService } from "./DesktopBrowserService.js";
 import { DesktopProjectService } from "./DesktopProjectService.js";
+import { DesktopSkillService } from "./DesktopSkillService.js";
 import { DesktopStateStore } from "./DesktopStateStore.js";
 import { DesktopTerminalManager } from "./DesktopTerminalManager.js";
 
@@ -36,6 +37,7 @@ interface IpcContext {
   agents: DesktopAgentManager;
   terminals: DesktopTerminalManager;
   browser: DesktopBrowserService;
+  skills: DesktopSkillService;
   getWindow(): BrowserWindow | undefined;
   bootstrap(): Promise<DesktopBootstrap>;
 }
@@ -130,6 +132,9 @@ const runtimeMutationSchema = z.enum([
   "capability.invoke", "capability.accept", "capability.start", "capability.result", "capability.chunk", "capability.fail", "capability.cancel"
 ]);
 const runtimePayloadSchema = z.record(z.unknown()).optional();
+const skillIdSchema = z.string().trim().min(1).max(128);
+const skillFilePathSchema = z.string().trim().min(1).max(2_000);
+const skillFileContentSchema = z.string().max(512 * 1024);
 
 export function registerDesktopIpc(context: IpcContext): void {
   handle(desktopIpc.bootstrap, async () => await context.bootstrap());
@@ -496,6 +501,25 @@ export function registerDesktopIpc(context: IpcContext): void {
     const project = context.projects.requireProject(idSchema.parse(projectId));
     const filePath = context.projects.workspaceFile(project, z.string().min(1).max(2_000).parse(relativePath));
     const error = await shell.openPath(filePath);
+    if (error) throw new Error(error);
+  });
+
+  handle(desktopIpc.skillCatalog, async () => await context.skills.snapshot());
+
+  handle(desktopIpc.skillFileRead, async (_event, skillId: unknown, relativePath: unknown) => {
+    return await context.skills.readFile(skillIdSchema.parse(skillId), skillFilePathSchema.parse(relativePath));
+  });
+
+  handle(desktopIpc.skillFileWrite, async (_event, skillId: unknown, relativePath: unknown, content: unknown) => {
+    await context.skills.writeFile(
+      skillIdSchema.parse(skillId),
+      skillFilePathSchema.parse(relativePath),
+      skillFileContentSchema.parse(content)
+    );
+  });
+
+  handle(desktopIpc.skillOpenDirectory, async (_event, skillId: unknown) => {
+    const error = await shell.openPath(await context.skills.directory(skillIdSchema.parse(skillId)));
     if (error) throw new Error(error);
   });
 

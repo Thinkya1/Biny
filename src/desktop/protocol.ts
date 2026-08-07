@@ -91,7 +91,11 @@ export const desktopIpc = {
   disposeTerminal: "desktop:terminal:dispose",
   terminalEvent: "desktop:terminal:event",
   event: "desktop:agent:event",
-  menuAction: "desktop:menu:action"
+  menuAction: "desktop:menu:action",
+  skillCatalog: "desktop:skill:catalog",
+  skillFileRead: "desktop:skill:file-read",
+  skillFileWrite: "desktop:skill:file-write",
+  skillOpenDirectory: "desktop:skill:open-directory"
 } as const;
 
 export type DesktopThemePreference = "system" | "light" | "dark";
@@ -261,6 +265,56 @@ export interface DesktopWorkspaceDirectoryEntry {
 export interface DesktopWorkspaceDirectory {
   path: string;
   entries: DesktopWorkspaceDirectoryEntry[];
+}
+
+export type DesktopSkillScope = "global" | "project";
+export type DesktopSkillEngine = "biny" | "codex" | "claude" | "pi";
+
+export interface DesktopSkillFile {
+  path: string;
+  name: string;
+  kind: "file";
+  size: number;
+}
+
+export interface DesktopSkillCatalogEntry {
+  id: string;
+  name: string;
+  description: string;
+  scope: DesktopSkillScope;
+  engine: DesktopSkillEngine;
+  linkedEngines: DesktopSkillEngine[];
+  absolutePath: string;
+  mdPath: string;
+  projectRoot?: string;
+  files: DesktopSkillFile[];
+  frontmatter: Record<string, unknown>;
+  parseError?: string;
+}
+
+export interface DesktopPluginSummary {
+  id: string;
+  name: string;
+  path: string;
+  scope: "project";
+  projectId: string;
+  projectName: string;
+  status: "configured" | "missing";
+  moduleCount: number;
+}
+
+export interface DesktopSkillCatalogSnapshot {
+  skills: DesktopSkillCatalogEntry[];
+  plugins: DesktopPluginSummary[];
+  warnings: string[];
+}
+
+export interface DesktopSkillFilePreview {
+  path: string;
+  content?: string;
+  bytes: number;
+  binary: boolean;
+  truncated: boolean;
 }
 
 export interface DesktopModelConfigurationInput {
@@ -564,6 +618,10 @@ export interface DesktopApi {
   writeTerminal(terminalId: string, data: string): void;
   resizeTerminal(terminalId: string, cols: number, rows: number): void;
   disposeTerminal(terminalId: string): Promise<void>;
+  skillCatalog(): Promise<DesktopSkillCatalogSnapshot>;
+  readSkillFile(skillId: string, relativePath: string): Promise<DesktopSkillFilePreview>;
+  writeSkillFile(skillId: string, relativePath: string, content: string): Promise<void>;
+  openSkillDirectory(skillId: string): Promise<void>;
   onTerminalEvent(listener: (event: DesktopTerminalEvent) => void): () => void;
   onAgentEvent(listener: (envelope: DesktopAgentEventEnvelope) => void): () => void;
   onSessionHandoff(listener: (target: DesktopSessionHandoff) => void): () => void;
